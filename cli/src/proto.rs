@@ -116,6 +116,72 @@ pub struct ShellResp {
     pub exit_code: Option<i32>,
 }
 
+// ── /v1/find, /v1/find_tap, /v1/xpath ────────────────────────────────
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SelectorQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub klass: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xpath: Option<String>,
+    #[serde(default)]
+    pub all: bool,
+    #[serde(default)]
+    pub exact: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clickable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FindResp {
+    pub matched: Option<Element>,
+    pub elements: Vec<Element>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FindTapResp {
+    pub matched: Element,
+    pub x: i32,
+    pub y: i32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct XpathReq {
+    pub query: String,
+    pub tap: bool,
+}
+
+// ── /v1/toast/* ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToastRecentResp {
+    pub toasts: Vec<ToastEvent>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ToastEvent {
+    pub package: Option<String>,
+    pub text: String,
+    pub ts: u64,
+}
+
+// ── /v1/files/* ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FileWriteResp {
+    pub path: String,
+    pub bytes: u64,
+    pub mode: u32,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct OkResponse {
     #[serde(default = "_true")]

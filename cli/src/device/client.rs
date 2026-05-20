@@ -95,6 +95,38 @@ impl ServerClient {
         Ok(resp.bytes().await?.to_vec())
     }
 
+    pub async fn find(&self, query: &SelectorQuery) -> Result<FindResp> {
+        self.post("/find", query).await
+    }
+
+    pub async fn find_tap(&self, query: &SelectorQuery) -> Result<FindTapResp> {
+        self.post("/find_tap", query).await
+    }
+
+    pub async fn xpath(&self, query: &str, tap: bool) -> Result<FindResp> {
+        self.post(
+            "/xpath",
+            &XpathReq {
+                query: query.to_string(),
+                tap,
+            },
+        )
+        .await
+    }
+
+    pub async fn xpath_tap(&self, query: &str) -> Result<FindTapResp> {
+        let resp = self
+            .http
+            .post(format!("{}/xpath", self.base))
+            .json(&XpathReq {
+                query: query.to_string(),
+                tap: true,
+            })
+            .send()
+            .await?;
+        check_then_json(resp).await
+    }
+
     // ── gestures ────────────────────────────────────────────────
 
     pub async fn tap_xy(&self, x: i32, y: i32) -> Result<()> {
@@ -276,6 +308,45 @@ impl ServerClient {
         )
         .await
     }
+
+    pub async fn toast_start(&self, buffer_size: u32) -> Result<()> {
+        let _: OkResponse = self
+            .post(
+                "/toast/start",
+                &serde_json::json!({"buffer_size": buffer_size}),
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn toast_stop(&self) -> Result<()> {
+        let _: OkResponse = self.post_empty("/toast/stop").await?;
+        Ok(())
+    }
+
+    pub async fn toast_recent(&self, since_ts: u64) -> Result<ToastRecentResp> {
+        self.get(&format!("/toast/recent?since_ts={since_ts}"))
+            .await
+    }
+
+    pub async fn push_file(&self, remote: &str, bytes: Vec<u8>) -> Result<FileWriteResp> {
+        let resp = self
+            .http
+            .put(format!("{}{}", self.base, file_path(remote)))
+            .body(bytes)
+            .send()
+            .await?;
+        check_then_json(resp).await
+    }
+
+    pub async fn pull_file(&self, remote: &str) -> Result<Vec<u8>> {
+        let resp = self
+            .http
+            .get(format!("{}{}", self.base, file_path(remote)))
+            .send()
+            .await?;
+        check_then_bytes(resp).await
+    }
 }
 
 /// Check response status; on non-2xx, try to parse our wire-error envelope
@@ -296,4 +367,33 @@ async fn check_then_json<T: serde::de::DeserializeOwned>(resp: Response) -> Resu
         );
     }
     Err(anyhow!("server returned {}: {}", status, text))
+}
+
+async fn check_then_bytes(resp: Response) -> Result<Vec<u8>> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.bytes().await?.to_vec());
+    }
+    let text = resp.text().await?;
+    if let Ok(env) = serde_json::from_str::<ErrorEnvelope>(&text) {
+        bail!(
+            "server error {}: {} ({})",
+            status,
+            env.error.message,
+            env.error.code
+        );
+    }
+    Err(anyhow!("server returned {}: {}", status, text))
+}
+
+fn file_path(path: &str) -> String {
+    let trimmed = path.trim();
+    let normalized = trimmed.trim_start_matches('/');
+    let encoded = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(|part| urlencoding::encode(part).into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("/files/{encoded}")
 }

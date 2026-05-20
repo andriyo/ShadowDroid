@@ -60,9 +60,9 @@ class HttpServer(
                         AppRoutes.register(this, uiDevice, instrumentation)
                         SystemRoutes.register(this, uiDevice, instrumentation)
                         // M4:
-                        SelectorRoutes.register(this, uiDevice)
-                        ToastRoutes.register(this, uiDevice)
-                        FileRoutes.register(this)
+                        SelectorRoutes.register(this, uiDevice, instrumentation)
+                        ToastRoutes.register(this, instrumentation)
+                        FileRoutes.register(this, instrumentation)
                     }
                 }
             }.also { it.start(wait = false) }

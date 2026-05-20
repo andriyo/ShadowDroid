@@ -8,13 +8,14 @@
 //! M2 implements one-shot inspection/action verbs. M3 implements `watch`.
 //! M4 verbs are still clap-visible but return a milestone error.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use std::path::PathBuf;
 
 use crate::device::client::ServerClient;
 use crate::device::{adb, installer};
+use crate::proto::{Element, SelectorQuery};
 
 #[derive(Parser)]
 #[command(
@@ -291,6 +292,53 @@ pub async fn run() -> Result<()> {
                 &serde_json::json!({"direction":direction,"scale":scale,"duration_ms":duration_ms}),
             );
         }
+        Cmd::TapText { value } => {
+            cmd_find_tap(
+                &client,
+                "tap_text",
+                SelectorQuery {
+                    text: Some(value),
+                    ..Default::default()
+                },
+            )
+            .await?
+        }
+        Cmd::TapRid { value } => {
+            cmd_find_tap(
+                &client,
+                "tap_rid",
+                SelectorQuery {
+                    rid: Some(value),
+                    ..Default::default()
+                },
+            )
+            .await?
+        }
+        Cmd::TapDesc { value } => {
+            cmd_find_tap(
+                &client,
+                "tap_desc",
+                SelectorQuery {
+                    desc: Some(value),
+                    ..Default::default()
+                },
+            )
+            .await?
+        }
+        Cmd::Xpath { query } => {
+            let r = client.xpath(&query, false).await?;
+            emit_action(
+                "xpath",
+                &serde_json::json!({"query":query,"matched":r.matched,"elements":r.elements}),
+            );
+        }
+        Cmd::XpathTap { query } => {
+            let r = client.xpath_tap(&query).await?;
+            emit_action(
+                "xpath_tap",
+                &serde_json::json!({"query":query,"x":r.x,"y":r.y,"matched":r.matched}),
+            );
+        }
 
         // ── keys + text ────────────────────────────────────────
         Cmd::Back => {
@@ -408,6 +456,56 @@ pub async fn run() -> Result<()> {
             client.open_url(&url).await?;
             emit_action("open_url", &serde_json::json!({"url":url}));
         }
+        Cmd::Push {
+            local,
+            remote,
+            mode,
+        } => {
+            let bytes = std::fs::read(&local).with_context(|| format!("reading {local}"))?;
+            let r = client.push_file(&remote, bytes).await?;
+            emit_action(
+                "push",
+                &serde_json::json!({"local":local,"remote":remote,"path":r.path,"bytes":r.bytes,"mode":r.mode,"requested_mode":mode}),
+            );
+        }
+        Cmd::Pull { remote, local } => {
+            let bytes = client.pull_file(&remote).await?;
+            std::fs::write(&local, &bytes).with_context(|| format!("writing {local}"))?;
+            emit_action(
+                "pull",
+                &serde_json::json!({"remote":remote,"local":local,"bytes":bytes.len() as u64}),
+            );
+        }
+        Cmd::Toast { wait_ms } => {
+            cmd_toast(&client, wait_ms).await?;
+        }
+        Cmd::WaitFor {
+            text,
+            rid,
+            desc,
+            klass,
+            activity,
+            package,
+            gone,
+            timeout_ms,
+            poll_ms,
+        } => {
+            cmd_wait_for(
+                &client,
+                WaitForQuery {
+                    text,
+                    rid,
+                    desc,
+                    klass,
+                    activity,
+                    package,
+                },
+                gone,
+                timeout_ms,
+                poll_ms,
+            )
+            .await?;
+        }
         Cmd::Watch {
             app,
             poll_ms,
@@ -416,9 +514,6 @@ pub async fn run() -> Result<()> {
             no_crash_detect,
             watcher_file,
         } => {
-            if !watcher_file.is_empty() {
-                bail!("--watcher-file is not yet implemented — that's milestone M4. M3 ships streaming watch + crash detection.");
-            }
             crate::watch::r#loop::run(crate::watch::r#loop::WatchConfig {
                 serial,
                 client,
@@ -427,26 +522,10 @@ pub async fn run() -> Result<()> {
                 debounce_ms,
                 accept_stdin: !no_stdin,
                 detect_crashes: !no_crash_detect,
+                watcher_files: watcher_file,
             })
             .await?;
-        }
-
-        // ── deferred / M2-OUT ──────────────────────────────────
-        other @ (Cmd::TapText { .. }
-        | Cmd::TapRid { .. }
-        | Cmd::TapDesc { .. }
-        | Cmd::Xpath { .. }
-        | Cmd::XpathTap { .. }
-        | Cmd::Push { .. }
-        | Cmd::Pull { .. }
-        | Cmd::Toast { .. }
-        | Cmd::WaitFor { .. }) => {
-            bail!(
-                "`{}` is not yet implemented — that's milestone M3/M4. \
-                   M2 ships everything one-shot up to /v1/shell.",
-                subcommand_name(&other)
-            );
-        }
+        } // ── deferred / M2-OUT ──────────────────────────────────
     }
     Ok(())
 }
@@ -553,50 +632,112 @@ async fn cmd_wait_activity(client: &ServerClient, name: &str, timeout_ms: u32) -
     }
 }
 
-fn subcommand_name(c: &Cmd) -> &'static str {
-    match c {
-        Cmd::Devices => "devices",
-        Cmd::Connect => "connect",
-        Cmd::Disconnect => "disconnect",
-        Cmd::Screen => "screen",
-        Cmd::Screenshot { .. } => "screenshot",
-        Cmd::Tap { .. } => "tap",
-        Cmd::DoubleTap { .. } => "double_tap",
-        Cmd::LongTap { .. } => "long_tap",
-        Cmd::Swipe { .. } => "swipe",
-        Cmd::Drag { .. } => "drag",
-        Cmd::SwipeExt { .. } => "swipe_ext",
-        Cmd::TapText { .. } => "tap_text",
-        Cmd::TapRid { .. } => "tap_rid",
-        Cmd::TapDesc { .. } => "tap_desc",
-        Cmd::Xpath { .. } => "xpath",
-        Cmd::XpathTap { .. } => "xpath_tap",
-        Cmd::Back => "back",
-        Cmd::Home => "home",
-        Cmd::Key { .. } => "key",
-        Cmd::Text { .. } => "text",
-        Cmd::Launch { .. } => "launch",
-        Cmd::Stop { .. } => "stop",
-        Cmd::AppClear { .. } => "app_clear",
-        Cmd::AppWait { .. } => "app_wait",
-        Cmd::AppInfo { .. } => "app_info",
-        Cmd::WaitActivity { .. } => "wait_activity",
-        Cmd::Shell { .. } => "shell",
-        Cmd::ScreenOn => "screen_on",
-        Cmd::ScreenOff => "screen_off",
-        Cmd::Unlock => "unlock",
-        Cmd::Wakeup => "wakeup",
-        Cmd::Orientation { .. } => "orientation",
-        Cmd::Clipboard { .. } => "clipboard",
-        Cmd::Notifications => "notifications",
-        Cmd::QuickSettings => "quick_settings",
-        Cmd::OpenUrl { .. } => "open_url",
-        Cmd::Push { .. } => "push",
-        Cmd::Pull { .. } => "pull",
-        Cmd::Toast { .. } => "toast",
-        Cmd::WaitFor { .. } => "wait_for",
-        Cmd::Watch { .. } => "watch",
+async fn cmd_find_tap(client: &ServerClient, cmd: &str, query: SelectorQuery) -> Result<()> {
+    let r = client.find_tap(&query).await?;
+    emit_action(
+        cmd,
+        &serde_json::json!({"x":r.x,"y":r.y,"matched":r.matched}),
+    );
+    Ok(())
+}
+
+async fn cmd_toast(client: &ServerClient, wait_ms: u32) -> Result<()> {
+    let start = unix_ms();
+    client.toast_start(50).await?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms as u64);
+    loop {
+        let recent = client.toast_recent(start).await?;
+        if !recent.toasts.is_empty() || std::time::Instant::now() >= deadline {
+            emit_action("toast", &serde_json::json!({"toasts":recent.toasts}));
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+}
+
+struct WaitForQuery {
+    text: Option<String>,
+    rid: Option<String>,
+    desc: Option<String>,
+    klass: Option<String>,
+    activity: Option<String>,
+    package: Option<String>,
+}
+
+async fn cmd_wait_for(
+    client: &ServerClient,
+    query: WaitForQuery,
+    gone: bool,
+    timeout_ms: u32,
+    poll_ms: u32,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+    loop {
+        let screen = client.screen().await?;
+        let matched = wait_query_matches(&query, &screen.current_app, &screen.elements);
+        let screen_hash = screen.screen_hash;
+        if matched != gone {
+            emit_action(
+                "wait_for",
+                &serde_json::json!({"matched":matched,"gone":gone,"screen_hash":screen_hash}),
+            );
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            emit_action(
+                "wait_for",
+                &serde_json::json!({"matched":matched,"gone":gone,"screen_hash":screen_hash,"timeout":true}),
+            );
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(poll_ms.max(1) as u64)).await;
+    }
+}
+
+fn wait_query_matches(
+    query: &WaitForQuery,
+    app: &crate::proto::AppRef,
+    elements: &[Element],
+) -> bool {
+    if let Some(package) = &query.package {
+        if !app.package.as_deref().unwrap_or("").contains(package) {
+            return false;
+        }
+    }
+    if let Some(activity) = &query.activity {
+        if !app.activity.as_deref().unwrap_or("").contains(activity) {
+            return false;
+        }
+    }
+    let has_element_query = query.text.is_some()
+        || query.rid.is_some()
+        || query.desc.is_some()
+        || query.klass.is_some();
+    if !has_element_query {
+        return true;
+    }
+    elements.iter().any(|el| {
+        selector_string_matches(el.text.as_deref(), query.text.as_deref())
+            && selector_string_matches(el.rid.as_deref(), query.rid.as_deref())
+            && selector_string_matches(el.desc.as_deref(), query.desc.as_deref())
+            && selector_string_matches(el.klass.as_deref(), query.klass.as_deref())
+    })
+}
+
+fn selector_string_matches(actual: Option<&str>, expected: Option<&str>) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    actual
+        .map(|actual| actual.to_lowercase().contains(&expected.to_lowercase()))
+        .unwrap_or(false)
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 // ── M1 subcommands ───────────────────────────────────────────
