@@ -6,7 +6,7 @@
 //!   - `disconnect` — stop server, remove port forward
 //!
 //! M2 implements one-shot inspection/action verbs. M3 implements `watch`.
-//! M4 verbs are still clap-visible but return a milestone error.
+//! M4 adds selectors, toasts, files, and declarative popup watchers.
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use crate::device::client::ServerClient;
 use crate::device::{adb, installer};
 use crate::proto::{Element, SelectorQuery};
+use crate::watch::watcher::PermissionDialogPolicy;
 
 #[derive(Parser)]
 #[command(
@@ -212,6 +213,11 @@ pub enum Cmd {
         no_stdin: bool,
         #[arg(long)]
         no_crash_detect: bool,
+        /// Built-in Android permission dialog policy.
+        ///
+        /// `allow` taps PermissionController allow buttons; `deny` taps deny buttons.
+        #[arg(long, value_enum, default_value_t = PermissionDialogPolicy::Ignore)]
+        permission_dialogs: PermissionDialogPolicy,
         #[arg(long)]
         watcher_file: Vec<String>,
     },
@@ -512,6 +518,7 @@ pub async fn run() -> Result<()> {
             debounce_ms,
             no_stdin,
             no_crash_detect,
+            permission_dialogs,
             watcher_file,
         } => {
             crate::watch::r#loop::run(crate::watch::r#loop::WatchConfig {
@@ -523,6 +530,7 @@ pub async fn run() -> Result<()> {
                 accept_stdin: !no_stdin,
                 detect_crashes: !no_crash_detect,
                 watcher_files: watcher_file,
+                permission_dialog_policy: permission_dialogs,
             })
             .await?;
         } // ── deferred / M2-OUT ──────────────────────────────────

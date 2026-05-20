@@ -18,7 +18,7 @@
 use crate::device::client::ServerClient;
 use crate::events::{self, now_ts, Event};
 use crate::proto::{AppRef, Element, SelectorQuery};
-use crate::watch::watcher::{WatcherRule, WatcherSet};
+use crate::watch::watcher::{PermissionDialogPolicy, WatcherRule, WatcherSet};
 use crate::watch::{logcat, stdin};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
@@ -46,6 +46,7 @@ pub struct WatchConfig {
     pub accept_stdin: bool,
     pub detect_crashes: bool,
     pub watcher_files: Vec<String>,
+    pub permission_dialog_policy: PermissionDialogPolicy,
 }
 
 enum WatchMsg {
@@ -55,6 +56,7 @@ enum WatchMsg {
 
 pub async fn run(cfg: WatchConfig) -> Result<()> {
     let watchers = WatcherSet::from_files(&cfg.watcher_files)?;
+    watchers.set_permission_dialog_policy(cfg.permission_dialog_policy);
     let state = cfg
         .client
         .state()
@@ -602,6 +604,17 @@ async fn dispatch_command(
         "clear_watchers" => {
             watchers.clear();
             emit_json(json!({"type":"action","cmd":"clear_watchers"}));
+        }
+        "permission_dialogs" => {
+            let policy = req_str(cmd, "policy")?;
+            let policy = PermissionDialogPolicy::parse(policy)
+                .ok_or_else(|| anyhow!("permission_dialogs policy must be ignore|allow|deny"))?;
+            watchers.set_permission_dialog_policy(policy);
+            emit_json(json!({
+                "type":"action",
+                "cmd":"permission_dialogs",
+                "policy": policy.as_str()
+            }));
         }
         _ => bail!("unknown cmd: {op}"),
     }

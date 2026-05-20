@@ -109,17 +109,20 @@ adb shell am crash com.livd
 
 **Demo:**
 ```bash
-cat > /tmp/rules.json <<'EOF'
-[{"name":"allow","when":{"text":"Allow"},"then":[{"cmd":"tap_text","value":"Allow"}],"max_fires":3}]
-EOF
-shadowdroid watch --app com.livd --watcher-file /tmp/rules.json | jq -c .
-# Reset permissions on another shell:
+shadowdroid watch --app com.livd --permission-dialogs allow | jq -c .
+
+# Reset permissions in another shell:
 adb shell pm reset-permissions com.livd
 # Watch stream emits:
-# {"type":"watcher_fired","name":"allow","matched":{...},"ts":...}
+# {"type":"watcher_fired","name":"builtin_permission_allow","matched":{...},"ts":...}
 # {"type":"action","cmd":"tap","x":540,"y":1331}
 # {"type":"screen", ...}
 ```
+
+Use `--permission-dialogs deny` for negative-path tests. Custom `--watcher-file`
+rules remain the escape hatch for app-specific dialogs, but Android
+PermissionController buttons are covered by built-in resource-id rules so agents
+do not need to shell out to ADB for the common permission flow.
 
 **Validates:** end-to-end feature parity with `movi`. At this point the legacy Python tool can be retired.
 

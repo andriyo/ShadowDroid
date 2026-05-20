@@ -19,6 +19,38 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum PermissionDialogPolicy {
+    Ignore,
+    Allow,
+    Deny,
+}
+
+impl Default for PermissionDialogPolicy {
+    fn default() -> Self {
+        Self::Ignore
+    }
+}
+
+impl PermissionDialogPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ignore => "ignore",
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "ignore" | "off" | "none" => Some(Self::Ignore),
+            "allow" | "accept" => Some(Self::Allow),
+            "deny" | "dismiss" => Some(Self::Deny),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WatcherRule {
     pub name: String,
@@ -76,6 +108,16 @@ impl WatcherSet {
             guard.append(&mut rules);
         }
         Ok(set)
+    }
+
+    pub fn set_permission_dialog_policy(&self, policy: PermissionDialogPolicy) {
+        {
+            let mut guard = self.inner.lock().expect("watcher mutex poisoned");
+            guard.retain(|rule| !is_builtin_permission_rule(&rule.name));
+        }
+        for rule in permission_dialog_rules(policy) {
+            self.add(rule);
+        }
     }
 
     pub fn add(&self, rule: WatcherRule) {
@@ -139,6 +181,53 @@ fn parse_rules(text: &str) -> Result<Vec<WatcherRule>> {
     Ok(vec![serde_json::from_str::<WatcherRule>(text)?])
 }
 
+fn permission_dialog_rules(policy: PermissionDialogPolicy) -> Vec<WatcherRule> {
+    match policy {
+        PermissionDialogPolicy::Ignore => Vec::new(),
+        PermissionDialogPolicy::Allow => vec![
+            permission_dialog_button_rule(
+                "permission_allow_foreground",
+                "permission_allow_foreground_only_button",
+            ),
+            permission_dialog_button_rule("permission_allow", "permission_allow_button"),
+        ],
+        PermissionDialogPolicy::Deny => vec![
+            permission_dialog_button_rule("permission_deny", "permission_deny_button"),
+            permission_dialog_button_rule(
+                "permission_deny_and_dont_ask_again",
+                "permission_deny_and_dont_ask_again_button",
+            ),
+        ],
+    }
+}
+
+fn is_builtin_permission_rule(name: &str) -> bool {
+    matches!(
+        name,
+        "builtin_permission_allow_foreground"
+            | "builtin_permission_allow"
+            | "builtin_permission_deny"
+            | "builtin_permission_deny_and_dont_ask_again"
+    )
+}
+
+fn permission_dialog_button_rule(name: &str, rid: &str) -> WatcherRule {
+    WatcherRule {
+        name: format!("builtin_{name}"),
+        when: WhenQuery {
+            text: None,
+            rid: Some(rid.to_string()),
+            desc: None,
+            klass: None,
+            clickable: Some(true),
+        },
+        then: vec![serde_json::json!({"cmd": "tap_rid", "value": rid})],
+        max_fires: None,
+        fire_count: 0,
+        last_fired_hash: None,
+    }
+}
+
 fn matches_text(actual: Option<&str>, expected: Option<&str>) -> bool {
     let Some(expected) = expected else {
         return true;
@@ -150,7 +239,7 @@ fn matches_text(actual: Option<&str>, expected: Option<&str>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{WatcherRule, WatcherSet};
+    use super::{PermissionDialogPolicy, WatcherRule, WatcherSet};
     use crate::proto::Element;
 
     fn element(text: &str) -> Element {
@@ -176,6 +265,13 @@ mod tests {
         }
     }
 
+    fn element_with_rid(rid: &str) -> Element {
+        Element {
+            rid: Some(format!("com.android.permissioncontroller:id/{rid}")),
+            ..element("")
+        }
+    }
+
     #[test]
     fn fires_once_per_screen_hash() {
         let set = WatcherSet::default();
@@ -190,5 +286,47 @@ mod tests {
         assert_eq!(set.matches("a", &[element("Allow")]).len(), 1);
         assert_eq!(set.matches("a", &[element("Allow")]).len(), 0);
         assert_eq!(set.matches("b", &[element("Allow")]).len(), 1);
+    }
+
+    #[test]
+    fn builtin_permission_allow_targets_allow_buttons_by_rid() {
+        let set = WatcherSet::default();
+        set.set_permission_dialog_policy(PermissionDialogPolicy::Allow);
+
+        let hits = set.matches(
+            "permission",
+            &[
+                element_with_rid("permission_deny_button"),
+                element_with_rid("permission_allow_button"),
+            ],
+        );
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "builtin_permission_allow");
+        assert_eq!(
+            hits[0].then[0],
+            serde_json::json!({"cmd": "tap_rid", "value": "permission_allow_button"})
+        );
+    }
+
+    #[test]
+    fn builtin_permission_deny_does_not_match_allow_button() {
+        let set = WatcherSet::default();
+        set.set_permission_dialog_policy(PermissionDialogPolicy::Deny);
+
+        assert!(set
+            .matches("permission", &[element_with_rid("permission_allow_button")])
+            .is_empty());
+    }
+
+    #[test]
+    fn builtin_permission_policy_can_be_switched_off() {
+        let set = WatcherSet::default();
+        set.set_permission_dialog_policy(PermissionDialogPolicy::Allow);
+        set.set_permission_dialog_policy(PermissionDialogPolicy::Ignore);
+
+        assert!(set
+            .matches("permission", &[element_with_rid("permission_allow_button")])
+            .is_empty());
     }
 }
