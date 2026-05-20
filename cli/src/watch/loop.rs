@@ -16,8 +16,8 @@
 #![allow(dead_code)]
 
 use crate::device::client::ServerClient;
-use crate::events::{self, now_ts, Event};
-use crate::proto::{AppRef, Element, SelectorQuery};
+use crate::events::{self, now_ts, Event, ScreenFormat};
+use crate::proto::{AppRef, Element, ScreenResponse, SelectorQuery};
 use crate::watch::watcher::{PermissionDialogPolicy, WatcherRule, WatcherSet};
 use crate::watch::{logcat, stdin};
 use anyhow::{anyhow, bail, Context, Result};
@@ -47,11 +47,18 @@ pub struct WatchConfig {
     pub detect_crashes: bool,
     pub watcher_files: Vec<String>,
     pub permission_dialog_policy: PermissionDialogPolicy,
+    pub screen_format: ScreenFormat,
 }
 
 enum WatchMsg {
     Wake(Wake),
     Command(String),
+}
+
+#[derive(Default)]
+struct WatchState {
+    last_hash: Option<String>,
+    last_screen: Option<ScreenResponse>,
 }
 
 pub async fn run(cfg: WatchConfig) -> Result<()> {
@@ -87,7 +94,7 @@ pub async fn run(cfg: WatchConfig) -> Result<()> {
     poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
-    let mut last_hash: Option<String> = None;
+    let mut state = WatchState::default();
 
     loop {
         tokio::select! {
@@ -96,7 +103,7 @@ pub async fn run(cfg: WatchConfig) -> Result<()> {
                 break;
             }
             _ = poll.tick() => {
-                handle_screen_wake(&cfg, &watchers, &mut last_hash, Wake::Poll, false).await;
+                handle_screen_wake(&cfg, &watchers, &mut state, Wake::Poll, false).await;
             }
             Some(evt) = event_rx.recv() => {
                 events::emit(&evt);
@@ -105,10 +112,10 @@ pub async fn run(cfg: WatchConfig) -> Result<()> {
                 match msg {
                     WatchMsg::Wake(wake) => {
                         let force = matches!(wake, Wake::Init | Wake::Command);
-                        handle_screen_wake(&cfg, &watchers, &mut last_hash, wake, force).await;
+                        handle_screen_wake(&cfg, &watchers, &mut state, wake, force).await;
                     }
                     WatchMsg::Command(line) => {
-                        let should_quit = handle_command(&cfg, &watchers, &mut last_hash, &line).await;
+                        let should_quit = handle_command(&cfg, &watchers, &mut state, &line).await;
                         if should_quit {
                             break;
                         }
@@ -220,12 +227,13 @@ fn spawn_stdin(watch_tx: mpsc::Sender<WatchMsg>) {
 async fn handle_screen_wake(
     cfg: &WatchConfig,
     watchers: &WatcherSet,
-    last_hash: &mut Option<String>,
+    state: &mut WatchState,
     wake: Wake,
     force: bool,
 ) {
-    if !matches!(wake, Wake::Poll) && cfg.debounce_ms > 0 {
-        sleep(Duration::from_millis(cfg.debounce_ms as u64)).await;
+    let debounce_ms = debounce_delay_ms(wake, cfg.debounce_ms);
+    if debounce_ms > 0 {
+        sleep(Duration::from_millis(debounce_ms as u64)).await;
     }
     match cfg.client.screen().await {
         Ok(screen) => {
@@ -237,12 +245,17 @@ async fn handle_screen_wake(
                     return;
                 }
             }
-            if !force && last_hash.as_deref() == Some(screen.screen_hash.as_str()) {
+            if !force && state.last_hash.as_deref() == Some(screen.screen_hash.as_str()) {
                 return;
             }
-            *last_hash = Some(screen.screen_hash.clone());
+            state.last_hash = Some(screen.screen_hash.clone());
+            state.last_screen = Some(screen.clone());
             let hits = watchers.matches(&screen.screen_hash, &screen.elements);
-            events::emit(&events::screen_event(&cfg.serial, screen));
+            events::emit(&events::screen_event(
+                &cfg.serial,
+                screen,
+                cfg.screen_format,
+            ));
             for hit in hits {
                 events::emit(&Event::WatcherFired {
                     name: hit.name.clone(),
@@ -251,7 +264,8 @@ async fn handle_screen_wake(
                     ts: now_ts(),
                 });
                 for action in hit.then {
-                    match dispatch_command(cfg, watchers, last_hash, &action).await {
+                    match dispatch_command(cfg, watchers, state, &action).await {
+                        Ok(DispatchOutcome::Handled) => {}
                         Ok(DispatchOutcome::Continue) => {}
                         Ok(DispatchOutcome::ScreenOnly) => {}
                         Ok(DispatchOutcome::Quit) => return,
@@ -277,7 +291,7 @@ async fn handle_screen_wake(
 async fn handle_command(
     cfg: &WatchConfig,
     watchers: &WatcherSet,
-    last_hash: &mut Option<String>,
+    state: &mut WatchState,
     line: &str,
 ) -> bool {
     let cmd = match stdin::parse_command(line) {
@@ -294,13 +308,14 @@ async fn handle_command(
         }
     };
 
-    match dispatch_command(cfg, watchers, last_hash, &cmd).await {
+    match dispatch_command(cfg, watchers, state, &cmd).await {
+        Ok(DispatchOutcome::Handled) => false,
         Ok(DispatchOutcome::Continue) => {
-            handle_screen_wake(cfg, watchers, last_hash, Wake::Command, true).await;
+            handle_screen_wake(cfg, watchers, state, Wake::Command, false).await;
             false
         }
         Ok(DispatchOutcome::ScreenOnly) => {
-            handle_screen_wake(cfg, watchers, last_hash, Wake::Command, true).await;
+            handle_screen_wake(cfg, watchers, state, Wake::Command, true).await;
             false
         }
         Ok(DispatchOutcome::Quit) => true,
@@ -316,16 +331,32 @@ async fn handle_command(
     }
 }
 
+fn debounce_delay_ms(wake: Wake, configured_ms: u32) -> u32 {
+    match wake {
+        Wake::Event | Wake::Init => configured_ms,
+        Wake::Command | Wake::Poll => 0,
+    }
+}
+
 enum DispatchOutcome {
+    Handled,
     Continue,
     ScreenOnly,
     Quit,
 }
 
+#[derive(Debug, Clone)]
+struct TapOutcome {
+    id: Option<u32>,
+    x: i32,
+    y: i32,
+    source: String,
+}
+
 async fn dispatch_command(
     cfg: &WatchConfig,
     watchers: &WatcherSet,
-    _last_hash: &mut Option<String>,
+    state: &mut WatchState,
     cmd: &Value,
 ) -> Result<DispatchOutcome> {
     let op = req_str(cmd, "cmd")?;
@@ -338,27 +369,13 @@ async fn dispatch_command(
             return Ok(DispatchOutcome::ScreenOnly);
         }
         "tap" => {
-            if let Some(id) = opt_u32(cmd, "id")? {
-                let screen = cfg.client.screen().await?;
-                let el = screen
-                    .elements
-                    .iter()
-                    .find(|el| el.id == id)
-                    .ok_or_else(|| {
-                        anyhow!("element id {id} out of range (0..{})", screen.element_count)
-                    })?;
-                let [x, y] = el.tap;
-                cfg.client.tap_xy(x, y).await?;
-                emit_json(json!({
-                    "type":"action","cmd":"tap","id":id,"x":x,"y":y,
-                    "matched":{"text":el.text,"rid":el.rid,"desc":el.desc}
-                }));
-            } else {
-                let x = req_i32(cmd, "x")?;
-                let y = req_i32(cmd, "y")?;
-                cfg.client.tap_xy(x, y).await?;
-                emit_json(json!({"type":"action","cmd":"tap","x":x,"y":y}));
-            }
+            dispatch_tap(cfg, state, cmd, "tap").await?;
+        }
+        "tap_and_wait" => {
+            let start_hash = state.last_hash.clone();
+            let tapped = dispatch_tap(cfg, state, cmd, "tap_and_wait").await?;
+            wait_after_action(cfg, state, cmd, start_hash, "tap_and_wait", Some(tapped)).await?;
+            return Ok(DispatchOutcome::Handled);
         }
         "double_tap" => {
             let x = req_i32(cmd, "x")?;
@@ -505,27 +522,47 @@ async fn dispatch_command(
             cfg.client.open_url(url).await?;
             emit_json(json!({"type":"action","cmd":"open_url","url":url}));
         }
-        "tap_text" | "tap_rid" | "tap_desc" => {
+        "tap_text" | "tap_rid" | "tap_desc" | "tap_text_and_wait" | "tap_rid_and_wait"
+        | "tap_desc_and_wait" => {
             let value = req_str(cmd, "value")?;
+            let base_op = op.strip_suffix("_and_wait").unwrap_or(op);
             let query = match op {
-                "tap_text" => SelectorQuery {
+                "tap_text" | "tap_text_and_wait" => SelectorQuery {
                     text: Some(value.to_string()),
                     ..Default::default()
                 },
-                "tap_rid" => SelectorQuery {
+                "tap_rid" | "tap_rid_and_wait" => SelectorQuery {
                     rid: Some(value.to_string()),
                     ..Default::default()
                 },
-                "tap_desc" => SelectorQuery {
+                "tap_desc" | "tap_desc_and_wait" => SelectorQuery {
                     desc: Some(value.to_string()),
                     ..Default::default()
                 },
                 _ => unreachable!(),
             };
+            let start_hash = state.last_hash.clone();
             let r = cfg.client.find_tap(&query).await?;
             emit_json(
-                json!({"type":"action","cmd":op,"value":value,"x":r.x,"y":r.y,"matched":r.matched}),
+                json!({"type":"action","cmd":base_op,"value":value,"x":r.x,"y":r.y,"matched":r.matched}),
             );
+            if op.ends_with("_and_wait") {
+                wait_after_action(
+                    cfg,
+                    state,
+                    cmd,
+                    start_hash,
+                    op,
+                    Some(TapOutcome {
+                        id: Some(r.matched.id),
+                        x: r.x,
+                        y: r.y,
+                        source: "server".to_string(),
+                    }),
+                )
+                .await?;
+                return Ok(DispatchOutcome::Handled);
+            }
         }
         "xpath" => {
             let query = req_any_str(cmd, &["query", "value"])?;
@@ -619,6 +656,149 @@ async fn dispatch_command(
         _ => bail!("unknown cmd: {op}"),
     }
     Ok(DispatchOutcome::Continue)
+}
+
+async fn dispatch_tap(
+    cfg: &WatchConfig,
+    state: &mut WatchState,
+    cmd: &Value,
+    action_cmd: &str,
+) -> Result<TapOutcome> {
+    if let Some(id) = opt_u32(cmd, "id")? {
+        if let Some(expected_hash) = cmd.get("screen_hash").and_then(Value::as_str) {
+            if state.last_hash.as_deref() != Some(expected_hash) {
+                bail!(
+                    "stale screen id {id}: expected screen_hash {expected_hash}, current cached screen_hash {:?}",
+                    state.last_hash
+                );
+            }
+        }
+        let (el, source) = if let Some(el) = cached_element_by_id(state, id) {
+            (el, "cache".to_string())
+        } else {
+            let screen = cfg.client.screen().await?;
+            let el = screen
+                .elements
+                .iter()
+                .find(|el| el.id == id)
+                .cloned()
+                .ok_or_else(|| anyhow!("element id {id} is not present in the latest screen"))?;
+            state.last_hash = Some(screen.screen_hash.clone());
+            state.last_screen = Some(screen);
+            (el, "fresh".to_string())
+        };
+        let [x, y] = el.tap;
+        cfg.client.tap_xy(x, y).await?;
+        emit_json(json!({
+            "type":"action","cmd":action_cmd,"id":id,"x":x,"y":y,
+            "source":source,
+            "matched":{"text":el.text,"rid":el.rid,"desc":el.desc}
+        }));
+        return Ok(TapOutcome {
+            id: Some(id),
+            x,
+            y,
+            source,
+        });
+    }
+
+    let x = req_i32(cmd, "x")?;
+    let y = req_i32(cmd, "y")?;
+    cfg.client.tap_xy(x, y).await?;
+    emit_json(json!({"type":"action","cmd":action_cmd,"x":x,"y":y,"source":"coordinates"}));
+    Ok(TapOutcome {
+        id: None,
+        x,
+        y,
+        source: "coordinates".to_string(),
+    })
+}
+
+fn cached_element_by_id(state: &WatchState, id: u32) -> Option<Element> {
+    state
+        .last_screen
+        .as_ref()?
+        .elements
+        .iter()
+        .find(|el| el.id == id)
+        .cloned()
+}
+
+async fn wait_after_action(
+    cfg: &WatchConfig,
+    state: &mut WatchState,
+    cmd: &Value,
+    start_hash: Option<String>,
+    action_cmd: &str,
+    tap: Option<TapOutcome>,
+) -> Result<()> {
+    let timeout = timeout_ms(cmd, 2_000)?;
+    let poll_ms = opt_u32(cmd, "poll_ms")?.unwrap_or(25).max(1);
+    let gone = opt_bool(cmd, "gone").unwrap_or(false);
+    let has_query = has_wait_query(cmd);
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout as u64);
+
+    loop {
+        let screen = cfg.client.screen().await?;
+        if let Some(filter) = &cfg.app_filter {
+            if !should_emit_package(Some(filter.as_str()), screen.current_app.package.as_deref()) {
+                if std::time::Instant::now() >= deadline {
+                    emit_json(json!({
+                        "type":"action","cmd":action_cmd,"matched":false,
+                        "timeout":true,"reason":"app_filter"
+                    }));
+                    return Ok(());
+                }
+                sleep(Duration::from_millis(poll_ms as u64)).await;
+                continue;
+            }
+        }
+
+        let query_matched = wait_query_matches(cmd, &screen.current_app, &screen.elements);
+        let hash_changed = start_hash
+            .as_deref()
+            .map(|hash| hash != screen.screen_hash.as_str())
+            .unwrap_or(true);
+        let done = if has_query {
+            query_matched != gone
+        } else {
+            hash_changed
+        };
+        let timed_out = std::time::Instant::now() >= deadline;
+
+        if done || timed_out {
+            state.last_hash = Some(screen.screen_hash.clone());
+            state.last_screen = Some(screen.clone());
+            events::emit(&events::screen_event(
+                &cfg.serial,
+                screen.clone(),
+                cfg.screen_format,
+            ));
+            emit_json(json!({
+                "type":"action",
+                "cmd":action_cmd,
+                "matched":done,
+                "timeout": timed_out && !done,
+                "screen_hash":screen.screen_hash,
+                "hash_changed":hash_changed,
+                "tap": tap.map(|tap| json!({
+                    "id":tap.id,
+                    "x":tap.x,
+                    "y":tap.y,
+                    "source":tap.source
+                }))
+            }));
+            return Ok(());
+        }
+
+        sleep(Duration::from_millis(poll_ms as u64)).await;
+    }
+}
+
+fn has_wait_query(cmd: &Value) -> bool {
+    ["text", "rid", "desc", "klass", "package", "activity"]
+        .iter()
+        .any(|key| cmd.get(*key).and_then(Value::as_str).is_some())
 }
 
 async fn wait_activity(client: &ServerClient, name: &str, timeout_ms: u32) -> Result<()> {
@@ -857,7 +1037,7 @@ fn is_system_interruption(package: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::should_emit_package;
+    use super::{debounce_delay_ms, should_emit_package, Wake};
 
     #[test]
     fn app_filter_allows_target_package() {
@@ -878,5 +1058,13 @@ mod tests {
             Some("com.livd"),
             Some("com.google.android.apps.nexuslauncher")
         ));
+    }
+
+    #[test]
+    fn command_wakes_do_not_pay_debounce_delay() {
+        assert_eq!(debounce_delay_ms(Wake::Command, 80), 0);
+        assert_eq!(debounce_delay_ms(Wake::Poll, 80), 0);
+        assert_eq!(debounce_delay_ms(Wake::Event, 80), 80);
+        assert_eq!(debounce_delay_ms(Wake::Init, 80), 80);
     }
 }

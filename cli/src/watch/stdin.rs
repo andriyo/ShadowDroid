@@ -28,21 +28,21 @@ pub fn parse_command(line: &str) -> Result<Value> {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
 
     match cmd.as_str() {
-        "tap" => {
+        "tap" | "tap_and_wait" => {
             if args.len() == 1 {
                 return Ok(json_obj(
-                    &[("cmd", "tap"), ("id", args[0])],
+                    &[("cmd", cmd), ("id", args[0])],
                     &[("id", parse_i32(args[0])?)],
                 ));
             }
             if args.len() == 2 {
                 return Ok(serde_json::json!({
-                    "cmd": "tap",
+                    "cmd": cmd,
                     "x": parse_i32(args[0])?,
                     "y": parse_i32(args[1])?,
                 }));
             }
-            bail!("tap takes <id> or <x> <y>");
+            bail!("{cmd} takes <id> or <x> <y>");
         }
         "double_tap" => {
             require_len(cmd, &args, 2)?;
@@ -72,9 +72,8 @@ pub fn parse_command(line: &str) -> Result<Value> {
                 "duration": parse_f64_opt(args.get(4), if cmd == "drag" { 0.5 } else { 0.2 })?,
             }))
         }
-        "tap_text" | "tap_rid" | "tap_desc" => {
-            Ok(serde_json::json!({"cmd": cmd, "value": args.join(" ")}))
-        }
+        "tap_text" | "tap_rid" | "tap_desc" | "tap_text_and_wait" | "tap_rid_and_wait"
+        | "tap_desc_and_wait" => Ok(serde_json::json!({"cmd": cmd, "value": args.join(" ")})),
         "back" | "home" | "menu" => Ok(serde_json::json!({"cmd":"key","name":cmd})),
         "key" => {
             require_len(cmd, &args, 1)?;
@@ -268,5 +267,19 @@ mod tests {
         let v = parse_command("permission_dialogs deny").unwrap();
         assert_eq!(v["cmd"], "permission_dialogs");
         assert_eq!(v["policy"], "deny");
+    }
+
+    #[test]
+    fn parses_tap_and_wait_by_id() {
+        let v = parse_command("tap_and_wait 12").unwrap();
+        assert_eq!(v["cmd"], "tap_and_wait");
+        assert_eq!(v["id"], 12);
+    }
+
+    #[test]
+    fn parses_tap_rid_and_wait() {
+        let v = parse_command("tap_rid_and_wait main_tab_profile").unwrap();
+        assert_eq!(v["cmd"], "tap_rid_and_wait");
+        assert_eq!(v["value"], "main_tab_profile");
     }
 }
