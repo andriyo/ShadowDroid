@@ -8,7 +8,7 @@
 //! and the right version, downloads + installs from GitHub releases if not,
 //! then `am instrument`s the runner and verifies the HTTP server is up.
 
+pub mod actions;
 pub mod adb;
 pub mod client;
 pub mod installer;
-pub mod actions;

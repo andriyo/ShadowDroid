@@ -7,8 +7,8 @@
 
 #![allow(dead_code)]
 
-use crate::events::ActionResult;
 use crate::device::client::ServerClient;
+use crate::events::ActionResult;
 use anyhow::Result;
 
 pub async fn tap_xy(s: &ServerClient, x: i32, y: i32) -> Result<ActionResult> {

@@ -19,7 +19,7 @@ android {
 
     defaultConfig {
         applicationId = "io.github.andriyo.shadowdroid"
-        minSdk = 24                  // covers ~98% of in-use devices; UA 2.3 requires 24+
+        minSdk = 24 // covers ~98% of in-use devices; UA 2.3 requires 24+
         targetSdk = 36
         versionCode = 1
         versionName = "0.1.0"
@@ -34,8 +34,8 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false  // small, single APK — no need
-            signingConfig = signingConfigs.getByName("debug")  // ship signed-with-debug-key for now
+            isMinifyEnabled = false // small, single APK — no need
+            signingConfig = signingConfigs.getByName("debug") // ship signed-with-debug-key for now
         }
     }
 
@@ -45,13 +45,14 @@ android {
     }
 
     packaging {
-        resources.excludes += setOf(
-            "META-INF/INDEX.LIST",
-            "META-INF/io.netty.versions.properties",
-            "META-INF/AL2.0",
-            "META-INF/LGPL2.1",
-            "META-INF/versions/9/OSGI-INF/MANIFEST.MF",
-        )
+        resources.excludes +=
+            setOf(
+                "META-INF/INDEX.LIST",
+                "META-INF/io.netty.versions.properties",
+                "META-INF/AL2.0",
+                "META-INF/LGPL2.1",
+                "META-INF/versions/9/OSGI-INF/MANIFEST.MF",
+            )
     }
 }
 

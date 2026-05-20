@@ -54,20 +54,33 @@ pub struct Element {
     pub rid: Option<String>,
     pub bounds: [i32; 4],
     pub tap: [i32; 2],
-    #[serde(default)] pub clickable: bool,
-    #[serde(default)] pub long_clickable: bool,
-    #[serde(default)] pub scrollable: bool,
-    #[serde(default)] pub checkable: bool,
-    #[serde(default)] pub focusable: bool,
-    #[serde(default = "_true")] pub enabled: bool,
-    #[serde(default)] pub selected: bool,
-    #[serde(default)] pub checked: bool,
-    #[serde(default)] pub focused: bool,
-    #[serde(default)] pub password: bool,
-    #[serde(default)] pub input: bool,
+    #[serde(default)]
+    pub clickable: bool,
+    #[serde(default)]
+    pub long_clickable: bool,
+    #[serde(default)]
+    pub scrollable: bool,
+    #[serde(default)]
+    pub checkable: bool,
+    #[serde(default)]
+    pub focusable: bool,
+    #[serde(default = "_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub selected: bool,
+    #[serde(default)]
+    pub checked: bool,
+    #[serde(default)]
+    pub focused: bool,
+    #[serde(default)]
+    pub password: bool,
+    #[serde(default)]
+    pub input: bool,
 }
 
-fn _true() -> bool { true }
+fn _true() -> bool {
+    true
+}
 
 // ── /v1/app/* ────────────────────────────────────────────────────────
 
@@ -87,10 +100,14 @@ pub struct AppWaitResp {
 // ── /v1/orientation, /v1/clipboard, /v1/shell ───────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct OrientationResp { pub value: String }
+pub struct OrientationResp {
+    pub value: String,
+}
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct ClipResp { pub value: Option<String> }
+pub struct ClipResp {
+    pub value: Option<String>,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ShellResp {
@@ -100,12 +117,17 @@ pub struct ShellResp {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct OkResponse { #[serde(default = "_true")] pub ok: bool }
+pub struct OkResponse {
+    #[serde(default = "_true")]
+    pub ok: bool,
+}
 
 // ── error envelope ───────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
-pub struct ErrorEnvelope { pub error: ErrorBody }
+pub struct ErrorEnvelope {
+    pub error: ErrorBody,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct ErrorBody {

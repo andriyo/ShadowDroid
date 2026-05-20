@@ -39,7 +39,6 @@ import org.junit.runner.RunWith
  */
 @RunWith(AndroidJUnit4::class)
 class ShadowDroidServerTest {
-
     private lateinit var server: HttpServer
     private lateinit var uiDevice: UiDevice
 
@@ -83,7 +82,10 @@ class ShadowDroidServerTest {
     @After
     fun tearDown() {
         Log.i(TAG, "ShadowDroid server stopping")
-        try { server.stop() } catch (_: Throwable) {}
+        try {
+            server.stop()
+        } catch (_: Throwable) {
+        }
     }
 
     companion object {

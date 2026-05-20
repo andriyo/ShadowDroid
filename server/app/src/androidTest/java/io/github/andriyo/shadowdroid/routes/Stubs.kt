@@ -1,7 +1,7 @@
 package io.github.andriyo.shadowdroid.routes
 
 import androidx.test.uiautomator.UiDevice
-import io.ktor.server.routing.*
+import io.ktor.server.routing.Route
 
 /**
  * Stubs for route groups landing in M4. Kept as no-op `register` functions so
@@ -10,9 +10,10 @@ import io.ktor.server.routing.*
 
 object SelectorRoutes {
     /** POST /v1/{find,find_tap,xpath}. */
-    fun register(route: Route, uiDevice: UiDevice) { /* M4 */
-        @Suppress("UNUSED_PARAMETER") val _ignored = Pair(route, uiDevice)
-    }
+    fun register(
+        @Suppress("UNUSED_PARAMETER") route: Route,
+        @Suppress("UNUSED_PARAMETER") uiDevice: UiDevice,
+    ) = Unit // M4
 }
 
 object ToastRoutes {
@@ -21,14 +22,15 @@ object ToastRoutes {
      *
      * Backed by an accessibility-event listener; keeps a small ring buffer.
      */
-    fun register(route: Route, uiDevice: UiDevice) { /* M4 */
-        @Suppress("UNUSED_PARAMETER") val _ignored = Pair(route, uiDevice)
-    }
+    fun register(
+        @Suppress("UNUSED_PARAMETER") route: Route,
+        @Suppress("UNUSED_PARAMETER") uiDevice: UiDevice,
+    ) = Unit // M4
 }
 
 object FileRoutes {
     /** PUT/GET /v1/files{path}. Limited to the server's accessible storage. */
-    fun register(route: Route) { /* M4 */
-        @Suppress("UNUSED_PARAMETER") val _ignored = route
-    }
+    fun register(
+        @Suppress("UNUSED_PARAMETER") route: Route,
+    ) = Unit // M4
 }

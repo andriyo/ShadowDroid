@@ -8,15 +8,22 @@ import io.github.andriyo.shadowdroid.dump.TreeWalker
 import io.github.andriyo.shadowdroid.proto.AppRef
 import io.github.andriyo.shadowdroid.proto.ScreenResponse
 import io.github.andriyo.shadowdroid.proto.Viewport
-import io.ktor.http.*
-import io.ktor.server.response.*
-import io.ktor.server.routing.*
+import io.ktor.http.ContentType
+import io.ktor.http.HttpStatusCode
+import io.ktor.server.response.respond
+import io.ktor.server.response.respondBytes
+import io.ktor.server.routing.Route
+import io.ktor.server.routing.get
 import java.io.ByteArrayOutputStream
 import java.io.File
 
 object ScreenRoutes {
     /** GET /v1/screen?format=elements|xml and GET /v1/screenshot.png. */
-    fun register(route: Route, uiDevice: UiDevice, instr: Instrumentation) {
+    fun register(
+        route: Route,
+        uiDevice: UiDevice,
+        instr: Instrumentation,
+    ) {
         route.get("/screen") {
             val format = call.request.queryParameters["format"] ?: "elements"
             if (format == "xml") {
@@ -51,8 +58,12 @@ object ScreenRoutes {
                 if (!ok) {
                     call.respond(
                         HttpStatusCode.InternalServerError,
-                        ErrorEnvelope(ErrorBody("screenshot_failed",
-                            "UiDevice.takeScreenshot returned false"))
+                        ErrorEnvelope(
+                            ErrorBody(
+                                "screenshot_failed",
+                                "UiDevice.takeScreenshot returned false",
+                            ),
+                        ),
                     )
                     return@get
                 }
