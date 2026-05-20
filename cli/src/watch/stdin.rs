@@ -157,6 +157,10 @@ pub fn parse_command(line: &str) -> Result<Value> {
         "add_watcher" | "remove_watcher" | "list_watchers" | "clear_watchers" => {
             bail!("{cmd} requires JSON form")
         }
+        "permission_dialogs" => {
+            require_len(cmd, &args, 1)?;
+            Ok(serde_json::json!({"cmd":"permission_dialogs","policy":args[0]}))
+        }
         "screen" => Ok(serde_json::json!({"cmd":"screen"})),
         "quit" | "exit" => Ok(serde_json::json!({"cmd":"quit"})),
         _ => bail!("unknown command: {cmd}"),
@@ -257,5 +261,12 @@ mod tests {
         let v = parse_command(r#"{"cmd":"key","name":"back"}"#).unwrap();
         assert_eq!(v["cmd"], "key");
         assert_eq!(v["name"], "back");
+    }
+
+    #[test]
+    fn parses_permission_dialog_policy_command() {
+        let v = parse_command("permission_dialogs deny").unwrap();
+        assert_eq!(v["cmd"], "permission_dialogs");
+        assert_eq!(v["policy"], "deny");
     }
 }

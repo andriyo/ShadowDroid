@@ -170,14 +170,14 @@ $ shadowdroid shell "getprop ro.product.model"  → "sdk_gphone64_arm64"
 |---|---|---|
 | #27 | Investigate UiAutomation slot leak on Android 16 emulator | **INVESTIGATED** — current evidence points to slot contention from a respawned openatx/u2 process, not a proven Android 16 leak. Keep the `-wipe-data` path as last resort only. |
 | Future | M3: streaming `watch` + crash detection | **SHIPPED** — Livd built-in debug crash emitted a structured `crash` event with `java.lang.RuntimeException`, `Crashlytics DEV fatal test`, stack, context, and device_info. |
-| Future | M4: SelectorRoutes (find/find_tap/xpath) + ToastRoutes + FileRoutes + watchers | **IMPLEMENTED; mostly live-validated** — selectors/xpath/file round-trip/watcher-file/runtime watcher list passed on the emulator. Toast route compiles and CLI is wired; still needs a known real app-toast source for visible proof. |
+| Future | M4: SelectorRoutes (find/find_tap/xpath) + ToastRoutes + FileRoutes + watchers | **IMPLEMENTED; live-validated** — selectors/xpath/file round-trip/watcher-file/runtime watcher list passed on the emulator. Built-in PermissionController policies are available through `watch --permission-dialogs allow|deny` and runtime `permission_dialogs allow|deny|ignore`. Toast capture was proved against Livd's temporary `shadowdroid_debug_toast_button`. |
 | Future | M5: GitHub Actions APK build/sign, `cargo install shadowdroid`, GH releases auto-download | Not started. |
 
 ## Three suggested next moves
 
-1. **Finish the last M4 toast proof** (~20 min). Use or build a tiny known-toast source app, then verify `shadowdroid toast --wait-ms ...` captures it from the accessibility-event ring buffer.
+1. **Remove or gate the temporary Livd toast hook** (~10 min). Keep it only if we want a repeatable debug surface for ShadowDroid validation.
 
-2. **Polish M4 docs/examples** (~30 min). Add example watcher files for Android permission dialogs and a short selector cookbook for Compose testTags.
+2. **Polish M4 docs/examples** (~30 min). Add a short selector cookbook for Compose testTags and app-specific watcher examples beyond the built-in permission dialog policies.
 
 3. **Start M5 distribution** (~3 days). Build release APKs and CLI artifacts in GitHub Actions, embed/download the APK version from GitHub releases, then make `cargo install shadowdroid` work for a clean machine.
 
