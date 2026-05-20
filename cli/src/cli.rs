@@ -5,10 +5,10 @@
 //!   - `connect` — install APK, start server, verify with /v1/state
 //!   - `disconnect` — stop server, remove port forward
 //!
-//! Every other subcommand is wired into clap but dispatches to `todo!()` —
-//! they land in M2 (`screen`, `tap`, etc.), M3 (`watch`), M4 (`xpath`, watchers).
+//! M2 implements one-shot inspection/action verbs. M3 implements `watch`.
+//! M4 verbs are still clap-visible but return a milestone error.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use std::path::PathBuf;
@@ -54,85 +54,187 @@ pub enum Cmd {
 
     // ── M2: inspection + gestures ─────────────────────────────
     Screen,
-    Screenshot { path: Option<String> },
-    Tap { a: i32, b: Option<i32> },
-    DoubleTap { x: i32, y: i32 },
-    LongTap { x: i32, y: i32, #[arg(long, default_value_t = 600)] duration_ms: u32 },
-    Swipe { x1: i32, y1: i32, x2: i32, y2: i32, #[arg(long, default_value_t = 200)] duration_ms: u32 },
-    Drag  { x1: i32, y1: i32, x2: i32, y2: i32, #[arg(long, default_value_t = 500)] duration_ms: u32 },
+    Screenshot {
+        path: Option<String>,
+    },
+    Tap {
+        a: i32,
+        b: Option<i32>,
+    },
+    DoubleTap {
+        x: i32,
+        y: i32,
+    },
+    LongTap {
+        x: i32,
+        y: i32,
+        #[arg(long, default_value_t = 600)]
+        duration_ms: u32,
+    },
+    Swipe {
+        x1: i32,
+        y1: i32,
+        x2: i32,
+        y2: i32,
+        #[arg(long, default_value_t = 200)]
+        duration_ms: u32,
+    },
+    Drag {
+        x1: i32,
+        y1: i32,
+        x2: i32,
+        y2: i32,
+        #[arg(long, default_value_t = 500)]
+        duration_ms: u32,
+    },
     SwipeExt {
         #[arg(value_parser = ["up", "down", "left", "right"])]
         direction: String,
-        #[arg(long, default_value_t = 0.9)] scale: f32,
-        #[arg(long, default_value_t = 200)] duration_ms: u32,
+        #[arg(long, default_value_t = 0.9)]
+        scale: f32,
+        #[arg(long, default_value_t = 200)]
+        duration_ms: u32,
     },
-    TapText { value: String },
-    TapRid  { value: String },
-    TapDesc { value: String },
-    Xpath { query: String },
-    XpathTap { query: String },
+    TapText {
+        value: String,
+    },
+    TapRid {
+        value: String,
+    },
+    TapDesc {
+        value: String,
+    },
+    Xpath {
+        query: String,
+    },
+    XpathTap {
+        query: String,
+    },
     Back,
     Home,
-    Key { name: String },
-    Text { value: String, #[arg(long)] clear: bool },
-    Launch  { package: String },
-    Stop    { package: String },
-    AppClear { package: String },
-    AppWait { package: String, #[arg(long, default_value_t = 20000)] timeout_ms: u32, #[arg(long)] front: bool },
-    AppInfo { package: String },
-    WaitActivity { name: String, #[arg(long, default_value_t = 10000)] timeout_ms: u32 },
-    Shell { cmd: String, #[arg(long, default_value_t = 30000)] timeout_ms: u32 },
+    Key {
+        name: String,
+    },
+    Text {
+        value: String,
+        #[arg(long)]
+        clear: bool,
+    },
+    Launch {
+        package: String,
+    },
+    Stop {
+        package: String,
+    },
+    AppClear {
+        package: String,
+    },
+    AppWait {
+        package: String,
+        #[arg(long, default_value_t = 20000)]
+        timeout_ms: u32,
+        #[arg(long)]
+        front: bool,
+    },
+    AppInfo {
+        package: String,
+    },
+    WaitActivity {
+        name: String,
+        #[arg(long, default_value_t = 10000)]
+        timeout_ms: u32,
+    },
+    Shell {
+        cmd: String,
+        #[arg(long, default_value_t = 30000)]
+        timeout_ms: u32,
+    },
     ScreenOn,
     ScreenOff,
     Unlock,
     Wakeup,
-    Orientation { value: Option<String> },
-    Clipboard   { value: Option<String> },
+    Orientation {
+        value: Option<String>,
+    },
+    Clipboard {
+        value: Option<String>,
+    },
     Notifications,
     QuickSettings,
-    OpenUrl { url: String },
-    Push { local: String, remote: String, #[arg(long, default_value_t = 0o644)] mode: u32 },
-    Pull { remote: String, local: String },
-    Toast { #[arg(long, default_value_t = 5000)] wait_ms: u32 },
+    OpenUrl {
+        url: String,
+    },
+    Push {
+        local: String,
+        remote: String,
+        #[arg(long, default_value_t = 0o644)]
+        mode: u32,
+    },
+    Pull {
+        remote: String,
+        local: String,
+    },
+    Toast {
+        #[arg(long, default_value_t = 5000)]
+        wait_ms: u32,
+    },
     WaitFor {
-        #[arg(long)] text: Option<String>,
-        #[arg(long)] rid: Option<String>,
-        #[arg(long)] desc: Option<String>,
-        #[arg(long)] klass: Option<String>,
-        #[arg(long)] activity: Option<String>,
-        #[arg(long)] package: Option<String>,
-        #[arg(long)] gone: bool,
-        #[arg(long, default_value_t = 10000)] timeout_ms: u32,
-        #[arg(long, default_value_t = 200)] poll_ms: u32,
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long)]
+        rid: Option<String>,
+        #[arg(long)]
+        desc: Option<String>,
+        #[arg(long)]
+        klass: Option<String>,
+        #[arg(long)]
+        activity: Option<String>,
+        #[arg(long)]
+        package: Option<String>,
+        #[arg(long)]
+        gone: bool,
+        #[arg(long, default_value_t = 10000)]
+        timeout_ms: u32,
+        #[arg(long, default_value_t = 200)]
+        poll_ms: u32,
     },
 
     // ── M3: streaming ─────────────────────────────────────────
     Watch {
-        #[arg(long)] app: Option<String>,
-        #[arg(long, default_value_t = 1000)] poll_ms: u32,
-        #[arg(long, default_value_t = 80)]   debounce_ms: u32,
-        #[arg(long)] no_stdin: bool,
-        #[arg(long)] no_crash_detect: bool,
-        #[arg(long)] watcher_file: Vec<String>,
+        #[arg(long)]
+        app: Option<String>,
+        #[arg(long, default_value_t = 1000)]
+        poll_ms: u32,
+        #[arg(long, default_value_t = 80)]
+        debounce_ms: u32,
+        #[arg(long)]
+        no_stdin: bool,
+        #[arg(long)]
+        no_crash_detect: bool,
+        #[arg(long)]
+        watcher_file: Vec<String>,
     },
 }
 
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
+    let device = cli.device;
+    let apk = cli.apk;
+    let cmd = cli.cmd;
     // For everything beyond `devices` we need an on-device server. ensure_ready
     // installs/starts as needed (no-op if already running).
-    match cli.cmd {
+    match &cmd {
         Cmd::Devices => return cmd_devices().await,
-        Cmd::Connect => return cmd_connect(cli.device.as_deref(), cli.apk.as_deref()).await,
-        Cmd::Disconnect => return cmd_disconnect(cli.device.as_deref()).await,
+        Cmd::Connect => return cmd_connect(device.as_deref(), apk.as_deref()).await,
+        Cmd::Disconnect => return cmd_disconnect(device.as_deref()).await,
         _ => {}
     }
 
     // Shared setup for all UI verbs.
-    let serial = resolve_serial(cli.device.as_deref()).await?;
-    let client = installer::ensure_ready(&serial, cli.apk.as_deref()).await?;
+    let serial = resolve_serial(device.as_deref()).await?;
+    let client = installer::ensure_ready(&serial, apk.as_deref()).await?;
 
-    match cli.cmd {
+    match cmd {
         Cmd::Devices | Cmd::Connect | Cmd::Disconnect => unreachable!(), // handled above
 
         // ── inspection ─────────────────────────────────────────
@@ -141,28 +243,68 @@ pub async fn run() -> Result<()> {
 
         // ── gestures ───────────────────────────────────────────
         Cmd::Tap { a, b } => cmd_tap(&client, a, b).await?,
-        Cmd::DoubleTap { x, y } => { client.double_tap(x, y).await?; emit_action("double_tap", &serde_json::json!({"x":x,"y":y})); }
+        Cmd::DoubleTap { x, y } => {
+            client.double_tap(x, y).await?;
+            emit_action("double_tap", &serde_json::json!({"x":x,"y":y}));
+        }
         Cmd::LongTap { x, y, duration_ms } => {
             client.long_tap(x, y, duration_ms).await?;
-            emit_action("long_tap", &serde_json::json!({"x":x,"y":y,"duration_ms":duration_ms}));
+            emit_action(
+                "long_tap",
+                &serde_json::json!({"x":x,"y":y,"duration_ms":duration_ms}),
+            );
         }
-        Cmd::Swipe { x1, y1, x2, y2, duration_ms } => {
+        Cmd::Swipe {
+            x1,
+            y1,
+            x2,
+            y2,
+            duration_ms,
+        } => {
             client.swipe(x1, y1, x2, y2, duration_ms).await?;
-            emit_action("swipe", &serde_json::json!({"from":[x1,y1],"to":[x2,y2],"duration_ms":duration_ms}));
+            emit_action(
+                "swipe",
+                &serde_json::json!({"from":[x1,y1],"to":[x2,y2],"duration_ms":duration_ms}),
+            );
         }
-        Cmd::Drag { x1, y1, x2, y2, duration_ms } => {
+        Cmd::Drag {
+            x1,
+            y1,
+            x2,
+            y2,
+            duration_ms,
+        } => {
             client.drag(x1, y1, x2, y2, duration_ms).await?;
-            emit_action("drag", &serde_json::json!({"from":[x1,y1],"to":[x2,y2],"duration_ms":duration_ms}));
+            emit_action(
+                "drag",
+                &serde_json::json!({"from":[x1,y1],"to":[x2,y2],"duration_ms":duration_ms}),
+            );
         }
-        Cmd::SwipeExt { direction, scale, duration_ms } => {
+        Cmd::SwipeExt {
+            direction,
+            scale,
+            duration_ms,
+        } => {
             client.swipe_ext(&direction, scale, duration_ms).await?;
-            emit_action("swipe_ext", &serde_json::json!({"direction":direction,"scale":scale,"duration_ms":duration_ms}));
+            emit_action(
+                "swipe_ext",
+                &serde_json::json!({"direction":direction,"scale":scale,"duration_ms":duration_ms}),
+            );
         }
 
         // ── keys + text ────────────────────────────────────────
-        Cmd::Back => { client.key("back").await?; emit_action("key", &serde_json::json!({"name":"back"})); }
-        Cmd::Home => { client.key("home").await?; emit_action("key", &serde_json::json!({"name":"home"})); }
-        Cmd::Key { name } => { client.key(&name).await?; emit_action("key", &serde_json::json!({"name":name})); }
+        Cmd::Back => {
+            client.key("back").await?;
+            emit_action("key", &serde_json::json!({"name":"back"}));
+        }
+        Cmd::Home => {
+            client.key("home").await?;
+            emit_action("key", &serde_json::json!({"name":"home"}));
+        }
+        Cmd::Key { name } => {
+            client.key(&name).await?;
+            emit_action("key", &serde_json::json!({"name":name}));
+        }
         Cmd::Text { value, clear } => {
             client.text(&value, clear).await?;
             emit_action("text", &serde_json::json!({"value":value,"clear":clear}));
@@ -181,18 +323,28 @@ pub async fn run() -> Result<()> {
             client.app_clear(&package).await?;
             emit_action("app_clear", &serde_json::json!({"package":package}));
         }
-        Cmd::AppWait { package, timeout_ms, front } => {
+        Cmd::AppWait {
+            package,
+            timeout_ms,
+            front,
+        } => {
             let r = client.app_wait(&package, timeout_ms, front).await?;
-            emit_action("app_wait", &serde_json::json!({"package":package,"matched":r.matched,"current":r.current}));
+            emit_action(
+                "app_wait",
+                &serde_json::json!({"package":package,"matched":r.matched,"current":r.current}),
+            );
         }
         Cmd::AppInfo { package } => {
             let info = client.app_info(&package).await?;
-            emit_action("app_info", &serde_json::json!({
-                "package":package,
-                "version_name":info.version_name,
-                "version_code":info.version_code,
-                "label":info.label,
-            }));
+            emit_action(
+                "app_info",
+                &serde_json::json!({
+                    "package":package,
+                    "version_name":info.version_name,
+                    "version_code":info.version_code,
+                    "label":info.label,
+                }),
+            );
         }
         Cmd::WaitActivity { name, timeout_ms } => {
             cmd_wait_activity(&client, &name, timeout_ms).await?;
@@ -201,37 +353,99 @@ pub async fn run() -> Result<()> {
         // ── system ─────────────────────────────────────────────
         Cmd::Shell { cmd, timeout_ms } => {
             let r = client.shell(&cmd, timeout_ms).await?;
-            emit_action("shell", &serde_json::json!({
-                "input":r.input,"output":r.output,"exit_code":r.exit_code
-            }));
+            emit_action(
+                "shell",
+                &serde_json::json!({
+                    "input":r.input,"output":r.output,"exit_code":r.exit_code
+                }),
+            );
         }
-        Cmd::ScreenOn => { client.screen_on().await?; emit_action("screen_on", &serde_json::Value::Null); }
-        Cmd::ScreenOff => { client.screen_off().await?; emit_action("screen_off", &serde_json::Value::Null); }
-        Cmd::Unlock => { client.unlock().await?; emit_action("unlock", &serde_json::Value::Null); }
-        Cmd::Wakeup => { client.wakeup().await?; emit_action("wakeup", &serde_json::Value::Null); }
-        Cmd::Orientation { value } => {
-            match value {
-                None => emit_action("orientation", &serde_json::json!({"value": client.orientation_get().await?})),
-                Some(v) => { client.orientation_set(&v).await?; emit_action("set_orientation", &serde_json::json!({"value":v})); }
+        Cmd::ScreenOn => {
+            client.screen_on().await?;
+            emit_action("screen_on", &serde_json::Value::Null);
+        }
+        Cmd::ScreenOff => {
+            client.screen_off().await?;
+            emit_action("screen_off", &serde_json::Value::Null);
+        }
+        Cmd::Unlock => {
+            client.unlock().await?;
+            emit_action("unlock", &serde_json::Value::Null);
+        }
+        Cmd::Wakeup => {
+            client.wakeup().await?;
+            emit_action("wakeup", &serde_json::Value::Null);
+        }
+        Cmd::Orientation { value } => match value {
+            None => emit_action(
+                "orientation",
+                &serde_json::json!({"value": client.orientation_get().await?}),
+            ),
+            Some(v) => {
+                client.orientation_set(&v).await?;
+                emit_action("set_orientation", &serde_json::json!({"value":v}));
             }
-        }
-        Cmd::Clipboard { value } => {
-            match value {
-                None => emit_action("clipboard", &serde_json::json!({"value": client.clipboard_get().await?})),
-                Some(v) => { client.clipboard_set(&v).await?; emit_action("set_clipboard", &serde_json::json!({"value":v})); }
+        },
+        Cmd::Clipboard { value } => match value {
+            None => emit_action(
+                "clipboard",
+                &serde_json::json!({"value": client.clipboard_get().await?}),
+            ),
+            Some(v) => {
+                client.clipboard_set(&v).await?;
+                emit_action("set_clipboard", &serde_json::json!({"value":v}));
             }
+        },
+        Cmd::Notifications => {
+            client.open_notifications().await?;
+            emit_action("open_notification", &serde_json::Value::Null);
         }
-        Cmd::Notifications => { client.open_notifications().await?; emit_action("open_notification", &serde_json::Value::Null); }
-        Cmd::QuickSettings => { client.open_quick_settings().await?; emit_action("open_quick_settings", &serde_json::Value::Null); }
-        Cmd::OpenUrl { url } => { client.open_url(&url).await?; emit_action("open_url", &serde_json::json!({"url":url})); }
+        Cmd::QuickSettings => {
+            client.open_quick_settings().await?;
+            emit_action("open_quick_settings", &serde_json::Value::Null);
+        }
+        Cmd::OpenUrl { url } => {
+            client.open_url(&url).await?;
+            emit_action("open_url", &serde_json::json!({"url":url}));
+        }
+        Cmd::Watch {
+            app,
+            poll_ms,
+            debounce_ms,
+            no_stdin,
+            no_crash_detect,
+            watcher_file,
+        } => {
+            if !watcher_file.is_empty() {
+                bail!("--watcher-file is not yet implemented — that's milestone M4. M3 ships streaming watch + crash detection.");
+            }
+            crate::watch::r#loop::run(crate::watch::r#loop::WatchConfig {
+                serial,
+                client,
+                app_filter: app,
+                poll_ms: poll_ms.max(1),
+                debounce_ms,
+                accept_stdin: !no_stdin,
+                detect_crashes: !no_crash_detect,
+            })
+            .await?;
+        }
 
         // ── deferred / M2-OUT ──────────────────────────────────
-        other @ (Cmd::TapText { .. } | Cmd::TapRid { .. } | Cmd::TapDesc { .. }
-            | Cmd::Xpath { .. } | Cmd::XpathTap { .. }
-            | Cmd::Push { .. } | Cmd::Pull { .. } | Cmd::Toast { .. } | Cmd::WaitFor { .. }
-            | Cmd::Watch { .. }) => {
-            bail!("`{}` is not yet implemented — that's milestone M3/M4. \
-                   M2 ships everything one-shot up to /v1/shell.", subcommand_name(&other));
+        other @ (Cmd::TapText { .. }
+        | Cmd::TapRid { .. }
+        | Cmd::TapDesc { .. }
+        | Cmd::Xpath { .. }
+        | Cmd::XpathTap { .. }
+        | Cmd::Push { .. }
+        | Cmd::Pull { .. }
+        | Cmd::Toast { .. }
+        | Cmd::WaitFor { .. }) => {
+            bail!(
+                "`{}` is not yet implemented — that's milestone M3/M4. \
+                   M2 ships everything one-shot up to /v1/shell.",
+                subcommand_name(&other)
+            );
         }
     }
     Ok(())
@@ -247,9 +461,14 @@ fn emit_action(cmd: &str, body: &serde_json::Value) {
     m.insert("type".into(), serde_json::Value::String("action".into()));
     m.insert("cmd".into(), serde_json::Value::String(cmd.into()));
     if let serde_json::Value::Object(b) = body {
-        for (k, v) in b { m.insert(k.clone(), v.clone()); }
+        for (k, v) in b {
+            m.insert(k.clone(), v.clone());
+        }
     }
-    println!("{}", serde_json::to_string(&serde_json::Value::Object(m)).unwrap());
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::Value::Object(m)).unwrap()
+    );
 }
 
 // ── specific handlers ──────────────────────────────────────────
@@ -260,15 +479,20 @@ async fn cmd_screenshot(client: &ServerClient, path: Option<String>) -> Result<(
         Some(p) => p.into(),
         None => {
             let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
             std::env::temp_dir().join(format!("shadowdroid-screenshot-{ts}.png"))
         }
     };
     std::fs::write(&p, &bytes).with_context(|| format!("writing {}", p.display()))?;
-    emit_action("screenshot", &serde_json::json!({
-        "path": p.display().to_string(),
-        "bytes": bytes.len() as u64,
-    }));
+    emit_action(
+        "screenshot",
+        &serde_json::json!({
+            "path": p.display().to_string(),
+            "bytes": bytes.len() as u64,
+        }),
+    );
     Ok(())
 }
 
@@ -282,14 +506,18 @@ async fn cmd_tap(client: &ServerClient, a: i32, b: Option<i32>) -> Result<()> {
         None => {
             let id = u32::try_from(a).map_err(|_| anyhow!("element id must be >= 0, got {a}"))?;
             let screen = client.screen().await?;
-            let el = screen.elements.iter().find(|e| e.id == id)
-                .ok_or_else(|| anyhow!("element id {id} out of range (0..{})", screen.element_count))?;
+            let el = screen.elements.iter().find(|e| e.id == id).ok_or_else(|| {
+                anyhow!("element id {id} out of range (0..{})", screen.element_count)
+            })?;
             let [x, y] = el.tap;
             client.tap_xy(x, y).await?;
-            emit_action("tap", &serde_json::json!({
-                "id": id, "x": x, "y": y,
-                "matched": {"text": el.text, "rid": el.rid, "desc": el.desc}
-            }));
+            emit_action(
+                "tap",
+                &serde_json::json!({
+                    "id": id, "x": x, "y": y,
+                    "matched": {"text": el.text, "rid": el.rid, "desc": el.desc}
+                }),
+            );
         }
     }
     Ok(())
@@ -298,21 +526,27 @@ async fn cmd_tap(client: &ServerClient, a: i32, b: Option<i32>) -> Result<()> {
 /// Poll `app_current` until the activity (or its substring) matches.
 async fn cmd_wait_activity(client: &ServerClient, name: &str, timeout_ms: u32) -> Result<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
-    let mut last_app: Option<crate::proto::AppRef> = None;
+    let mut last_app: Option<crate::proto::AppRef>;
     loop {
         let cur = client.app_current().await?;
         let activity = cur.activity.as_deref().unwrap_or("");
         if activity.contains(name) {
-            emit_action("wait_activity", &serde_json::json!({
-                "name":name,"matched":true,"current":cur,
-            }));
+            emit_action(
+                "wait_activity",
+                &serde_json::json!({
+                    "name":name,"matched":true,"current":cur,
+                }),
+            );
             return Ok(());
         }
         last_app = Some(cur);
         if std::time::Instant::now() >= deadline {
-            emit_action("wait_activity", &serde_json::json!({
-                "name":name,"matched":false,"current":last_app,
-            }));
+            emit_action(
+                "wait_activity",
+                &serde_json::json!({
+                    "name":name,"matched":false,"current":last_app,
+                }),
+            );
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;

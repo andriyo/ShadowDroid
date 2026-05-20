@@ -2,17 +2,28 @@ package io.github.andriyo.shadowdroid
 
 import android.app.Instrumentation
 import androidx.test.uiautomator.UiDevice
-import io.github.andriyo.shadowdroid.routes.*
-import io.ktor.http.*
-import io.ktor.serialization.kotlinx.json.*
-import io.ktor.server.application.*
-import io.ktor.server.cio.*
-import io.ktor.server.engine.*
-import io.ktor.server.plugins.calllogging.*
-import io.ktor.server.plugins.contentnegotiation.*
-import io.ktor.server.plugins.statuspages.*
-import io.ktor.server.response.*
-import io.ktor.server.routing.*
+import io.github.andriyo.shadowdroid.routes.AppRoutes
+import io.github.andriyo.shadowdroid.routes.FileRoutes
+import io.github.andriyo.shadowdroid.routes.GestureRoutes
+import io.github.andriyo.shadowdroid.routes.KeyTextRoutes
+import io.github.andriyo.shadowdroid.routes.ScreenRoutes
+import io.github.andriyo.shadowdroid.routes.SelectorRoutes
+import io.github.andriyo.shadowdroid.routes.StateRoutes
+import io.github.andriyo.shadowdroid.routes.SystemRoutes
+import io.github.andriyo.shadowdroid.routes.ToastRoutes
+import io.ktor.http.HttpStatusCode
+import io.ktor.serialization.kotlinx.json.json
+import io.ktor.server.application.Application
+import io.ktor.server.application.install
+import io.ktor.server.cio.CIO
+import io.ktor.server.engine.EmbeddedServer
+import io.ktor.server.engine.embeddedServer
+import io.ktor.server.plugins.calllogging.CallLogging
+import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.server.plugins.statuspages.StatusPages
+import io.ktor.server.response.respond
+import io.ktor.server.routing.route
+import io.ktor.server.routing.routing
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import org.slf4j.event.Level
@@ -37,23 +48,24 @@ class HttpServer(
     private var engine: EmbeddedServer<*, *>? = null
 
     fun start() {
-        engine = embeddedServer(CIO, port = port, host = "127.0.0.1") {
-            installPlugins()
-            routing {
-                route("/v1") {
-                    StateRoutes.register(this, uiDevice, instrumentation)
-                    ScreenRoutes.register(this, uiDevice, instrumentation)
-                    GestureRoutes.register(this, uiDevice)
-                    KeyTextRoutes.register(this, uiDevice)
-                    AppRoutes.register(this, uiDevice, instrumentation)
-                    SystemRoutes.register(this, uiDevice, instrumentation)
-                    // M4:
-                    SelectorRoutes.register(this, uiDevice)
-                    ToastRoutes.register(this, uiDevice)
-                    FileRoutes.register(this)
+        engine =
+            embeddedServer(CIO, port = port, host = "127.0.0.1") {
+                installPlugins()
+                routing {
+                    route("/v1") {
+                        StateRoutes.register(this, uiDevice, instrumentation)
+                        ScreenRoutes.register(this, uiDevice, instrumentation)
+                        GestureRoutes.register(this, uiDevice)
+                        KeyTextRoutes.register(this, uiDevice)
+                        AppRoutes.register(this, uiDevice, instrumentation)
+                        SystemRoutes.register(this, uiDevice, instrumentation)
+                        // M4:
+                        SelectorRoutes.register(this, uiDevice)
+                        ToastRoutes.register(this, uiDevice)
+                        FileRoutes.register(this)
+                    }
                 }
-            }
-        }.also { it.start(wait = false) }
+            }.also { it.start(wait = false) }
     }
 
     fun stop() {
@@ -68,14 +80,16 @@ class HttpServer(
  */
 private fun Application.installPlugins() {
     install(ContentNegotiation) {
-        json(Json {
-            ignoreUnknownKeys = true
-            encodeDefaults = true
-            explicitNulls = false
-        })
+        json(
+            Json {
+                ignoreUnknownKeys = true
+                encodeDefaults = true
+                explicitNulls = false
+            },
+        )
     }
     install(CallLogging) {
-        level = Level.DEBUG  // captured in `adb logcat` under the test process tag
+        level = Level.DEBUG // captured in `adb logcat` under the test process tag
     }
     install(StatusPages) {
         // Map our domain exceptions to the wire-error envelope documented in
@@ -93,8 +107,13 @@ private fun Application.installPlugins() {
         exception<Throwable> { call, e ->
             call.respond(
                 HttpStatusCode.InternalServerError,
-                ErrorEnvelope(ErrorBody("internal", e.message ?: e::class.java.simpleName,
-                    detail = mapOf("type" to e::class.java.simpleName))),
+                ErrorEnvelope(
+                    ErrorBody(
+                        "internal",
+                        e.message ?: e::class.java.simpleName,
+                        detail = mapOf("type" to e::class.java.simpleName),
+                    ),
+                ),
             )
         }
     }
@@ -103,12 +122,26 @@ private fun Application.installPlugins() {
 // ── Wire-error types ───────────────────────────────────────────────────
 // Routes throw these; StatusPages maps them to the JSON envelope.
 
-class BadRequest(val code: String, message: String, val detail: Map<String, Any?>? = null) : RuntimeException(message)
-class NotFound(val code: String, message: String) : RuntimeException(message)
-class Timeout(val code: String, message: String) : RuntimeException(message)
+class BadRequest(
+    val code: String,
+    message: String,
+    val detail: Map<String, Any?>? = null,
+) : RuntimeException(message)
+
+class NotFound(
+    val code: String,
+    message: String,
+) : RuntimeException(message)
+
+class Timeout(
+    val code: String,
+    message: String,
+) : RuntimeException(message)
 
 @Serializable
-data class ErrorEnvelope(val error: ErrorBody)
+data class ErrorEnvelope(
+    val error: ErrorBody,
+)
 
 @Serializable
 data class ErrorBody(
@@ -116,13 +149,22 @@ data class ErrorBody(
     val message: String,
     val detail: Map<String, kotlinx.serialization.json.JsonElement>? = null,
 ) {
-    constructor(code: String, message: String, detail: Map<String, Any?>? = null, @Suppress("UNUSED_PARAMETER") unused: Unit = Unit) :
-        this(code, message, detail?.mapValues {
-            when (val v = it.value) {
-                null -> kotlinx.serialization.json.JsonNull
-                is Number -> kotlinx.serialization.json.JsonPrimitive(v)
-                is Boolean -> kotlinx.serialization.json.JsonPrimitive(v)
-                else -> kotlinx.serialization.json.JsonPrimitive(v.toString())
-            }
-        })
+    constructor(
+        code: String,
+        message: String,
+        detail: Map<String, Any?>? = null,
+        @Suppress("UNUSED_PARAMETER") unused: Unit = Unit,
+    ) :
+        this(
+            code,
+            message,
+            detail?.mapValues {
+                when (val v = it.value) {
+                    null -> kotlinx.serialization.json.JsonNull
+                    is Number -> kotlinx.serialization.json.JsonPrimitive(v)
+                    is Boolean -> kotlinx.serialization.json.JsonPrimitive(v)
+                    else -> kotlinx.serialization.json.JsonPrimitive(v.toString())
+                }
+            },
+        )
 }

@@ -2,7 +2,7 @@ package io.github.andriyo.shadowdroid.proto
 
 import kotlinx.serialization.Serializable
 
-/**
+/*
  * Wire types for the v1 HTTP API. Mirrors docs/protocol.md exactly.
  *
  * Kept in their own package + file so the wire schema is greppable as one unit
@@ -23,7 +23,10 @@ data class ServerState(
 )
 
 @Serializable
-data class Viewport(val w: Int, val h: Int)
+data class Viewport(
+    val w: Int,
+    val h: Int,
+)
 
 @Serializable
 data class AppRef(
@@ -50,8 +53,8 @@ data class Element(
     val desc: String? = null,
     val klass: String? = null,
     val rid: String? = null,
-    val bounds: List<Int>,        // [x1, y1, x2, y2]
-    val tap: List<Int>,           // [cx, cy]
+    val bounds: List<Int>, // [x1, y1, x2, y2]
+    val tap: List<Int>, // [cx, cy]
     val clickable: Boolean = false,
     val long_clickable: Boolean = false,
     val scrollable: Boolean = false,
@@ -68,4 +71,6 @@ data class Element(
 // ── shared 'ok' response for state-changing endpoints ────────────────
 
 @Serializable
-data class OkResponse(val ok: Boolean = true)
+data class OkResponse(
+    val ok: Boolean = true,
+)

@@ -19,8 +19,11 @@ import java.security.MessageDigest
  * dump. After any UI change the agent must re-dump.
  */
 object TreeWalker {
-
-    fun walk(root: AccessibilityNodeInfo?, viewportW: Int, viewportH: Int): List<Element> {
+    fun walk(
+        root: AccessibilityNodeInfo?,
+        viewportW: Int,
+        viewportH: Int,
+    ): List<Element> {
         val elements = mutableListOf<Element>()
         if (root == null) return elements
         visit(root, elements, viewportW, viewportH)
@@ -33,45 +36,60 @@ object TreeWalker {
         vw: Int,
         vh: Int,
     ) {
-        val text = node.text?.toString()?.trim().orEmpty()
-        val desc = node.contentDescription?.toString()?.trim().orEmpty()
+        val text =
+            node.text
+                ?.toString()
+                ?.trim()
+                .orEmpty()
+        val desc =
+            node.contentDescription
+                ?.toString()
+                ?.trim()
+                .orEmpty()
         val rid = node.viewIdResourceName.orEmpty()
         val cls = node.className?.toString().orEmpty()
 
         val isInput = cls.contains("EditText")
         val isInteractive =
-            node.isClickable || node.isLongClickable ||
-            node.isScrollable || node.isCheckable
+            node.isClickable ||
+                node.isLongClickable ||
+                node.isScrollable ||
+                node.isCheckable
         val hasContent = text.isNotEmpty() || desc.isNotEmpty()
 
         if (isInteractive || hasContent || isInput) {
             val bounds = Rect().also { node.getBoundsInScreen(it) }
             // Skip elements completely outside the viewport (off-screen pages in
             // a ViewPager etc.) — their tap points would be nonsense.
-            val onScreen = bounds.right > 0 && bounds.bottom > 0 &&
-                           bounds.left < vw && bounds.top < vh &&
-                           bounds.width() > 0 && bounds.height() > 0
+            val onScreen =
+                bounds.right > 0 &&
+                    bounds.bottom > 0 &&
+                    bounds.left < vw &&
+                    bounds.top < vh &&
+                    bounds.width() > 0 &&
+                    bounds.height() > 0
             if (onScreen) {
-                out += Element(
-                    id = out.size,
-                    text = text.ifEmpty { null },
-                    desc = desc.ifEmpty { null },
-                    klass = cls.substringAfterLast('.').ifEmpty { null },
-                    rid = rid.ifEmpty { null },
-                    bounds = listOf(bounds.left, bounds.top, bounds.right, bounds.bottom),
-                    tap = listOf((bounds.left + bounds.right) / 2, (bounds.top + bounds.bottom) / 2),
-                    clickable = node.isClickable,
-                    long_clickable = node.isLongClickable,
-                    scrollable = node.isScrollable,
-                    checkable = node.isCheckable,
-                    focusable = node.isFocusable,
-                    enabled = node.isEnabled,
-                    selected = node.isSelected,
-                    checked = node.isChecked,
-                    focused = node.isFocused,
-                    password = node.isPassword,
-                    input = isInput,
-                )
+                out +=
+                    Element(
+                        id = out.size,
+                        text = text.ifEmpty { null },
+                        desc = desc.ifEmpty { null },
+                        klass = cls.substringAfterLast('.').ifEmpty { null },
+                        rid = rid.ifEmpty { null },
+                        bounds = listOf(bounds.left, bounds.top, bounds.right, bounds.bottom),
+                        tap = listOf((bounds.left + bounds.right) / 2, (bounds.top + bounds.bottom) / 2),
+                        clickable = node.isClickable,
+                        long_clickable = node.isLongClickable,
+                        scrollable = node.isScrollable,
+                        checkable = node.isCheckable,
+                        focusable = node.isFocusable,
+                        enabled = node.isEnabled,
+                        selected = node.isSelected,
+                        checked = node.isChecked,
+                        focused = node.isFocused,
+                        password = node.isPassword,
+                        input = isInput,
+                    )
             }
         }
 
@@ -101,13 +119,15 @@ object TreeWalker {
             md.update(e.rid.orEmpty().toByteArray())
             md.update(e.klass.orEmpty().toByteArray())
             md.update(e.bounds.joinToString(",").toByteArray())
-            md.update(byteArrayOf(
-                if (e.clickable) 1 else 0,
-                if (e.scrollable) 1 else 0,
-                if (e.checked) 1 else 0,
-                if (e.focused) 1 else 0,
-                if (e.enabled) 1 else 0,
-            ))
+            md.update(
+                byteArrayOf(
+                    if (e.clickable) 1 else 0,
+                    if (e.scrollable) 1 else 0,
+                    if (e.checked) 1 else 0,
+                    if (e.focused) 1 else 0,
+                    if (e.enabled) 1 else 0,
+                ),
+            )
         }
         // First 8 bytes hex — matches movi's blake2b digest length for wire compat.
         return md.digest().take(8).joinToString("") { "%02x".format(it) }

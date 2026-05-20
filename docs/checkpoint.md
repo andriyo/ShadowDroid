@@ -1,11 +1,12 @@
-# ShadowDroid — Checkpoint (M1 ✅ shipped, M2 ✅ feature-complete)
+# ShadowDroid — Checkpoint (M1 ✅ shipped, M2 ✅ feature-complete, M3 CLI implemented)
 
-Last update: end of the M2 session.
+Last update: 2026-05-19 M3 CLI/watch validation pass.
 
 ## TL;DR
 
 - **M1 ships clean.** `shadowdroid connect/disconnect/devices` work end-to-end against the live emulator. Cold connect: 1.5s; warm: 130ms; steady-state `/v1/state`: ~18ms.
 - **M2 is feature-complete on both sides** — server endpoints (`/v1/screen`, `/v1/tap`, `/v1/swipe`, `/v1/screenshot.png`, `/v1/shell`, all the others) + CLI dispatch for every subcommand. The full Livd demo (launch → screen dump → tap profile tab by id → screenshot → shell) ran end-to-end and worked.
+- **M3 CLI watch is implemented and Livd-tested.** `shadowdroid watch --app com.livd` emits ready/screen/action/error/crash-shaped JSON lines, accepts stdin commands, tails logcat for UI wakeups, and parses Java/native/ANR crashes. A live Livd flow covered notification/location permissions, Profile, Local results, restaurant detail, add-to-cart, cart view, and cart cleanup with no crash markers; an induced app crash is still the remaining proof before marking M3 fully shipped.
 - **One known blocker for repeated dev cycles**: UiAutomation is single-owner. The scary Android 16 "already registered" failure was reproduced, but the live cause in follow-up was an old host-side `movi`/openatx watcher respawning `/data/local/tmp/u2.jar` (`com.wetest.uia2.Main`) after ShadowDroid killed it. After stopping that watcher and killing the device process, `shadowdroid connect` worked again on the same Android 16 emulator without `-wipe-data`.
 
 ## What's in the repo
@@ -26,7 +27,7 @@ ShadowDroid/
 │       ├── main.rs                          tokio entry, tracing → stderr
 │       ├── cli.rs                           clap defs + every subcommand dispatch
 │       ├── proto.rs                         wire types
-│       ├── events.rs                        stdout JSON event shapes (M3+)
+│       ├── events.rs                        stdout JSON event shapes
 │       ├── dump.rs                          M3+ XML fallback parser stub
 │       └── device/
 │           ├── mod.rs
@@ -34,7 +35,7 @@ ShadowDroid/
 │           ├── client.rs                    reqwest HTTP client for /v1/* endpoints
 │           ├── installer.rs                 APK resolver (6-source precedence chain) + ensure_ready
 │           └── actions.rs                   M3+ stub
-│       └── watch/                           M3+ stubs (logcat tail + watcher engine + stdin)
+│       └── watch/                           M3 watch loop/crash/stdin; M4 watcher engine stub
 └── server/                                  Gradle 9.4.1 + AGP 9.2.1 + Kotlin 2.2.0
     ├── settings.gradle.kts
     ├── build.gradle.kts                     plugin versions
@@ -165,7 +166,7 @@ $ shadowdroid shell "getprop ro.product.model"  → "sdk_gphone64_arm64"
 | # | Item | Status |
 |---|---|---|
 | #27 | Investigate UiAutomation slot leak on Android 16 emulator | **INVESTIGATED** — current evidence points to slot contention from a respawned openatx/u2 process, not a proven Android 16 leak. Keep the `-wipe-data` path as last resort only. |
-| Future | M3: streaming `watch` + crash detection | Skeleton + stubs in place; needs implementation. |
+| Future | M3: streaming `watch` + crash detection | **IMPLEMENTED in CLI; induced crash validation pending** — `watch` emits ready/screen/action/error/crash-shaped events, dispatches stdin commands, tails UI logcat wake signals, and emits structured Java/native/ANR crashes. Parser and app-filter coverage passes in `cargo test`; live Livd flow on `com.livd` 3.0.49/149 covered permission dialogs, Profile, Local results, detail, add-to-cart, cart view, and cart cleanup without crash markers. App-scoped watch now allows system interruption packages such as permission controller/system UI so agents can see and answer dialogs. |
 | Future | M4: SelectorRoutes (find/find_tap/xpath) + ToastRoutes + FileRoutes + watchers | Stubs in place. |
 | Future | M5: GitHub Actions APK build/sign, `cargo install shadowdroid`, GH releases auto-download | Not started. |
 
@@ -175,6 +176,6 @@ $ shadowdroid shell "getprop ro.product.model"  → "sdk_gphone64_arm64"
 
 2. **Try API 35 emulator** (~10 min). Still useful as a control, but not urgent until we can reproduce a no-visible-owner stuck slot.
 
-3. **Push into M3** (~5 days). The streaming `watch` + crash detection don't touch UiAutomation (logcat tail is pure CLI-side), so we'd make progress regardless of the leak. Then come back to (1)/(2) when picking up M4.
+3. **Finish M3 validation** (~30 min). Run `shadowdroid watch --app ...` with stdin commands, then induce a Java crash and confirm the structured `crash` event includes stack + context + device_info.
 
-My pick: **1 → 3**, with API 35 only if a true no-visible-owner slot leak reappears. The real near-term fix is a friendlier diagnostic and avoiding concurrent UiAutomation owners.
+My pick: **3 → 1 → M4**, with API 35 only if a true no-visible-owner slot leak reappears. The real near-term fix is proving crash events live, then keeping diagnostics friendly when concurrent UiAutomation owners interfere.

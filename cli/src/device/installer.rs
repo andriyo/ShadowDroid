@@ -18,7 +18,7 @@
 //! if bytes changed). Sources 5-6 are *user* sources; versionName must match
 //! the CLI's baked-in `EXPECTED_APK_VERSION`.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
@@ -78,14 +78,20 @@ pub fn resolve_apk(explicit: Option<&Path>) -> Result<ApkPair> {
     }
     // 2. Repo auto-discovery
     if let Some(pair) = resolve_repo_build()? {
-        info!("using local APK at {} (dev mode, source: {})",
-              pair.test.display(), pair.source.label());
+        info!(
+            "using local APK at {} (dev mode, source: {})",
+            pair.test.display(),
+            pair.source.label()
+        );
         return Ok(pair);
     }
     // 3. Local drop-in
     if let Some(pair) = resolve_local_dropin()? {
-        info!("using local APK at {} (dev mode, source: {})",
-              pair.test.display(), pair.source.label());
+        info!(
+            "using local APK at {} (dev mode, source: {})",
+            pair.test.display(),
+            pair.source.label()
+        );
         return Ok(pair);
     }
     // 4. Versioned cache
@@ -115,7 +121,11 @@ fn resolve_explicit(p: &Path) -> Result<ApkPair> {
         "using local APK at {} (dev mode, source: --apk explicit)",
         test.display()
     );
-    Ok(ApkPair { main, test, source: ApkSource::Explicit })
+    Ok(ApkPair {
+        main,
+        test,
+        source: ApkSource::Explicit,
+    })
 }
 
 fn resolve_repo_build() -> Result<Option<ApkPair>> {
@@ -154,7 +164,11 @@ fn resolve_local_dropin() -> Result<Option<ApkPair>> {
     let main = local.join("main.apk");
     let test = local.join("test.apk");
     if main.is_file() && test.is_file() {
-        Ok(Some(ApkPair { main, test, source: ApkSource::LocalDropIn }))
+        Ok(Some(ApkPair {
+            main,
+            test,
+            source: ApkSource::LocalDropIn,
+        }))
     } else {
         Ok(None)
     }
@@ -169,7 +183,11 @@ fn resolve_versioned_cache() -> Result<Option<ApkPair>> {
             "using cached APK at {} (version {EXPECTED_APK_VERSION})",
             dir.display()
         );
-        Ok(Some(ApkPair { main, test, source: ApkSource::VersionedCache }))
+        Ok(Some(ApkPair {
+            main,
+            test,
+            source: ApkSource::VersionedCache,
+        }))
     } else {
         Ok(None)
     }
@@ -196,14 +214,11 @@ fn pair_from_path(p: &Path) -> Result<(PathBuf, PathBuf)> {
         .ok_or_else(|| anyhow!("--apk has no parent dir: {}", p.display()))?;
     // The main APK lives in androidTest/debug → ../../debug (Gradle layout)
     // or in the same dir (user-staged).
-    let candidates = [
-        parent.join("../../debug"),
-        parent.to_path_buf(),
-    ];
+    let candidates = [parent.join("../../debug"), parent.to_path_buf()];
     for cand in &candidates {
         if cand.is_dir() {
-            if let Some(main) = first_apk_matching(cand, "app-debug.apk")?
-                .or(first_apk_matching(cand, "main.apk")?)
+            if let Some(main) =
+                first_apk_matching(cand, "app-debug.apk")?.or(first_apk_matching(cand, "main.apk")?)
             {
                 if main != *p {
                     return Ok((main, p.to_path_buf()));
@@ -267,10 +282,7 @@ fn shadowdroid_home() -> Result<PathBuf> {
 
 /// Make sure the device has our server running and reachable, then return
 /// a connected ServerClient ready to use.
-pub async fn ensure_ready(
-    serial: &str,
-    explicit_apk: Option<&Path>,
-) -> Result<ServerClient> {
+pub async fn ensure_ready(serial: &str, explicit_apk: Option<&Path>) -> Result<ServerClient> {
     // Probe early: if the server is already up from a previous connect, we can
     // skip APK resolution, install checks, and any cooldowns. Warm path stays
     // <100ms.
@@ -343,13 +355,7 @@ async fn start_instrumentation(serial: &str) -> Result<()> {
     adb::am_force_stop(serial, TEST_PACKAGE).await?;
     adb::am_force_stop(serial, APP_PACKAGE).await?;
     let runner = format!("{TEST_PACKAGE}/{RUNNER_CLASS}");
-    adb::am_instrument(
-        serial,
-        runner,
-        Some(SERVER_TEST_CLASS),
-        INSTRUMENT_LOG_PATH,
-    )
-    .await?;
+    adb::am_instrument(serial, runner, Some(SERVER_TEST_CLASS), INSTRUMENT_LOG_PATH).await?;
     Ok(())
 }
 
@@ -371,8 +377,10 @@ async fn wait_for_server(serial: &str, client: &ServerClient) -> Result<()> {
     if let Some(hint) = ui_automation_failure_hint(serial).await {
         bail!("server did not become ready within 10s after `am instrument`.\n{hint}")
     }
-    bail!("server did not become ready within 10s after `am instrument`. \
-           Check the on-device log: `adb shell cat {INSTRUMENT_LOG_PATH}`")
+    bail!(
+        "server did not become ready within 10s after `am instrument`. \
+           Check the on-device log: `adb shell cat {INSTRUMENT_LOG_PATH}`"
+    )
 }
 
 async fn ui_automation_failure_hint(serial: &str) -> Option<String> {

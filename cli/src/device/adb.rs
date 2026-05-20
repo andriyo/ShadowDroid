@@ -8,10 +8,10 @@
 //! CLI dispatch without stalling the runtime. The blocking work itself is
 //! always sub-second.
 
-use adb_client::ADBDeviceExt;
 use adb_client::server::ADBServer;
 use adb_client::server_device::ADBServerDevice;
-use anyhow::{Context, Result, anyhow};
+use adb_client::ADBDeviceExt;
+use anyhow::{anyhow, Context, Result};
 use std::path::PathBuf;
 use tokio::task::spawn_blocking;
 use tracing::debug;
@@ -21,9 +21,7 @@ use tracing::debug;
 pub async fn list_devices() -> Result<Vec<String>> {
     spawn_blocking(|| {
         let mut server = ADBServer::default();
-        let devices = server
-            .devices()
-            .map_err(|e| anyhow!("adb devices: {e}"))?;
+        let devices = server.devices().map_err(|e| anyhow!("adb devices: {e}"))?;
         // DeviceShort stringifies as `<serial> <state>`; we want only "device"
         Ok(devices
             .into_iter()
