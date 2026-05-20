@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The shipping artifact is the test/instrumentation APK. This main APK is
+  intentionally empty — but it must be a real Android app (with code) so
+  the instrumentation can target it. `hasCode="false"` would make
+  `am instrument` fail with "Instrumentation target has no code".
+
+  INTERNET permission is required for the on-device Ktor server to bind
+  a localhost socket — otherwise `ServerSocketChannel.bind` throws
+  `SocketException: Operation not permitted`.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!--
+      Android 11+ package visibility: without QUERY_ALL_PACKAGES our test APK
+      can't see other apps via PackageManager (getLaunchIntentForPackage
+      returns null, getPackageInfo throws NameNotFoundException). Since the
+      whole point of ShadowDroid is to drive other apps, we need this.
+      Granted normally for testing/instrumentation packages.
+    -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+
+    <application
+        android:label="ShadowDroid"
+        android:allowBackup="false"
+        android:usesCleartextTraffic="true" />
+</manifest>

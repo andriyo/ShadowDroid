@@ -1,0 +1,31 @@
+# ---- Rust ----
+target/
+**/*.rs.bk
+Cargo.lock         # keep in apps if you want reproducible builds; we'll commit it later
+
+# ---- Android / Gradle ----
+.gradle/
+build/
+local.properties
+*.iml
+captures/
+.cxx/
+
+# ---- IDE ----
+.idea/
+.vscode/
+*.swp
+
+# ---- OS ----
+.DS_Store
+
+# ---- Build / release artifacts ----
+dist/
+*.apk-signed
+release-keystore.jks
+
+# ---- ShadowDroid local state ----
+~/.shadowdroid/
+
+# Per-machine paths
+local.properties
