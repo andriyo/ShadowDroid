@@ -34,6 +34,7 @@ pub const TEST_PACKAGE: &str = "io.github.andriyo.shadowdroid.test";
 pub const RUNNER_CLASS: &str = "androidx.test.runner.AndroidJUnitRunner";
 pub const SERVER_TEST_CLASS: &str = "io.github.andriyo.shadowdroid.ShadowDroidServerTest";
 pub const DEFAULT_PORT: u16 = 7912;
+const INSTRUMENT_LOG_PATH: &str = "/sdcard/shadowdroid-instr.log";
 
 /// Where each APK pair came from. Used for logging + to decide whether to
 /// version-check.
@@ -281,21 +282,21 @@ pub async fn ensure_ready(
     }
     // Cold path: resolve + install + start. May need a retry with longer
     // cooldown if Android's system_server hasn't released the UiAutomation
-    // slot from a prior dev cycle.
+    // slot from a prior dev cycle, or another UI automation process is still
+    // claiming it.
     let pair = resolve_apk(explicit_apk)?;
     install_if_needed(serial, &pair).await?;
     adb::forward(serial, DEFAULT_PORT, DEFAULT_PORT).await?;
     start_instrumentation(serial).await?;
-    if wait_for_server(&client).await.is_ok() {
+    if wait_for_server(serial, &client).await.is_ok() {
         return Ok(client);
     }
-    // First start failed — most likely the UiAutomation slot is stuck from a
-    // prior instrumentation that crashed mid-disconnect. Heavier cleanup +
-    // retry.
+    // First start failed — most likely the UiAutomation slot is still owned
+    // by a prior instrumentation/app_process. Heavier cleanup + retry.
     warn!("first start attempt failed; cooling down 10s and retrying (UiAutomation slot may need time to release)");
     long_cooldown(serial).await?;
     start_instrumentation(serial).await?;
-    wait_for_server(&client).await?;
+    wait_for_server(serial, &client).await?;
     Ok(client)
 }
 
@@ -346,7 +347,7 @@ async fn start_instrumentation(serial: &str) -> Result<()> {
         serial,
         runner,
         Some(SERVER_TEST_CLASS),
-        "/sdcard/shadowdroid-instr.log",
+        INSTRUMENT_LOG_PATH,
     )
     .await?;
     Ok(())
@@ -356,7 +357,7 @@ async fn probe(client: &ServerClient) -> bool {
     client.state().await.is_ok()
 }
 
-async fn wait_for_server(client: &ServerClient) -> Result<()> {
+async fn wait_for_server(serial: &str, client: &ServerClient) -> Result<()> {
     // 10s gives Ktor + UiAutomation + JUnit setup enough headroom on slower
     // emulators (Android 16 emulator with fresh APK install can take ~3s
     // for the test framework to fully initialise before our @Before runs).
@@ -367,6 +368,47 @@ async fn wait_for_server(client: &ServerClient) -> Result<()> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     }
+    if let Some(hint) = ui_automation_failure_hint(serial).await {
+        bail!("server did not become ready within 10s after `am instrument`.\n{hint}")
+    }
     bail!("server did not become ready within 10s after `am instrument`. \
-           Check the on-device log: `adb shell cat /sdcard/shadowdroid-instr.log`")
+           Check the on-device log: `adb shell cat {INSTRUMENT_LOG_PATH}`")
+}
+
+async fn ui_automation_failure_hint(serial: &str) -> Option<String> {
+    let log = adb::shell(serial, format!("cat {INSTRUMENT_LOG_PATH} 2>/dev/null"))
+        .await
+        .ok()?;
+    if !log.contains("already registered") {
+        return None;
+    }
+
+    let owners = adb::shell(
+        serial,
+        "ps -A -o USER,PID,PPID,NAME,ARGS \
+         | grep -E 'app_process|uiautomator|shadowdroid|wetest|atx' \
+         | grep -v grep",
+    )
+    .await
+    .unwrap_or_default();
+
+    let mut hint = String::from(
+        "Android reports the UiAutomation slot is already registered. Only one \
+         UiAutomation owner can run at a time.",
+    );
+    if owners.contains("com.wetest.uia2.Main") {
+        hint.push_str(
+            "\nDetected openatx/uiautomator2 (`com.wetest.uia2.Main`) on the device. \
+             Stop any host-side uiautomator2/movi watcher that may be respawning it, \
+             then kill the device process and retry.",
+        );
+    } else if !owners.trim().is_empty() {
+        hint.push_str("\nPotential on-device owners:\n");
+        hint.push_str(owners.trim());
+    }
+    hint.push_str(&format!(
+        "\nInstrumentation log: `adb shell cat {INSTRUMENT_LOG_PATH}`. If no owner \
+         remains visible after cleanup, reset the AVD with `emulator -wipe-data`."
+    ));
+    Some(hint)
 }
