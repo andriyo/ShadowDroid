@@ -145,11 +145,10 @@ pub async fn am_instrument(
     Ok(())
 }
 
-/// Kill any lingering `am instrument` shell processes on device. Each prior
-/// instrumentation run leaves an `app_process` zombie that holds the
-/// UiAutomation system slot — without cleanup, the next `am instrument` fails
-/// with "UiAutomationService already registered!". Call this before every
-/// re-launch of the server.
+/// Kill any lingering shell-owned `app_process` on device. ShadowDroid's
+/// backgrounded `am instrument` wrapper uses one, and tools like openatx's
+/// uiautomator2 `u2.jar` do too. Any live UiAutomation owner can make the next
+/// `am instrument` fail with "UiAutomationService already registered!".
 pub async fn kill_instrument_zombies(serial: impl Into<String>) -> Result<()> {
     let serial = serial.into();
     // First: kill any `app_process` shells. They run as uid=2000 (shell) and

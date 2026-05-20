@@ -6,7 +6,7 @@ Last update: end of the M2 session.
 
 - **M1 ships clean.** `shadowdroid connect/disconnect/devices` work end-to-end against the live emulator. Cold connect: 1.5s; warm: 130ms; steady-state `/v1/state`: ~18ms.
 - **M2 is feature-complete on both sides** — server endpoints (`/v1/screen`, `/v1/tap`, `/v1/swipe`, `/v1/screenshot.png`, `/v1/shell`, all the others) + CLI dispatch for every subcommand. The full Livd demo (launch → screen dump → tap profile tab by id → screenshot → shell) ran end-to-end and worked.
-- **One known blocker for repeated dev cycles**: Android 16 emulator's `system_server.mUiAutomationManager` leaks a stale `IAccessibilityServiceClient` registration after ~3 install/instrument cycles. Survives `am force-stop`, `pm uninstall`, and `adb reboot`. Only `emulator -wipe-data` clears it. Same wall openatx's atx-agent would hit.
+- **One known blocker for repeated dev cycles**: UiAutomation is single-owner. The scary Android 16 "already registered" failure was reproduced, but the live cause in follow-up was an old host-side `movi`/openatx watcher respawning `/data/local/tmp/u2.jar` (`com.wetest.uia2.Main`) after ShadowDroid killed it. After stopping that watcher and killing the device process, `shadowdroid connect` worked again on the same Android 16 emulator without `-wipe-data`.
 
 ## What's in the repo
 
@@ -81,7 +81,13 @@ cli/target/debug/shadowdroid shell "id && getprop ro.product.model"
 cli/target/debug/shadowdroid disconnect
 ```
 
-If `connect` fails with "server did not become ready", check `adb shell cat /sdcard/shadowdroid-instr.log` — if it shows `UiAutomationService ... already registered!`, you're in the stuck-slot state. Workaround:
+If `connect` fails with "server did not become ready", check `adb shell cat /sdcard/shadowdroid-instr.log` — if it shows `UiAutomationService ... already registered!`, first look for a competing owner:
+
+```bash
+adb shell "ps -A -o USER,PID,PPID,NAME,ARGS | grep -E 'app_process|uiautomator|shadowdroid|wetest|atx'"
+```
+
+If you see `com.wetest.uia2.Main`, stop the host-side `uiautomator2`/`movi` watcher that is respawning it, then kill the device process and retry. If there is no visible owner and the slot still survives cleanup, use the heavier AVD reset:
 
 ```bash
 # Stop emulator, wipe data, restart fresh:
@@ -158,17 +164,17 @@ $ shadowdroid shell "getprop ro.product.model"  → "sdk_gphone64_arm64"
 
 | # | Item | Status |
 |---|---|---|
-| #27 | Investigate UiAutomation slot leak on Android 16 emulator | **OPEN** — only `emulator -wipe-data` clears it. Three follow-up paths in the task description. |
+| #27 | Investigate UiAutomation slot leak on Android 16 emulator | **INVESTIGATED** — current evidence points to slot contention from a respawned openatx/u2 process, not a proven Android 16 leak. Keep the `-wipe-data` path as last resort only. |
 | Future | M3: streaming `watch` + crash detection | Skeleton + stubs in place; needs implementation. |
 | Future | M4: SelectorRoutes (find/find_tap/xpath) + ToastRoutes + FileRoutes + watchers | Stubs in place. |
 | Future | M5: GitHub Actions APK build/sign, `cargo install shadowdroid`, GH releases auto-download | Not started. |
 
 ## Three suggested next moves
 
-1. **Detect-and-recommend on the UA leak** (~30 min). When `wait_for_server` fails and the on-device log contains "already registered", print: `stuck UiAutomation slot — run "emulator -wipe-data -avd Pixel_9" to reset`. Lowest-effort QoL win.
+1. **Detect-and-recommend on the UA contention** (~30 min). When `wait_for_server` fails and the on-device log contains "already registered", print competing `app_process` / openatx owner hints before suggesting `emulator -wipe-data`. Lowest-effort QoL win.
 
-2. **Try API 35 emulator** (~10 min). Spin a Pixel emulator on Android 15 (API 35), see if the leak doesn't happen. If clean → document as the validated target, bump to 36/37 when fixed upstream.
+2. **Try API 35 emulator** (~10 min). Still useful as a control, but not urgent until we can reproduce a no-visible-owner stuck slot.
 
 3. **Push into M3** (~5 days). The streaming `watch` + crash detection don't touch UiAutomation (logcat tail is pure CLI-side), so we'd make progress regardless of the leak. Then come back to (1)/(2) when picking up M4.
 
-My pick: **2 → 1 → 3**. Quick spike on API 35 to characterize the bug, then ship the friendlier error, then move forward with M3 where the bug doesn't bite.
+My pick: **1 → 3**, with API 35 only if a true no-visible-owner slot leak reappears. The real near-term fix is a friendlier diagnostic and avoiding concurrent UiAutomation owners.
