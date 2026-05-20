@@ -17,6 +17,8 @@
 
 use crate::device::client::ServerClient;
 use crate::events::{self, now_ts, Event};
+use crate::proto::{AppRef, Element, SelectorQuery};
+use crate::watch::watcher::{WatcherRule, WatcherSet};
 use crate::watch::{logcat, stdin};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
@@ -43,6 +45,7 @@ pub struct WatchConfig {
     pub debounce_ms: u32,
     pub accept_stdin: bool,
     pub detect_crashes: bool,
+    pub watcher_files: Vec<String>,
 }
 
 enum WatchMsg {
@@ -51,6 +54,7 @@ enum WatchMsg {
 }
 
 pub async fn run(cfg: WatchConfig) -> Result<()> {
+    let watchers = WatcherSet::from_files(&cfg.watcher_files)?;
     let state = cfg
         .client
         .state()
@@ -90,7 +94,7 @@ pub async fn run(cfg: WatchConfig) -> Result<()> {
                 break;
             }
             _ = poll.tick() => {
-                handle_screen_wake(&cfg, &mut last_hash, Wake::Poll, false).await;
+                handle_screen_wake(&cfg, &watchers, &mut last_hash, Wake::Poll, false).await;
             }
             Some(evt) = event_rx.recv() => {
                 events::emit(&evt);
@@ -99,10 +103,10 @@ pub async fn run(cfg: WatchConfig) -> Result<()> {
                 match msg {
                     WatchMsg::Wake(wake) => {
                         let force = matches!(wake, Wake::Init | Wake::Command);
-                        handle_screen_wake(&cfg, &mut last_hash, wake, force).await;
+                        handle_screen_wake(&cfg, &watchers, &mut last_hash, wake, force).await;
                     }
                     WatchMsg::Command(line) => {
-                        let should_quit = handle_command(&cfg, &mut last_hash, &line).await;
+                        let should_quit = handle_command(&cfg, &watchers, &mut last_hash, &line).await;
                         if should_quit {
                             break;
                         }
@@ -213,6 +217,7 @@ fn spawn_stdin(watch_tx: mpsc::Sender<WatchMsg>) {
 
 async fn handle_screen_wake(
     cfg: &WatchConfig,
+    watchers: &WatcherSet,
     last_hash: &mut Option<String>,
     wake: Wake,
     force: bool,
@@ -234,7 +239,29 @@ async fn handle_screen_wake(
                 return;
             }
             *last_hash = Some(screen.screen_hash.clone());
+            let hits = watchers.matches(&screen.screen_hash, &screen.elements);
             events::emit(&events::screen_event(&cfg.serial, screen));
+            for hit in hits {
+                events::emit(&Event::WatcherFired {
+                    name: hit.name.clone(),
+                    screen_hash: hit.screen_hash.clone(),
+                    matched: hit.matched.clone(),
+                    ts: now_ts(),
+                });
+                for action in hit.then {
+                    match dispatch_command(cfg, watchers, last_hash, &action).await {
+                        Ok(DispatchOutcome::Continue) => {}
+                        Ok(DispatchOutcome::ScreenOnly) => {}
+                        Ok(DispatchOutcome::Quit) => return,
+                        Err(err) => events::emit(&Event::Error {
+                            stage: "watcher".to_string(),
+                            msg: err.to_string(),
+                            input: Some(action.to_string()),
+                            ts: now_ts(),
+                        }),
+                    }
+                }
+            }
         }
         Err(err) => events::emit(&Event::Error {
             stage: "screen".to_string(),
@@ -245,7 +272,12 @@ async fn handle_screen_wake(
     }
 }
 
-async fn handle_command(cfg: &WatchConfig, last_hash: &mut Option<String>, line: &str) -> bool {
+async fn handle_command(
+    cfg: &WatchConfig,
+    watchers: &WatcherSet,
+    last_hash: &mut Option<String>,
+    line: &str,
+) -> bool {
     let cmd = match stdin::parse_command(line) {
         Ok(Value::Null) => return false,
         Ok(cmd) => cmd,
@@ -260,12 +292,15 @@ async fn handle_command(cfg: &WatchConfig, last_hash: &mut Option<String>, line:
         }
     };
 
-    match dispatch_command(cfg, last_hash, &cmd).await {
+    match dispatch_command(cfg, watchers, last_hash, &cmd).await {
         Ok(DispatchOutcome::Continue) => {
-            handle_screen_wake(cfg, last_hash, Wake::Command, true).await;
+            handle_screen_wake(cfg, watchers, last_hash, Wake::Command, true).await;
             false
         }
-        Ok(DispatchOutcome::ScreenOnly) => false,
+        Ok(DispatchOutcome::ScreenOnly) => {
+            handle_screen_wake(cfg, watchers, last_hash, Wake::Command, true).await;
+            false
+        }
         Ok(DispatchOutcome::Quit) => true,
         Err(err) => {
             events::emit(&Event::Error {
@@ -287,7 +322,8 @@ enum DispatchOutcome {
 
 async fn dispatch_command(
     cfg: &WatchConfig,
-    last_hash: &mut Option<String>,
+    watchers: &WatcherSet,
+    _last_hash: &mut Option<String>,
     cmd: &Value,
 ) -> Result<DispatchOutcome> {
     let op = req_str(cmd, "cmd")?;
@@ -297,7 +333,6 @@ async fn dispatch_command(
             return Ok(DispatchOutcome::Quit);
         }
         "screen" => {
-            handle_screen_wake(cfg, last_hash, Wake::Command, true).await;
             return Ok(DispatchOutcome::ScreenOnly);
         }
         "tap" => {
@@ -468,11 +503,105 @@ async fn dispatch_command(
             cfg.client.open_url(url).await?;
             emit_json(json!({"type":"action","cmd":"open_url","url":url}));
         }
-        "tap_text" | "tap_rid" | "tap_desc" | "xpath" | "xpath_tap" | "toast" | "push" | "pull"
-        | "wait_for" | "add_watcher" | "remove_watcher" | "list_watchers" | "clear_watchers" => {
-            bail!(
-                "`{op}` is milestone M4; M3 watch supports M2 one-shot commands plus crash events"
-            )
+        "tap_text" | "tap_rid" | "tap_desc" => {
+            let value = req_str(cmd, "value")?;
+            let query = match op {
+                "tap_text" => SelectorQuery {
+                    text: Some(value.to_string()),
+                    ..Default::default()
+                },
+                "tap_rid" => SelectorQuery {
+                    rid: Some(value.to_string()),
+                    ..Default::default()
+                },
+                "tap_desc" => SelectorQuery {
+                    desc: Some(value.to_string()),
+                    ..Default::default()
+                },
+                _ => unreachable!(),
+            };
+            let r = cfg.client.find_tap(&query).await?;
+            emit_json(
+                json!({"type":"action","cmd":op,"value":value,"x":r.x,"y":r.y,"matched":r.matched}),
+            );
+        }
+        "xpath" => {
+            let query = req_any_str(cmd, &["query", "value"])?;
+            let r = cfg.client.xpath(query, false).await?;
+            emit_json(
+                json!({"type":"action","cmd":"xpath","query":query,"matched":r.matched,"elements":r.elements}),
+            );
+        }
+        "xpath_tap" => {
+            let query = req_any_str(cmd, &["query", "value"])?;
+            let r = cfg.client.xpath_tap(query).await?;
+            emit_json(
+                json!({"type":"action","cmd":"xpath_tap","query":query,"x":r.x,"y":r.y,"matched":r.matched}),
+            );
+        }
+        "toast" => {
+            let wait = timeout_ms(cmd, 5_000)?;
+            let start = unix_ms();
+            cfg.client.toast_start(50).await?;
+            let deadline = std::time::Instant::now() + Duration::from_millis(wait as u64);
+            loop {
+                let recent = cfg.client.toast_recent(start).await?;
+                if !recent.toasts.is_empty() || std::time::Instant::now() >= deadline {
+                    emit_json(json!({"type":"action","cmd":"toast","toasts":recent.toasts}));
+                    break;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        }
+        "push" => {
+            let local = req_str(cmd, "local")?;
+            let remote = req_str(cmd, "remote")?;
+            let bytes = std::fs::read(local).with_context(|| format!("reading {local}"))?;
+            let r = cfg.client.push_file(remote, bytes).await?;
+            emit_json(
+                json!({"type":"action","cmd":"push","local":local,"remote":remote,"path":r.path,"bytes":r.bytes}),
+            );
+        }
+        "pull" => {
+            let remote = req_str(cmd, "remote")?;
+            let local = req_str(cmd, "local")?;
+            let bytes = cfg.client.pull_file(remote).await?;
+            std::fs::write(local, &bytes).with_context(|| format!("writing {local}"))?;
+            emit_json(
+                json!({"type":"action","cmd":"pull","remote":remote,"local":local,"bytes":bytes.len() as u64}),
+            );
+        }
+        "wait_for" => {
+            let timeout = timeout_ms(cmd, 10_000)?;
+            let poll_ms = opt_u32(cmd, "poll_ms")?.unwrap_or(200).max(1);
+            let gone = opt_bool(cmd, "gone").unwrap_or(false);
+            wait_for(cfg, cmd, gone, timeout, poll_ms).await?;
+        }
+        "add_watcher" => {
+            let rule_value = cmd.get("rule").cloned().unwrap_or_else(|| {
+                let mut copy = cmd.clone();
+                if let Value::Object(map) = &mut copy {
+                    map.remove("cmd");
+                }
+                copy
+            });
+            let rule: WatcherRule = serde_json::from_value(rule_value)?;
+            watchers.add(rule.clone());
+            emit_json(json!({"type":"action","cmd":"add_watcher","name":rule.name}));
+        }
+        "remove_watcher" => {
+            let name = req_str(cmd, "name")?;
+            let removed = watchers.remove(name);
+            emit_json(
+                json!({"type":"action","cmd":"remove_watcher","name":name,"removed":removed}),
+            );
+        }
+        "list_watchers" => {
+            emit_json(json!({"type":"action","cmd":"list_watchers","watchers":watchers.list()}));
+        }
+        "clear_watchers" => {
+            watchers.clear();
+            emit_json(json!({"type":"action","cmd":"clear_watchers"}));
         }
         _ => bail!("unknown cmd: {op}"),
     }
@@ -499,6 +628,70 @@ async fn wait_activity(client: &ServerClient, name: &str, timeout_ms: u32) -> Re
     }
 }
 
+async fn wait_for(
+    cfg: &WatchConfig,
+    cmd: &Value,
+    gone: bool,
+    timeout_ms: u32,
+    poll_ms: u32,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms as u64);
+    loop {
+        let screen = cfg.client.screen().await?;
+        let matched = wait_query_matches(cmd, &screen.current_app, &screen.elements);
+        if matched != gone {
+            emit_json(json!({
+                "type":"action","cmd":"wait_for","matched":matched,"gone":gone,
+                "screen_hash":screen.screen_hash
+            }));
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            emit_json(json!({
+                "type":"action","cmd":"wait_for","matched":matched,"gone":gone,
+                "screen_hash":screen.screen_hash,"timeout":true
+            }));
+            return Ok(());
+        }
+        sleep(Duration::from_millis(poll_ms as u64)).await;
+    }
+}
+
+fn wait_query_matches(cmd: &Value, app: &AppRef, elements: &[Element]) -> bool {
+    if let Some(package) = cmd.get("package").and_then(Value::as_str) {
+        if !app.package.as_deref().unwrap_or("").contains(package) {
+            return false;
+        }
+    }
+    if let Some(activity) = cmd.get("activity").and_then(Value::as_str) {
+        if !app.activity.as_deref().unwrap_or("").contains(activity) {
+            return false;
+        }
+    }
+    let text = cmd.get("text").and_then(Value::as_str);
+    let rid = cmd.get("rid").and_then(Value::as_str);
+    let desc = cmd.get("desc").and_then(Value::as_str);
+    let klass = cmd.get("klass").and_then(Value::as_str);
+    if text.is_none() && rid.is_none() && desc.is_none() && klass.is_none() {
+        return true;
+    }
+    elements.iter().any(|el| {
+        selector_string_matches(el.text.as_deref(), text)
+            && selector_string_matches(el.rid.as_deref(), rid)
+            && selector_string_matches(el.desc.as_deref(), desc)
+            && selector_string_matches(el.klass.as_deref(), klass)
+    })
+}
+
+fn selector_string_matches(actual: Option<&str>, expected: Option<&str>) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    actual
+        .map(|actual| actual.to_lowercase().contains(&expected.to_lowercase()))
+        .unwrap_or(false)
+}
+
 async fn write_screenshot(client: &ServerClient, path: Option<String>) -> Result<(String, u64)> {
     let bytes = client.screenshot_png().await?;
     let path = match path {
@@ -517,6 +710,13 @@ async fn write_screenshot(client: &ServerClient, path: Option<String>) -> Result
 
 fn emit_json(value: Value) {
     println!("{}", serde_json::to_string(&value).unwrap());
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn req_str<'a>(cmd: &'a Value, key: &str) -> Result<&'a str> {
