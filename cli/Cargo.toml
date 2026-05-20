@@ -1,0 +1,64 @@
+[package]
+name = "shadowdroid"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"   # raised: reqwest 0.13 requires 1.81+; modern crates assume 1.80+
+description = "Drive Android apps from the command line — streaming JSON events, structured crashes, declarative popup watchers"
+authors = ["Andrii <andriy@...>"]
+license = "Apache-2.0"
+repository = "https://github.com/andriyo/ShadowDroid"
+readme = "../README.md"
+keywords = ["android", "uiautomator", "testing", "automation", "agent"]
+categories = ["command-line-utilities", "development-tools::testing"]
+
+[[bin]]
+name = "shadowdroid"
+path = "src/main.rs"
+
+[dependencies]
+# Versions verified against crates.io as of the latest stable channel.
+# When bumping, prefer the major version, e.g. `tokio = "1"` only if you
+# explicitly mean "any 1.x" — but pinning the minor lets us treat changes
+# as deliberate.
+
+# ── CLI ──────────────────────────────────────────────────────────────────
+clap = { version = "4.6", features = ["derive", "env"] }
+
+# ── Async runtime + HTTP client ─────────────────────────────────────────
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "process", "io-util", "fs", "signal", "sync", "time"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+
+# ── Serialization ───────────────────────────────────────────────────────
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+
+# ── XML hierarchy parsing (fallback path; usually we ask the server for elements) ──
+quick-xml = { version = "0.40", features = ["serialize"] }
+
+# ── ADB protocol (no shell-out to adb binary) ───────────────────────────
+adb_client = "3.2"        # NB: 3.x is a breaking change from 2.x; touch points are in device/adb.rs
+
+# ── Logcat tail + crash parsing ─────────────────────────────────────────
+regex = "1.12"
+
+# ── Utility ─────────────────────────────────────────────────────────────
+anyhow = "1.0"
+thiserror = "2.0"         # NB: 2.x reworks #[error(...)] macro paths; we don't use it yet
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+directories = "6.0"       # NB: 6.x renames ProjectDirs::from() variants — sites in installer.rs
+blake3 = "1.8"            # screen hashing
+futures = "0.3"
+urlencoding = "2.1"   # used for ?package= query strings
+# once_cell removed: std::sync::OnceLock (stable since 1.70) covers our use case.
+# Bring it back if we need the &'static initialisation guarantee for ergonomics.
+
+[dev-dependencies]
+tempfile = "3.27"
+wiremock = "0.6"          # mock the on-device HTTP server for unit tests
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+opt-level = 3
