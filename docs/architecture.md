@@ -134,14 +134,16 @@ We'll start with Solution 1 and only build Solution 2 if real use surfaces pain.
 
 ```json
 {"type":"ready","device":"emulator-5554","viewport":{"w":1080,"h":2424},"server_version":"0.1.0","ts":...}
+{"type":"screen_compact","ts":...,"screen_hash":"...","elements":[{"id":7,"rid":"main_tab_profile","tap":[980,2256],"clickable":true}]}
 {"type":"screen","ts":...,"package":"...","activity":"...","screen_hash":"...","element_count":N,"elements":[...]}
 {"type":"action","cmd":"tap","id":5,"x":540,"y":1800}
+{"type":"action","cmd":"tap_and_wait","matched":true,"timeout":false,"screen_hash":"...","hash_changed":true}
 {"type":"crash","kind":"java","exception":"...","stack":[...],"context":[...],"device_info":{...}}
 {"type":"watcher_fired","name":"...","matched":{...},"ts":...}
 {"type":"error","stage":"dump|parse|dispatch|watcher","msg":"..."}
 ```
 
-The agent-facing contract is **exactly the same** as `movi`. That's deliberate: anyone using `movi` (and the `/movi` skill we wrote) should be able to swap the binary and have things keep working.
+The default `watch` screen payload is `screen_compact` because agents usually need ids, tap points, labels, resource ids, classes, and true state flags. Use `watch --screen-format full` when the agent needs the full UIAutomator-style dump with bounds and every boolean flag.
 
 ## 9. Resolved architectural decisions
 

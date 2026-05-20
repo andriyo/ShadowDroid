@@ -8,6 +8,12 @@ use crate::proto::{AppRef, Element, ScreenResponse, Viewport};
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ScreenFormat {
+    Full,
+    Compact,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
@@ -29,6 +35,16 @@ pub enum Event {
         element_count: u32,
         elements: Vec<Element>,
     },
+    ScreenCompact {
+        ts: f64,
+        device: String,
+        package: Option<String>,
+        activity: Option<String>,
+        viewport: Viewport,
+        screen_hash: String,
+        element_count: u32,
+        elements: Vec<CompactElement>,
+    },
     Action(ActionResult),
     Crash(CrashEvent),
     WatcherFired {
@@ -44,6 +60,52 @@ pub enum Event {
         input: Option<String>,
         ts: f64,
     },
+}
+
+#[derive(Debug, Serialize)]
+pub struct CompactElement {
+    pub id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub klass: Option<String>,
+    pub tap: [i32; 2],
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub clickable: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub scrollable: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub input: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub selected: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub checked: bool,
+}
+
+impl From<Element> for CompactElement {
+    fn from(el: Element) -> Self {
+        Self {
+            id: el.id,
+            text: el.text,
+            desc: el.desc,
+            rid: el.rid,
+            klass: el.klass,
+            tap: el.tap,
+            clickable: el.clickable,
+            scrollable: el.scrollable,
+            input: el.input,
+            selected: el.selected,
+            checked: el.checked,
+        }
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Serialize)]
@@ -117,21 +179,37 @@ pub fn now_ts() -> f64 {
         .unwrap_or(0.0)
 }
 
-pub fn screen_event(device: &str, screen: ScreenResponse) -> Event {
+pub fn screen_event(device: &str, screen: ScreenResponse, format: ScreenFormat) -> Event {
     let AppRef {
         package,
         activity,
         pid: _,
     } = screen.current_app;
-    Event::Screen {
-        ts: now_ts(),
-        device: device.to_string(),
-        package,
-        activity,
-        viewport: screen.viewport,
-        screen_hash: screen.screen_hash,
-        element_count: screen.element_count,
-        elements: screen.elements,
+    match format {
+        ScreenFormat::Full => Event::Screen {
+            ts: now_ts(),
+            device: device.to_string(),
+            package,
+            activity,
+            viewport: screen.viewport,
+            screen_hash: screen.screen_hash,
+            element_count: screen.element_count,
+            elements: screen.elements,
+        },
+        ScreenFormat::Compact => Event::ScreenCompact {
+            ts: now_ts(),
+            device: device.to_string(),
+            package,
+            activity,
+            viewport: screen.viewport,
+            screen_hash: screen.screen_hash,
+            element_count: screen.element_count,
+            elements: screen
+                .elements
+                .into_iter()
+                .map(CompactElement::from)
+                .collect(),
+        },
     }
 }
 

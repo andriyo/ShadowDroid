@@ -15,6 +15,7 @@ use std::path::PathBuf;
 
 use crate::device::client::ServerClient;
 use crate::device::{adb, installer};
+use crate::events::ScreenFormat;
 use crate::proto::{Element, SelectorQuery};
 use crate::watch::watcher::PermissionDialogPolicy;
 
@@ -213,6 +214,10 @@ pub enum Cmd {
         no_stdin: bool,
         #[arg(long)]
         no_crash_detect: bool,
+        /// Screen event payload shape. `compact` is the default for fast agent
+        /// parsing; use `full` when you need bounds and every UIAutomator flag.
+        #[arg(long, value_enum, default_value_t = ScreenFormat::Compact)]
+        screen_format: ScreenFormat,
         /// Built-in Android permission dialog policy.
         ///
         /// `allow` taps PermissionController allow buttons; `deny` taps deny buttons.
@@ -518,6 +523,7 @@ pub async fn run() -> Result<()> {
             debounce_ms,
             no_stdin,
             no_crash_detect,
+            screen_format,
             permission_dialogs,
             watcher_file,
         } => {
@@ -531,6 +537,7 @@ pub async fn run() -> Result<()> {
                 detect_crashes: !no_crash_detect,
                 watcher_files: watcher_file,
                 permission_dialog_policy: permission_dialogs,
+                screen_format,
             })
             .await?;
         } // ── deferred / M2-OUT ──────────────────────────────────

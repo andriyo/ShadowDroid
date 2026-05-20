@@ -103,7 +103,7 @@ adb shell am crash com.livd
 **In:**
 - Server: `ToastRoutes` (accessibility-event listener, ring buffer). `SelectorRoutes` (find / find_tap / xpath). `FileRoutes` (push/pull within accessible storage).
 - CLI: `watch::watcher` rule engine. `--watcher-file` flag on `watch`. Add/remove/list at runtime via JSON commands. Watcher fires dispatch through the normal action path.
-- CLI: `tap_text`, `tap_rid`, `tap_desc`, `xpath`, `xpath_tap`, `toast`, `wait_for`, `swipe_ext`, `open_url`, `push`, `pull` — all the verbs we added in `movi` after M2.
+- CLI: `tap_text`, `tap_rid`, `tap_desc`, `tap_and_wait`, `tap_text_and_wait`, `tap_rid_and_wait`, `tap_desc_and_wait`, `xpath`, `xpath_tap`, `toast`, `wait_for`, `swipe_ext`, `open_url`, `push`, `pull` — all the verbs we added in `movi` after M2, plus fast agent-loop helpers.
 
 **Out:** the `MoviSession` Python adapter — that's not a ShadowDroid concern. Agents drive the CLI directly via stdin/stdout, or via the JSON-line stream from `shadowdroid watch`. (If we miss the in-process adapter, an `agent` crate could add it later, but `movi`'s agent layer was Python-only and doesn't need to carry forward.)
 
@@ -123,6 +123,17 @@ Use `--permission-dialogs deny` for negative-path tests. Custom `--watcher-file`
 rules remain the escape hatch for app-specific dialogs, but Android
 PermissionController buttons are covered by built-in resource-id rules so agents
 do not need to shell out to ADB for the common permission flow.
+
+Fast agent loop:
+```bash
+shadowdroid watch --app com.livd --permission-dialogs deny --debounce-ms 0
+```
+
+`screen_compact` is the default screen event. Agents should read the latest
+compact event, use cached element ids or `tap` coordinates from that event, and
+send `tap_and_wait` when the next decision depends on a screen change. JSON
+commands can include `screen_hash` to reject stale cached ids. Use
+`--screen-format full` only when an agent needs a full screen dump.
 
 **Validates:** end-to-end feature parity with `movi`. At this point the legacy Python tool can be retired.
 
