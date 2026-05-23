@@ -43,4 +43,4 @@ Design phase. See [docs/architecture.md](docs/architecture.md), [docs/protocol.m
 
 ## License
 
-TBD — proposed Apache 2.0.
+Apache-2.0. See [LICENSE](LICENSE).
