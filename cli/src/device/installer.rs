@@ -9,8 +9,7 @@
 //!         + sibling main APK at server/app/build/outputs/apk/debug/*.apk
 //!   4. Dev drop-in:  ~/.shadowdroid/apks/local/{main,test}.apk
 //!   5. Versioned cache:  ~/.shadowdroid/apks/<EXPECTED_APK_VERSION>/{main,test}.apk
-//!   6. Download from GitHub releases (stubbed — `bail!`s with a clear
-//!      "not yet implemented; use --apk" message until M5)
+//!   6. Download from GitHub releases.
 //!
 //! Sources 1-4 are *developer* sources: we install them as-is, identifying
 //! re-install need by APK SHA-256 instead of versionName (so a `gradlew
@@ -19,6 +18,7 @@
 //! the CLI's baked-in `EXPECTED_APK_VERSION`.
 
 use anyhow::{anyhow, bail, Context, Result};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
@@ -34,6 +34,9 @@ pub const TEST_PACKAGE: &str = "io.github.andriyo.shadowdroid.test";
 pub const RUNNER_CLASS: &str = "androidx.test.runner.AndroidJUnitRunner";
 pub const SERVER_TEST_CLASS: &str = "io.github.andriyo.shadowdroid.ShadowDroidServerTest";
 pub const DEFAULT_PORT: u16 = 7912;
+const RELEASE_MAIN_APK_ASSET: &str = "shadowdroid-server-main.apk";
+const RELEASE_TEST_APK_ASSET: &str = "shadowdroid-server-test.apk";
+const RELEASE_CHECKSUMS_ASSET: &str = "SHA256SUMS";
 const INSTRUMENT_LOG_PATH: &str = "/sdcard/shadowdroid-instr.log";
 
 /// Where each APK pair came from. Used for logging + to decide whether to
@@ -71,48 +74,40 @@ pub struct ApkPair {
 }
 
 /// Walk the precedence chain and return the APK pair to install.
-pub fn resolve_apk(explicit: Option<&Path>) -> Result<ApkPair> {
+pub async fn resolve_apk(explicit: Option<&Path>) -> Result<ApkPair> {
     // 1. Explicit override (--apk / SHADOWDROID_APK)
     if let Some(p) = explicit {
         return resolve_explicit(p);
     }
-    // 2. Repo auto-discovery
-    if let Some(pair) = resolve_repo_build()? {
-        info!(
-            "using local APK at {} (dev mode, source: {})",
-            pair.test.display(),
-            pair.source.label()
-        );
-        return Ok(pair);
-    }
-    // 3. Local drop-in
-    if let Some(pair) = resolve_local_dropin()? {
-        info!(
-            "using local APK at {} (dev mode, source: {})",
-            pair.test.display(),
-            pair.source.label()
-        );
-        return Ok(pair);
+    let disable_dev_sources = env_truthy("SHADOWDROID_DISABLE_DEV_SOURCES");
+    if !disable_dev_sources {
+        // 2. Repo auto-discovery
+        if let Some(pair) = resolve_repo_build()? {
+            info!(
+                "using local APK at {} (dev mode, source: {})",
+                pair.test.display(),
+                pair.source.label()
+            );
+            return Ok(pair);
+        }
+        // 3. Local drop-in
+        if let Some(pair) = resolve_local_dropin()? {
+            info!(
+                "using local APK at {} (dev mode, source: {})",
+                pair.test.display(),
+                pair.source.label()
+            );
+            return Ok(pair);
+        }
+    } else {
+        info!("skipping repo/local APK discovery because SHADOWDROID_DISABLE_DEV_SOURCES is set");
     }
     // 4. Versioned cache
     if let Some(pair) = resolve_versioned_cache()? {
         return Ok(pair);
     }
-    // 5. GitHub release — M5
-    bail!(
-        "no ShadowDroid APK found.\n\
-         Tried (in order):\n  \
-         1. --apk / SHADOWDROID_APK (not set)\n  \
-         2. repo: $CWD or ancestor with server/app/build/outputs/.../*.apk (none)\n  \
-         3. ~/.shadowdroid/apks/local/{{main,test}}.apk (missing)\n  \
-         4. ~/.shadowdroid/apks/{version}/{{main,test}}.apk (missing)\n  \
-         5. GitHub release v{version} (download not implemented yet — M5)\n\
-         \n\
-         For now, pass --apk pointing at app-debug-androidTest.apk (the sibling\n\
-         main APK is auto-discovered), or build the server:\n  \
-         cd server && ./gradlew :app:assembleDebug :app:assembleDebugAndroidTest",
-        version = EXPECTED_APK_VERSION,
-    )
+    // 5. GitHub release
+    download_github_release().await
 }
 
 fn resolve_explicit(p: &Path) -> Result<ApkPair> {
@@ -175,7 +170,7 @@ fn resolve_local_dropin() -> Result<Option<ApkPair>> {
 }
 
 fn resolve_versioned_cache() -> Result<Option<ApkPair>> {
-    let dir = shadowdroid_home()?.join("apks").join(EXPECTED_APK_VERSION);
+    let dir = versioned_cache_dir()?;
     let main = dir.join("main.apk");
     let test = dir.join("test.apk");
     if main.is_file() && test.is_file() {
@@ -191,6 +186,178 @@ fn resolve_versioned_cache() -> Result<Option<ApkPair>> {
     } else {
         Ok(None)
     }
+}
+
+async fn download_github_release() -> Result<ApkPair> {
+    let cache_dir = versioned_cache_dir()?;
+    let staging_dir = shadowdroid_home()?.join("apks").join(format!(
+        ".download-{}-{}",
+        EXPECTED_APK_VERSION,
+        std::process::id()
+    ));
+    if staging_dir.exists() {
+        fs::remove_dir_all(&staging_dir)
+            .context(format!("remove stale {}", staging_dir.display()))?;
+    }
+    fs::create_dir_all(&staging_dir).context(format!("create {}", staging_dir.display()))?;
+
+    let base = release_base_url();
+    let main_url = release_asset_url(&base, RELEASE_MAIN_APK_ASSET);
+    let test_url = release_asset_url(&base, RELEASE_TEST_APK_ASSET);
+    let sums_url = release_asset_url(&base, RELEASE_CHECKSUMS_ASSET);
+    info!("downloading ShadowDroid server APKs from {base}");
+
+    let checksums = download_text(&sums_url).await.with_context(|| {
+        format!("download {RELEASE_CHECKSUMS_ASSET} from GitHub release v{EXPECTED_APK_VERSION}")
+    })?;
+    let main_sha = expected_sha(
+        option_env!("SHADOWDROID_RELEASE_MAIN_APK_SHA256"),
+        &checksums,
+        RELEASE_MAIN_APK_ASSET,
+    )?;
+    let test_sha = expected_sha(
+        option_env!("SHADOWDROID_RELEASE_TEST_APK_SHA256"),
+        &checksums,
+        RELEASE_TEST_APK_ASSET,
+    )?;
+
+    let main_tmp = staging_dir.join("main.apk");
+    let test_tmp = staging_dir.join("test.apk");
+    download_file(&main_url, &main_tmp)
+        .await
+        .with_context(|| format!("download {RELEASE_MAIN_APK_ASSET}"))?;
+    verify_sha256(&main_tmp, &main_sha)
+        .with_context(|| format!("verify {RELEASE_MAIN_APK_ASSET}"))?;
+    download_file(&test_url, &test_tmp)
+        .await
+        .with_context(|| format!("download {RELEASE_TEST_APK_ASSET}"))?;
+    verify_sha256(&test_tmp, &test_sha)
+        .with_context(|| format!("verify {RELEASE_TEST_APK_ASSET}"))?;
+
+    if cache_dir.exists() {
+        fs::remove_dir_all(&cache_dir).context(format!("replace {}", cache_dir.display()))?;
+    }
+    fs::create_dir_all(cache_dir.parent().unwrap())
+        .context(format!("create parent for {}", cache_dir.display()))?;
+    fs::rename(&staging_dir, &cache_dir)
+        .context(format!("move downloaded APKs into {}", cache_dir.display()))?;
+    info!(
+        "cached ShadowDroid server APKs at {} (version {EXPECTED_APK_VERSION})",
+        cache_dir.display()
+    );
+    Ok(ApkPair {
+        main: cache_dir.join("main.apk"),
+        test: cache_dir.join("test.apk"),
+        source: ApkSource::GithubRelease,
+    })
+}
+
+async fn download_text(url: &str) -> Result<String> {
+    let resp = reqwest::Client::new()
+        .get(url)
+        .header(reqwest::header::USER_AGENT, "shadowdroid")
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(resp.text().await?)
+}
+
+async fn download_file(url: &str, path: &Path) -> Result<()> {
+    let resp = reqwest::Client::new()
+        .get(url)
+        .header(reqwest::header::USER_AGENT, "shadowdroid")
+        .send()
+        .await?
+        .error_for_status()?;
+    let bytes = resp.bytes().await?;
+    tokio::fs::write(path, bytes).await?;
+    Ok(())
+}
+
+fn expected_sha(embedded: Option<&str>, checksums: &str, asset: &str) -> Result<String> {
+    if let Some(value) = embedded.map(str::trim).filter(|s| !s.is_empty()) {
+        return normalize_sha256(value);
+    }
+    checksum_for(checksums, asset)
+        .ok_or_else(|| anyhow!("no checksum found for {asset} in {RELEASE_CHECKSUMS_ASSET}"))
+}
+
+fn checksum_for(checksums: &str, asset: &str) -> Option<String> {
+    checksums.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let sha = parts.next()?;
+        let name = parts.next()?.trim_start_matches('*');
+        if name == asset {
+            normalize_sha256(sha).ok()
+        } else {
+            None
+        }
+    })
+}
+
+fn normalize_sha256(value: &str) -> Result<String> {
+    let lower = value.trim().to_ascii_lowercase();
+    if lower.len() == 64 && lower.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(lower)
+    } else {
+        bail!("invalid SHA-256 digest: {value}")
+    }
+}
+
+fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
+    let actual = sha256_file(path)?;
+    if actual != expected {
+        bail!(
+            "checksum mismatch for {}: expected {expected}, got {actual}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).context(format!("read {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    Ok(hex_lower(&digest))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
+fn release_base_url() -> String {
+    let template = option_env!("SHADOWDROID_RELEASE_BASE_URL")
+        .unwrap_or("https://github.com/andriyo/ShadowDroid/releases/download/v{version}");
+    template
+        .replace("{version}", EXPECTED_APK_VERSION)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn release_asset_url(base: &str, asset: &str) -> String {
+    format!("{}/{asset}", base.trim_end_matches('/'))
+}
+
+fn versioned_cache_dir() -> Result<PathBuf> {
+    Ok(shadowdroid_home()?.join("apks").join(EXPECTED_APK_VERSION))
+}
+
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 /// Given a path that's either the test APK or a directory containing both,
@@ -282,13 +449,17 @@ fn shadowdroid_home() -> Result<PathBuf> {
 
 /// Make sure the device has our server running and reachable, then return
 /// a connected ServerClient ready to use.
-pub async fn ensure_ready(serial: &str, explicit_apk: Option<&Path>) -> Result<ServerClient> {
+pub async fn ensure_ready(
+    serial: &str,
+    explicit_apk: Option<&Path>,
+    any_apk_version: bool,
+) -> Result<ServerClient> {
     // Probe early: if the server is already up from a previous connect, we can
     // skip APK resolution, install checks, and any cooldowns. Warm path stays
     // <100ms.
     adb::forward(serial, DEFAULT_PORT, DEFAULT_PORT).await.ok();
     let client = ServerClient::new(DEFAULT_PORT)?;
-    if probe(&client).await {
+    if probe(&client, any_apk_version).await {
         info!("server already up — reusing");
         return Ok(client);
     }
@@ -296,11 +467,14 @@ pub async fn ensure_ready(serial: &str, explicit_apk: Option<&Path>) -> Result<S
     // cooldown if Android's system_server hasn't released the UiAutomation
     // slot from a prior dev cycle, or another UI automation process is still
     // claiming it.
-    let pair = resolve_apk(explicit_apk)?;
-    install_if_needed(serial, &pair).await?;
+    let pair = resolve_apk(explicit_apk).await?;
+    install_if_needed(serial, &pair, any_apk_version).await?;
     adb::forward(serial, DEFAULT_PORT, DEFAULT_PORT).await?;
     start_instrumentation(serial).await?;
-    if wait_for_server(serial, &client).await.is_ok() {
+    if wait_for_server(serial, &client, any_apk_version)
+        .await
+        .is_ok()
+    {
         return Ok(client);
     }
     // First start failed — most likely the UiAutomation slot is still owned
@@ -308,7 +482,7 @@ pub async fn ensure_ready(serial: &str, explicit_apk: Option<&Path>) -> Result<S
     warn!("first start attempt failed; cooling down 10s and retrying (UiAutomation slot may need time to release)");
     long_cooldown(serial).await?;
     start_instrumentation(serial).await?;
-    wait_for_server(serial, &client).await?;
+    wait_for_server(serial, &client, any_apk_version).await?;
     Ok(client)
 }
 
@@ -323,7 +497,7 @@ async fn long_cooldown(serial: &str) -> Result<()> {
     Ok(())
 }
 
-async fn install_if_needed(serial: &str, pair: &ApkPair) -> Result<()> {
+async fn install_if_needed(serial: &str, pair: &ApkPair, any_apk_version: bool) -> Result<()> {
     let installed_main = adb::pm_path(serial, APP_PACKAGE).await?.is_some();
     let installed_test = adb::pm_path(serial, TEST_PACKAGE).await?.is_some();
     if !installed_main || !installed_test {
@@ -344,7 +518,21 @@ async fn install_if_needed(serial: &str, pair: &ApkPair) -> Result<()> {
         }
         return Ok(());
     }
-    // For cached/release sources, version-check would go here. M5.
+    if any_apk_version {
+        return Ok(());
+    }
+    let main_version = adb::pm_version(serial, APP_PACKAGE).await?;
+    let test_version = adb::pm_version(serial, TEST_PACKAGE).await?;
+    if main_version.as_deref() != Some(EXPECTED_APK_VERSION)
+        || test_version.as_deref() != Some(EXPECTED_APK_VERSION)
+    {
+        info!(
+            "reinstalling APKs (expected version {EXPECTED_APK_VERSION}, found main={:?}, test={:?})",
+            main_version, test_version
+        );
+        adb::install(serial, pair.main.clone()).await?;
+        adb::install(serial, pair.test.clone()).await?;
+    }
     Ok(())
 }
 
@@ -359,17 +547,27 @@ async fn start_instrumentation(serial: &str) -> Result<()> {
     Ok(())
 }
 
-async fn probe(client: &ServerClient) -> bool {
-    client.state().await.is_ok()
+async fn probe(client: &ServerClient, any_apk_version: bool) -> bool {
+    match client.state().await {
+        Ok(state) if any_apk_version || state.server_version == EXPECTED_APK_VERSION => true,
+        Ok(state) => {
+            warn!(
+                "server version mismatch: expected {EXPECTED_APK_VERSION}, got {}",
+                state.server_version
+            );
+            false
+        }
+        Err(_) => false,
+    }
 }
 
-async fn wait_for_server(serial: &str, client: &ServerClient) -> Result<()> {
+async fn wait_for_server(serial: &str, client: &ServerClient, any_apk_version: bool) -> Result<()> {
     // 10s gives Ktor + UiAutomation + JUnit setup enough headroom on slower
     // emulators (Android 16 emulator with fresh APK install can take ~3s
     // for the test framework to fully initialise before our @Before runs).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
-        if probe(client).await {
+        if probe(client, any_apk_version).await {
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -419,4 +617,35 @@ async fn ui_automation_failure_hint(serial: &str) -> Option<String> {
          remains visible after cleanup, reset the AVD with `emulator -wipe-data`."
     ));
     Some(hint)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_sha256sums_lines() {
+        let sums = "\
+0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  shadowdroid-server-main.apk
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa *shadowdroid-server-test.apk
+";
+        assert_eq!(
+            checksum_for(sums, RELEASE_MAIN_APK_ASSET).as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(
+            checksum_for(sums, RELEASE_TEST_APK_ASSET).as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert!(checksum_for(sums, "missing.apk").is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_sha256() {
+        assert!(normalize_sha256("abc").is_err());
+        assert!(normalize_sha256(
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+        )
+        .is_err());
+    }
 }

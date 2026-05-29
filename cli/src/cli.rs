@@ -232,19 +232,22 @@ pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     let device = cli.device;
     let apk = cli.apk;
+    let any_apk_version = cli.any_apk_version;
     let cmd = cli.cmd;
     // For everything beyond `devices` we need an on-device server. ensure_ready
     // installs/starts as needed (no-op if already running).
     match &cmd {
         Cmd::Devices => return cmd_devices().await,
-        Cmd::Connect => return cmd_connect(device.as_deref(), apk.as_deref()).await,
+        Cmd::Connect => {
+            return cmd_connect(device.as_deref(), apk.as_deref(), any_apk_version).await
+        }
         Cmd::Disconnect => return cmd_disconnect(device.as_deref()).await,
         _ => {}
     }
 
     // Shared setup for all UI verbs.
     let serial = resolve_serial(device.as_deref()).await?;
-    let client = installer::ensure_ready(&serial, apk.as_deref()).await?;
+    let client = installer::ensure_ready(&serial, apk.as_deref(), any_apk_version).await?;
 
     match cmd {
         Cmd::Devices | Cmd::Connect | Cmd::Disconnect => unreachable!(), // handled above
@@ -769,9 +772,13 @@ async fn cmd_devices() -> Result<()> {
     Ok(())
 }
 
-async fn cmd_connect(device: Option<&str>, apk: Option<&std::path::Path>) -> Result<()> {
+async fn cmd_connect(
+    device: Option<&str>,
+    apk: Option<&std::path::Path>,
+    any_apk_version: bool,
+) -> Result<()> {
     let serial = resolve_serial(device).await?;
-    let client = installer::ensure_ready(&serial, apk).await?;
+    let client = installer::ensure_ready(&serial, apk, any_apk_version).await?;
     let state = client.state().await?;
     let out = json!({
         "type": "connected",

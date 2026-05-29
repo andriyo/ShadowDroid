@@ -37,9 +37,38 @@ ShadowDroid/
 └── README.md
 ```
 
+## Install
+
+macOS / Linux:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/andriyo/ShadowDroid/releases/latest/download/shadowdroid-installer.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/andriyo/ShadowDroid/releases/latest/download/shadowdroid-installer.ps1 | iex"
+```
+
+Then connect to an attached Android device or emulator:
+
+```bash
+shadowdroid connect
+```
+
+The installer only installs the host CLI. On first `connect`, ShadowDroid
+downloads the matching instrumentation APKs from the same GitHub Release,
+verifies them with SHA-256, caches them under `~/.shadowdroid/apks/<version>/`,
+and installs them on the device.
+
+See [docs/getting-started.md](docs/getting-started.md) for manual downloads
+and pinned versions. Maintainers can use [docs/release.md](docs/release.md) to
+cut a release.
+
 ## Status
 
-Design phase. See [docs/architecture.md](docs/architecture.md), [docs/protocol.md](docs/protocol.md), and [docs/delivery-plan.md](docs/delivery-plan.md).
+M5 distribution wiring is implemented. See [docs/architecture.md](docs/architecture.md), [docs/protocol.md](docs/protocol.md), and [docs/delivery-plan.md](docs/delivery-plan.md).
 
 ## License
 
