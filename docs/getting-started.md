@@ -6,10 +6,23 @@ verifies, caches, and installs the APKs during `shadowdroid connect`.
 
 ## Install the CLI
 
+Homebrew:
+
+```bash
+brew install andriyo/tap/shadowdroid
+```
+
 macOS / Linux:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/andriyo/ShadowDroid/releases/latest/download/shadowdroid-installer.sh | sh
+```
+
+Scoop:
+
+```powershell
+scoop bucket add andriyo https://github.com/andriyo/scoop-bucket
+scoop install shadowdroid
 ```
 
 Windows PowerShell:
@@ -24,15 +37,43 @@ the user PATH.
 
 ## Install a pinned version
 
-Use a tag such as `v0.1.0`:
+Use a tag such as `v0.1.1`:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/andriyo/ShadowDroid/releases/latest/download/shadowdroid-installer.sh | SHADOWDROID_VERSION=v0.1.0 sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/andriyo/ShadowDroid/releases/latest/download/shadowdroid-installer.sh \
+  | sh -s -- --version v0.1.1
 ```
 
 ```powershell
-$env:SHADOWDROID_VERSION = "v0.1.0"
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/andriyo/ShadowDroid/releases/latest/download/shadowdroid-installer.ps1 | iex"
+$installer = Join-Path $env:TEMP "shadowdroid-installer.ps1"
+iwr https://github.com/andriyo/ShadowDroid/releases/latest/download/shadowdroid-installer.ps1 -OutFile $installer
+powershell -ExecutionPolicy Bypass -File $installer -Version v0.1.1
+```
+
+## Custom install directory
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/andriyo/ShadowDroid/releases/latest/download/shadowdroid-installer.sh \
+  | sh -s -- --install-dir "$HOME/bin"
+```
+
+```powershell
+$installer = Join-Path $env:TEMP "shadowdroid-installer.ps1"
+iwr https://github.com/andriyo/ShadowDroid/releases/latest/download/shadowdroid-installer.ps1 -OutFile $installer
+powershell -ExecutionPolicy Bypass -File $installer -InstallDir "$env:USERPROFILE\bin"
+```
+
+## Uninstall
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/andriyo/ShadowDroid/releases/latest/download/shadowdroid-installer.sh \
+  | sh -s -- --uninstall
+```
+
+```powershell
+$installer = Join-Path $env:TEMP "shadowdroid-installer.ps1"
+iwr https://github.com/andriyo/ShadowDroid/releases/latest/download/shadowdroid-installer.ps1 -OutFile $installer
+powershell -ExecutionPolicy Bypass -File $installer -Uninstall -RemovePath
 ```
 
 ## Connect
