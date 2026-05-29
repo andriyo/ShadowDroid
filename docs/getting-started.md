@@ -35,6 +35,11 @@ The shell installer writes to `~/.local/bin` by default. The PowerShell
 installer writes to `%LOCALAPPDATA%\ShadowDroid\bin` and adds that directory to
 the user PATH.
 
+ShadowDroid also needs Android Platform Tools (`adb`) on PATH before
+`shadowdroid connect` can talk to a device. The installers print a hint if `adb`
+is missing. On macOS, use `brew install --cask android-platform-tools`; on
+Windows with Scoop, use `scoop install adb`.
+
 ## Install a pinned version
 
 Use a tag such as `v0.1.1`:

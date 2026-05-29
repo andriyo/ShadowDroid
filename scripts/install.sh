@@ -148,6 +148,20 @@ Add this to $profile:
 EOF
 }
 
+adb_hint() {
+  if command -v adb >/dev/null 2>&1; then
+    return 0
+  fi
+
+  cat <<'EOF'
+
+adb was not found on PATH.
+Install Android Platform Tools before running `shadowdroid connect`:
+  macOS: brew install --cask android-platform-tools
+  Linux: install android-sdk-platform-tools with your package manager
+EOF
+}
+
 case "$(uname -s)" in
   Darwin) os="apple-darwin" ;;
   Linux) os="unknown-linux-gnu" ;;
@@ -198,3 +212,4 @@ Run:
   shadowdroid connect
 EOF
 path_hint
+adb_hint
