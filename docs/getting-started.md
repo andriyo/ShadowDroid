@@ -42,17 +42,17 @@ Windows with Scoop, use `scoop install adb`.
 
 ## Install a pinned version
 
-Use a tag such as `v0.1.1`:
+Use a tag such as `v0.1.2`:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/andriyo/ShadowDroid/releases/latest/download/shadowdroid-installer.sh \
-  | sh -s -- --version v0.1.1
+  | sh -s -- --version v0.1.2
 ```
 
 ```powershell
 $installer = Join-Path $env:TEMP "shadowdroid-installer.ps1"
 iwr https://github.com/andriyo/ShadowDroid/releases/latest/download/shadowdroid-installer.ps1 -OutFile $installer
-powershell -ExecutionPolicy Bypass -File $installer -Version v0.1.1
+powershell -ExecutionPolicy Bypass -File $installer -Version v0.1.2
 ```
 
 ## Custom install directory
