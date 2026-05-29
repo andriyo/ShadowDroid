@@ -31,7 +31,7 @@ cd ShadowDroid/server && ./gradlew :app:assembleDebug :app:assembleDebugAndroidT
 # Auto-discovery: from inside ShadowDroid/, the CLI finds the freshly-built APKs
 cd .. && cargo run -p shadowdroid -- connect
 # → "using local APK at server/app/build/outputs/.../app-debug-androidTest.apk (dev mode)"
-# → {"type":"connected","server_version":"0.1.1",...}
+# → {"type":"connected","server_version":"0.1.2",...}
 
 # Explicit path (from anywhere):
 shadowdroid --apk ~/Downloads/shadowdroid-test.apk connect

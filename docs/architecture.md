@@ -133,7 +133,7 @@ We'll start with Solution 1 and only build Solution 2 if real use surfaces pain.
 ## 8. What the agent's view looks like (unchanged from `movi`)
 
 ```json
-{"type":"ready","device":"emulator-5554","viewport":{"w":1080,"h":2424},"server_version":"0.1.1","ts":...}
+{"type":"ready","device":"emulator-5554","viewport":{"w":1080,"h":2424},"server_version":"0.1.2","ts":...}
 {"type":"screen_compact","ts":...,"screen_hash":"...","elements":[{"id":7,"rid":"main_tab_profile","tap":[980,2256],"clickable":true}]}
 {"type":"screen","ts":...,"package":"...","activity":"...","screen_hash":"...","element_count":N,"elements":[...]}
 {"type":"action","cmd":"tap","id":5,"x":540,"y":1800}
