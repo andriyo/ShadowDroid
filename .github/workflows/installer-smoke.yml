@@ -1,0 +1,72 @@
+name: Installer Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release tag to test, or latest.
+        required: false
+        default: latest
+
+jobs:
+  smoke-installers:
+    name: Smoke installer on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-15
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    env:
+      SHADOWDROID_SMOKE_VERSION: ${{ inputs.version }}
+    steps:
+      - name: Resolve release URL
+        shell: bash
+        if: runner.os != 'Windows'
+        run: |
+          if [ "$SHADOWDROID_SMOKE_VERSION" = "latest" ]; then
+            echo "SHADOWDROID_RELEASE_URL=https://github.com/${GITHUB_REPOSITORY}/releases/latest/download" >> "$GITHUB_ENV"
+          else
+            echo "SHADOWDROID_RELEASE_URL=https://github.com/${GITHUB_REPOSITORY}/releases/download/${SHADOWDROID_SMOKE_VERSION}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Resolve release URL
+        shell: pwsh
+        if: runner.os == 'Windows'
+        run: |
+          if ($env:SHADOWDROID_SMOKE_VERSION -eq "latest") {
+            "SHADOWDROID_RELEASE_URL=https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download" | Out-File -FilePath $env:GITHUB_ENV -Append
+          } else {
+            "SHADOWDROID_RELEASE_URL=https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:SHADOWDROID_SMOKE_VERSION" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
+
+      - name: Smoke macOS/Linux installer
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          installer="$RUNNER_TEMP/shadowdroid-installer.sh"
+          install_dir="$RUNNER_TEMP/shadowdroid-bin"
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            "${SHADOWDROID_RELEASE_URL}/shadowdroid-installer.sh" \
+            -o "$installer"
+          sh "$installer" --version "$SHADOWDROID_SMOKE_VERSION" --install-dir "$install_dir"
+          "$install_dir/shadowdroid" --version | grep "shadowdroid "
+          sh "$installer" --install-dir "$install_dir" --uninstall
+          test ! -e "$install_dir/shadowdroid"
+
+      - name: Smoke Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP "shadowdroid-installer.ps1"
+          $installDir = Join-Path $env:RUNNER_TEMP "shadowdroid-bin"
+          Invoke-WebRequest -Uri "$env:SHADOWDROID_RELEASE_URL/shadowdroid-installer.ps1" -OutFile $installer
+          powershell -ExecutionPolicy Bypass -File $installer -Version $env:SHADOWDROID_SMOKE_VERSION -InstallDir $installDir -NoPathUpdate
+          & (Join-Path $installDir "shadowdroid.exe") --version | Select-String "shadowdroid "
+          powershell -ExecutionPolicy Bypass -File $installer -InstallDir $installDir -Uninstall
+          if (Test-Path (Join-Path $installDir "shadowdroid.exe")) {
+            throw "shadowdroid.exe still exists after uninstall"
+          }

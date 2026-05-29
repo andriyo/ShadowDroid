@@ -177,3 +177,46 @@ jobs:
               --title "ShadowDroid $tag" \
               --notes-file release-notes.md
           fi
+
+  smoke-installers:
+    name: Smoke installer on ${{ matrix.os }}
+    needs: publish
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-15
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Smoke macOS/Linux installer
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          installer="$RUNNER_TEMP/shadowdroid-installer.sh"
+          install_dir="$RUNNER_TEMP/shadowdroid-bin"
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/shadowdroid-installer.sh" \
+            -o "$installer"
+          sh "$installer" --version "$GITHUB_REF_NAME" --install-dir "$install_dir"
+          "$install_dir/shadowdroid" --version | grep "shadowdroid ${GITHUB_REF_NAME#v}"
+          sh "$installer" --install-dir "$install_dir" --uninstall
+          test ! -e "$install_dir/shadowdroid"
+
+      - name: Smoke Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP "shadowdroid-installer.ps1"
+          $installDir = Join-Path $env:RUNNER_TEMP "shadowdroid-bin"
+          Invoke-WebRequest `
+            -Uri "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:GITHUB_REF_NAME/shadowdroid-installer.ps1" `
+            -OutFile $installer
+          powershell -ExecutionPolicy Bypass -File $installer -Version $env:GITHUB_REF_NAME -InstallDir $installDir -NoPathUpdate
+          & (Join-Path $installDir "shadowdroid.exe") --version | Select-String "shadowdroid $($env:GITHUB_REF_NAME.TrimStart('v'))"
+          powershell -ExecutionPolicy Bypass -File $installer -InstallDir $installDir -Uninstall
+          if (Test-Path (Join-Path $installDir "shadowdroid.exe")) {
+            throw "shadowdroid.exe still exists after uninstall"
+          }

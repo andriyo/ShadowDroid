@@ -39,10 +39,23 @@ ShadowDroid/
 
 ## Install
 
+Homebrew:
+
+```bash
+brew install andriyo/tap/shadowdroid
+```
+
 macOS / Linux:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/andriyo/ShadowDroid/releases/latest/download/shadowdroid-installer.sh | sh
+```
+
+Scoop:
+
+```powershell
+scoop bucket add andriyo https://github.com/andriyo/scoop-bucket
+scoop install shadowdroid
 ```
 
 Windows PowerShell:

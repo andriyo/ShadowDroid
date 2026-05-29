@@ -1,11 +1,93 @@
+param(
+    [string]$Version = $(if ($env:SHADOWDROID_VERSION) { $env:SHADOWDROID_VERSION } else { "latest" }),
+    [string]$InstallDir = $(if ($env:SHADOWDROID_INSTALL_DIR) { $env:SHADOWDROID_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA "ShadowDroid\bin" }),
+    [string]$Repo = $(if ($env:SHADOWDROID_REPO) { $env:SHADOWDROID_REPO } else { "andriyo/ShadowDroid" }),
+    [switch]$NoPathUpdate,
+    [switch]$Uninstall,
+    [switch]$RemovePath,
+    [switch]$Help
+)
+
 $ErrorActionPreference = "Stop"
 
-$Repo = if ($env:SHADOWDROID_REPO) { $env:SHADOWDROID_REPO } else { "andriyo/ShadowDroid" }
-$Version = if ($env:SHADOWDROID_VERSION) { $env:SHADOWDROID_VERSION } else { "latest" }
-$InstallDir = if ($env:SHADOWDROID_INSTALL_DIR) {
-    $env:SHADOWDROID_INSTALL_DIR
-} else {
-    Join-Path $env:LOCALAPPDATA "ShadowDroid\bin"
+function Show-Help {
+@"
+ShadowDroid installer for Windows PowerShell.
+
+Usage:
+  .\install.ps1 [options]
+
+Options:
+  -Version <tag>      Install a specific release tag, e.g. v0.1.1.
+                      Values without a leading "v" are normalized.
+  -InstallDir <dir>   Install directory. Default: %LOCALAPPDATA%\ShadowDroid\bin.
+  -Repo <owner/repo>  GitHub repo. Default: andriyo/ShadowDroid.
+  -NoPathUpdate       Install only; do not update the user PATH.
+  -Uninstall          Remove shadowdroid.exe from the install directory.
+  -RemovePath         With -Uninstall, also remove install dir from the user PATH.
+  -Help               Show this help.
+
+Environment overrides:
+  SHADOWDROID_VERSION
+  SHADOWDROID_INSTALL_DIR
+  SHADOWDROID_REPO
+
+Examples:
+  powershell -ExecutionPolicy Bypass -c "irm https://github.com/andriyo/ShadowDroid/releases/latest/download/shadowdroid-installer.ps1 | iex"
+
+  .\install.ps1 -Version v0.1.1 -InstallDir "$env:USERPROFILE\bin"
+"@
+}
+
+function Normalize-Version([string]$Value) {
+    if ($Value -eq "latest" -or $Value.StartsWith("v")) {
+        return $Value
+    }
+    return "v$Value"
+}
+
+function Update-UserPath([string]$Directory) {
+    $currentUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $parts = @()
+    if (-not [string]::IsNullOrWhiteSpace($currentUserPath)) {
+        $parts = $currentUserPath -split ";" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    }
+    if ($parts -notcontains $Directory) {
+        $newPath = (@($parts) + $Directory) -join ";"
+        [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
+        $env:Path = "$env:Path;$Directory"
+        return "Added $Directory to your user PATH. Open a new terminal if shadowdroid is not found."
+    }
+    return "$Directory is already on your user PATH."
+}
+
+function Remove-UserPath([string]$Directory) {
+    $currentUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    if ([string]::IsNullOrWhiteSpace($currentUserPath)) {
+        return "User PATH is already empty."
+    }
+    $parts = $currentUserPath -split ";" | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_) -and $_ -ne $Directory
+    }
+    [Environment]::SetEnvironmentVariable("Path", ($parts -join ";"), "User")
+    return "Removed $Directory from your user PATH."
+}
+
+if ($Help) {
+    Show-Help
+    exit 0
+}
+
+$Version = Normalize-Version $Version
+$exe = Join-Path $InstallDir "shadowdroid.exe"
+
+if ($Uninstall) {
+    Remove-Item -Path $exe -Force -ErrorAction SilentlyContinue
+    Write-Host "removed $exe"
+    if ($RemovePath) {
+        Write-Host (Remove-UserPath $InstallDir)
+    }
+    exit 0
 }
 
 $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
@@ -25,6 +107,8 @@ $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("shadowdroid-install-" + [Sy
 New-Item -ItemType Directory -Path $tmp | Out-Null
 
 try {
+    Write-Host "Installing shadowdroid $Version for $target..."
+
     $archive = Join-Path $tmp $asset
     $sums = Join-Path $tmp "SHA256SUMS"
     Invoke-WebRequest -Uri "$baseUrl/$asset" -OutFile $archive
@@ -43,21 +127,15 @@ try {
 
     Expand-Archive -Path $archive -DestinationPath $tmp -Force
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-    Copy-Item -Path (Join-Path $tmp "shadowdroid.exe") -Destination (Join-Path $InstallDir "shadowdroid.exe") -Force
+    Copy-Item -Path (Join-Path $tmp "shadowdroid.exe") -Destination $exe -Force
 
-    $currentUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-    if (-not (($currentUserPath -split ";") -contains $InstallDir)) {
-        $newPath = if ([string]::IsNullOrWhiteSpace($currentUserPath)) { $InstallDir } else { "$currentUserPath;$InstallDir" }
-        [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
-        $env:Path = "$env:Path;$InstallDir"
-        $pathMessage = "Added $InstallDir to your user PATH. Open a new terminal if shadowdroid is not found."
-    } else {
-        $pathMessage = "$InstallDir is already on your user PATH."
-    }
-
-    Write-Host "shadowdroid installed to $(Join-Path $InstallDir 'shadowdroid.exe')"
+    Write-Host "shadowdroid installed to $exe"
     Write-Host "Run: shadowdroid connect"
-    Write-Host $pathMessage
+    if (-not $NoPathUpdate) {
+        Write-Host (Update-UserPath $InstallDir)
+    } else {
+        Write-Host "PATH update skipped. Add $InstallDir to PATH if needed."
+    }
 }
 finally {
     Remove-Item -Path $tmp -Recurse -Force -ErrorAction SilentlyContinue
