@@ -149,6 +149,7 @@ the release-signed APK from GitHub and caches it under
 `~/.shadowdroid/apks/0.1.0/`. From then on, every `shadowdroid` invocation hits
 source 5 in a millisecond.
 
-You can simulate this locally by setting `SHADOWDROID_DISABLE_DEV_SOURCES=1`
-(if/when we add it; currently the way to test the user flow is to run from
-outside the repo with `SHADOWDROID_APK` unset and an empty `~/.shadowdroid/apks/local/`).
+You can simulate this locally by setting `SHADOWDROID_DISABLE_DEV_SOURCES=1`.
+That skips repo auto-discovery and `~/.shadowdroid/apks/local/`, so the CLI uses
+the versioned cache or GitHub Release path even when you are running from inside
+the repo.

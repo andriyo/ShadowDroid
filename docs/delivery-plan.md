@@ -142,9 +142,10 @@ commands can include `screen_hash` to reject stale cached ids. Use
 ## M5 — Distribution (3 days)
 
 **In:**
-- GitHub Actions: build APK on tag, sign with project release key, upload to release assets. Build cross-compiled CLI binaries (macOS arm64/x86_64, Linux x86_64/arm64, Windows x86_64).
-- CLI: at install time, embed the expected APK version + sha256 + download URL via `build.rs`. On first run, fetch and verify.
-- Publish to crates.io: `cargo install shadowdroid` should work.
+- GitHub Actions: build APKs on tag and upload release assets. Build CLI binaries for macOS arm64/x86_64, Linux x86_64/arm64, and Windows x86_64.
+- CLI: embed the expected APK version and optional release SHA-256 values at build time. On first run, fetch `SHA256SUMS`, download the matching APK pair, verify, cache, and install.
+- Copy-paste installers: `shadowdroid-installer.sh` for macOS/Linux and `shadowdroid-installer.ps1` for Windows.
+- Publish to crates.io: `cargo install shadowdroid` should work once the matching GitHub Release exists.
 - Homebrew tap: optional, can come later.
 - Release notes + a short `docs/getting-started.md`.
 
