@@ -141,7 +141,7 @@ jobs:
           (
             cd dist
             rm -f SHA256SUMS
-            for f in $(find . -maxdepth 1 -type f -print | sed 's#^\./##' | sort); do
+            for f in $(find . -maxdepth 1 -type f ! -name SHA256SUMS -print | sed 's#^\./##' | sort); do
               shasum -a 256 "$f"
             done > SHA256SUMS
           )
