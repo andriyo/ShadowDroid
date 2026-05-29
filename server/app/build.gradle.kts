@@ -13,9 +13,8 @@ plugins {
 
 android {
     namespace = "io.github.andriyo.shadowdroid"
-    // compileSdk = 37 (Android 17) — installed platform available locally.
-    // targetSdk stays at 36 (Android 16, last GA) until 17 ships stable.
-    compileSdk = 37
+    // compileSdk tracks the latest GA SDK available on GitHub-hosted runners.
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "io.github.andriyo.shadowdroid"
