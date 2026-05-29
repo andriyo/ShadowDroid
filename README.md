@@ -64,6 +64,11 @@ Windows PowerShell:
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/andriyo/ShadowDroid/releases/latest/download/shadowdroid-installer.ps1 | iex"
 ```
 
+ShadowDroid requires Android Platform Tools (`adb`) on PATH. The installers
+print a hint if `adb` is missing; on macOS you can install it with
+`brew install --cask android-platform-tools`, and on Windows with
+`scoop install adb`.
+
 Then connect to an attached Android device or emulator:
 
 ```bash

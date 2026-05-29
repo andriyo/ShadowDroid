@@ -73,6 +73,18 @@ function Remove-UserPath([string]$Directory) {
     return "Removed $Directory from your user PATH."
 }
 
+function Show-AdbHint {
+    if (Get-Command adb -ErrorAction SilentlyContinue) {
+        return
+    }
+
+    Write-Host ""
+    Write-Host "adb was not found on PATH."
+    Write-Host "Install Android Platform Tools before running 'shadowdroid connect':"
+    Write-Host "  Scoop: scoop install adb"
+    Write-Host "  Android Studio: SDK Manager > Android SDK Platform-Tools"
+}
+
 if ($Help) {
     Show-Help
     exit 0
@@ -136,6 +148,7 @@ try {
     } else {
         Write-Host "PATH update skipped. Add $InstallDir to PATH if needed."
     }
+    Show-AdbHint
 }
 finally {
     Remove-Item -Path $tmp -Recurse -Force -ErrorAction SilentlyContinue
