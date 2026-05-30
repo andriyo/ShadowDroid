@@ -19,7 +19,7 @@ ASSETS = {
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--version", required=True, help="Release tag, e.g. v0.1.2")
+    parser.add_argument("--version", required=True, help="Release tag, e.g. v0.1.3")
     parser.add_argument("--checksums", required=True, type=Path, help="Path to SHA256SUMS")
     parser.add_argument("--homebrew-path", required=True, type=Path)
     parser.add_argument("--scoop-path", required=True, type=Path)

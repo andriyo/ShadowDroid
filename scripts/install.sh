@@ -15,7 +15,7 @@ Usage:
   sh install.sh [options]
 
 Options:
-  --version <tag>       Install a specific release tag, e.g. v0.1.2.
+  --version <tag>       Install a specific release tag, e.g. v0.1.3.
                         Values without a leading "v" are normalized.
   --install-dir <dir>   Install directory. Default: ~/.local/bin.
   --repo <owner/repo>   GitHub repo. Default: andriyo/ShadowDroid.
@@ -33,7 +33,7 @@ Examples:
 
   curl --proto '=https' --tlsv1.2 -LsSf \
     https://github.com/andriyo/ShadowDroid/releases/latest/download/shadowdroid-installer.sh \
-    | sh -s -- --version v0.1.2 --install-dir "$HOME/bin"
+    | sh -s -- --version v0.1.3 --install-dir "$HOME/bin"
 EOF
 }
 
