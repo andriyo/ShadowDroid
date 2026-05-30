@@ -63,11 +63,11 @@ shadowdroid connect             # → reinstalls, ~3s
 
 **Demo:**
 ```bash
-shadowdroid launch com.livd
+shadowdroid app start com.livd
 shadowdroid screen | jq '.elements | length'    # → 17
-shadowdroid tap_text Profile                    # (uses /v1/find_tap)
+shadowdroid tap --text Profile                  # (uses /v1/find_tap)
 shadowdroid screenshot /tmp/profile.png
-shadowdroid shell "getprop ro.product.model"
+shadowdroid device shell "getprop ro.product.model"
 ```
 
 **Validates:** UI Automator coverage, error envelopes, the round-trip latency we promised (target: <100ms for a tap+screen cycle).

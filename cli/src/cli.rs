@@ -1,18 +1,26 @@
 //! Argument parsing + subcommand dispatch.
 //!
-//! M1 implements:
-//!   - `devices` — list attached emulators / phones
-//!   - `connect` — install APK, start server, verify with /v1/state
-//!   - `disconnect` — stop server, remove port forward
+//! Command surface follows a noun-namespace model:
+//!   - **Interaction primitives stay flat** — gestures (`tap`, `swipe`, …),
+//!     input (`text`, `key`, `back`, `home`), reads (`screen`, `screenshot`),
+//!     locate (`find`), `scroll-to`, sync/stream (`wait`, `watch`, `toast`),
+//!     and session/diagnostics (`connect`, `doctor`, `collect`, …).
+//!   - **Resources are nested** under a noun: `app`, `perm`, `appops`,
+//!     `profile`, `device`, `files` (e.g. `app install`, `perm grant`,
+//!     `device shell`, `files pull`).
 //!
-//! M2 implements one-shot inspection/action verbs. M3 implements `watch`.
-//! M4 adds selectors, toasts, files, and declarative popup watchers.
+//! Dispatch is two-phase: host-only commands (no on-device server) run first
+//! and return; everything else shares one `ensure_ready` bring-up, then routes
+//! through per-namespace sub-dispatchers.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use std::path::PathBuf;
 
+use crate::cmd::app_install::AppInstallArgs;
+use crate::cmd::device_profile::ProfileApplyArgs;
+use crate::cmd::scroll::ScrollArgs;
 use crate::device::client::ServerClient;
 use crate::device::{adb, installer};
 use crate::events::ScreenFormat;
@@ -50,15 +58,17 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Cmd {
-    // ── M1 ────────────────────────────────────────────────────
+    // ── session / diagnostics (flat) ──────────────────────────
+    /// List attached devices / emulators.
     Devices,
+    /// Install the server APK, start it, and verify (also disables the stylus tutorial).
     Connect,
+    /// Stop the server and remove the port forward.
     Disconnect,
+    /// Check whether this CLI is older than the latest GitHub Release.
     Update {
-        /// Check whether this CLI is older than the latest GitHub Release.
         #[arg(long)]
         check: bool,
-        /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
     },
@@ -79,108 +89,74 @@ pub enum Cmd {
     /// recent logcat + crash buffer, and — if the server is up — screen dump,
     /// screenshot, current activity, app info) into a directory.
     Collect {
-        /// App package to include version/info for.
         #[arg(long)]
         app: Option<String>,
-        /// Output directory (default: a temp dir under the OS temp path).
         #[arg(short = 'o', long)]
         out: Option<PathBuf>,
-        /// Skip the screenshot capture.
         #[arg(long)]
         no_screenshot: bool,
     },
-    /// Grant one or more runtime permissions to a package, then report the
-    /// observed state (verify-by-readback).
-    PermGrant {
-        package: String,
-        #[arg(required = true)]
-        perms: Vec<String>,
+    /// Emit the full command catalog (machine-readable self-introspection for agents).
+    Commands {
+        /// Emit JSON instead of a human tree.
+        #[arg(long)]
+        json: bool,
     },
-    /// Revoke one or more runtime permissions from a package.
-    PermRevoke {
-        package: String,
-        #[arg(required = true)]
-        perms: Vec<String>,
-    },
-    /// List a package's runtime permission grant states.
-    PermList {
-        package: String,
-    },
-    /// Revoke all granted runtime permissions, returning the package to a
-    /// fresh-install prompt state.
-    PermReset {
-        package: String,
-    },
-    /// Get appop mode(s) for a package (all ops, or one named op).
-    AppopGet {
-        package: String,
-        op: Option<String>,
-    },
-    /// Set an appop mode (allow|deny|ignore|default|foreground|…).
-    AppopSet {
-        package: String,
-        op: String,
-        mode: String,
-    },
-    /// Install an APK and run the app-under-test setup ritual: optional clear /
-    /// grant / launch / wait-for-front. Emits a structured per-step summary.
-    AppInstall(crate::cmd::app_install::AppInstallArgs),
-    /// Like app-install, but uninstall any existing copy first (crosses a
-    /// signature change or wipes state).
-    AppReinstall(crate::cmd::app_install::AppInstallArgs),
-    /// Capture the device display profile (animation scales, font scale,
-    /// density, size, rotation) as JSON, optionally to a file.
-    ProfileSnapshot {
-        /// Write the profile to this file (default: stdout only).
-        #[arg(short = 'o', long)]
-        out: Option<PathBuf>,
-    },
-    /// Apply a display profile: a preset (`automation` = animations off), a
-    /// snapshot file, or individual flags.
-    ProfileApply(crate::cmd::device_profile::ProfileApplyArgs),
-    /// Reset the display profile to stock defaults (animations on, size/density
-    /// reset, auto-rotate on).
-    ProfileReset,
+    /// Generate an agent-integration file (Claude Code / Cursor / Codex).
+    Skill(crate::cmd::skill::SkillArgs),
 
-    // ── M2: inspection + gestures ─────────────────────────────
+    // ── resource namespaces (nested) ──────────────────────────
+    /// Application lifecycle, info, and install rituals.
+    #[command(subcommand)]
+    App(AppCmd),
+    /// Runtime permission grants.
+    #[command(subcommand)]
+    Perm(PermCmd),
+    /// App-ops (allow|deny|ignore|default|… per operation).
+    #[command(subcommand)]
+    Appops(AppopsCmd),
+    /// Device display profile (animations, font, density, size, rotation).
+    #[command(subcommand)]
+    Profile(ProfileCmd),
+    /// Device & system controls (info, shell, power, orientation, clipboard, …).
+    #[command(subcommand)]
+    Device(DeviceCmd),
+    /// On-device file operations.
+    #[command(subcommand)]
+    Files(FilesCmd),
+
+    // ── UI read (flat) ────────────────────────────────────────
+    /// Dump the current UI as a flat element list.
     Screen,
+    /// Capture a screenshot to a file.
     Screenshot {
         path: Option<String>,
-        /// Image format: png (default) or jpeg. Requires a 0.1.4+ server.
+        /// Image format: png (default) or jpeg.
         #[arg(long)]
         format: Option<String>,
-        /// Server-side downscale factor, e.g. 0.5. Requires a 0.1.4+ server.
+        /// Server-side downscale factor, e.g. 0.5.
         #[arg(long)]
         scale: Option<f32>,
-        /// JPEG quality 1..100 (format=jpeg only). Requires a 0.1.4+ server.
+        /// JPEG quality 1..100 (format=jpeg only).
         #[arg(long)]
         quality: Option<u32>,
     },
-    /// One-shot detailed device info (model, fingerprint, locale, density).
-    Device,
-    /// Pinch in (zoom out) or out (zoom in) on the element matched by a
-    /// selector. Requires a 0.1.4+ server.
-    Pinch {
-        #[arg(value_parser = ["in", "out"])]
-        direction: String,
-        #[arg(long)]
-        rid: Option<String>,
+
+    // ── gestures (flat) ───────────────────────────────────────
+    /// Tap by element id, coordinates, or a selector (--text/--rid/--desc/--xpath).
+    Tap {
+        /// Element id (from `screen`) or X coordinate.
+        a: Option<i32>,
+        /// Y coordinate (with X for a coordinate tap).
+        b: Option<i32>,
         #[arg(long)]
         text: Option<String>,
         #[arg(long)]
+        rid: Option<String>,
+        #[arg(long)]
         desc: Option<String>,
-        #[arg(long, default_value_t = 50)]
-        percent: u32,
-    },
-    /// Print the current foreground app (package / activity / pid).
-    Current,
-    /// List a directory on the device (within accessible storage).
-    Ls {
-        remote: String,
-    },
-    Tap {
-        a: i32,
-        b: Option<i32>,
+        #[arg(long)]
+        xpath: Option<String>,
     },
     DoubleTap {
         x: i32,
@@ -216,93 +192,55 @@ pub enum Cmd {
         #[arg(long, default_value_t = 200)]
         duration_ms: u32,
     },
-    TapText {
-        value: String,
+    /// Pinch in (zoom out) or out (zoom in) on the element matched by a selector.
+    Pinch {
+        #[arg(value_parser = ["in", "out"])]
+        direction: String,
+        #[arg(long)]
+        rid: Option<String>,
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long)]
+        desc: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        percent: u32,
     },
-    TapRid {
-        value: String,
+    /// Scroll a list until a selector is visible, then optionally tap it.
+    ScrollTo(ScrollArgs),
+
+    // ── locate (flat) ─────────────────────────────────────────
+    /// Find elements by selector (--text/--rid/--desc/--xpath); does not tap.
+    Find {
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long)]
+        rid: Option<String>,
+        #[arg(long)]
+        desc: Option<String>,
+        #[arg(long)]
+        xpath: Option<String>,
+        /// Return all matches instead of the first.
+        #[arg(long)]
+        all: bool,
     },
-    TapDesc {
-        value: String,
-    },
-    Xpath {
-        query: String,
-    },
-    XpathTap {
-        query: String,
-    },
-    /// Scroll a list until an element matching a selector is visible, then
-    /// optionally tap it.
-    ScrollTo(crate::cmd::scroll::ScrollArgs),
-    Back,
-    Home,
-    Key {
-        name: String,
-    },
+
+    // ── input (flat) ──────────────────────────────────────────
+    /// Type into the focused field.
     Text {
         value: String,
         #[arg(long)]
         clear: bool,
     },
-    Launch {
-        package: String,
-    },
-    Stop {
-        package: String,
-    },
-    AppClear {
-        package: String,
-    },
-    AppWait {
-        package: String,
-        #[arg(long, default_value_t = 20000)]
-        timeout_ms: u32,
-        #[arg(long)]
-        front: bool,
-    },
-    AppInfo {
-        package: String,
-    },
-    WaitActivity {
+    /// Press a named key or keycode.
+    Key {
         name: String,
-        #[arg(long, default_value_t = 10000)]
-        timeout_ms: u32,
     },
-    Shell {
-        cmd: String,
-        #[arg(long, default_value_t = 30000)]
-        timeout_ms: u32,
-    },
-    ScreenOn,
-    ScreenOff,
-    Unlock,
-    Wakeup,
-    Orientation {
-        value: Option<String>,
-    },
-    Clipboard {
-        value: Option<String>,
-    },
-    Notifications,
-    QuickSettings,
-    OpenUrl {
-        url: String,
-    },
-    Push {
-        local: String,
-        remote: String,
-        #[arg(long, default_value_t = 0o644)]
-        mode: u32,
-    },
-    Pull {
-        remote: String,
-        local: String,
-    },
-    Toast {
-        #[arg(long, default_value_t = 5000)]
-        wait_ms: u32,
-    },
-    WaitFor {
+    Back,
+    Home,
+
+    // ── sync / stream / capture (flat) ────────────────────────
+    /// Wait for an element / activity / package to appear (or be --gone).
+    Wait {
         #[arg(long)]
         text: Option<String>,
         #[arg(long)]
@@ -322,8 +260,12 @@ pub enum Cmd {
         #[arg(long, default_value_t = 200)]
         poll_ms: u32,
     },
-
-    // ── M3: streaming ─────────────────────────────────────────
+    /// Capture recent toast messages.
+    Toast {
+        #[arg(long, default_value_t = 5000)]
+        wait_ms: u32,
+    },
+    /// Stream UI/crash/toast events as JSON lines.
     Watch {
         #[arg(long)]
         app: Option<String>,
@@ -349,25 +291,143 @@ pub enum Cmd {
     },
 }
 
+// ── nested namespaces ─────────────────────────────────────────
+
+#[derive(Subcommand)]
+pub enum AppCmd {
+    /// Launch the app's default activity.
+    Start { package: String },
+    /// Force-stop the app.
+    Stop { package: String },
+    /// Install an APK and run the app-under-test setup ritual (clear/grant/launch/wait).
+    Install(AppInstallArgs),
+    /// Like `install`, but uninstall any existing copy first.
+    Reinstall(AppInstallArgs),
+    /// Clear the app's data.
+    Clear { package: String },
+    /// Version name/code + label.
+    Info { package: String },
+    /// Wait for the app to launch (or, with --front, reach the foreground).
+    Wait {
+        package: String,
+        #[arg(long, default_value_t = 20000)]
+        timeout_ms: u32,
+        #[arg(long)]
+        front: bool,
+    },
+    /// Print the current foreground app (package / activity / pid).
+    Current,
+}
+
+#[derive(Subcommand)]
+pub enum PermCmd {
+    /// Grant one or more runtime permissions (verify-by-readback).
+    Grant {
+        package: String,
+        #[arg(required = true)]
+        perms: Vec<String>,
+    },
+    /// Revoke one or more runtime permissions.
+    Revoke {
+        package: String,
+        #[arg(required = true)]
+        perms: Vec<String>,
+    },
+    /// List a package's runtime permission grant states.
+    List { package: String },
+    /// Revoke all granted runtime permissions (fresh-install prompt state).
+    Reset { package: String },
+}
+
+#[derive(Subcommand)]
+pub enum AppopsCmd {
+    /// Get appop mode(s) for a package (all ops, or one named op).
+    Get { package: String, op: Option<String> },
+    /// Set an appop mode (allow|deny|ignore|default|foreground|…).
+    Set {
+        package: String,
+        op: String,
+        mode: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ProfileCmd {
+    /// Capture the display profile as JSON, optionally to a file.
+    Snapshot {
+        #[arg(short = 'o', long)]
+        out: Option<PathBuf>,
+    },
+    /// Apply a preset (`automation`), a snapshot file, or individual flags.
+    Apply(ProfileApplyArgs),
+    /// Reset the display profile to stock defaults.
+    Reset,
+}
+
+#[derive(Subcommand)]
+pub enum DeviceCmd {
+    /// Detailed device info (model, fingerprint, locale, density).
+    Info,
+    /// Run a shell command on the device.
+    Shell {
+        cmd: String,
+        #[arg(long, default_value_t = 30000)]
+        timeout_ms: u32,
+    },
+    /// Wake the screen / turn the display on.
+    Wake,
+    /// Put the display to sleep.
+    Sleep,
+    /// Wake and dismiss the keyguard.
+    Unlock,
+    /// Get (no value) or set the screen orientation.
+    Orientation { value: Option<String> },
+    /// Get (no value) or set the clipboard.
+    Clipboard { value: Option<String> },
+    /// Open the notification shade.
+    Notifications,
+    /// Open quick settings.
+    QuickSettings,
+    /// Open a URL via an ACTION_VIEW intent.
+    OpenUrl { url: String },
+}
+
+#[derive(Subcommand)]
+pub enum FilesCmd {
+    /// List a directory on the device.
+    Ls { remote: String },
+    /// Push a local file to the device.
+    Push {
+        local: String,
+        remote: String,
+        #[arg(long, default_value_t = 0o644)]
+        mode: u32,
+    },
+    /// Pull a device file to the host.
+    Pull { remote: String, local: String },
+}
+
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     let device = cli.device;
     let apk = cli.apk;
     let any_apk_version = cli.any_apk_version;
     let cmd = cli.cmd;
-    // For everything beyond `devices` we need an on-device server. ensure_ready
-    // installs/starts as needed (no-op if already running).
+
+    // ── Phase 1: commands that do NOT need the on-device server ──
+    // doctor diagnoses the very server `ensure_ready` would start; collect does
+    // its own best-effort bring-up so it can degrade; perm/appops/profile and
+    // `app install`/`reinstall` are pure host-side `adb`.
     match &cmd {
         Cmd::Devices => return cmd_devices().await,
+        Cmd::Update { check, json } => return crate::update::cmd_update(*check, *json).await,
+        // Pure self-introspection / file generation — no device needed.
+        Cmd::Commands { json } => return crate::cmd::introspect::run(*json),
+        Cmd::Skill(args) => return crate::cmd::skill::run(args),
         Cmd::Connect => {
             return cmd_connect(device.as_deref(), apk.as_deref(), any_apk_version).await
         }
         Cmd::Disconnect => return cmd_disconnect(device.as_deref()).await,
-        Cmd::Update { check, json } => return crate::update::cmd_update(*check, *json).await,
-        // doctor must NOT go through ensure_ready — it diagnoses the very server
-        // ensure_ready would start. collect handles its own (best-effort)
-        // bring-up so it can degrade to host-side diagnostics when the server
-        // can't start.
         Cmd::Doctor { fix, force, json } => {
             return crate::cmd::doctor::run(device.as_deref(), *fix, *force, *json).await
         }
@@ -380,79 +440,53 @@ pub async fn run() -> Result<()> {
             return crate::cmd::collect::run(&serial, app.clone(), out.clone(), !*no_screenshot)
                 .await;
         }
-        // perm-*/appop-* are host-only (plain `adb shell`); they need a device
-        // but not the on-device server.
-        Cmd::PermGrant { package, perms } => {
+        Cmd::Perm(c) => {
             let serial = resolve_serial(device.as_deref()).await?;
-            return crate::cmd::permissions::grant(&serial, package, perms).await;
+            return dispatch_perm(c, &serial).await;
         }
-        Cmd::PermRevoke { package, perms } => {
+        Cmd::Appops(c) => {
             let serial = resolve_serial(device.as_deref()).await?;
-            return crate::cmd::permissions::revoke(&serial, package, perms).await;
+            return dispatch_appops(c, &serial).await;
         }
-        Cmd::PermList { package } => {
+        Cmd::Profile(c) => {
             let serial = resolve_serial(device.as_deref()).await?;
-            return crate::cmd::permissions::list(&serial, package).await;
+            return dispatch_profile(c, &serial).await;
         }
-        Cmd::PermReset { package } => {
+        Cmd::App(AppCmd::Install(a)) => {
             let serial = resolve_serial(device.as_deref()).await?;
-            return crate::cmd::permissions::reset(&serial, package).await;
+            return crate::cmd::app_install::run(&serial, a, false).await;
         }
-        Cmd::AppopGet { package, op } => {
+        Cmd::App(AppCmd::Reinstall(a)) => {
             let serial = resolve_serial(device.as_deref()).await?;
-            return crate::cmd::permissions::appop_get(&serial, package, op.as_deref()).await;
-        }
-        Cmd::AppopSet { package, op, mode } => {
-            let serial = resolve_serial(device.as_deref()).await?;
-            return crate::cmd::permissions::appop_set(&serial, package, op, mode).await;
-        }
-        Cmd::AppInstall(args) => {
-            let serial = resolve_serial(device.as_deref()).await?;
-            return crate::cmd::app_install::run(&serial, args, false).await;
-        }
-        Cmd::AppReinstall(args) => {
-            let serial = resolve_serial(device.as_deref()).await?;
-            return crate::cmd::app_install::run(&serial, args, true).await;
-        }
-        Cmd::ProfileSnapshot { out } => {
-            let serial = resolve_serial(device.as_deref()).await?;
-            return crate::cmd::device_profile::snapshot(&serial, out.as_ref()).await;
-        }
-        Cmd::ProfileApply(args) => {
-            let serial = resolve_serial(device.as_deref()).await?;
-            return crate::cmd::device_profile::apply(&serial, args).await;
-        }
-        Cmd::ProfileReset => {
-            let serial = resolve_serial(device.as_deref()).await?;
-            return crate::cmd::device_profile::reset(&serial).await;
+            return crate::cmd::app_install::run(&serial, a, true).await;
         }
         _ => {}
     }
 
-    // Shared setup for all UI verbs.
+    // ── Phase 2: server-backed commands share one bring-up ──
     let serial = resolve_serial(device.as_deref()).await?;
     let client = installer::ensure_ready(&serial, apk.as_deref(), any_apk_version).await?;
 
     match cmd {
+        // handled in phase 1
         Cmd::Devices
         | Cmd::Connect
         | Cmd::Disconnect
         | Cmd::Update { .. }
         | Cmd::Doctor { .. }
         | Cmd::Collect { .. }
-        | Cmd::PermGrant { .. }
-        | Cmd::PermRevoke { .. }
-        | Cmd::PermList { .. }
-        | Cmd::PermReset { .. }
-        | Cmd::AppopGet { .. }
-        | Cmd::AppopSet { .. }
-        | Cmd::AppInstall(..)
-        | Cmd::AppReinstall(..)
-        | Cmd::ProfileSnapshot { .. }
-        | Cmd::ProfileApply(..)
-        | Cmd::ProfileReset => unreachable!(), // handled above
+        | Cmd::Commands { .. }
+        | Cmd::Skill(_)
+        | Cmd::Perm(_)
+        | Cmd::Appops(_)
+        | Cmd::Profile(_) => unreachable!("handled before ensure_ready"),
 
-        // ── inspection ─────────────────────────────────────────
+        // ── namespaces ─────────────────────────────────────────
+        Cmd::App(app_cmd) => dispatch_app(app_cmd, &client).await?,
+        Cmd::Device(device_cmd) => dispatch_device(device_cmd, &client, &serial).await?,
+        Cmd::Files(files_cmd) => dispatch_files(files_cmd, &client, &serial).await?,
+
+        // ── UI read ────────────────────────────────────────────
         Cmd::Screen => emit(&client.screen().await?),
         Cmd::Screenshot {
             path,
@@ -460,7 +494,61 @@ pub async fn run() -> Result<()> {
             scale,
             quality,
         } => cmd_screenshot(&client, path, format, scale, quality).await?,
-        Cmd::Device => cmd_device(&client, &serial).await?,
+
+        // ── gestures ───────────────────────────────────────────
+        Cmd::Tap {
+            a,
+            b,
+            text,
+            rid,
+            desc,
+            xpath,
+        } => cmd_tap(&client, a, b, text, rid, desc, xpath).await?,
+        Cmd::DoubleTap { x, y } => {
+            client.double_tap(x, y).await?;
+            emit_action("double_tap", &json!({"x":x,"y":y}));
+        }
+        Cmd::LongTap { x, y, duration_ms } => {
+            client.long_tap(x, y, duration_ms).await?;
+            emit_action("long_tap", &json!({"x":x,"y":y,"duration_ms":duration_ms}));
+        }
+        Cmd::Swipe {
+            x1,
+            y1,
+            x2,
+            y2,
+            duration_ms,
+        } => {
+            client.swipe(x1, y1, x2, y2, duration_ms).await?;
+            emit_action(
+                "swipe",
+                &json!({"from":[x1,y1],"to":[x2,y2],"duration_ms":duration_ms}),
+            );
+        }
+        Cmd::Drag {
+            x1,
+            y1,
+            x2,
+            y2,
+            duration_ms,
+        } => {
+            client.drag(x1, y1, x2, y2, duration_ms).await?;
+            emit_action(
+                "drag",
+                &json!({"from":[x1,y1],"to":[x2,y2],"duration_ms":duration_ms}),
+            );
+        }
+        Cmd::SwipeExt {
+            direction,
+            scale,
+            duration_ms,
+        } => {
+            client.swipe_ext(&direction, scale, duration_ms).await?;
+            emit_action(
+                "swipe_ext",
+                &json!({"direction":direction,"scale":scale,"duration_ms":duration_ms}),
+            );
+        }
         Cmd::Pinch {
             direction,
             rid,
@@ -479,276 +567,51 @@ pub async fn run() -> Result<()> {
                 .await?;
             emit_action(
                 "pinch",
-                &serde_json::json!({"direction":direction,"rid":rid,"text":text,"desc":desc,"percent":percent}),
-            );
-        }
-        Cmd::Current => {
-            let cur = client.app_current().await?;
-            emit_action("current", &serde_json::to_value(&cur).unwrap_or_default());
-        }
-        Cmd::Ls { remote } => {
-            let r = client.list_dir(&remote).await?;
-            emit_action(
-                "ls",
-                &serde_json::json!({"remote":remote,"entries":r.entries}),
-            );
-        }
-
-        // ── gestures ───────────────────────────────────────────
-        Cmd::Tap { a, b } => cmd_tap(&client, a, b).await?,
-        Cmd::DoubleTap { x, y } => {
-            client.double_tap(x, y).await?;
-            emit_action("double_tap", &serde_json::json!({"x":x,"y":y}));
-        }
-        Cmd::LongTap { x, y, duration_ms } => {
-            client.long_tap(x, y, duration_ms).await?;
-            emit_action(
-                "long_tap",
-                &serde_json::json!({"x":x,"y":y,"duration_ms":duration_ms}),
-            );
-        }
-        Cmd::Swipe {
-            x1,
-            y1,
-            x2,
-            y2,
-            duration_ms,
-        } => {
-            client.swipe(x1, y1, x2, y2, duration_ms).await?;
-            emit_action(
-                "swipe",
-                &serde_json::json!({"from":[x1,y1],"to":[x2,y2],"duration_ms":duration_ms}),
-            );
-        }
-        Cmd::Drag {
-            x1,
-            y1,
-            x2,
-            y2,
-            duration_ms,
-        } => {
-            client.drag(x1, y1, x2, y2, duration_ms).await?;
-            emit_action(
-                "drag",
-                &serde_json::json!({"from":[x1,y1],"to":[x2,y2],"duration_ms":duration_ms}),
-            );
-        }
-        Cmd::SwipeExt {
-            direction,
-            scale,
-            duration_ms,
-        } => {
-            client.swipe_ext(&direction, scale, duration_ms).await?;
-            emit_action(
-                "swipe_ext",
-                &serde_json::json!({"direction":direction,"scale":scale,"duration_ms":duration_ms}),
-            );
-        }
-        Cmd::TapText { value } => {
-            cmd_find_tap(
-                &client,
-                "tap_text",
-                SelectorQuery {
-                    text: Some(value),
-                    ..Default::default()
-                },
-            )
-            .await?
-        }
-        Cmd::TapRid { value } => {
-            cmd_find_tap(
-                &client,
-                "tap_rid",
-                SelectorQuery {
-                    rid: Some(value),
-                    ..Default::default()
-                },
-            )
-            .await?
-        }
-        Cmd::TapDesc { value } => {
-            cmd_find_tap(
-                &client,
-                "tap_desc",
-                SelectorQuery {
-                    desc: Some(value),
-                    ..Default::default()
-                },
-            )
-            .await?
-        }
-        Cmd::Xpath { query } => {
-            let r = client.xpath(&query, false).await?;
-            emit_action(
-                "xpath",
-                &serde_json::json!({"query":query,"matched":r.matched,"elements":r.elements}),
-            );
-        }
-        Cmd::XpathTap { query } => {
-            let r = client.xpath_tap(&query).await?;
-            emit_action(
-                "xpath_tap",
-                &serde_json::json!({"query":query,"x":r.x,"y":r.y,"matched":r.matched}),
+                &json!({"direction":direction,"rid":rid,"text":text,"desc":desc,"percent":percent}),
             );
         }
         Cmd::ScrollTo(args) => crate::cmd::scroll::run(&client, &args).await?,
 
-        // ── keys + text ────────────────────────────────────────
+        // ── locate ─────────────────────────────────────────────
+        Cmd::Find {
+            text,
+            rid,
+            desc,
+            xpath,
+            all,
+        } => {
+            let query = SelectorQuery {
+                text,
+                rid,
+                desc,
+                xpath,
+                all,
+                ..Default::default()
+            };
+            let r = client.find(&query).await?;
+            emit_action("find", &json!({"matched":r.matched,"elements":r.elements}));
+        }
+
+        // ── input ──────────────────────────────────────────────
         Cmd::Back => {
             client.key("back").await?;
-            emit_action("key", &serde_json::json!({"name":"back"}));
+            emit_action("key", &json!({"name":"back"}));
         }
         Cmd::Home => {
             client.key("home").await?;
-            emit_action("key", &serde_json::json!({"name":"home"}));
+            emit_action("key", &json!({"name":"home"}));
         }
         Cmd::Key { name } => {
             client.key(&name).await?;
-            emit_action("key", &serde_json::json!({"name":name}));
+            emit_action("key", &json!({"name":name}));
         }
         Cmd::Text { value, clear } => {
             client.text(&value, clear).await?;
-            emit_action("text", &serde_json::json!({"value":value,"clear":clear}));
+            emit_action("text", &json!({"value":value,"clear":clear}));
         }
 
-        // ── app lifecycle ──────────────────────────────────────
-        Cmd::Launch { package } => {
-            client.app_start(&package).await?;
-            emit_action("launch", &serde_json::json!({"package":package}));
-        }
-        Cmd::Stop { package } => {
-            client.app_stop(&package).await?;
-            emit_action("stop", &serde_json::json!({"package":package}));
-        }
-        Cmd::AppClear { package } => {
-            client.app_clear(&package).await?;
-            emit_action("app_clear", &serde_json::json!({"package":package}));
-        }
-        Cmd::AppWait {
-            package,
-            timeout_ms,
-            front,
-        } => {
-            let r = client.app_wait(&package, timeout_ms, front).await?;
-            emit_action(
-                "app_wait",
-                &serde_json::json!({"package":package,"matched":r.matched,"current":r.current}),
-            );
-        }
-        Cmd::AppInfo { package } => {
-            let info = client.app_info(&package).await?;
-            emit_action(
-                "app_info",
-                &serde_json::json!({
-                    "package":package,
-                    "version_name":info.version_name,
-                    "version_code":info.version_code,
-                    "label":info.label,
-                }),
-            );
-        }
-        Cmd::WaitActivity { name, timeout_ms } => {
-            cmd_wait_activity(&client, &name, timeout_ms).await?;
-        }
-
-        // ── system ─────────────────────────────────────────────
-        Cmd::Shell { cmd, timeout_ms } => {
-            let r = client.shell(&cmd, timeout_ms).await?;
-            emit_action(
-                "shell",
-                &serde_json::json!({
-                    "input":r.input,"output":r.output,"exit_code":r.exit_code
-                }),
-            );
-        }
-        Cmd::ScreenOn => {
-            client.screen_on().await?;
-            emit_action("screen_on", &serde_json::Value::Null);
-        }
-        Cmd::ScreenOff => {
-            client.screen_off().await?;
-            emit_action("screen_off", &serde_json::Value::Null);
-        }
-        Cmd::Unlock => {
-            client.unlock().await?;
-            emit_action("unlock", &serde_json::Value::Null);
-        }
-        Cmd::Wakeup => {
-            client.wakeup().await?;
-            emit_action("wakeup", &serde_json::Value::Null);
-        }
-        Cmd::Orientation { value } => match value {
-            None => emit_action(
-                "orientation",
-                &serde_json::json!({"value": client.orientation_get().await?}),
-            ),
-            Some(v) => {
-                client.orientation_set(&v).await?;
-                emit_action("set_orientation", &serde_json::json!({"value":v}));
-            }
-        },
-        Cmd::Clipboard { value } => match value {
-            None => emit_action(
-                "clipboard",
-                &serde_json::json!({"value": client.clipboard_get().await?}),
-            ),
-            Some(v) => {
-                client.clipboard_set(&v).await?;
-                emit_action("set_clipboard", &serde_json::json!({"value":v}));
-            }
-        },
-        Cmd::Notifications => {
-            client.open_notifications().await?;
-            emit_action("open_notification", &serde_json::Value::Null);
-        }
-        Cmd::QuickSettings => {
-            client.open_quick_settings().await?;
-            emit_action("open_quick_settings", &serde_json::Value::Null);
-        }
-        Cmd::OpenUrl { url } => {
-            client.open_url(&url).await?;
-            emit_action("open_url", &serde_json::json!({"url":url}));
-        }
-        Cmd::Push {
-            local,
-            remote,
-            mode,
-        } => {
-            let bytes = std::fs::read(&local).with_context(|| format!("reading {local}"))?;
-            let bytes_len = bytes.len() as u64;
-            // Server first (app-accessible storage); fall back to `adb push` for
-            // paths the instrumentation uid can't write (e.g. /sdcard under
-            // scoped storage).
-            match client.push_file(&remote, bytes).await {
-                Ok(r) => emit_action(
-                    "push",
-                    &serde_json::json!({"local":local,"remote":remote,"path":r.path,"bytes":r.bytes,"mode":r.mode,"requested_mode":mode,"via":"server"}),
-                ),
-                Err(_) => {
-                    adb::push(&serial, std::path::PathBuf::from(&local), remote.clone()).await?;
-                    emit_action(
-                        "push",
-                        &serde_json::json!({"local":local,"remote":remote,"bytes":bytes_len,"via":"adb"}),
-                    );
-                }
-            }
-        }
-        Cmd::Pull { remote, local } => {
-            // Server first; fall back to `adb pull` for paths it can't read.
-            let (bytes, via) = match client.pull_file(&remote).await {
-                Ok(b) => (b, "server"),
-                Err(_) => (adb::pull(&serial, remote.clone()).await?, "adb"),
-            };
-            std::fs::write(&local, &bytes).with_context(|| format!("writing {local}"))?;
-            emit_action(
-                "pull",
-                &serde_json::json!({"remote":remote,"local":local,"bytes":bytes.len() as u64,"via":via}),
-            );
-        }
-        Cmd::Toast { wait_ms } => {
-            cmd_toast(&client, wait_ms).await?;
-        }
-        Cmd::WaitFor {
+        // ── sync / stream / capture ────────────────────────────
+        Cmd::Wait {
             text,
             rid,
             desc,
@@ -759,9 +622,9 @@ pub async fn run() -> Result<()> {
             timeout_ms,
             poll_ms,
         } => {
-            cmd_wait_for(
+            cmd_wait(
                 &client,
-                WaitForQuery {
+                WaitQuery {
                     text,
                     rid,
                     desc,
@@ -775,6 +638,7 @@ pub async fn run() -> Result<()> {
             )
             .await?;
         }
+        Cmd::Toast { wait_ms } => cmd_toast(&client, wait_ms).await?,
         Cmd::Watch {
             app,
             poll_ms,
@@ -798,7 +662,196 @@ pub async fn run() -> Result<()> {
                 screen_format,
             })
             .await?;
-        } // ── deferred / M2-OUT ──────────────────────────────────
+        }
+    }
+    Ok(())
+}
+
+// ── namespace sub-dispatchers ─────────────────────────────────
+
+async fn dispatch_perm(c: &PermCmd, serial: &str) -> Result<()> {
+    use crate::cmd::permissions;
+    match c {
+        PermCmd::Grant { package, perms } => permissions::grant(serial, package, perms).await,
+        PermCmd::Revoke { package, perms } => permissions::revoke(serial, package, perms).await,
+        PermCmd::List { package } => permissions::list(serial, package).await,
+        PermCmd::Reset { package } => permissions::reset(serial, package).await,
+    }
+}
+
+async fn dispatch_appops(c: &AppopsCmd, serial: &str) -> Result<()> {
+    use crate::cmd::permissions;
+    match c {
+        AppopsCmd::Get { package, op } => {
+            permissions::appop_get(serial, package, op.as_deref()).await
+        }
+        AppopsCmd::Set { package, op, mode } => {
+            permissions::appop_set(serial, package, op, mode).await
+        }
+    }
+}
+
+async fn dispatch_profile(c: &ProfileCmd, serial: &str) -> Result<()> {
+    use crate::cmd::device_profile;
+    match c {
+        ProfileCmd::Snapshot { out } => device_profile::snapshot(serial, out.as_ref()).await,
+        ProfileCmd::Apply(args) => device_profile::apply(serial, args).await,
+        ProfileCmd::Reset => device_profile::reset(serial).await,
+    }
+}
+
+/// Server-backed `app` verbs. `Install`/`Reinstall` are handled host-side in
+/// phase 1, so they're unreachable here.
+async fn dispatch_app(c: AppCmd, client: &ServerClient) -> Result<()> {
+    match c {
+        AppCmd::Install(_) | AppCmd::Reinstall(_) => {
+            unreachable!("app install/reinstall handled host-side")
+        }
+        AppCmd::Start { package } => {
+            client.app_start(&package).await?;
+            emit_action("app_start", &json!({"package":package}));
+        }
+        AppCmd::Stop { package } => {
+            client.app_stop(&package).await?;
+            emit_action("app_stop", &json!({"package":package}));
+        }
+        AppCmd::Clear { package } => {
+            client.app_clear(&package).await?;
+            emit_action("app_clear", &json!({"package":package}));
+        }
+        AppCmd::Info { package } => {
+            let info = client.app_info(&package).await?;
+            emit_action(
+                "app_info",
+                &json!({
+                    "package":package,
+                    "version_name":info.version_name,
+                    "version_code":info.version_code,
+                    "label":info.label,
+                }),
+            );
+        }
+        AppCmd::Wait {
+            package,
+            timeout_ms,
+            front,
+        } => {
+            let r = client.app_wait(&package, timeout_ms, front).await?;
+            emit_action(
+                "app_wait",
+                &json!({"package":package,"matched":r.matched,"current":r.current}),
+            );
+        }
+        AppCmd::Current => {
+            let cur = client.app_current().await?;
+            emit_action(
+                "app_current",
+                &serde_json::to_value(&cur).unwrap_or_default(),
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn dispatch_device(c: DeviceCmd, client: &ServerClient, serial: &str) -> Result<()> {
+    match c {
+        DeviceCmd::Info => cmd_device_info(client, serial).await?,
+        DeviceCmd::Shell { cmd, timeout_ms } => {
+            let r = client.shell(&cmd, timeout_ms).await?;
+            emit_action(
+                "shell",
+                &json!({"input":r.input,"output":r.output,"exit_code":r.exit_code}),
+            );
+        }
+        DeviceCmd::Wake => {
+            client.wakeup().await?;
+            emit_action("wake", &serde_json::Value::Null);
+        }
+        DeviceCmd::Sleep => {
+            client.screen_off().await?;
+            emit_action("sleep", &serde_json::Value::Null);
+        }
+        DeviceCmd::Unlock => {
+            client.unlock().await?;
+            emit_action("unlock", &serde_json::Value::Null);
+        }
+        DeviceCmd::Orientation { value } => match value {
+            None => emit_action(
+                "orientation",
+                &json!({"value": client.orientation_get().await?}),
+            ),
+            Some(v) => {
+                client.orientation_set(&v).await?;
+                emit_action("set_orientation", &json!({"value":v}));
+            }
+        },
+        DeviceCmd::Clipboard { value } => match value {
+            None => emit_action(
+                "clipboard",
+                &json!({"value": client.clipboard_get().await?}),
+            ),
+            Some(v) => {
+                client.clipboard_set(&v).await?;
+                emit_action("set_clipboard", &json!({"value":v}));
+            }
+        },
+        DeviceCmd::Notifications => {
+            client.open_notifications().await?;
+            emit_action("notifications", &serde_json::Value::Null);
+        }
+        DeviceCmd::QuickSettings => {
+            client.open_quick_settings().await?;
+            emit_action("quick_settings", &serde_json::Value::Null);
+        }
+        DeviceCmd::OpenUrl { url } => {
+            client.open_url(&url).await?;
+            emit_action("open_url", &json!({"url":url}));
+        }
+    }
+    Ok(())
+}
+
+async fn dispatch_files(c: FilesCmd, client: &ServerClient, serial: &str) -> Result<()> {
+    match c {
+        FilesCmd::Ls { remote } => {
+            let r = client.list_dir(&remote).await?;
+            emit_action("ls", &json!({"remote":remote,"entries":r.entries}));
+        }
+        FilesCmd::Push {
+            local,
+            remote,
+            mode,
+        } => {
+            let bytes = std::fs::read(&local).with_context(|| format!("reading {local}"))?;
+            let bytes_len = bytes.len() as u64;
+            // Server first (app-accessible storage); fall back to `adb push` for
+            // paths the instrumentation uid can't write (e.g. /sdcard under
+            // scoped storage).
+            match client.push_file(&remote, bytes).await {
+                Ok(r) => emit_action(
+                    "push",
+                    &json!({"local":local,"remote":remote,"path":r.path,"bytes":r.bytes,"mode":r.mode,"requested_mode":mode,"via":"server"}),
+                ),
+                Err(_) => {
+                    adb::push(serial, std::path::PathBuf::from(&local), remote.clone()).await?;
+                    emit_action(
+                        "push",
+                        &json!({"local":local,"remote":remote,"bytes":bytes_len,"via":"adb"}),
+                    );
+                }
+            }
+        }
+        FilesCmd::Pull { remote, local } => {
+            let (bytes, via) = match client.pull_file(&remote).await {
+                Ok(b) => (b, "server"),
+                Err(_) => (adb::pull(serial, remote.clone()).await?, "adb"),
+            };
+            std::fs::write(&local, &bytes).with_context(|| format!("writing {local}"))?;
+            emit_action(
+                "pull",
+                &json!({"remote":remote,"local":local,"bytes":bytes.len() as u64,"via":via}),
+            );
+        }
     }
     Ok(())
 }
@@ -825,17 +878,17 @@ fn emit_action(cmd: &str, body: &serde_json::Value) {
 
 // ── specific handlers ──────────────────────────────────────────
 
-async fn cmd_device(client: &ServerClient, serial: &str) -> Result<()> {
+async fn cmd_device_info(client: &ServerClient, serial: &str) -> Result<()> {
     match client.device().await {
         // 0.1.4+ server: rich device facts.
-        Ok(d) => emit_action("device", &serde_json::to_value(&d).unwrap_or_default()),
+        Ok(d) => emit_action("device_info", &serde_json::to_value(&d).unwrap_or_default()),
         // Older server without /v1/device: fall back to /state + getprop.
         Err(_) => {
             let state = client.state().await?;
             let getprop = adb::device_info(serial).await;
             emit_action(
-                "device",
-                &serde_json::json!({
+                "device_info",
+                &json!({
                     "source": "fallback",
                     "android_release": state.android_release,
                     "android_sdk": state.android_sdk,
@@ -868,7 +921,7 @@ async fn cmd_screenshot(
     std::fs::write(&p, &bytes).with_context(|| format!("writing {}", p.display()))?;
     emit_action(
         "screenshot",
-        &serde_json::json!({
+        &json!({
             "path": p.display().to_string(),
             "bytes": bytes.len() as u64,
         }),
@@ -876,14 +929,49 @@ async fn cmd_screenshot(
     Ok(())
 }
 
-/// `shadowdroid tap N` — id from a fresh dump. `shadowdroid tap X Y` — coords.
-async fn cmd_tap(client: &ServerClient, a: i32, b: Option<i32>) -> Result<()> {
-    match b {
-        Some(y) => {
-            client.tap_xy(a, y).await?;
-            emit_action("tap", &serde_json::json!({"x":a,"y":y}));
+/// `tap` covers four targeting modes: a selector (`--text/--rid/--desc/--xpath`),
+/// an element id from a fresh `screen` dump, or `<x> <y>` coordinates.
+#[allow(clippy::too_many_arguments)]
+async fn cmd_tap(
+    client: &ServerClient,
+    a: Option<i32>,
+    b: Option<i32>,
+    text: Option<String>,
+    rid: Option<String>,
+    desc: Option<String>,
+    xpath: Option<String>,
+) -> Result<()> {
+    // Selector modes take priority.
+    if let Some(query) = xpath {
+        let r = client.xpath_tap(&query).await?;
+        emit_action(
+            "tap",
+            &json!({"via":"xpath","xpath":query,"x":r.x,"y":r.y,"matched":r.matched}),
+        );
+        return Ok(());
+    }
+    if text.is_some() || rid.is_some() || desc.is_some() {
+        let r = client
+            .find_tap(&SelectorQuery {
+                text,
+                rid,
+                desc,
+                ..Default::default()
+            })
+            .await?;
+        emit_action(
+            "tap",
+            &json!({"via":"selector","x":r.x,"y":r.y,"matched":r.matched}),
+        );
+        return Ok(());
+    }
+    // Coordinate / id modes.
+    match (a, b) {
+        (Some(x), Some(y)) => {
+            client.tap_xy(x, y).await?;
+            emit_action("tap", &json!({"via":"coords","x":x,"y":y}));
         }
-        None => {
+        (Some(a), None) => {
             let id = u32::try_from(a).map_err(|_| anyhow!("element id must be >= 0, got {a}"))?;
             let screen = client.screen().await?;
             let el = screen.elements.iter().find(|e| e.id == id).ok_or_else(|| {
@@ -893,52 +981,16 @@ async fn cmd_tap(client: &ServerClient, a: i32, b: Option<i32>) -> Result<()> {
             client.tap_xy(x, y).await?;
             emit_action(
                 "tap",
-                &serde_json::json!({
-                    "id": id, "x": x, "y": y,
+                &json!({
+                    "via":"id","id": id, "x": x, "y": y,
                     "matched": {"text": el.text, "rid": el.rid, "desc": el.desc}
                 }),
             );
         }
-    }
-    Ok(())
-}
-
-/// Poll `app_current` until the activity (or its substring) matches.
-async fn cmd_wait_activity(client: &ServerClient, name: &str, timeout_ms: u32) -> Result<()> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
-    let mut last_app: Option<crate::proto::AppRef>;
-    loop {
-        let cur = client.app_current().await?;
-        let activity = cur.activity.as_deref().unwrap_or("");
-        if activity.contains(name) {
-            emit_action(
-                "wait_activity",
-                &serde_json::json!({
-                    "name":name,"matched":true,"current":cur,
-                }),
-            );
-            return Ok(());
+        (None, _) => {
+            bail!("tap needs a target: <id>, <x> <y>, or --text/--rid/--desc/--xpath <value>")
         }
-        last_app = Some(cur);
-        if std::time::Instant::now() >= deadline {
-            emit_action(
-                "wait_activity",
-                &serde_json::json!({
-                    "name":name,"matched":false,"current":last_app,
-                }),
-            );
-            return Ok(());
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
-}
-
-async fn cmd_find_tap(client: &ServerClient, cmd: &str, query: SelectorQuery) -> Result<()> {
-    let r = client.find_tap(&query).await?;
-    emit_action(
-        cmd,
-        &serde_json::json!({"x":r.x,"y":r.y,"matched":r.matched}),
-    );
     Ok(())
 }
 
@@ -949,14 +1001,14 @@ async fn cmd_toast(client: &ServerClient, wait_ms: u32) -> Result<()> {
     loop {
         let recent = client.toast_recent(start).await?;
         if !recent.toasts.is_empty() || std::time::Instant::now() >= deadline {
-            emit_action("toast", &serde_json::json!({"toasts":recent.toasts}));
+            emit_action("toast", &json!({"toasts":recent.toasts}));
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 
-struct WaitForQuery {
+struct WaitQuery {
     text: Option<String>,
     rid: Option<String>,
     desc: Option<String>,
@@ -965,9 +1017,9 @@ struct WaitForQuery {
     package: Option<String>,
 }
 
-async fn cmd_wait_for(
+async fn cmd_wait(
     client: &ServerClient,
-    query: WaitForQuery,
+    query: WaitQuery,
     gone: bool,
     timeout_ms: u32,
     poll_ms: u32,
@@ -979,15 +1031,15 @@ async fn cmd_wait_for(
         let screen_hash = screen.screen_hash;
         if matched != gone {
             emit_action(
-                "wait_for",
-                &serde_json::json!({"matched":matched,"gone":gone,"screen_hash":screen_hash}),
+                "wait",
+                &json!({"matched":matched,"gone":gone,"screen_hash":screen_hash}),
             );
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
             emit_action(
-                "wait_for",
-                &serde_json::json!({"matched":matched,"gone":gone,"screen_hash":screen_hash,"timeout":true}),
+                "wait",
+                &json!({"matched":matched,"gone":gone,"screen_hash":screen_hash,"timeout":true}),
             );
             return Ok(());
         }
@@ -995,11 +1047,7 @@ async fn cmd_wait_for(
     }
 }
 
-fn wait_query_matches(
-    query: &WaitForQuery,
-    app: &crate::proto::AppRef,
-    elements: &[Element],
-) -> bool {
+fn wait_query_matches(query: &WaitQuery, app: &crate::proto::AppRef, elements: &[Element]) -> bool {
     if let Some(package) = &query.package {
         if !app.package.as_deref().unwrap_or("").contains(package) {
             return false;
@@ -1041,7 +1089,7 @@ fn unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-// ── M1 subcommands ───────────────────────────────────────────
+// ── session subcommands ───────────────────────────────────────
 
 async fn cmd_devices() -> Result<()> {
     let devices = adb::list_devices().await?;

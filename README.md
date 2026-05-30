@@ -4,7 +4,7 @@ Drive Android apps with **structured output** and **agent-friendly latency**.
 
 ShadowDroid is a two-piece system:
 
-- **`shadowdroid`** — a single static **Rust** binary on the laptop that gives you a streaming JSON-line view of the device UI and a small set of CLI verbs (`tap`, `swipe`, `screenshot`, `xpath`, `watch`, …).
+- **`shadowdroid`** — a single static **Rust** binary on the laptop that gives you a streaming JSON-line view of the device UI and a set of CLI verbs: flat interaction primitives (`tap`, `swipe`, `text`, `find`, `scroll-to`, `screen`, `watch`, …) plus nested resource namespaces (`app`, `perm`, `appops`, `profile`, `device`, `files`).
 - **`io.github.andriyo.shadowdroid`** — a tiny **Kotlin Instrumentation APK** on the device that wraps **AndroidX UI Automator 2.3.0** behind a localhost HTTP service.
 
 The two talk over `adb forward` + HTTP. No Python anywhere. No Appium server. No `uiautomator2` Python package.
@@ -89,6 +89,22 @@ and installs them on the device.
 See [docs/getting-started.md](docs/getting-started.md) for manual downloads
 and pinned versions. Maintainers can use [docs/release.md](docs/release.md) to
 cut a release.
+
+## Agent integration
+
+ShadowDroid is self-describing. `shadowdroid commands --json` emits the full
+command catalog (names, nesting, args, help) straight from the CLI definition —
+the machine-readable counterpart to `--help` that an agent can read once to
+discover the whole tool.
+
+`shadowdroid skill <agent>` generates a ready-to-drop integration file for a
+coding agent, with driving guidance and an auto-generated command reference:
+
+```bash
+shadowdroid skill claude-code --install   # → ~/.claude/skills/shadowdroid/SKILL.md
+shadowdroid skill cursor   --install      # → .cursor/rules/shadowdroid.mdc
+shadowdroid skill codex                   # → prints an AGENTS.md section to stdout
+```
 
 ## Status
 
