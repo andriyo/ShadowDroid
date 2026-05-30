@@ -31,17 +31,42 @@ ShadowDroid releases are tag-driven. A `v*` tag builds and publishes:
    ```
 
 4. Watch the `Release` workflow. It creates or updates the matching GitHub
-   Release, uploads the assets, then installs the published release through the
-   macOS/Linux and Windows installers.
-5. Update package-manager lanes:
+   Release, uploads the assets, installs the published release through the
+   macOS/Linux and Windows installers, then updates package-manager repos when
+   `SHADOWDROID_PACKAGE_BOT_TOKEN` is configured as a repository secret. The
+   token needs push access to:
+   - `andriyo/homebrew-tap`
+   - `andriyo/scoop-bucket`
 
-   ```bash
-   brew tap andriyo/tap
-   brew install shadowdroid
+## Update package-manager lanes manually
 
-   scoop bucket add andriyo https://github.com/andriyo/scoop-bucket
-   scoop install shadowdroid
-   ```
+The release workflow runs this automatically when
+`SHADOWDROID_PACKAGE_BOT_TOKEN` exists. To do the same bump locally:
+
+```bash
+tmpdir="$(mktemp -d)"
+gh release download v0.1.2 \
+  --repo andriyo/ShadowDroid \
+  --pattern SHA256SUMS \
+  --dir "$tmpdir"
+
+python3 scripts/update-package-managers.py \
+  --version v0.1.2 \
+  --checksums "$tmpdir/SHA256SUMS" \
+  --homebrew-path /Users/andrii/Work/homebrew-tap \
+  --scoop-path /Users/andrii/Work/scoop-bucket
+```
+
+Then review, commit, and push those two repos.
+
+## Update-check UX
+
+Users can check whether their host CLI is current without touching a device:
+
+```bash
+shadowdroid update --check
+shadowdroid update --check --json
+```
 
 ## Publish to crates.io
 

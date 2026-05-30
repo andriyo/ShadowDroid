@@ -40,6 +40,25 @@ ShadowDroid also needs Android Platform Tools (`adb`) on PATH before
 is missing. On macOS, use `brew install --cask android-platform-tools`; on
 Windows with Scoop, use `scoop install adb`.
 
+## Keep the CLI updated
+
+Check the latest GitHub Release and the right updater for your install method:
+
+```bash
+shadowdroid update --check
+```
+
+For machine-readable output:
+
+```bash
+shadowdroid update --check --json
+```
+
+The command is non-mutating. It prints `brew upgrade shadowdroid`,
+`scoop update shadowdroid`, `cargo install shadowdroid --locked --force`, or the
+direct installer command depending on how the current binary appears to be
+installed.
+
 ## Install a pinned version
 
 Use a tag such as `v0.1.2`:

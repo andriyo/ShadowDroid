@@ -220,3 +220,82 @@ jobs:
           if (Test-Path (Join-Path $installDir "shadowdroid.exe")) {
             throw "shadowdroid.exe still exists after uninstall"
           }
+
+  update-package-managers:
+    name: Update package-manager repos
+    needs: smoke-installers
+    runs-on: ubuntu-24.04
+    env:
+      PACKAGE_BOT_TOKEN: ${{ secrets.SHADOWDROID_PACKAGE_BOT_TOKEN }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Skip when package token is not configured
+        if: env.PACKAGE_BOT_TOKEN == ''
+        run: |
+          echo "Set SHADOWDROID_PACKAGE_BOT_TOKEN to auto-update andriyo/homebrew-tap and andriyo/scoop-bucket."
+
+      - uses: actions/checkout@v6
+        if: env.PACKAGE_BOT_TOKEN != ''
+        with:
+          path: shadowdroid
+
+      - uses: actions/checkout@v6
+        if: env.PACKAGE_BOT_TOKEN != ''
+        with:
+          repository: andriyo/homebrew-tap
+          path: homebrew-tap
+          token: ${{ env.PACKAGE_BOT_TOKEN }}
+
+      - uses: actions/checkout@v6
+        if: env.PACKAGE_BOT_TOKEN != ''
+        with:
+          repository: andriyo/scoop-bucket
+          path: scoop-bucket
+          token: ${{ env.PACKAGE_BOT_TOKEN }}
+
+      - name: Download release checksums
+        if: env.PACKAGE_BOT_TOKEN != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern SHA256SUMS \
+            --dir "$RUNNER_TEMP"
+
+      - name: Rewrite package metadata
+        if: env.PACKAGE_BOT_TOKEN != ''
+        run: |
+          python3 shadowdroid/scripts/update-package-managers.py \
+            --version "$RELEASE_TAG" \
+            --checksums "$RUNNER_TEMP/SHA256SUMS" \
+            --homebrew-path homebrew-tap \
+            --scoop-path scoop-bucket
+
+      - name: Push Homebrew tap update
+        if: env.PACKAGE_BOT_TOKEN != ''
+        working-directory: homebrew-tap
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- Formula/shadowdroid.rb; then
+            echo "Homebrew formula already up to date."
+          else
+            git add Formula/shadowdroid.rb
+            git commit -m "Bump ShadowDroid formula to ${RELEASE_TAG#v}"
+            git push
+          fi
+
+      - name: Push Scoop bucket update
+        if: env.PACKAGE_BOT_TOKEN != ''
+        working-directory: scoop-bucket
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- bucket/shadowdroid.json; then
+            echo "Scoop manifest already up to date."
+          else
+            git add bucket/shadowdroid.json
+            git commit -m "Bump ShadowDroid manifest to ${RELEASE_TAG#v}"
+            git push
+          fi

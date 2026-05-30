@@ -16,6 +16,7 @@ mod device;
 mod dump;
 mod events;
 mod proto;
+mod update;
 mod watch;
 
 use anyhow::Result;
