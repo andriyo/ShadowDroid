@@ -18,7 +18,7 @@ Usage:
   .\install.ps1 [options]
 
 Options:
-  -Version <tag>      Install a specific release tag, e.g. v0.1.2.
+  -Version <tag>      Install a specific release tag, e.g. v0.1.3.
                       Values without a leading "v" are normalized.
   -InstallDir <dir>   Install directory. Default: %LOCALAPPDATA%\ShadowDroid\bin.
   -Repo <owner/repo>  GitHub repo. Default: andriyo/ShadowDroid.
@@ -35,7 +35,7 @@ Environment overrides:
 Examples:
   powershell -ExecutionPolicy Bypass -c "irm https://github.com/andriyo/ShadowDroid/releases/latest/download/shadowdroid-installer.ps1 | iex"
 
-  .\install.ps1 -Version v0.1.2 -InstallDir "$env:USERPROFILE\bin"
+  .\install.ps1 -Version v0.1.3 -InstallDir "$env:USERPROFILE\bin"
 "@
 }
 

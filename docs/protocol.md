@@ -23,7 +23,7 @@ Cheap probe used by the CLI to verify the server is alive and version-compatible
 **Response**
 ```json
 {
-  "server_version": "0.1.2",
+  "server_version": "0.1.3",
   "api_version": "1",
   "ui_automator_version": "2.3.0",
   "android_sdk": 36,

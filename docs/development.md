@@ -146,7 +146,7 @@ End-user flow — none of sources 1–4 fire because there's no repo, no
 `~/.shadowdroid/apks/local/`, and no env var. The CLI falls through to source
 5 (versioned cache, missing on first run) and finally source 6, which downloads
 the release-signed APK from GitHub and caches it under
-`~/.shadowdroid/apks/0.1.2/`. From then on, every `shadowdroid` invocation hits
+`~/.shadowdroid/apks/0.1.3/`. From then on, every `shadowdroid` invocation hits
 source 5 in a millisecond.
 
 You can simulate this locally by setting `SHADOWDROID_DISABLE_DEV_SOURCES=1`.

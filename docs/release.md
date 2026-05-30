@@ -26,8 +26,8 @@ ShadowDroid releases are tag-driven. A `v*` tag builds and publishes:
 3. Tag and push:
 
    ```bash
-   git tag v0.1.2
-   git push origin v0.1.2
+   git tag v0.1.3
+   git push origin v0.1.3
    ```
 
 4. Watch the `Release` workflow. It creates or updates the matching GitHub
@@ -45,13 +45,13 @@ The release workflow runs this automatically when
 
 ```bash
 tmpdir="$(mktemp -d)"
-gh release download v0.1.2 \
+gh release download v0.1.3 \
   --repo andriyo/ShadowDroid \
   --pattern SHA256SUMS \
   --dir "$tmpdir"
 
 python3 scripts/update-package-managers.py \
-  --version v0.1.2 \
+  --version v0.1.3 \
   --checksums "$tmpdir/SHA256SUMS" \
   --homebrew-path /Users/andrii/Work/homebrew-tap \
   --scoop-path /Users/andrii/Work/scoop-bucket
@@ -83,12 +83,12 @@ cargo publish --manifest-path cli/Cargo.toml --locked
 Use a clean cache to force the GitHub Release APK download:
 
 ```bash
-rm -rf ~/.shadowdroid/apks/0.1.2
+rm -rf ~/.shadowdroid/apks/0.1.3
 SHADOWDROID_DISABLE_DEV_SOURCES=1 shadowdroid connect
 ```
 
 The connect log should mention the GitHub Release download once, then future
-runs should use `~/.shadowdroid/apks/0.1.2/`.
+runs should use `~/.shadowdroid/apks/0.1.3/`.
 
 You can also rerun installer-only checks from GitHub Actions with the
-`Installer Smoke` workflow and a release tag such as `v0.1.2`.
+`Installer Smoke` workflow and a release tag such as `v0.1.3`.
