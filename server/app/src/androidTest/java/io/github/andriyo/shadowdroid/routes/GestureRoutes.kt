@@ -1,7 +1,9 @@
 package io.github.andriyo.shadowdroid.routes
 
+import androidx.test.uiautomator.By
 import androidx.test.uiautomator.UiDevice
 import io.github.andriyo.shadowdroid.BadRequest
+import io.github.andriyo.shadowdroid.NotFound
 import io.github.andriyo.shadowdroid.proto.OkResponse
 import io.ktor.server.request.receive
 import io.ktor.server.response.respond
@@ -69,6 +71,28 @@ object GestureRoutes {
             uiDevice.swipe(x1, y1, x2, y2, steps)
             call.respond(OkResponse())
         }
+        route.post("/pinch") {
+            val r: PinchReq = call.receive()
+            // UiObject2.pinchIn/Out needs a real object handle, so pinch targets
+            // a selector (rid/text/desc) rather than a dump element id.
+            val by =
+                when {
+                    r.rid != null -> By.res(r.rid)
+                    r.text != null -> By.textContains(r.text)
+                    r.desc != null -> By.descContains(r.desc)
+                    else -> throw BadRequest("empty_selector", "pinch needs one of rid|text|desc")
+                }
+            val obj =
+                uiDevice.findObject(by)
+                    ?: throw NotFound("element_not_found", "no element matched the pinch selector")
+            val pct = (r.percent.coerceIn(1, 100)) / 100f
+            when (r.direction.lowercase()) {
+                "in", "close" -> obj.pinchClose(pct)
+                "out", "open" -> obj.pinchOpen(pct)
+                else -> throw BadRequest("bad_direction", "direction must be in|out, got '${r.direction}'")
+            }
+            call.respond(OkResponse())
+        }
     }
 }
 
@@ -132,4 +156,13 @@ private data class SwipeExtReq(
     val direction: String,
     val scale: Float = 0.9f,
     val duration_ms: Int = 200,
+)
+
+@Serializable
+private data class PinchReq(
+    val rid: String? = null,
+    val text: String? = null,
+    val desc: String? = null,
+    val direction: String,
+    val percent: Int = 50,
 )

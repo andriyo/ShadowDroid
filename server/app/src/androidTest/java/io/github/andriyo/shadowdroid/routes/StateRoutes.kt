@@ -10,14 +10,36 @@ import io.github.andriyo.shadowdroid.proto.Viewport
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.get
+import kotlinx.serialization.Serializable
 
 object StateRoutes {
-    /** GET /v1/state — cheap version + viewport probe. */
+    /** GET /v1/state — cheap version + viewport probe. GET /v1/device — detail. */
     fun register(
         route: Route,
         uiDevice: UiDevice,
-        @Suppress("UNUSED_PARAMETER") instr: Instrumentation,
+        instr: Instrumentation,
     ) {
+        route.get("/device") {
+            val cfg = instr.targetContext.resources.configuration
+            val metrics = instr.targetContext.resources.displayMetrics
+            val locale =
+                if (!cfg.locales.isEmpty) cfg.locales[0].toLanguageTag() else ""
+            call.respond(
+                DeviceInfo(
+                    manufacturer = Build.MANUFACTURER ?: "",
+                    model = Build.MODEL ?: "",
+                    brand = Build.BRAND ?: "",
+                    device = Build.DEVICE ?: "",
+                    product = Build.PRODUCT ?: "",
+                    fingerprint = Build.FINGERPRINT ?: "",
+                    android_release = Build.VERSION.RELEASE ?: "",
+                    android_sdk = Build.VERSION.SDK_INT,
+                    locale = locale,
+                    density_dpi = metrics.densityDpi,
+                ),
+            )
+        }
+
         route.get("/state") {
             val pkg = uiDevice.currentPackageName
             val activity = currentFocusedActivity(uiDevice)
@@ -37,3 +59,17 @@ object StateRoutes {
         }
     }
 }
+
+@Serializable
+private data class DeviceInfo(
+    val manufacturer: String,
+    val model: String,
+    val brand: String,
+    val device: String,
+    val product: String,
+    val fingerprint: String,
+    val android_release: String,
+    val android_sdk: Int,
+    val locale: String,
+    val density_dpi: Int,
+)

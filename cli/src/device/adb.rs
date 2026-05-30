@@ -80,6 +80,61 @@ pub async fn install(serial: impl Into<String>, apk_path: impl Into<PathBuf>) ->
     .context("install task panicked")?
 }
 
+/// Uninstall a package by name. Idempotent-ish: errors (e.g. "not installed")
+/// are surfaced to the caller, which usually treats them as best-effort.
+pub async fn uninstall(serial: impl Into<String>, package: impl Into<String>) -> Result<()> {
+    let serial = serial.into();
+    let package = package.into();
+    spawn_blocking(move || {
+        let mut device = get_device_sync(&serial)?;
+        device
+            .uninstall(&package.as_str(), None)
+            .map_err(|e| anyhow!("adb uninstall {package}: {e}"))
+    })
+    .await
+    .context("uninstall task panicked")?
+}
+
+/// Push a local file to the device over the ADB protocol. Used as a fallback
+/// when the on-device server can't reach the target path (e.g. `/sdcard` under
+/// Android's scoped storage returns EPERM to the instrumentation uid).
+pub async fn push(
+    serial: impl Into<String>,
+    local: impl Into<PathBuf>,
+    remote: impl Into<String>,
+) -> Result<()> {
+    let serial = serial.into();
+    let local = local.into();
+    let remote = remote.into();
+    spawn_blocking(move || {
+        let mut device = get_device_sync(&serial)?;
+        let mut file =
+            std::fs::File::open(&local).with_context(|| format!("open {}", local.display()))?;
+        device
+            .push(&mut file, &remote.as_str())
+            .map_err(|e| anyhow!("adb push {} -> {remote}: {e}", local.display()))
+    })
+    .await
+    .context("push task panicked")?
+}
+
+/// Pull a device file to memory over the ADB protocol. Fallback counterpart to
+/// [push] for paths the on-device server can't read.
+pub async fn pull(serial: impl Into<String>, remote: impl Into<String>) -> Result<Vec<u8>> {
+    let serial = serial.into();
+    let remote = remote.into();
+    spawn_blocking(move || {
+        let mut device = get_device_sync(&serial)?;
+        let mut buf: Vec<u8> = Vec::new();
+        device
+            .pull(&remote.as_str(), &mut buf)
+            .map_err(|e| anyhow!("adb pull {remote}: {e}"))?;
+        Ok(buf)
+    })
+    .await
+    .context("pull task panicked")?
+}
+
 /// Set up `adb forward tcp:<host_port> tcp:<device_port>`.
 /// A laptop-side connect to host_port is proxied to device_port.
 pub async fn forward(serial: impl Into<String>, host_port: u16, device_port: u16) -> Result<()> {
@@ -199,4 +254,130 @@ pub async fn pm_version(
         .strip_prefix("versionName=")
         .map(String::from)
         .filter(|s| !s.is_empty()))
+}
+
+/// Like `list_devices` but returns **every** device paired with its connection
+/// state string (`"device"`, `"offline"`, `"unauthorized"`, `"noperm"`, …),
+/// unfiltered. `list_devices` hides anything that isn't fully "device"; the
+/// `doctor` command needs to *surface* those unhealthy states.
+pub async fn list_devices_with_state() -> Result<Vec<(String, String)>> {
+    spawn_blocking(|| {
+        let mut server = ADBServer::default();
+        let devices = server.devices().map_err(|e| anyhow!("adb devices: {e}"))?;
+        Ok(devices
+            .into_iter()
+            .map(|d| (d.identifier, format!("{}", d.state)))
+            .collect())
+    })
+    .await
+    .context("list_devices_with_state task panicked")?
+}
+
+/// Raw `ps` lines for processes that can hold the single device-wide
+/// UiAutomation slot: any `app_process` shell, openatx/uiautomator2's
+/// `com.wetest.uia2.Main`, our own test process, or atx. Empty string when
+/// none are present. Shared by `doctor` and the installer's failure hint so
+/// the detection heuristic lives in one place.
+pub async fn ps_ui_automation_owners(serial: impl Into<String>) -> Result<String> {
+    let out = shell(
+        serial,
+        "ps -A -o USER,PID,PPID,NAME,ARGS \
+         | grep -E 'app_process|uiautomator|shadowdroid|wetest|atx' \
+         | grep -v grep",
+    )
+    .await?;
+    Ok(out.trim().to_string())
+}
+
+/// A small map of device facts (`android_release`, `android_sdk`,
+/// `device_model`, `device_manufacturer`) parsed from `getprop`. Shared by
+/// crash events ([crate::watch]) and `collect`. Best-effort: missing props are
+/// simply omitted.
+pub async fn device_info(serial: impl Into<String>) -> serde_json::Value {
+    let out = shell(serial, "getprop").await.unwrap_or_default();
+    let wanted = [
+        ("ro.build.version.release", "android_release"),
+        ("ro.build.version.sdk", "android_sdk"),
+        ("ro.product.model", "device_model"),
+        ("ro.product.manufacturer", "device_manufacturer"),
+    ];
+    let mut info = serde_json::Map::new();
+    for line in out.lines() {
+        let Some((key, value)) = parse_getprop_line(line) else {
+            continue;
+        };
+        if let Some((_, out_key)) = wanted.iter().find(|(prop, _)| *prop == key) {
+            info.insert(
+                (*out_key).to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
+        }
+    }
+    serde_json::Value::Object(info)
+}
+
+/// The currently-foreground `package/activity` component, parsed from
+/// `dumpsys activity activities` (the `ResumedActivity` line). `None` if it
+/// can't be determined. Host-side — does not depend on the ShadowDroid server,
+/// so it survives the server being evicted under memory pressure.
+pub async fn foreground_activity(serial: impl Into<String>) -> Option<String> {
+    let out = shell(serial, "dumpsys activity activities").await.ok()?;
+    for line in out.lines() {
+        if !line.contains("ResumedActivity") {
+            continue;
+        }
+        // e.g. "topResumedActivity=ActivityRecord{hash u0 com.x/com.x.Main t8}"
+        if let Some(tok) = line
+            .split_whitespace()
+            .find(|t| t.contains('/') && t.contains('.') && !t.contains('{'))
+        {
+            return Some(tok.trim_end_matches('}').to_string());
+        }
+    }
+    None
+}
+
+/// The last `lines` of logcat in threadtime format. Best-effort; empty on error.
+pub async fn recent_logcat(serial: impl Into<String>, lines: u32) -> Vec<String> {
+    shell(serial, format!("logcat -d -v threadtime -t {lines}"))
+        .await
+        .map(|out| out.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// Parse a single `getprop` line of the form `[key]: [value]`. Returns `None`
+/// for lines that don't match. Tolerates extra whitespace after the colon.
+/// Equivalent to the regex `\[([^\]]+)\]:\s*\[([^\]]*)\]` but allocation-free.
+fn parse_getprop_line(line: &str) -> Option<(&str, &str)> {
+    let after_open = line.trim().strip_prefix('[')?;
+    let (key, rest) = after_open.split_once(']')?;
+    let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+    let value = rest.strip_prefix('[')?.strip_suffix(']')?;
+    Some((key, value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_getprop_line;
+
+    #[test]
+    fn parses_getprop_lines() {
+        assert_eq!(
+            parse_getprop_line("[ro.build.version.release]: [16]"),
+            Some(("ro.build.version.release", "16"))
+        );
+        // values with spaces
+        assert_eq!(
+            parse_getprop_line("[ro.product.model]: [sdk gphone64 arm64]"),
+            Some(("ro.product.model", "sdk gphone64 arm64"))
+        );
+        // empty value
+        assert_eq!(
+            parse_getprop_line("[persist.sys.timezone]: []"),
+            Some(("persist.sys.timezone", ""))
+        );
+        // non-getprop noise
+        assert_eq!(parse_getprop_line("not a prop line"), None);
+        assert_eq!(parse_getprop_line(""), None);
+    }
 }

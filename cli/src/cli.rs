@@ -62,11 +62,121 @@ pub enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Diagnose (and optionally repair) the host↔device pipe: device state,
+    /// APK version, port forward, server reachability, UiAutomation owners.
+    Doctor {
+        /// Attempt to repair the issues found.
+        #[arg(long)]
+        fix: bool,
+        /// Allow --fix to kill a competing (non-ShadowDroid) UiAutomation owner.
+        #[arg(long)]
+        force: bool,
+        /// Emit the report as a single JSON object instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Gather a self-contained diagnostic bundle (doctor report, device info,
+    /// recent logcat + crash buffer, and — if the server is up — screen dump,
+    /// screenshot, current activity, app info) into a directory.
+    Collect {
+        /// App package to include version/info for.
+        #[arg(long)]
+        app: Option<String>,
+        /// Output directory (default: a temp dir under the OS temp path).
+        #[arg(short = 'o', long)]
+        out: Option<PathBuf>,
+        /// Skip the screenshot capture.
+        #[arg(long)]
+        no_screenshot: bool,
+    },
+    /// Grant one or more runtime permissions to a package, then report the
+    /// observed state (verify-by-readback).
+    PermGrant {
+        package: String,
+        #[arg(required = true)]
+        perms: Vec<String>,
+    },
+    /// Revoke one or more runtime permissions from a package.
+    PermRevoke {
+        package: String,
+        #[arg(required = true)]
+        perms: Vec<String>,
+    },
+    /// List a package's runtime permission grant states.
+    PermList {
+        package: String,
+    },
+    /// Revoke all granted runtime permissions, returning the package to a
+    /// fresh-install prompt state.
+    PermReset {
+        package: String,
+    },
+    /// Get appop mode(s) for a package (all ops, or one named op).
+    AppopGet {
+        package: String,
+        op: Option<String>,
+    },
+    /// Set an appop mode (allow|deny|ignore|default|foreground|…).
+    AppopSet {
+        package: String,
+        op: String,
+        mode: String,
+    },
+    /// Install an APK and run the app-under-test setup ritual: optional clear /
+    /// grant / launch / wait-for-front. Emits a structured per-step summary.
+    AppInstall(crate::cmd::app_install::AppInstallArgs),
+    /// Like app-install, but uninstall any existing copy first (crosses a
+    /// signature change or wipes state).
+    AppReinstall(crate::cmd::app_install::AppInstallArgs),
+    /// Capture the device display profile (animation scales, font scale,
+    /// density, size, rotation) as JSON, optionally to a file.
+    ProfileSnapshot {
+        /// Write the profile to this file (default: stdout only).
+        #[arg(short = 'o', long)]
+        out: Option<PathBuf>,
+    },
+    /// Apply a display profile: a preset (`automation` = animations off), a
+    /// snapshot file, or individual flags.
+    ProfileApply(crate::cmd::device_profile::ProfileApplyArgs),
+    /// Reset the display profile to stock defaults (animations on, size/density
+    /// reset, auto-rotate on).
+    ProfileReset,
 
     // ── M2: inspection + gestures ─────────────────────────────
     Screen,
     Screenshot {
         path: Option<String>,
+        /// Image format: png (default) or jpeg. Requires a 0.1.4+ server.
+        #[arg(long)]
+        format: Option<String>,
+        /// Server-side downscale factor, e.g. 0.5. Requires a 0.1.4+ server.
+        #[arg(long)]
+        scale: Option<f32>,
+        /// JPEG quality 1..100 (format=jpeg only). Requires a 0.1.4+ server.
+        #[arg(long)]
+        quality: Option<u32>,
+    },
+    /// One-shot detailed device info (model, fingerprint, locale, density).
+    Device,
+    /// Pinch in (zoom out) or out (zoom in) on the element matched by a
+    /// selector. Requires a 0.1.4+ server.
+    Pinch {
+        #[arg(value_parser = ["in", "out"])]
+        direction: String,
+        #[arg(long)]
+        rid: Option<String>,
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long)]
+        desc: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        percent: u32,
+    },
+    /// Print the current foreground app (package / activity / pid).
+    Current,
+    /// List a directory on the device (within accessible storage).
+    Ls {
+        remote: String,
     },
     Tap {
         a: i32,
@@ -121,6 +231,9 @@ pub enum Cmd {
     XpathTap {
         query: String,
     },
+    /// Scroll a list until an element matching a selector is visible, then
+    /// optionally tap it.
+    ScrollTo(crate::cmd::scroll::ScrollArgs),
     Back,
     Home,
     Key {
@@ -251,6 +364,68 @@ pub async fn run() -> Result<()> {
         }
         Cmd::Disconnect => return cmd_disconnect(device.as_deref()).await,
         Cmd::Update { check, json } => return crate::update::cmd_update(*check, *json).await,
+        // doctor must NOT go through ensure_ready — it diagnoses the very server
+        // ensure_ready would start. collect handles its own (best-effort)
+        // bring-up so it can degrade to host-side diagnostics when the server
+        // can't start.
+        Cmd::Doctor { fix, force, json } => {
+            return crate::cmd::doctor::run(device.as_deref(), *fix, *force, *json).await
+        }
+        Cmd::Collect {
+            app,
+            out,
+            no_screenshot,
+        } => {
+            let serial = resolve_serial(device.as_deref()).await?;
+            return crate::cmd::collect::run(&serial, app.clone(), out.clone(), !*no_screenshot)
+                .await;
+        }
+        // perm-*/appop-* are host-only (plain `adb shell`); they need a device
+        // but not the on-device server.
+        Cmd::PermGrant { package, perms } => {
+            let serial = resolve_serial(device.as_deref()).await?;
+            return crate::cmd::permissions::grant(&serial, package, perms).await;
+        }
+        Cmd::PermRevoke { package, perms } => {
+            let serial = resolve_serial(device.as_deref()).await?;
+            return crate::cmd::permissions::revoke(&serial, package, perms).await;
+        }
+        Cmd::PermList { package } => {
+            let serial = resolve_serial(device.as_deref()).await?;
+            return crate::cmd::permissions::list(&serial, package).await;
+        }
+        Cmd::PermReset { package } => {
+            let serial = resolve_serial(device.as_deref()).await?;
+            return crate::cmd::permissions::reset(&serial, package).await;
+        }
+        Cmd::AppopGet { package, op } => {
+            let serial = resolve_serial(device.as_deref()).await?;
+            return crate::cmd::permissions::appop_get(&serial, package, op.as_deref()).await;
+        }
+        Cmd::AppopSet { package, op, mode } => {
+            let serial = resolve_serial(device.as_deref()).await?;
+            return crate::cmd::permissions::appop_set(&serial, package, op, mode).await;
+        }
+        Cmd::AppInstall(args) => {
+            let serial = resolve_serial(device.as_deref()).await?;
+            return crate::cmd::app_install::run(&serial, args, false).await;
+        }
+        Cmd::AppReinstall(args) => {
+            let serial = resolve_serial(device.as_deref()).await?;
+            return crate::cmd::app_install::run(&serial, args, true).await;
+        }
+        Cmd::ProfileSnapshot { out } => {
+            let serial = resolve_serial(device.as_deref()).await?;
+            return crate::cmd::device_profile::snapshot(&serial, out.as_ref()).await;
+        }
+        Cmd::ProfileApply(args) => {
+            let serial = resolve_serial(device.as_deref()).await?;
+            return crate::cmd::device_profile::apply(&serial, args).await;
+        }
+        Cmd::ProfileReset => {
+            let serial = resolve_serial(device.as_deref()).await?;
+            return crate::cmd::device_profile::reset(&serial).await;
+        }
         _ => {}
     }
 
@@ -259,11 +434,65 @@ pub async fn run() -> Result<()> {
     let client = installer::ensure_ready(&serial, apk.as_deref(), any_apk_version).await?;
 
     match cmd {
-        Cmd::Devices | Cmd::Connect | Cmd::Disconnect | Cmd::Update { .. } => unreachable!(), // handled above
+        Cmd::Devices
+        | Cmd::Connect
+        | Cmd::Disconnect
+        | Cmd::Update { .. }
+        | Cmd::Doctor { .. }
+        | Cmd::Collect { .. }
+        | Cmd::PermGrant { .. }
+        | Cmd::PermRevoke { .. }
+        | Cmd::PermList { .. }
+        | Cmd::PermReset { .. }
+        | Cmd::AppopGet { .. }
+        | Cmd::AppopSet { .. }
+        | Cmd::AppInstall(..)
+        | Cmd::AppReinstall(..)
+        | Cmd::ProfileSnapshot { .. }
+        | Cmd::ProfileApply(..)
+        | Cmd::ProfileReset => unreachable!(), // handled above
 
         // ── inspection ─────────────────────────────────────────
         Cmd::Screen => emit(&client.screen().await?),
-        Cmd::Screenshot { path } => cmd_screenshot(&client, path).await?,
+        Cmd::Screenshot {
+            path,
+            format,
+            scale,
+            quality,
+        } => cmd_screenshot(&client, path, format, scale, quality).await?,
+        Cmd::Device => cmd_device(&client, &serial).await?,
+        Cmd::Pinch {
+            direction,
+            rid,
+            text,
+            desc,
+            percent,
+        } => {
+            client
+                .pinch(
+                    rid.as_deref(),
+                    text.as_deref(),
+                    desc.as_deref(),
+                    &direction,
+                    percent,
+                )
+                .await?;
+            emit_action(
+                "pinch",
+                &serde_json::json!({"direction":direction,"rid":rid,"text":text,"desc":desc,"percent":percent}),
+            );
+        }
+        Cmd::Current => {
+            let cur = client.app_current().await?;
+            emit_action("current", &serde_json::to_value(&cur).unwrap_or_default());
+        }
+        Cmd::Ls { remote } => {
+            let r = client.list_dir(&remote).await?;
+            emit_action(
+                "ls",
+                &serde_json::json!({"remote":remote,"entries":r.entries}),
+            );
+        }
 
         // ── gestures ───────────────────────────────────────────
         Cmd::Tap { a, b } => cmd_tap(&client, a, b).await?,
@@ -362,6 +591,7 @@ pub async fn run() -> Result<()> {
                 &serde_json::json!({"query":query,"x":r.x,"y":r.y,"matched":r.matched}),
             );
         }
+        Cmd::ScrollTo(args) => crate::cmd::scroll::run(&client, &args).await?,
 
         // ── keys + text ────────────────────────────────────────
         Cmd::Back => {
@@ -485,18 +715,34 @@ pub async fn run() -> Result<()> {
             mode,
         } => {
             let bytes = std::fs::read(&local).with_context(|| format!("reading {local}"))?;
-            let r = client.push_file(&remote, bytes).await?;
-            emit_action(
-                "push",
-                &serde_json::json!({"local":local,"remote":remote,"path":r.path,"bytes":r.bytes,"mode":r.mode,"requested_mode":mode}),
-            );
+            let bytes_len = bytes.len() as u64;
+            // Server first (app-accessible storage); fall back to `adb push` for
+            // paths the instrumentation uid can't write (e.g. /sdcard under
+            // scoped storage).
+            match client.push_file(&remote, bytes).await {
+                Ok(r) => emit_action(
+                    "push",
+                    &serde_json::json!({"local":local,"remote":remote,"path":r.path,"bytes":r.bytes,"mode":r.mode,"requested_mode":mode,"via":"server"}),
+                ),
+                Err(_) => {
+                    adb::push(&serial, std::path::PathBuf::from(&local), remote.clone()).await?;
+                    emit_action(
+                        "push",
+                        &serde_json::json!({"local":local,"remote":remote,"bytes":bytes_len,"via":"adb"}),
+                    );
+                }
+            }
         }
         Cmd::Pull { remote, local } => {
-            let bytes = client.pull_file(&remote).await?;
+            // Server first; fall back to `adb pull` for paths it can't read.
+            let (bytes, via) = match client.pull_file(&remote).await {
+                Ok(b) => (b, "server"),
+                Err(_) => (adb::pull(&serial, remote.clone()).await?, "adb"),
+            };
             std::fs::write(&local, &bytes).with_context(|| format!("writing {local}"))?;
             emit_action(
                 "pull",
-                &serde_json::json!({"remote":remote,"local":local,"bytes":bytes.len() as u64}),
+                &serde_json::json!({"remote":remote,"local":local,"bytes":bytes.len() as u64,"via":via}),
             );
         }
         Cmd::Toast { wait_ms } => {
@@ -579,8 +825,36 @@ fn emit_action(cmd: &str, body: &serde_json::Value) {
 
 // ── specific handlers ──────────────────────────────────────────
 
-async fn cmd_screenshot(client: &ServerClient, path: Option<String>) -> Result<()> {
-    let bytes = client.screenshot_png().await?;
+async fn cmd_device(client: &ServerClient, serial: &str) -> Result<()> {
+    match client.device().await {
+        // 0.1.4+ server: rich device facts.
+        Ok(d) => emit_action("device", &serde_json::to_value(&d).unwrap_or_default()),
+        // Older server without /v1/device: fall back to /state + getprop.
+        Err(_) => {
+            let state = client.state().await?;
+            let getprop = adb::device_info(serial).await;
+            emit_action(
+                "device",
+                &serde_json::json!({
+                    "source": "fallback",
+                    "android_release": state.android_release,
+                    "android_sdk": state.android_sdk,
+                    "getprop": getprop,
+                }),
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_screenshot(
+    client: &ServerClient,
+    path: Option<String>,
+    format: Option<String>,
+    scale: Option<f32>,
+    quality: Option<u32>,
+) -> Result<()> {
+    let bytes = client.screenshot(format.as_deref(), scale, quality).await?;
     let p: std::path::PathBuf = match path {
         Some(p) => p.into(),
         None => {
@@ -788,6 +1062,11 @@ async fn cmd_connect(
 ) -> Result<()> {
     let serial = resolve_serial(device).await?;
     let client = installer::ensure_ready(&serial, apk, any_apk_version).await?;
+    // Device prep: disable the Android 14+ stylus-handwriting tutorial that
+    // otherwise hijacks the first text-field focus and breaks `text` input.
+    // Best-effort + idempotent; surfaced in the output rather than done silently.
+    let stylus_tutorial_disabled =
+        crate::cmd::device_profile::disable_stylus_tutorial(&serial).await;
     let state = client.state().await?;
     let out = json!({
         "type": "connected",
@@ -799,6 +1078,7 @@ async fn cmd_connect(
         "android_release": state.android_release,
         "viewport": {"w": state.viewport.w, "h": state.viewport.h},
         "current_app": state.current_app,
+        "device_prep": {"stylus_tutorial_disabled": stylus_tutorial_disabled},
     });
     println!("{}", serde_json::to_string(&out).unwrap());
     Ok(())

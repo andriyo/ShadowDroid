@@ -1,6 +1,8 @@
 package io.github.andriyo.shadowdroid.routes
 
 import android.app.Instrumentation
+import androidx.test.uiautomator.By
+import androidx.test.uiautomator.Direction
 import androidx.test.uiautomator.UiDevice
 import io.github.andriyo.shadowdroid.BadRequest
 import io.github.andriyo.shadowdroid.NotFound
@@ -52,7 +54,59 @@ object SelectorRoutes {
                 call.respond(FindResp(matched = matches.firstOrNull(), elements = matches))
             }
         }
+
+        // Fast on-device scroll-to: drive a scrollable UiObject2 directly rather
+        // than the host loop's dump→swipe→dump per step. The CLI falls back to
+        // the host loop if this route is absent (404) or there's no scrollable.
+        route.post("/scroll") {
+            val r: ScrollReq = call.receive()
+            val target =
+                bySelector(r.text, r.rid, r.desc)
+                    ?: throw BadRequest("empty_selector", "scroll needs one of text|rid|desc")
+            val scrollable =
+                (
+                    if (r.container_rid != null) {
+                        uiDevice.findObject(By.res(r.container_rid))
+                    } else {
+                        uiDevice.findObject(By.scrollable(true))
+                    }
+                )
+                    ?: throw NotFound("no_scrollable", "no scrollable container found")
+            val dir =
+                when (r.direction.lowercase()) {
+                    "up" -> Direction.UP
+                    "left" -> Direction.LEFT
+                    "right" -> Direction.RIGHT
+                    else -> Direction.DOWN
+                }
+            var found = uiDevice.findObject(target)
+            var swipes = 0
+            while (found == null && swipes < r.max_swipes) {
+                val more = scrollable.scroll(dir, 0.8f)
+                swipes++
+                found = uiDevice.findObject(target)
+                if (!more) break
+            }
+            if (found == null) {
+                call.respond(ScrollResp(matched = false, x = -1, y = -1, swipes = swipes))
+            } else {
+                val center = found.visibleCenter
+                if (r.tap) found.click()
+                call.respond(ScrollResp(matched = true, x = center.x, y = center.y, swipes = swipes))
+            }
+        }
     }
+}
+
+private fun bySelector(
+    text: String?,
+    rid: String?,
+    desc: String?,
+) = when {
+    rid != null -> By.res(rid)
+    text != null -> By.textContains(text)
+    desc != null -> By.descContains(desc)
+    else -> null
 }
 
 private fun findElements(
@@ -109,6 +163,25 @@ data class SelectorReq(
 private data class XpathReq(
     val query: String,
     val tap: Boolean = false,
+)
+
+@Serializable
+private data class ScrollReq(
+    val text: String? = null,
+    val rid: String? = null,
+    val desc: String? = null,
+    val direction: String = "down",
+    val container_rid: String? = null,
+    val max_swipes: Int = 12,
+    val tap: Boolean = false,
+)
+
+@Serializable
+private data class ScrollResp(
+    val matched: Boolean,
+    val x: Int,
+    val y: Int,
+    val swipes: Int,
 )
 
 @Serializable

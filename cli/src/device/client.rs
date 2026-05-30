@@ -71,6 +71,13 @@ impl ServerClient {
         self.get("/state").await
     }
 
+    /// `GET /v1/device` — detailed device facts. Returns a typed 404 marker via
+    /// the error when the server predates this route, so the caller can fall
+    /// back to `/state` + getprop.
+    pub async fn device(&self) -> Result<DeviceInfo> {
+        self.get("/device").await
+    }
+
     pub async fn screen(&self) -> Result<ScreenResponse> {
         self.get("/screen").await
     }
@@ -86,17 +93,106 @@ impl ServerClient {
     }
 
     pub async fn screenshot_png(&self) -> Result<Vec<u8>> {
+        self.screenshot(None, None, None).await
+    }
+
+    /// `GET /v1/screenshot.png` with optional server-side encoding controls.
+    /// Unknown params are simply ignored by older servers (they always return
+    /// a full-resolution PNG), so this stays backward-compatible.
+    pub async fn screenshot(
+        &self,
+        format: Option<&str>,
+        scale: Option<f32>,
+        quality: Option<u32>,
+    ) -> Result<Vec<u8>> {
+        let mut q: Vec<String> = Vec::new();
+        if let Some(f) = format {
+            q.push(format!("format={f}"));
+        }
+        if let Some(s) = scale {
+            q.push(format!("scale={s}"));
+        }
+        if let Some(qual) = quality {
+            q.push(format!("quality={qual}"));
+        }
+        let query = if q.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", q.join("&"))
+        };
         let resp = self
             .http
-            .get(format!("{}/screenshot.png", self.base))
+            .get(format!("{}/screenshot.png{query}", self.base))
             .send()
             .await?
             .error_for_status()?;
         Ok(resp.bytes().await?.to_vec())
     }
 
+    /// `POST /v1/pinch` — pinch in/out on the element matched by a selector
+    /// (`UiObject2.pinchIn/Out` needs a real object handle, so pinch targets a
+    /// selector rather than a dump element id).
+    pub async fn pinch(
+        &self,
+        rid: Option<&str>,
+        text: Option<&str>,
+        desc: Option<&str>,
+        direction: &str,
+        percent: u32,
+    ) -> Result<()> {
+        let mut body = serde_json::Map::new();
+        if let Some(v) = rid {
+            body.insert("rid".into(), v.into());
+        }
+        if let Some(v) = text {
+            body.insert("text".into(), v.into());
+        }
+        if let Some(v) = desc {
+            body.insert("desc".into(), v.into());
+        }
+        body.insert("direction".into(), direction.into());
+        body.insert("percent".into(), percent.into());
+        let _: OkResponse = self
+            .post("/pinch", &serde_json::Value::Object(body))
+            .await?;
+        Ok(())
+    }
+
     pub async fn find(&self, query: &SelectorQuery) -> Result<FindResp> {
         self.post("/find", query).await
+    }
+
+    /// `POST /v1/scroll` — fast on-device scroll-to. Errors (notably 404 on an
+    /// older server, or no scrollable container) signal the caller to fall back
+    /// to the host scroll loop.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn scroll(
+        &self,
+        rid: Option<&str>,
+        text: Option<&str>,
+        desc: Option<&str>,
+        direction: &str,
+        container_rid: Option<&str>,
+        max_swipes: u32,
+        tap: bool,
+    ) -> Result<ScrollResp> {
+        let mut body = serde_json::Map::new();
+        if let Some(v) = rid {
+            body.insert("rid".into(), v.into());
+        }
+        if let Some(v) = text {
+            body.insert("text".into(), v.into());
+        }
+        if let Some(v) = desc {
+            body.insert("desc".into(), v.into());
+        }
+        if let Some(v) = container_rid {
+            body.insert("container_rid".into(), v.into());
+        }
+        body.insert("direction".into(), direction.into());
+        body.insert("max_swipes".into(), max_swipes.into());
+        body.insert("tap".into(), tap.into());
+        self.post("/scroll", &serde_json::Value::Object(body)).await
     }
 
     pub async fn find_tap(&self, query: &SelectorQuery) -> Result<FindTapResp> {
@@ -346,6 +442,16 @@ impl ServerClient {
             .send()
             .await?;
         check_then_bytes(resp).await
+    }
+
+    /// `GET /v1/files/{dir}?list=true` — directory listing.
+    pub async fn list_dir(&self, remote: &str) -> Result<FileListResp> {
+        let resp = self
+            .http
+            .get(format!("{}{}?list=true", self.base, file_path(remote)))
+            .send()
+            .await?;
+        check_then_json(resp).await
     }
 }
 
