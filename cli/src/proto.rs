@@ -153,6 +153,14 @@ pub struct FindTapResp {
     pub y: i32,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScrollResp {
+    pub matched: bool,
+    pub x: i32,
+    pub y: i32,
+    pub swipes: u32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct XpathReq {
     pub query: String,
@@ -180,6 +188,36 @@ pub struct FileWriteResp {
     pub path: String,
     pub bytes: u64,
     pub mode: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FileListResp {
+    pub entries: Vec<FileEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FileEntry {
+    pub name: String,
+    pub size: u64,
+    pub is_dir: bool,
+}
+
+// ── /v1/device ───────────────────────────────────────────────────────────────
+
+/// One-shot detailed device info from `GET /v1/device`. Older servers (before
+/// this route existed) return 404; the CLI falls back to `/v1/state` + getprop.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DeviceInfo {
+    pub manufacturer: String,
+    pub model: String,
+    pub brand: String,
+    pub device: String,
+    pub product: String,
+    pub fingerprint: String,
+    pub android_release: String,
+    pub android_sdk: u32,
+    pub locale: String,
+    pub density_dpi: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]

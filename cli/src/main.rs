@@ -2,6 +2,7 @@
 //!
 //! Module map:
 //!   cli         — clap argument definitions, dispatch
+//!   cmd         — larger multi-step subcommands (doctor, collect, …)
 //!   device      — talking to the on-device server (HTTP) + adb (ADB protocol)
 //!   watch       — event loop, debounce, crash watcher, watcher rule engine
 //!   dump        — XML / element JSON model
@@ -12,6 +13,7 @@
 //! and docs/architecture.md for the big picture.
 
 mod cli;
+mod cmd;
 mod device;
 mod dump;
 mod events;

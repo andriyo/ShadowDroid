@@ -1,6 +1,8 @@
 package io.github.andriyo.shadowdroid.routes
 
 import android.app.Instrumentation
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import androidx.test.uiautomator.UiDevice
 import io.github.andriyo.shadowdroid.ErrorBody
 import io.github.andriyo.shadowdroid.ErrorEnvelope
@@ -50,7 +52,11 @@ object ScreenRoutes {
         }
 
         // GET /v1/screenshot.png — PNG of the current display.
+        // Optional ?format=png|jpeg, ?scale=0..1, ?quality=1..100 (jpeg).
         route.get("/screenshot.png") {
+            val format = (call.request.queryParameters["format"] ?: "png").lowercase()
+            val scale = call.request.queryParameters["scale"]?.toFloatOrNull() ?: 1.0f
+            val quality = (call.request.queryParameters["quality"]?.toIntOrNull() ?: 90).coerceIn(1, 100)
             val cacheDir = instr.targetContext.cacheDir
             val tmp = File.createTempFile("sd-screenshot-", ".png", cacheDir)
             try {
@@ -67,7 +73,26 @@ object ScreenRoutes {
                     )
                     return@get
                 }
-                call.respondBytes(tmp.readBytes(), ContentType.parse("image/png"))
+                // Fast path: untouched PNG when no transform is requested.
+                if (format == "png" && scale >= 0.999f) {
+                    call.respondBytes(tmp.readBytes(), ContentType.parse("image/png"))
+                    return@get
+                }
+                var bitmap = BitmapFactory.decodeFile(tmp.path)
+                if (scale in 0.05f..0.999f) {
+                    val w = (bitmap.width * scale).toInt().coerceAtLeast(1)
+                    val h = (bitmap.height * scale).toInt().coerceAtLeast(1)
+                    bitmap = Bitmap.createScaledBitmap(bitmap, w, h, true)
+                }
+                val baos = ByteArrayOutputStream()
+                val (compress, ctype) =
+                    if (format == "jpeg" || format == "jpg") {
+                        Bitmap.CompressFormat.JPEG to "image/jpeg"
+                    } else {
+                        Bitmap.CompressFormat.PNG to "image/png"
+                    }
+                bitmap.compress(compress, quality, baos)
+                call.respondBytes(baos.toByteArray(), ContentType.parse(ctype))
             } finally {
                 tmp.delete()
             }

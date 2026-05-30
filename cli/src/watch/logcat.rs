@@ -365,28 +365,9 @@ async fn fetch_context(serial: &str) -> Vec<String> {
 }
 
 async fn fetch_device_info(serial: &str) -> serde_json::Value {
-    let out = adb::shell(serial, "getprop").await.unwrap_or_default();
-    let wanted = [
-        ("ro.build.version.release", "android_release"),
-        ("ro.build.version.sdk", "android_sdk"),
-        ("ro.product.model", "device_model"),
-        ("ro.product.manufacturer", "device_manufacturer"),
-    ];
-    let mut info = serde_json::Map::new();
-    for line in out.lines() {
-        let Some(caps) = getprop_re().captures(line) else {
-            continue;
-        };
-        let key = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-        let value = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-        if let Some((_, out_key)) = wanted.iter().find(|(prop, _)| *prop == key) {
-            info.insert(
-                (*out_key).to_string(),
-                serde_json::Value::String(value.to_string()),
-            );
-        }
-    }
-    serde_json::Value::Object(info)
+    // Shared with `collect` so the device-fact shape stays identical across
+    // crash events and diagnostic bundles.
+    adb::device_info(serial).await
 }
 
 fn logcat_re() -> &'static Regex {
@@ -443,11 +424,6 @@ fn native_pid_line_re() -> &'static Regex {
 fn anr_header_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"ANR in (\S+)").unwrap())
-}
-
-fn getprop_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\[([^\]]+)\]:\s*\[([^\]]*)\]").unwrap())
 }
 
 #[cfg(test)]

@@ -121,6 +121,37 @@ On first connect, the CLI resolves APKs in this order:
 
 Release downloads are verified with `SHA256SUMS` before they are cached.
 
+## Troubleshoot a connection
+
+When `connect` misbehaves — an offline/unauthorized device, a missing or
+version-mismatched APK, a dropped port forward, or a stuck instrumentation
+holding the device's single UiAutomation slot — run the diagnostics:
+
+```bash
+shadowdroid doctor          # human-readable report
+shadowdroid doctor --json   # machine-readable, one JSON object
+shadowdroid doctor --fix    # attempt repairs (reinstall, re-forward, restart)
+```
+
+`doctor` is read-only by default and never starts the server (it diagnoses the
+very server `connect` would start). `--fix` applies remediation; it refuses to
+kill a *competing*, non-ShadowDroid UiAutomation owner (e.g. an
+openatx/uiautomator2 process) unless you also pass `--force`.
+
+To capture a snapshot for a bug report, `collect` bundles the doctor report,
+device info, recent logcat (plus the crash buffer), and — when the server is up
+— a screen dump, screenshot, current activity, and app info into a directory:
+
+```bash
+shadowdroid collect --app com.example.app
+# → {"type":"action","cmd":"collect","bundle":"/tmp/shadowdroid-collect-…", …}
+```
+
+The bundle is written locally and never uploaded, and still produces the
+host-side diagnostics (logs, device info, doctor report) even when the on-device
+server can't start. Screenshots and logs may contain sensitive data — review the
+directory before sharing it.
+
 ## Manual downloads
 
 Every GitHub Release contains:

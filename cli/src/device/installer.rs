@@ -37,7 +37,7 @@ pub const DEFAULT_PORT: u16 = 7912;
 const RELEASE_MAIN_APK_ASSET: &str = "shadowdroid-server-main.apk";
 const RELEASE_TEST_APK_ASSET: &str = "shadowdroid-server-test.apk";
 const RELEASE_CHECKSUMS_ASSET: &str = "SHA256SUMS";
-const INSTRUMENT_LOG_PATH: &str = "/sdcard/shadowdroid-instr.log";
+pub const INSTRUMENT_LOG_PATH: &str = "/sdcard/shadowdroid-instr.log";
 
 /// Where each APK pair came from. Used for logging + to decide whether to
 /// version-check.
@@ -502,9 +502,7 @@ async fn install_if_needed(serial: &str, pair: &ApkPair, any_apk_version: bool) 
     let installed_test = adb::pm_path(serial, TEST_PACKAGE).await?.is_some();
     if !installed_main || !installed_test {
         info!("installing main + test APKs (cold install)");
-        adb::install(serial, pair.main.clone()).await?;
-        adb::install(serial, pair.test.clone()).await?;
-        return Ok(());
+        return install_pair(serial, pair).await;
     }
     if pair.source.is_dev() {
         // For dev sources we'd ideally hash-compare. For M1, simplest correct
@@ -513,27 +511,60 @@ async fn install_if_needed(serial: &str, pair: &ApkPair, any_apk_version: bool) 
         // later optimisation.
         if pair.source == ApkSource::Explicit {
             info!("reinstalling APKs (dev mode, explicit --apk)");
-            adb::install(serial, pair.main.clone()).await?;
-            adb::install(serial, pair.test.clone()).await?;
+            return install_pair(serial, pair).await;
         }
         return Ok(());
     }
     if any_apk_version {
         return Ok(());
     }
+    // The androidTest package has no versionName (always null), so keying the
+    // decision off it would reinstall on every connect. The main package's
+    // version is authoritative and the two APKs are always built together.
     let main_version = adb::pm_version(serial, APP_PACKAGE).await?;
-    let test_version = adb::pm_version(serial, TEST_PACKAGE).await?;
-    if main_version.as_deref() != Some(EXPECTED_APK_VERSION)
-        || test_version.as_deref() != Some(EXPECTED_APK_VERSION)
-    {
+    if main_version.as_deref() != Some(EXPECTED_APK_VERSION) {
         info!(
-            "reinstalling APKs (expected version {EXPECTED_APK_VERSION}, found main={:?}, test={:?})",
-            main_version, test_version
+            "reinstalling APKs (expected version {EXPECTED_APK_VERSION}, found main={:?})",
+            main_version
         );
-        adb::install(serial, pair.main.clone()).await?;
-        adb::install(serial, pair.test.clone()).await?;
+        return install_pair(serial, pair).await;
     }
     Ok(())
+}
+
+/// Install the main + test APKs, recovering from a signature mismatch. When the
+/// installed build was signed with a different key (e.g. a release APK over a
+/// locally dev-signed one), `adb install` fails with
+/// `INSTALL_FAILED_UPDATE_INCOMPATIBLE`. Our server packages hold no user data,
+/// so on that error we uninstall both and install fresh — this is what makes
+/// `doctor --fix` (and `connect`) able to recover a cross-signed device instead
+/// of dead-ending.
+async fn install_pair(serial: &str, pair: &ApkPair) -> Result<()> {
+    match try_install_pair(serial, pair).await {
+        Ok(()) => Ok(()),
+        Err(e) if is_signature_mismatch(&e) => {
+            warn!(
+                "APK signature differs from the installed build; uninstalling ShadowDroid \
+                 server packages and reinstalling fresh (they hold no user data)"
+            );
+            // Uninstall the test package before the app it instruments.
+            adb::uninstall(serial, TEST_PACKAGE).await.ok();
+            adb::uninstall(serial, APP_PACKAGE).await.ok();
+            try_install_pair(serial, pair).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn try_install_pair(serial: &str, pair: &ApkPair) -> Result<()> {
+    adb::install(serial, pair.main.clone()).await?;
+    adb::install(serial, pair.test.clone()).await?;
+    Ok(())
+}
+
+fn is_signature_mismatch(e: &anyhow::Error) -> bool {
+    let s = e.to_string();
+    s.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE") || s.contains("signatures do not match")
 }
 
 async fn start_instrumentation(serial: &str) -> Result<()> {
@@ -589,14 +620,9 @@ async fn ui_automation_failure_hint(serial: &str) -> Option<String> {
         return None;
     }
 
-    let owners = adb::shell(
-        serial,
-        "ps -A -o USER,PID,PPID,NAME,ARGS \
-         | grep -E 'app_process|uiautomator|shadowdroid|wetest|atx' \
-         | grep -v grep",
-    )
-    .await
-    .unwrap_or_default();
+    let owners = adb::ps_ui_automation_owners(serial)
+        .await
+        .unwrap_or_default();
 
     let mut hint = String::from(
         "Android reports the UiAutomation slot is already registered. Only one \
