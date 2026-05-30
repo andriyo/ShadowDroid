@@ -54,6 +54,14 @@ pub enum Cmd {
     Devices,
     Connect,
     Disconnect,
+    Update {
+        /// Check whether this CLI is older than the latest GitHub Release.
+        #[arg(long)]
+        check: bool,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
 
     // ── M2: inspection + gestures ─────────────────────────────
     Screen,
@@ -242,6 +250,7 @@ pub async fn run() -> Result<()> {
             return cmd_connect(device.as_deref(), apk.as_deref(), any_apk_version).await
         }
         Cmd::Disconnect => return cmd_disconnect(device.as_deref()).await,
+        Cmd::Update { check, json } => return crate::update::cmd_update(*check, *json).await,
         _ => {}
     }
 
@@ -250,7 +259,7 @@ pub async fn run() -> Result<()> {
     let client = installer::ensure_ready(&serial, apk.as_deref(), any_apk_version).await?;
 
     match cmd {
-        Cmd::Devices | Cmd::Connect | Cmd::Disconnect => unreachable!(), // handled above
+        Cmd::Devices | Cmd::Connect | Cmd::Disconnect | Cmd::Update { .. } => unreachable!(), // handled above
 
         // ── inspection ─────────────────────────────────────────
         Cmd::Screen => emit(&client.screen().await?),

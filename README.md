@@ -75,6 +75,12 @@ Then connect to an attached Android device or emulator:
 shadowdroid connect
 ```
 
+Check for CLI updates:
+
+```bash
+shadowdroid update --check
+```
+
 The installer only installs the host CLI. On first `connect`, ShadowDroid
 downloads the matching instrumentation APKs from the same GitHub Release,
 verifies them with SHA-256, caches them under `~/.shadowdroid/apks/<version>/`,
