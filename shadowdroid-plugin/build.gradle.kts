@@ -1,7 +1,6 @@
 import org.jetbrains.intellij.platform.gradle.TestFrameworkType
 
 plugins {
-    id("org.jetbrains.kotlin.jvm")
     id("org.jetbrains.changelog")
     id("org.jetbrains.intellij.platform")
 }
@@ -18,6 +17,5 @@ dependencies {
         // Add plugin dependencies for compilation here:
         bundledPlugin("org.jetbrains.android")
         bundledPlugin("com.intellij.java")
-        bundledPlugin("org.jetbrains.kotlin")
     }
 }
