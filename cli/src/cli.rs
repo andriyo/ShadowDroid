@@ -104,6 +104,9 @@ pub enum Cmd {
     },
     /// Generate an agent-integration file (Claude Code / Cursor / Codex).
     Skill(crate::cmd::skill::SkillArgs),
+    /// Operate Android Studio debugger sessions through the ShadowDroid plugin.
+    #[command(alias = "debug")]
+    Debugger(crate::cmd::debugger::DebuggerArgs),
 
     // ── resource namespaces (nested) ──────────────────────────
     /// Application lifecycle, info, and install rituals.
@@ -424,6 +427,7 @@ pub async fn run() -> Result<()> {
         // Pure self-introspection / file generation — no device needed.
         Cmd::Commands { json } => return crate::cmd::introspect::run(*json),
         Cmd::Skill(args) => return crate::cmd::skill::run(args),
+        Cmd::Debugger(args) => return crate::cmd::debugger::run(args).await,
         Cmd::Connect => {
             return cmd_connect(device.as_deref(), apk.as_deref(), any_apk_version).await
         }
@@ -477,6 +481,7 @@ pub async fn run() -> Result<()> {
         | Cmd::Collect { .. }
         | Cmd::Commands { .. }
         | Cmd::Skill(_)
+        | Cmd::Debugger(_)
         | Cmd::Perm(_)
         | Cmd::Appops(_)
         | Cmd::Profile(_) => unreachable!("handled before ensure_ready"),

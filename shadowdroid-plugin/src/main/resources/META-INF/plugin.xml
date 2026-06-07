@@ -28,4 +28,9 @@
     <extensions defaultExtensionNs="com.intellij">
         <postStartupActivity implementation="io.github.andriyo.shadowdroid.studio.ShadowDroidDebuggerBridge"/>
     </extensions>
+    <applicationListeners>
+        <listener
+            class="io.github.andriyo.shadowdroid.studio.ShadowDroidDebuggerBridge"
+            topic="com.intellij.openapi.project.ProjectManagerListener"/>
+    </applicationListeners>
 </idea-plugin>
