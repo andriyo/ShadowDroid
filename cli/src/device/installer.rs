@@ -631,7 +631,7 @@ async fn ui_automation_failure_hint(serial: &str) -> Option<String> {
     if owners.contains("com.wetest.uia2.Main") {
         hint.push_str(
             "\nDetected openatx/uiautomator2 (`com.wetest.uia2.Main`) on the device. \
-             Stop any host-side uiautomator2/movi watcher that may be respawning it, \
+             Stop any host-side uiautomator2 watcher that may be respawning it, \
              then kill the device process and retry.",
         );
     } else if !owners.trim().is_empty() {

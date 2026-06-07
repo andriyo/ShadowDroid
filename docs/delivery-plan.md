@@ -1,13 +1,13 @@
 # ShadowDroid — Phased Delivery Plan
 
-Five milestones. Each one ships a runnable artifact you can use, even if it doesn't yet match `movi` feature-for-feature. The principle: **end-to-end loop before depth in any one layer**.
+Five milestones. Each one ships a runnable artifact you can use, even before every helper is implemented. The principle: **end-to-end loop before depth in any one layer**.
 
 | Phase | Goal                                          | Done when…                                                                  | Estimate |
 | ----- | --------------------------------------------- | --------------------------------------------------------------------------- | -------- |
 | M1    | Hello-world round trip                        | `shadowdroid connect` installs the APK, starts it, gets `/v1/state` back    | 1 week   |
 | M2    | Inspection + core gestures                    | All the read/tap/swipe/text/launch verbs from the protocol implemented      | 1 week   |
 | M3    | Watch loop + crash detection                  | `shadowdroid watch` emits the full JSON event stream incl. crashes          | 5 days   |
-| M4    | Watchers + Toast + selectors + xpath          | Feature parity with `movi`                                                  | 4 days   |
+| M4    | Watchers + Toast + selectors + xpath          | Selectors, watchers, toast, and file helpers implemented                    | 4 days   |
 | M5    | Distribution                                  | `cargo install shadowdroid` works; APK lives in GitHub releases             | 3 days   |
 
 Total: **~3-4 weeks** of focused work. Each phase below lists what's in, what's out, and the smallest meaningful demo that proves it.
@@ -56,7 +56,7 @@ shadowdroid connect             # → reinstalls, ~3s
 
 **In:**
 - Server: implement `ScreenRoutes`, `GestureRoutes`, `KeyTextRoutes`, `AppRoutes`, `SystemRoutes` (everything except Toast/xpath/find — those are M4).
-- CLI: every one-shot subcommand from the legacy `movi` CLI — `screen`, `tap`, `swipe`, `text`, `launch`, etc.
+- CLI: every protocol-backed one-shot command — `screen`, `tap`, `swipe`, `text`, `app start`, etc.
 - Element model: server flattens the UI Automator XML into our element JSON shape *on device* (cheaper than shipping XML over loopback).
 
 **Out:** the watch loop, crash detection, watchers, xpath, find.
@@ -79,7 +79,7 @@ shadowdroid device shell "getprop ro.product.model"
 **In:**
 - CLI: `shadowdroid watch [--app PKG] [--no-stdin] [--no-crash-detect]` — the streaming subcommand.
 - CLI: `watch::loop` — wake on logcat events / safety-net poll / stdin commands, debounce, hash-diff, emit.
-- CLI: `watch::logcat` — port `movi/crash.py` regex parser line-for-line. Same structured `crash` event shape (Java/native/ANR, stack, context, device_info).
+- CLI: `watch::logcat` — structured `crash` events for Java/native/ANR crashes, including stack, context, and device_info.
 - CLI: `watch::stdin` — port `parse_command` shorthand + JSON forms.
 
 **Out:** watchers, toasts, xpath.
@@ -103,9 +103,9 @@ adb shell am crash com.livd
 **In:**
 - Server: `ToastRoutes` (accessibility-event listener, ring buffer). `SelectorRoutes` (find / find_tap / xpath). `FileRoutes` (push/pull within accessible storage).
 - CLI: `watch::watcher` rule engine. `--watcher-file` flag on `watch`. Add/remove/list at runtime via JSON commands. Watcher fires dispatch through the normal action path.
-- CLI: `tap_text`, `tap_rid`, `tap_desc`, `tap_and_wait`, `tap_text_and_wait`, `tap_rid_and_wait`, `tap_desc_and_wait`, `xpath`, `xpath_tap`, `toast`, `wait_for`, `swipe_ext`, `open_url`, `push`, `pull` — all the verbs we added in `movi` after M2, plus fast agent-loop helpers.
+- CLI: `tap_text`, `tap_rid`, `tap_desc`, `tap_and_wait`, `tap_text_and_wait`, `tap_rid_and_wait`, `tap_desc_and_wait`, `xpath`, `xpath_tap`, `toast`, `wait_for`, `swipe_ext`, `open_url`, `push`, `pull` — high-frequency agent-loop helpers on top of the core gestures.
 
-**Out:** the `MoviSession` Python adapter — that's not a ShadowDroid concern. Agents drive the CLI directly via stdin/stdout, or via the JSON-line stream from `shadowdroid watch`. (If we miss the in-process adapter, an `agent` crate could add it later, but `movi`'s agent layer was Python-only and doesn't need to carry forward.)
+**Out:** an in-process Python adapter — that's not a ShadowDroid concern. Agents drive the CLI directly via stdin/stdout, or via the JSON-line stream from `shadowdroid watch`. If an embedded adapter becomes useful later, an `agent` crate can add it without pulling Python into the main tool.
 
 **Demo:**
 ```bash
@@ -135,7 +135,7 @@ send `tap_and_wait` when the next decision depends on a screen change. JSON
 commands can include `screen_hash` to reject stale cached ids. Use
 `--screen-format full` only when an agent needs a full screen dump.
 
-**Validates:** end-to-end feature parity with `movi`. At this point the legacy Python tool can be retired.
+**Validates:** end-to-end coverage for the agent-driving workflows. At this point the prototype toolchain can be retired.
 
 ---
 

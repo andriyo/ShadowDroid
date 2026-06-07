@@ -1,7 +1,7 @@
 //! Crash detection via `adb logcat`.
 //!
 //! Tail with `-v threadtime -T 1 AndroidRuntime:E ActivityManager:E libc:F DEBUG:F *:S`.
-//! Parser is a direct port of the proven movi `crash.py` regexes.
+//! Parser emits structured crash events from proven AndroidRuntime/libc/DEBUG patterns.
 //!
 //! State machine: idle → collecting (after `FATAL EXCEPTION`/`Fatal signal`) →
 //! finalise after a quiet window (default 1s) or when another crash starts.

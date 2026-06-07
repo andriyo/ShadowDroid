@@ -2,7 +2,7 @@
 //!
 //! Normally the on-device server returns elements pre-flattened in `/v1/screen`.
 //! This module is the safety net for `format=xml` mode and for any caller that
-//! wants raw control. It's a port of movi/dump.py.
+//! wants raw control.
 
 #![allow(dead_code)]
 
@@ -17,7 +17,7 @@ pub fn screen_hash(xml: &str) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(xml.as_bytes());
     let digest = hasher.finalize();
-    // first 8 bytes hex, matching movi's blake2b digest length
+    // first 8 bytes hex, matching the public screen_hash length
     let bytes = &digest.as_bytes()[..8];
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }

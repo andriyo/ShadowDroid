@@ -129,7 +129,7 @@ object TreeWalker {
                 ),
             )
         }
-        // First 8 bytes hex — matches movi's blake2b digest length for wire compat.
+        // First 8 bytes hex to match the public screen_hash length.
         return md.digest().take(8).joinToString("") { "%02x".format(it) }
     }
 }

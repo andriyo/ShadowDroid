@@ -1,8 +1,7 @@
 //! The JSON-line events the CLI prints to stdout. The agent-facing contract.
 //!
-//! IMPORTANT: this shape is the public API. The legacy `movi` CLI prints
-//! exactly these shapes. ShadowDroid keeps wire-compat so the user-level
-//! `movi` skill keeps working unchanged.
+//! IMPORTANT: this shape is the public API. Keep it stable so existing watch
+//! stream consumers and generated agent integrations continue to work.
 
 use crate::proto::{AppRef, Element, ScreenResponse, Viewport};
 use serde::Serialize;

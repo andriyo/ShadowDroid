@@ -169,7 +169,7 @@ async fn swipe(
     }
 }
 
-/// Compute a swipe inside a rectangle for the given finger direction, moving
+/// Compute a swipe inside a rectangle for the given finger direction, crossing
 /// across the middle 60% so it stays clear of the edges.
 fn swipe_within(x1: i32, y1: i32, x2: i32, y2: i32, finger_dir: &str) -> (i32, i32, i32, i32) {
     let cx = (x1 + x2) / 2;

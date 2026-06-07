@@ -124,13 +124,13 @@ We'll start with Solution 1 and only build Solution 2 if real use surfaces pain.
 | UI Automator version         | Bundled, older                                  | AndroidX 2.3.0+ (first-class Compose)                    |
 | Wire format                  | JSON-RPC 2.0                                    | REST + JSON (cleaner, easier to curl)                    |
 | Crash detection              | Not built in                                    | Built in (logcat tail + structured events)               |
-| Watchers                     | On-device (limited)                             | Laptop-side (any movi command, max_fires, easy to evolve)|
+| Watchers                     | On-device (limited)                             | Laptop-side (JSON commands, max_fires, easy to evolve)    |
 | Streaming event model        | No                                              | Yes — JSON-lines, debounced, hash-diffed                  |
 | Distribution                 | `pip install`                                   | `cargo install` or single binary download                |
 | Initial dev effort to match  | Already shipping                                | ~3-4 weeks (this repo)                                   |
 | Long-term maintenance        | Inherits upstream                               | Owned (good and bad)                                     |
 
-## 8. What the agent's view looks like (unchanged from `movi`)
+## 8. What the agent's view looks like
 
 ```json
 {"type":"ready","device":"emulator-5554","viewport":{"w":1080,"h":2424},"server_version":"0.1.3","ts":...}

@@ -8,7 +8,7 @@ Last update: 2026-05-19 M3 crash proof + M4 implementation pass.
 - **M2 is feature-complete on both sides** — server endpoints (`/v1/screen`, `/v1/tap`, `/v1/swipe`, `/v1/screenshot.png`, `/v1/shell`, all the others) + CLI dispatch for every subcommand. The full Livd demo (launch → screen dump → tap profile tab by id → screenshot → shell) ran end-to-end and worked.
 - **M3 is now crash-proven against Livd.** `shadowdroid watch --app com.livd` captured Livd's built-in Crashlytics debug crash as a structured Java crash: `java.lang.RuntimeException`, message `Crashlytics DEV fatal test`, stack rooted at `CrashlyticsDebugScreen.kt:91`, plus logcat context and device info.
 - **M4 is implemented.** Server routes now cover `find`, `find_tap`, limited xpath, toast buffering, and file push/pull. CLI verbs now cover `tap_text`, `tap_rid`, `tap_desc`, `xpath`, `xpath_tap`, `wait_for`, `toast`, `push`, and `pull`. `watch --watcher-file` and runtime watcher commands (`add_watcher`, `remove_watcher`, `list_watchers`, `clear_watchers`) are wired through the same dispatch path. Live validation covered selectors, xpath, file round-trip, and watcher-file firing; a real app-toast source is still the remaining toast proof.
-- **One known blocker for repeated dev cycles**: UiAutomation is single-owner. The scary Android 16 "already registered" failure was reproduced, but the live cause in follow-up was an old host-side `movi`/openatx watcher respawning `/data/local/tmp/u2.jar` (`com.wetest.uia2.Main`) after ShadowDroid killed it. After stopping that watcher and killing the device process, `shadowdroid connect` worked again on the same Android 16 emulator without `-wipe-data`.
+- **One known blocker for repeated dev cycles**: UiAutomation is single-owner. The scary Android 16 "already registered" failure was reproduced, but the live cause in follow-up was an old host-side uiautomator2/openatx watcher respawning `/data/local/tmp/u2.jar` (`com.wetest.uia2.Main`) after ShadowDroid killed it. After stopping that watcher and killing the device process, `shadowdroid connect` worked again on the same Android 16 emulator without `-wipe-data`.
 
 ## What's in the repo
 
@@ -91,7 +91,7 @@ If `connect` fails with "server did not become ready", check `adb shell cat /sdc
 adb shell "ps -A -o USER,PID,PPID,NAME,ARGS | grep -E 'app_process|uiautomator|shadowdroid|wetest|atx'"
 ```
 
-If you see `com.wetest.uia2.Main`, stop the host-side `uiautomator2`/`movi` watcher that is respawning it, then kill the device process and retry. If there is no visible owner and the slot still survives cleanup, use the heavier AVD reset:
+If you see `com.wetest.uia2.Main`, stop the host-side `uiautomator2` or openatx watcher that is respawning it, then kill the device process and retry. If there is no visible owner and the slot still survives cleanup, use the heavier AVD reset:
 
 ```bash
 # Stop emulator, wipe data, restart fresh:
@@ -110,7 +110,7 @@ adb install -r -t ~/Work/Livd/androidApp/build/outputs/apk/debug/androidApp-debu
 - `shadowdroid disconnect` → cleanly force-stops + removes port forward
 - APK source precedence chain: `--apk` flag works; repo auto-discovery works; cached + GH release stubbed for M5
 
-### M2 (everything one-shot from the legacy `movi` CLI)
+### M2 (core one-shot CLI verbs)
 - `/v1/state` → version + viewport + current_app (✓)
 - `/v1/screen` → flat element list with stable IDs, screen_hash, viewport, current_app (✓ — got 16 elements from the launcher)
 - `/v1/screenshot.png` → ~1.2MB PNG 1080x2424 (✓)

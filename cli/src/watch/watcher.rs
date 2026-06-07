@@ -1,6 +1,6 @@
-//! Declarative popup-killers. Pure port of movi/watcher.py.
+//! Declarative popup-killers for `shadowdroid watch`.
 //!
-//! Rule shape (same as movi):
+//! Rule shape:
 //!   {
 //!     "name":   "allow_notifications",
 //!     "when":   {"text": "Allow"},

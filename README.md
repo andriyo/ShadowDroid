@@ -9,7 +9,7 @@ ShadowDroid is a two-piece system:
 
 The two talk over `adb forward` + HTTP. No Python anywhere. No Appium server. No `uiautomator2` Python package.
 
-> Successor to `movi` (MobiVision). Same agent-driving philosophy, no Python in the dependency tree, latest UI Automator, single binary distribution.
+ShadowDroid is intentionally self-contained: no Python dependency tree, current UI Automator, and a single binary distribution.
 
 ## Why it exists
 

@@ -4,8 +4,8 @@
 //!   - JSON: {"cmd":"tap","id":5}
 //!   - shorthand: `tap 5`, `back`, `launch com.foo`, `swipe 100 1500 100 200`
 //!
-//! Mirrors the `parse_command` function from the legacy `movi` CLI so existing
-//! piped scripts (and the `movi` skill) keep working.
+//! Keeps the watch stream's historical shorthand grammar so existing piped
+//! scripts and generated agent integrations keep working.
 
 #![allow(dead_code)]
 
