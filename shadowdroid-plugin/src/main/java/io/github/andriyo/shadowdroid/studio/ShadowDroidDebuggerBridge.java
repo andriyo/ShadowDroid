@@ -26,8 +26,7 @@ import com.intellij.openapi.application.Application;
 import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.diagnostic.Logger;
 import com.intellij.openapi.project.Project;
-import com.intellij.openapi.project.ProjectManagerListener;
-import com.intellij.openapi.startup.StartupActivity;
+import com.intellij.openapi.startup.ProjectActivity;
 import com.intellij.openapi.vfs.LocalFileSystem;
 import com.intellij.openapi.vfs.VirtualFile;
 import com.intellij.xdebugger.XDebugSession;
@@ -45,6 +44,8 @@ import com.sun.jdi.StringReference;
 import com.sun.jdi.Value;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import kotlin.Unit;
+import kotlin.coroutines.Continuation;
 import org.jetbrains.android.sdk.AndroidSdkUtils;
 import org.jetbrains.java.debugger.breakpoints.properties.JavaLineBreakpointProperties;
 
@@ -66,7 +67,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicReference;
 
-public final class ShadowDroidDebuggerBridge implements StartupActivity, ProjectManagerListener {
+public final class ShadowDroidDebuggerBridge implements ProjectActivity {
     private static final Logger LOG = Logger.getInstance(ShadowDroidDebuggerBridge.class);
     private static final int DEFAULT_PORT = 50576;
     private static final int API_VERSION = 1;
@@ -77,13 +78,9 @@ public final class ShadowDroidDebuggerBridge implements StartupActivity, Project
     private static volatile String serverUrl;
 
     @Override
-    public void runActivity(Project project) {
+    public Object execute(Project project, Continuation<? super Unit> continuation) {
         registerProject(project);
-    }
-
-    @Override
-    public void projectOpened(Project project) {
-        registerProject(project);
+        return Unit.INSTANCE;
     }
 
     private static void registerProject(Project project) {
@@ -142,24 +139,27 @@ public final class ShadowDroidDebuggerBridge implements StartupActivity, Project
         try {
             String path = exchange.getRequestURI().getPath();
             Map<String, String> query = parseQuery(exchange.getRequestURI().getRawQuery());
-            Response response;
-            switch (path) {
-                case "/v1/status" -> response = status();
-                case "/v1/sessions" -> response = sessions();
-                case "/v1/session/control" -> response = controlSession(query);
-                case "/v1/session/stack" -> response = currentStack(query);
-                case "/v1/session/threads" -> response = threads(query);
-                case "/v1/session/variables" -> response = variables(query);
-                case "/v1/clients" -> response = androidClients(query);
-                case "/v1/breakpoints" -> response = breakpoints();
-                case "/v1/breakpoints/line" -> response = addLineBreakpoint(query);
-                case "/v1/attach" -> response = openAndroidAttachDebugger(query);
-                default -> response = new Response(HttpURLConnection.HTTP_NOT_FOUND, obj("ok", false, "error", "not_found", "path", path));
-            }
+            Response response = onIdeaThread(() -> dispatch(path, query));
             send(exchange, response.status, response.body);
         } catch (Throwable t) {
             send(exchange, HttpURLConnection.HTTP_INTERNAL_ERROR, obj("ok", false, "error", t.getMessage() == null ? t.getClass().getName() : t.getMessage()));
         }
+    }
+
+    private static Response dispatch(String path, Map<String, String> query) {
+        return switch (path) {
+            case "/v1/status" -> status();
+            case "/v1/sessions" -> sessions();
+            case "/v1/session/control" -> controlSession(query);
+            case "/v1/session/stack" -> currentStack(query);
+            case "/v1/session/threads" -> threads(query);
+            case "/v1/session/variables" -> variables(query);
+            case "/v1/clients" -> androidClients(query);
+            case "/v1/breakpoints" -> breakpoints();
+            case "/v1/breakpoints/line" -> addLineBreakpoint(query);
+            case "/v1/attach" -> openAndroidAttachDebugger(query);
+            default -> new Response(HttpURLConnection.HTTP_NOT_FOUND, obj("ok", false, "error", "not_found", "path", path));
+        };
     }
 
     private static Response status() {
