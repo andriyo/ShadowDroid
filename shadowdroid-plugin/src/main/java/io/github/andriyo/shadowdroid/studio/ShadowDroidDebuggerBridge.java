@@ -10,7 +10,10 @@ import com.android.tools.idea.execution.common.debug.utils.AndroidConnectDebugge
 import com.intellij.execution.RunManager;
 import com.intellij.execution.RunnerAndConfigurationSettings;
 import com.intellij.execution.configurations.RunConfiguration;
+import com.intellij.debugger.engine.DebuggerManagerThreadImpl;
+import com.intellij.debugger.engine.JavaDebugProcess;
 import com.intellij.debugger.engine.JavaStackFrame;
+import com.intellij.debugger.engine.events.DebuggerCommandImpl;
 import com.intellij.debugger.jdi.LocalVariableProxyImpl;
 import com.intellij.debugger.jdi.StackFrameProxyImpl;
 import com.intellij.debugger.jdi.ThreadReferenceProxyImpl;
@@ -211,7 +214,7 @@ public final class ShadowDroidDebuggerBridge implements ProjectActivity {
         XStackFrame frame = session.getCurrentStackFrame();
         List<Object> frames = new ArrayList<>();
         if (frame instanceof JavaStackFrame javaFrame) {
-            frames.addAll(javaFrames(javaFrame, limit));
+            frames.addAll(javaFrames(session, javaFrame, limit));
         } else if (frame != null) {
             frames.add(frameInfo(frame, 0));
         }
@@ -229,7 +232,7 @@ public final class ShadowDroidDebuggerBridge implements ProjectActivity {
             XStackFrame top = stacks[i].getTopFrame();
             List<Object> frames = new ArrayList<>();
             if (top instanceof JavaStackFrame javaFrame) {
-                frames.addAll(javaFrames(javaFrame, limit));
+                frames.addAll(javaFrames(session, javaFrame, limit));
             } else if (top != null) {
                 frames.add(frameInfo(top, 0));
             }
@@ -246,24 +249,26 @@ public final class ShadowDroidDebuggerBridge implements ProjectActivity {
             return ok("ok", true, "session", sessionInfo(sessionIndex(session), session), "variables", Collections.emptyList(), "warning", "current frame is not a Java/Kotlin frame");
         }
         try {
-            StackFrameProxyImpl proxy = javaFrame.getStackFrameProxy();
-            List<Object> locals = new ArrayList<>();
-            for (LocalVariableProxyImpl local : proxy.visibleVariables()) {
-                Value value = proxy.getValue(local);
-                locals.add(map(
-                    "name", local.name(),
-                    "declared_type", local.typeName(),
-                    "type", value == null ? null : value.type().name(),
-                    "value", valueText(value)
-                ));
-            }
-            ObjectReference thisObject = proxy.thisObject();
-            return ok(
-                "ok", true,
-                "session", sessionInfo(sessionIndex(session), session),
-                "this", thisObject == null ? null : valueToMap("this", thisObject),
-                "variables", locals
-            );
+            return onDebuggerThread(session, () -> {
+                StackFrameProxyImpl proxy = javaFrame.getStackFrameProxy();
+                List<Object> locals = new ArrayList<>();
+                for (LocalVariableProxyImpl local : proxy.visibleVariables()) {
+                    Value value = proxy.getValue(local);
+                    locals.add(map(
+                        "name", local.name(),
+                        "declared_type", local.typeName(),
+                        "type", value == null ? null : value.type().name(),
+                        "value", valueText(value)
+                    ));
+                }
+                ObjectReference thisObject = proxy.thisObject();
+                return ok(
+                    "ok", true,
+                    "session", sessionInfo(sessionIndex(session), session),
+                    "this", thisObject == null ? null : valueToMap("this", thisObject),
+                    "variables", locals
+                );
+            });
         } catch (Throwable t) {
             return bad(t.getMessage());
         }
@@ -468,17 +473,19 @@ public final class ShadowDroidDebuggerBridge implements ProjectActivity {
         return defaultDebugger != null ? defaultDebugger : fallback;
     }
 
-    private static List<Object> javaFrames(JavaStackFrame frame, int limit) {
+    private static List<Object> javaFrames(XDebugSession session, JavaStackFrame frame, int limit) {
         try {
-            ThreadReferenceProxyImpl thread = frame.getStackFrameProxy().threadProxy();
-            List<Object> frames = new ArrayList<>();
-            int index = 0;
-            for (StackFrameProxyImpl stackFrame : thread.frames()) {
-                if (index >= limit) break;
-                frames.add(frameInfo(stackFrame.location(), index, thread.name()));
-                index++;
-            }
-            return frames;
+            return onDebuggerThread(session, () -> {
+                ThreadReferenceProxyImpl thread = frame.getStackFrameProxy().threadProxy();
+                List<Object> frames = new ArrayList<>();
+                int index = 0;
+                for (StackFrameProxyImpl stackFrame : thread.frames()) {
+                    if (index >= limit) break;
+                    frames.add(frameInfo(stackFrame.location(), index, thread.name()));
+                    index++;
+                }
+                return frames;
+            });
         } catch (Throwable t) {
             return List.of(map("error", t.getMessage()));
         }
@@ -721,6 +728,29 @@ public final class ShadowDroidDebuggerBridge implements ProjectActivity {
             }
         });
         if (error.get() != null) throw error.get();
+        return value.get();
+    }
+
+    private static <T> T onDebuggerThread(XDebugSession session, ThrowingSupplier<T> supplier) throws Exception {
+        if (DebuggerManagerThreadImpl.isManagerThread()) return supplier.get();
+        if (!(session.getDebugProcess() instanceof JavaDebugProcess javaProcess)) return supplier.get();
+
+        DebuggerManagerThreadImpl managerThread = javaProcess.getDebuggerSession().getProcess().getManagerThread();
+        AtomicReference<T> value = new AtomicReference<>();
+        AtomicReference<Throwable> error = new AtomicReference<>();
+        managerThread.invokeAndWait(new DebuggerCommandImpl() {
+            @Override
+            protected void action() {
+                try {
+                    value.set(supplier.get());
+                } catch (Throwable t) {
+                    error.set(t);
+                }
+            }
+        });
+        if (error.get() instanceof Exception e) throw e;
+        if (error.get() instanceof Error e) throw e;
+        if (error.get() != null) throw new RuntimeException(error.get());
         return value.get();
     }
 
