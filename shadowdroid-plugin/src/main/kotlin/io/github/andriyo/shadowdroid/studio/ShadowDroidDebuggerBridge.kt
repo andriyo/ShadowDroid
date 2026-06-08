@@ -1,0 +1,692 @@
+package io.github.andriyo.shadowdroid.studio
+
+import com.intellij.debugger.engine.JavaStackFrame
+import com.intellij.debugger.jdi.LocalVariableProxyImpl
+import com.intellij.debugger.jdi.StackFrameProxyImpl
+import com.intellij.openapi.diagnostic.Logger
+import com.intellij.openapi.project.Project
+import com.intellij.openapi.startup.ProjectActivity
+import com.intellij.xdebugger.XDebugProcess
+import com.intellij.xdebugger.XDebugSession
+import com.intellij.xdebugger.XDebugSessionListener
+import com.intellij.xdebugger.XDebuggerManager
+import com.intellij.xdebugger.XDebuggerManagerListener
+import com.intellij.xdebugger.XSourcePosition
+import com.intellij.xdebugger.breakpoints.XBreakpoint
+import com.intellij.xdebugger.breakpoints.XBreakpointListener
+import com.intellij.xdebugger.breakpoints.XLineBreakpoint
+import com.intellij.xdebugger.frame.XExecutionStack
+import com.intellij.xdebugger.frame.XStackFrame
+import com.sun.jdi.ObjectReference
+import com.sun.jdi.Value
+import com.sun.net.httpserver.HttpExchange
+import com.sun.net.httpserver.HttpServer
+import java.io.File
+import java.io.IOException
+import java.net.HttpURLConnection
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.nio.charset.StandardCharsets
+import java.nio.file.Files
+import java.time.Instant
+import java.util.Base64
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.Executors
+
+class ShadowDroidDebuggerBridge : ProjectActivity {
+    override suspend fun execute(project: Project) {
+        registerProject(project)
+    }
+
+    companion object {
+        private val LOG = Logger.getInstance(ShadowDroidDebuggerBridge::class.java)
+        private const val DEFAULT_PORT = 50576
+        private const val API_VERSION = 1
+
+        private val projects = CopyOnWriteArrayList<Project>()
+        private val watches = CopyOnWriteArrayList<WatchSpec>()
+        private val listenedProjects = ConcurrentHashMap.newKeySet<String>()
+        private val listenedSessions = ConcurrentHashMap.newKeySet<String>()
+        private val watchValues = ConcurrentHashMap<String, WatchValue>()
+        private val lock = Any()
+
+        @Volatile
+        private var server: HttpServer? = null
+
+        @Volatile
+        private var serverUrl: String? = null
+
+        private fun registerProject(project: Project) {
+            if (!projects.contains(project)) {
+                projects += project
+            }
+            installProjectListeners(project)
+            installSessionListeners(project)
+            ensureStarted()
+            writeRegistry()
+            LOG.info("ShadowDroid debugger bridge registered project ${project.name} at $serverUrl")
+        }
+
+        private fun installProjectListeners(project: Project) {
+            val key = projectKey(project)
+            if (!listenedProjects.add(key)) return
+            project.messageBus.connect(project).subscribe(XDebuggerManager.TOPIC, object : XDebuggerManagerListener {
+                override fun processStarted(debugProcess: XDebugProcess) {
+                    installSessionListeners(project)
+                }
+
+                override fun currentSessionChanged(previousSession: XDebugSession?, currentSession: XDebugSession?) {
+                    installSessionListeners(project)
+                    if (currentSession != null && currentSession.isSuspended) {
+                        recordSessionPause(currentSession)
+                    }
+                }
+            })
+            project.messageBus.connect(project).subscribe(XBreakpointListener.TOPIC, object : XBreakpointListener<XBreakpoint<*>> {
+                override fun breakpointLogMessage(breakpoint: XBreakpoint<*>, session: XDebugSession, message: String) {
+                    recordBreakpointHit(project, breakpoint)
+                }
+            })
+        }
+
+        private fun installSessionListeners(project: Project) {
+            for (session in XDebuggerManager.getInstance(project).debugSessions) {
+                val key = sessionKey(session)
+                if (!listenedSessions.add(key)) continue
+                session.addSessionListener(object : XDebugSessionListener {
+                    override fun sessionPaused() {
+                        recordSessionPause(session)
+                    }
+
+                    override fun stackFrameChanged() {
+                        if (session.isSuspended) {
+                            refreshWatchesForSession(session)
+                        }
+                    }
+
+                    override fun sessionStopped() {
+                        listenedSessions.remove(key)
+                    }
+                }, project)
+                if (session.isSuspended) {
+                    recordSessionPause(session)
+                }
+            }
+        }
+
+        private fun installAllSessionListeners() {
+            liveProjects().forEach(::installSessionListeners)
+        }
+
+        private fun recordSessionPause(session: XDebugSession) {
+            try {
+                recordLineBreakpointHit(session)
+            } catch (t: Throwable) {
+                LOG.debug("Unable to record breakpoint hit", t)
+            }
+            try {
+                refreshWatchesForSession(session)
+            } catch (t: Throwable) {
+                LOG.debug("Unable to refresh watches", t)
+            }
+        }
+
+        @Throws(Exception::class)
+        private fun recordLineBreakpointHit(session: XDebugSession) {
+            var pos: XSourcePosition? = session.currentPosition
+            if (pos == null && session.currentStackFrame != null) {
+                pos = session.currentStackFrame?.sourcePosition
+            }
+            if (pos?.file == null) return
+            val fileUrl = pos.file.url
+            val line = pos.line
+            val project = session.project
+            StudioThreading.onIdeaThread {
+                for (breakpoint in XDebuggerManager.getInstance(project).breakpointManager.allBreakpoints) {
+                    if (breakpoint is XLineBreakpoint<*> &&
+                        fileUrl == breakpoint.fileUrl &&
+                        breakpoint.line == line
+                    ) {
+                        recordBreakpointHit(project, breakpoint)
+                    }
+                }
+                null
+            }
+        }
+
+        private fun recordBreakpointHit(project: Project, breakpoint: XBreakpoint<*>) {
+            BreakpointBridge.recordHit(project, breakpoint)
+        }
+
+        private fun refreshWatchesForSession(session: XDebugSession) {
+            if (!session.isSuspended) return
+            val project = session.project
+            val projectKey = projectKey(project)
+            val renderOptions = DebuggerValues.RenderOptions(1, 64, 32)
+            for (watch in watches) {
+                if (watch.project != null && watch.project != projectKey) continue
+                try {
+                    val value = StudioThreading.onDebuggerThread(session) {
+                        val selected = DebuggerValues.selectedFrame(session, emptyMap())
+                        if (selected == null) {
+                            return@onDebuggerThread WatchValue.error(
+                                BridgeProtocol.nowMs(),
+                                sessionInfo(sessionIndex(session), session),
+                                null,
+                                "current frame is not a Java/Kotlin frame",
+                            )
+                        }
+                        val result = DebuggerValues.evaluatePath(selected.proxy, watch.expression)
+                        val rendered = DebuggerValues.valueToMap(
+                            watch.expression,
+                            result.value,
+                            result.declaredType,
+                            renderOptions,
+                            hashSetOf(),
+                        )
+                        WatchValue.ok(BridgeProtocol.nowMs(), sessionInfo(sessionIndex(session), session), selected.info(), rendered)
+                    }
+                    watchValues[watch.id] = value
+                } catch (t: Throwable) {
+                    watchValues[watch.id] = WatchValue.error(
+                        BridgeProtocol.nowMs(),
+                        sessionInfo(sessionIndex(session), session),
+                        null,
+                        t.message,
+                    )
+                }
+            }
+        }
+
+        private fun ensureStarted() {
+            if (server != null) return
+            synchronized(lock) {
+                if (server != null) return
+                val preferredPort = preferredPort()
+                val created = createServer(preferredPort) ?: createServer(0)
+                    ?: throw IllegalStateException("unable to start ShadowDroid debugger bridge")
+
+                created.createContext("/", ::handle)
+                created.executor = Executors.newCachedThreadPool { runnable ->
+                    Thread(runnable, "ShadowDroid debugger bridge").apply { isDaemon = true }
+                }
+                created.start()
+                server = created
+                serverUrl = "http://127.0.0.1:${created.address.port}"
+            }
+        }
+
+        private fun preferredPort(): Int {
+            val property = System.getProperty("shadowdroid.debugger.port")
+                ?.takeUnless { it.isBlank() }
+                ?: System.getenv("SHADOWDROID_STUDIO_DEBUGGER_PORT")
+            return property?.toIntOrNull() ?: DEFAULT_PORT
+        }
+
+        private fun createServer(port: Int): HttpServer? =
+            try {
+                HttpServer.create(InetSocketAddress(InetAddress.getByName("127.0.0.1"), port), 0)
+            } catch (_: IOException) {
+                null
+            }
+
+        private fun handle(exchange: HttpExchange) {
+            try {
+                val path = exchange.requestURI.path
+                val query = BridgeProtocol.parseQuery(exchange.requestURI.rawQuery)
+                val response = dispatch(path, query)
+                BridgeProtocol.send(exchange, response.status, response.body)
+            } catch (t: Throwable) {
+                BridgeProtocol.send(
+                    exchange,
+                    HttpURLConnection.HTTP_INTERNAL_ERROR,
+                    BridgeProtocol.obj("ok", false, "error", t.message ?: t.javaClass.name),
+                )
+            }
+        }
+
+        private fun dispatch(path: String, query: Map<String, String>): Response =
+            when (path) {
+                "/v1/status" -> status()
+                "/v1/sessions" -> sessions()
+                "/v1/session/control" -> controlSession(query)
+                "/v1/session/stack" -> currentStack(query)
+                "/v1/session/threads" -> threads(query)
+                "/v1/session/variables" -> variables(query)
+                "/v1/session/evaluate" -> evaluate(query)
+                "/v1/watches" -> watches(query)
+                "/v1/watches/add" -> addWatch(query)
+                "/v1/watches/remove" -> removeWatch(query)
+                "/v1/watches/clear" -> clearWatches()
+                "/v1/clients" -> AndroidAttachBridge.clients(selectProject(query, null), query)
+                "/v1/breakpoints" -> breakpoints()
+                "/v1/breakpoints/line" -> BreakpointBridge.addLine(query, selectProject(query, query["file"]))
+                "/v1/breakpoints/exception" -> BreakpointBridge.addException(query, selectProject(query, null))
+                "/v1/breakpoints/method" -> BreakpointBridge.addMethod(query, selectProject(query, null))
+                "/v1/breakpoints/field" -> BreakpointBridge.addField(query, selectProject(query, query["file"]))
+                "/v1/breakpoints/update" -> BreakpointBridge.update(query, liveProjects(), selectProject(query, null))
+                "/v1/breakpoints/remove" -> BreakpointBridge.remove(query, liveProjects(), selectProject(query, null))
+                "/v1/attach" -> AndroidAttachBridge.attach(selectProject(query, null), query)
+                "/v1/layout/snapshot" -> LayoutInspectorBridge.snapshot(selectProject(query, null), query)
+                "/v1/layout/recompositions" -> LayoutInspectorBridge.recompositions(selectProject(query, null), query)
+                "/v1/layout/source" -> LayoutInspectorBridge.source(selectProject(query, null), query)
+                else -> Response(
+                    HttpURLConnection.HTTP_NOT_FOUND,
+                    BridgeProtocol.obj("ok", false, "error", "not_found", "path", path),
+                )
+            }
+
+        private fun status(): Response {
+            installAllSessionListeners()
+            val sessions = allSessions()
+            val sessionPayload = sessions.mapIndexed { index, session -> sessionInfo(index, session) }
+            return BridgeProtocol.ok(
+                "ok", true,
+                "api_version", API_VERSION,
+                "url", serverUrl,
+                "projects", projectPayload(),
+                "sessions", sessionPayload,
+            )
+        }
+
+        private fun sessions(): Response {
+            installAllSessionListeners()
+            val payload = allSessions().mapIndexed { index, session -> sessionInfo(index, session) }
+            return BridgeProtocol.ok("ok", true, "sessions", payload)
+        }
+
+        private fun controlSession(query: Map<String, String>): Response {
+            val action = query["action"] ?: return BridgeProtocol.bad("missing action")
+            val session = selectSession(query) ?: return BridgeProtocol.bad("no debugger session")
+            return try {
+                StudioThreading.onIdeaThread {
+                    when (action) {
+                        "pause" -> session.pause()
+                        "resume" -> session.resume()
+                        "step_over" -> session.stepOver(false)
+                        "step_into" -> session.stepInto()
+                        "step_out" -> session.stepOut()
+                        "stop" -> session.stop()
+                        else -> throw IllegalArgumentException("unsupported action: $action")
+                    }
+                    null
+                }
+                BridgeProtocol.ok("ok", true, "action", action, "session", sessionInfo(sessionIndex(session), session))
+            } catch (t: Throwable) {
+                BridgeProtocol.bad(t.message)
+            }
+        }
+
+        private fun currentStack(query: Map<String, String>): Response {
+            val session = selectSession(query) ?: return BridgeProtocol.bad("no debugger session")
+            if (!session.isSuspended) {
+                return BridgeProtocol.ok(
+                    "ok", true,
+                    "session", sessionInfo(sessionIndex(session), session),
+                    "frames", emptyList<Any>(),
+                    "warning", "session is not suspended",
+                )
+            }
+            val limit = BridgeProtocol.intParam(query, "limit", 64, 1, 512)
+            val timeoutMs = BridgeProtocol.debuggerTimeoutMs(query)
+            val frame = session.currentStackFrame
+            val frames = mutableListOf<Any>()
+            if (frame is JavaStackFrame) {
+                frames.addAll(DebuggerValues.javaFrames(session, frame, limit, timeoutMs))
+            } else if (frame != null) {
+                frames += DebuggerValues.frameInfo(frame, 0)
+            }
+            return BridgeProtocol.ok("ok", true, "session", sessionInfo(sessionIndex(session), session), "frames", frames)
+        }
+
+        private fun threads(query: Map<String, String>): Response {
+            val session = selectSession(query) ?: return BridgeProtocol.bad("no debugger session")
+            if (!session.isSuspended) {
+                return BridgeProtocol.ok(
+                    "ok", true,
+                    "session", sessionInfo(sessionIndex(session), session),
+                    "threads", emptyList<Any>(),
+                    "warning", "session is not suspended",
+                )
+            }
+            val limit = BridgeProtocol.intParam(query, "limit", 32, 1, 128)
+            val timeoutMs = BridgeProtocol.debuggerTimeoutMs(query)
+            val stacks = session.suspendContext?.executionStacks ?: XExecutionStack.EMPTY_ARRAY
+            val payload = mutableListOf<Any>()
+            for (index in stacks.indices) {
+                val top: XStackFrame? = stacks[index].topFrame
+                val frames = mutableListOf<Any>()
+                if (top is JavaStackFrame) {
+                    frames.addAll(DebuggerValues.javaFrames(session, top, limit, timeoutMs))
+                } else if (top != null) {
+                    frames += DebuggerValues.frameInfo(top, 0)
+                }
+                payload += BridgeProtocol.map(
+                    "index", index,
+                    "name", stacks[index].displayName,
+                    "top_frame", top?.let { DebuggerValues.frameInfo(it, 0) },
+                    "frames", frames,
+                )
+            }
+            return BridgeProtocol.ok("ok", true, "session", sessionInfo(sessionIndex(session), session), "threads", payload)
+        }
+
+        private fun variables(query: Map<String, String>): Response {
+            val session = selectSession(query) ?: return BridgeProtocol.bad("no debugger session")
+            if (!session.isSuspended) {
+                return BridgeProtocol.ok(
+                    "ok", true,
+                    "session", sessionInfo(sessionIndex(session), session),
+                    "variables", emptyList<Any>(),
+                    "warning", "session is not suspended",
+                )
+            }
+            val renderOptions = DebuggerValues.RenderOptions(
+                BridgeProtocol.intParam(query, "depth", 0, 0, 8),
+                BridgeProtocol.intParam(query, "max_fields", 64, 1, 512),
+                BridgeProtocol.intParam(query, "max_array_items", 32, 0, 512),
+            )
+            val timeoutMs = BridgeProtocol.debuggerTimeoutMs(query)
+            return try {
+                StudioThreading.onDebuggerThread(session, timeoutMs) {
+                    val selected = DebuggerValues.selectedFrame(session, query)
+                    if (selected == null) {
+                        return@onDebuggerThread BridgeProtocol.ok(
+                            "ok", true,
+                            "session", sessionInfo(sessionIndex(session), session),
+                            "variables", emptyList<Any>(),
+                            "warning", "current frame is not a Java/Kotlin frame",
+                        )
+                    }
+                    val proxy: StackFrameProxyImpl = selected.proxy
+                    val locals = mutableListOf<Any>()
+                    for (local: LocalVariableProxyImpl in proxy.visibleVariables()) {
+                        val value: Value? = proxy.getValue(local)
+                        locals += DebuggerValues.valueToMap(local.name(), value, local.typeName(), renderOptions, hashSetOf())
+                    }
+                    val thisObject: ObjectReference? = proxy.thisObject()
+                    BridgeProtocol.ok(
+                        "ok", true,
+                        "session", sessionInfo(sessionIndex(session), session),
+                        "selected_frame", selected.info(),
+                        "this", thisObject?.let { DebuggerValues.valueToMap("this", it, null, renderOptions, hashSetOf()) },
+                        "variables", locals,
+                    )
+                }
+            } catch (t: Throwable) {
+                BridgeProtocol.bad(t.message)
+            }
+        }
+
+        private fun evaluate(query: Map<String, String>): Response {
+            val expression = query["expression"]
+            if (expression.isNullOrBlank()) return BridgeProtocol.bad("missing expression")
+            val session = selectSession(query) ?: return BridgeProtocol.bad("no debugger session")
+            if (!session.isSuspended) return BridgeProtocol.bad("session is not suspended")
+            val renderOptions = DebuggerValues.RenderOptions(
+                BridgeProtocol.intParam(query, "depth", 1, 0, 8),
+                BridgeProtocol.intParam(query, "max_fields", 64, 1, 512),
+                BridgeProtocol.intParam(query, "max_array_items", 32, 0, 512),
+            )
+            val timeoutMs = BridgeProtocol.debuggerTimeoutMs(query)
+            return try {
+                StudioThreading.onDebuggerThread(session, timeoutMs) {
+                    val selected = DebuggerValues.selectedFrame(session, query)
+                        ?: throw IllegalArgumentException("current frame is not a Java/Kotlin frame")
+                    val result = DebuggerValues.evaluatePath(selected.proxy, expression)
+                    BridgeProtocol.ok(
+                        "ok", true,
+                        "session", sessionInfo(sessionIndex(session), session),
+                        "selected_frame", selected.info(),
+                        "expression", expression,
+                        "mode", "jdi_path",
+                        "result", DebuggerValues.valueToMap(
+                            expression,
+                            result.value,
+                            result.declaredType,
+                            renderOptions,
+                            hashSetOf(),
+                        ),
+                    )
+                }
+            } catch (t: Throwable) {
+                BridgeProtocol.bad(t.message)
+            }
+        }
+
+        private fun addWatch(query: Map<String, String>): Response {
+            val expression = query["expression"]
+            if (expression.isNullOrBlank()) return BridgeProtocol.bad("missing expression")
+            val project = selectProject(query, null)
+            val projectKey = project?.let(::projectKey)
+            val name = query["name"]?.takeUnless { it.isBlank() } ?: expression
+            val watch = WatchSpec(watchId(projectKey, name, expression), projectKey, name, expression, true)
+            watches.removeIf { it.id == watch.id }
+            watches += watch
+            installAllSessionListeners()
+            return BridgeProtocol.ok("ok", true, "watch", watchInfo(watch, null))
+        }
+
+        private fun removeWatch(query: Map<String, String>): Response {
+            val id = query["id"]
+            if (id.isNullOrBlank()) return BridgeProtocol.bad("missing id")
+            val removed = watches.removeIf { it.id == id }
+            watchValues.remove(id)
+            return BridgeProtocol.ok("ok", true, "id", id, "removed", removed)
+        }
+
+        private fun clearWatches(): Response {
+            val removed = watches.size
+            watches.clear()
+            watchValues.clear()
+            return BridgeProtocol.ok("ok", true, "removed", removed)
+        }
+
+        private fun watches(query: Map<String, String>): Response {
+            installAllSessionListeners()
+            val session = selectSession(query)
+            val renderOptions = DebuggerValues.RenderOptions(
+                BridgeProtocol.intParam(query, "depth", 1, 0, 8),
+                BridgeProtocol.intParam(query, "max_fields", 64, 1, 512),
+                BridgeProtocol.intParam(query, "max_array_items", 32, 0, 512),
+            )
+            val timeoutMs = BridgeProtocol.debuggerTimeoutMs(query)
+            val payload = mutableListOf<Any>()
+            for (watch in watches) {
+                var value: Any? = null
+                val frame = session?.currentStackFrame
+                if (session != null && session.isSuspended && frame is JavaStackFrame) {
+                    try {
+                        value = StudioThreading.onDebuggerThread(session, timeoutMs) {
+                            val result = DebuggerValues.evaluatePath(frame.stackFrameProxy, watch.expression)
+                            val rendered = DebuggerValues.valueToMap(
+                                watch.expression,
+                                result.value,
+                                result.declaredType,
+                                renderOptions,
+                                hashSetOf(),
+                            )
+                            watchValues[watch.id] = WatchValue.ok(
+                                BridgeProtocol.nowMs(),
+                                sessionInfo(sessionIndex(session), session),
+                                null,
+                                rendered,
+                            )
+                            rendered
+                        }
+                    } catch (t: Throwable) {
+                        value = BridgeProtocol.map("ok", false, "error", t.message)
+                    }
+                }
+                payload += watchInfo(watch, value)
+            }
+            return BridgeProtocol.ok(
+                "ok", true,
+                "session", session?.let { sessionInfo(sessionIndex(it), it) },
+                "warning", if (session != null && !session.isSuspended) "session is not suspended; returning cached watch values" else null,
+                "watches", payload,
+            )
+        }
+
+        private fun breakpoints(): Response {
+            installAllSessionListeners()
+            return BreakpointBridge.list(liveProjects())
+        }
+
+        private fun watchInfo(watch: WatchSpec, value: Any?): Map<String, Any?> {
+            val cached = watchValues[watch.id]
+            val effectiveValue = value ?: cached?.value
+            return BridgeProtocol.map(
+                "id", watch.id,
+                "project", watch.project,
+                "name", watch.name,
+                "expression", watch.expression,
+                "enabled", watch.enabled,
+                "value", effectiveValue,
+                "updated_at", cached?.updatedAt,
+                "session", cached?.session,
+                "selected_frame", cached?.selectedFrame,
+                "error", cached?.error,
+            )
+        }
+
+        private fun watchId(project: String?, name: String, expression: String): String {
+            val raw = "${project ?: ""}|$name|$expression"
+            return "watch_" + Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(raw.toByteArray(StandardCharsets.UTF_8))
+        }
+
+        private fun sessionInfo(index: Int, session: XDebugSession): Map<String, Any?> {
+            var pos: XSourcePosition? = null
+            if (session.isSuspended) {
+                try {
+                    pos = session.currentPosition ?: session.currentStackFrame?.sourcePosition
+                } catch (t: Throwable) {
+                    LOG.debug("Unable to read current debugger source position", t)
+                }
+            }
+            return BridgeProtocol.map(
+                "index", index,
+                "name", session.sessionName,
+                "project", projectInfo(session.project),
+                "suspended", session.isSuspended,
+                "mixed_mode", session.isMixedMode,
+                "process", session.debugProcess.javaClass.name,
+                "position", sourcePositionInfo(pos),
+            )
+        }
+
+        private fun sourcePositionInfo(pos: XSourcePosition?): Map<String, Any?>? {
+            if (pos == null) return null
+            return BridgeProtocol.map(
+                "file", pos.file.path,
+                "url", pos.file.url,
+                "line", pos.line + 1,
+                "offset", pos.offset,
+            )
+        }
+
+        private fun projectInfo(project: Project): Map<String, Any?> =
+            BridgeProtocol.map(
+                "name", project.name,
+                "base_path", project.basePath,
+                "disposed", project.isDisposed,
+            )
+
+        private fun projectKey(project: Project): String = project.basePath ?: project.name
+
+        private fun sessionKey(session: XDebugSession): String =
+            "${projectKey(session.project)}|${session.sessionName}|${System.identityHashCode(session)}"
+
+        private fun selectSession(query: Map<String, String>): XDebugSession? {
+            val sessions = allSessions()
+            query["session"]?.toIntOrNull()?.let { index ->
+                if (index in sessions.indices) return sessions[index]
+            }
+            for (project in liveProjects()) {
+                XDebuggerManager.getInstance(project).currentSession?.let { return it }
+            }
+            return sessions.firstOrNull()
+        }
+
+        private fun selectProject(query: Map<String, String>, file: String?): Project? {
+            val requested = query["project"]
+            if (requested != null) {
+                for (project in liveProjects()) {
+                    if (requested == project.name || requested == project.basePath) return project
+                }
+            }
+            if (file != null) {
+                val normalized = File(file).absolutePath
+                for (project in liveProjects()) {
+                    val basePath = project.basePath
+                    if (basePath != null && normalized.startsWith(File(basePath).absolutePath + File.separator)) {
+                        return project
+                    }
+                }
+            }
+            return liveProjects().firstOrNull()
+        }
+
+        private fun sessionIndex(session: XDebugSession): Int =
+            allSessions().indexOfFirst { it === session }.takeIf { it >= 0 } ?: 0
+
+        private fun allSessions(): List<XDebugSession> =
+            liveProjects().flatMap { project -> XDebuggerManager.getInstance(project).debugSessions.toList() }
+
+        private fun liveProjects(): List<Project> {
+            val live = projects.filterNot { it.isDisposed }
+            if (live.size != projects.size) {
+                projects.clear()
+                projects.addAll(live)
+                writeRegistry()
+            }
+            return live
+        }
+
+        private fun projectPayload(): List<Map<String, Any?>> =
+            liveProjects().map(::projectInfo)
+
+        private fun writeRegistry() {
+            val url = serverUrl ?: return
+            try {
+                val dir = File(System.getProperty("user.home"), ".shadowdroid")
+                Files.createDirectories(dir.toPath())
+                val body = BridgeProtocol.obj(
+                    "api_version", API_VERSION,
+                    "url", url,
+                    "pid", ProcessHandle.current().pid(),
+                    "updated_at", Instant.now().toString(),
+                    "projects", projectPayload(),
+                )
+                Files.writeString(File(dir, "studio-debugger.json").toPath(), body, StandardCharsets.UTF_8)
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private data class WatchSpec(
+        val id: String,
+        val project: String?,
+        val name: String,
+        val expression: String,
+        val enabled: Boolean,
+    )
+
+    private data class WatchValue(
+        val updatedAt: Long,
+        val session: Any?,
+        val selectedFrame: Any?,
+        val value: Any?,
+        val error: String?,
+    ) {
+        companion object {
+            fun ok(updatedAt: Long, session: Any?, selectedFrame: Any?, value: Any?): WatchValue =
+                WatchValue(updatedAt, session, selectedFrame, value, null)
+
+            fun error(updatedAt: Long, session: Any?, selectedFrame: Any?, error: String?): WatchValue =
+                WatchValue(updatedAt, session, selectedFrame, null, error)
+        }
+    }
+}

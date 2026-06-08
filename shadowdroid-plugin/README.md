@@ -22,7 +22,6 @@ A generated project contains the following content structure:
 │   ├── libs.versions.toml  Version catalog
 ├── src                     Plugin sources
 │   ├── main
-│   │   ├── java/           Java production sources
 │   │   ├── kotlin/         Kotlin production sources
 │   │   └── resources/      Resources - plugin.xml, icons, messages
 ├── .gitignore              Git ignoring rules
@@ -97,11 +96,9 @@ bridge for source-aware agent debugging:
   Android Studio's active Layout Inspector model when it is connected to the
   running app.
 
-The plugin supports both Java and Kotlin sources. The debugger bridge remains
-mostly Java because that keeps calls into Android Studio's bundled debugger and
-Layout Inspector APIs independent from Kotlin compiler metadata drift. Prefer
-small bridge classes split by API area, and migrate individual pieces to Kotlin
-only after their Gradle and target Android Studio compatibility is verified.
+The plugin source is Kotlin. Keep bridge classes small and split by API area;
+when touching Android Studio's bundled debugger or Layout Inspector APIs, verify
+the Gradle Kotlin compiler version and target Android Studio version together.
 
 ## Publishing the plugin
 
