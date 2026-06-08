@@ -115,8 +115,15 @@ coding agent, with driving guidance and an auto-generated command reference:
 
 ```bash
 shadowdroid skill claude-code --install   # → ~/.claude/skills/shadowdroid/SKILL.md
-shadowdroid skill cursor   --install      # → .cursor/rules/shadowdroid.mdc
+shadowdroid skill cursor   --install      # → ~/.cursor/skills/shadowdroid/SKILL.md
 shadowdroid skill codex                   # → prints an AGENTS.md section to stdout
+```
+
+Cursor `--install` creates a personal skill that is available across projects.
+To write a project-scoped Cursor rule instead:
+
+```bash
+shadowdroid skill cursor --out /path/to/project/.cursor/rules/shadowdroid.mdc
 ```
 
 ## Agent debugging

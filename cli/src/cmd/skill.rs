@@ -11,7 +11,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use clap::CommandFactory;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::cli::Cli;
 
@@ -24,6 +24,9 @@ pub struct SkillArgs {
     #[arg(long)]
     pub out: Option<PathBuf>,
     /// Write to the agent's conventional location instead of stdout.
+    ///
+    /// Claude Code and Cursor installs are global under $HOME. Codex installs
+    /// are project-scoped and relative to the current working directory.
     #[arg(long)]
     pub install: bool,
 }
@@ -35,7 +38,6 @@ app (navigate, test, screenshot, reproduce a bug, automate a flow) — not for b
 
 pub fn run(args: &SkillArgs) -> Result<()> {
     let body = format!("{}\n\n{}", SKILL_BODY.trim(), command_reference());
-    let content = wrap_for_agent(&args.agent, &body)?;
 
     let path = if let Some(out) = &args.out {
         Some(out.clone())
@@ -45,6 +47,8 @@ pub fn run(args: &SkillArgs) -> Result<()> {
         None
     };
 
+    let content = content_for_destination(&args.agent, &body, path.as_deref(), args.install)?;
+
     match path {
         Some(p) => {
             if let Some(parent) = p.parent() {
@@ -52,18 +56,40 @@ pub fn run(args: &SkillArgs) -> Result<()> {
                     .with_context(|| format!("create {}", parent.display()))?;
             }
             std::fs::write(&p, &content).with_context(|| format!("writing {}", p.display()))?;
-            println!(
-                "{}",
-                serde_json::json!({
+            let absolute_path = absolute_path(&p)?;
+            let mut payload = serde_json::json!({
                     "type": "action", "cmd": "skill",
                     "agent": args.agent, "path": p.display().to_string(),
+                    "absolute_path": absolute_path.display().to_string(),
                     "bytes": content.len(),
-                })
-            );
+            });
+            if let Some(note) = install_note(&args.agent, &p, args.install) {
+                payload["note"] = serde_json::Value::String(note.to_string());
+            }
+            println!("{payload}");
         }
         None => print!("{content}"),
     }
     Ok(())
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    Ok(std::env::current_dir()
+        .context("resolve current working directory")?
+        .join(path))
+}
+
+fn install_note(agent: &str, path: &Path, install: bool) -> Option<&'static str> {
+    match agent {
+        "claude-code" => Some("Claude Code skills are global; restart or reload Claude Code if it was already running."),
+        "cursor" if install || is_cursor_skill_path(path) => Some("Cursor personal skills are global. Restart or reload Cursor if it was already running. For a project rule instead, pass --out <project>/.cursor/rules/shadowdroid.mdc."),
+        "cursor" => Some("Cursor project rules are workspace-scoped. Open the matching project folder in Cursor, or use --install for a global personal skill."),
+        "codex" => Some("Codex AGENTS.md instructions are project-scoped; place the file at the repo root opened by Codex."),
+        _ => None,
+    }
 }
 
 /// The agent's conventional integration location (relative to $HOME or $CWD).
@@ -75,10 +101,44 @@ fn conventional_path(agent: &str) -> Result<PathBuf> {
     };
     Ok(match agent {
         "claude-code" => home()?.join(".claude/skills/shadowdroid/SKILL.md"),
-        "cursor" => PathBuf::from(".cursor/rules/shadowdroid.mdc"),
+        "cursor" => home()?.join(".cursor/skills/shadowdroid/SKILL.md"),
         "codex" => PathBuf::from("AGENTS.md"),
         other => return Err(anyhow!("unknown agent '{other}'")),
     })
+}
+
+fn content_for_destination(
+    agent: &str,
+    body: &str,
+    path: Option<&Path>,
+    install: bool,
+) -> Result<String> {
+    if agent == "cursor" {
+        if install || path.is_some_and(is_cursor_skill_path) {
+            return Ok(wrap_cursor_skill(body));
+        }
+        if path.is_some_and(is_cursor_project_rule_path) {
+            return Ok(wrap_cursor_project_rule(body));
+        }
+    }
+    wrap_for_agent(agent, body)
+}
+
+fn is_cursor_skill_path(path: &Path) -> bool {
+    let raw = normalized_path(path);
+    raw.contains(".cursor/skills") || path.file_name().is_some_and(|name| name == "SKILL.md")
+}
+
+fn is_cursor_project_rule_path(path: &Path) -> bool {
+    let raw = normalized_path(path);
+    raw.contains(".cursor/rules")
+        || path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("mdc"))
+}
+
+fn normalized_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 fn wrap_for_agent(agent: &str, body: &str) -> Result<String> {
@@ -88,15 +148,65 @@ fn wrap_for_agent(agent: &str, body: &str) -> Result<String> {
             "---\nname: shadowdroid\ndescription: {desc}\n---\n\n# ShadowDroid\n\n{body}\n",
             desc = DESCRIPTION,
         ),
-        // Cursor rule: .mdc frontmatter. agent-requested (not always-applied).
-        "cursor" => format!(
-            "---\ndescription: {desc}\nglobs:\nalwaysApply: false\n---\n\n# ShadowDroid\n\n{body}\n",
-            desc = DESCRIPTION,
-        ),
+        // Cursor stdout defaults to a project rule because that is the most
+        // copy-paste friendly format for an arbitrary destination.
+        "cursor" => wrap_cursor_project_rule(body),
         // Codex / generic AGENTS.md: a self-contained section, no frontmatter.
         "codex" => format!("# ShadowDroid — driving Android\n\n{body}\n"),
-        other => return Err(anyhow!("unknown agent '{other}' (claude-code|cursor|codex)")),
+        other => {
+            return Err(anyhow!(
+                "unknown agent '{other}' (claude-code|cursor|codex)"
+            ))
+        }
     })
+}
+
+fn wrap_cursor_skill(body: &str) -> String {
+    format!(
+        "---\nname: shadowdroid\ndescription: {desc}\n---\n\n# ShadowDroid\n\n{body}\n",
+        desc = DESCRIPTION,
+    )
+}
+
+fn wrap_cursor_project_rule(body: &str) -> String {
+    format!(
+        "---\ndescription: {desc}\nglobs:\nalwaysApply: false\n---\n\n# ShadowDroid\n\n{body}\n",
+        desc = DESCRIPTION,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_install_uses_global_skill_format() {
+        let content = content_for_destination(
+            "cursor",
+            "body",
+            Some(Path::new("/home/user/.cursor/skills/shadowdroid/SKILL.md")),
+            true,
+        )
+        .unwrap();
+
+        assert!(content.starts_with("---\nname: shadowdroid\n"));
+        assert!(!content.contains("alwaysApply: false"));
+    }
+
+    #[test]
+    fn cursor_project_rule_output_uses_mdc_format() {
+        let content = content_for_destination(
+            "cursor",
+            "body",
+            Some(Path::new(".cursor/rules/shadowdroid.mdc")),
+            false,
+        )
+        .unwrap();
+
+        assert!(content.starts_with("---\ndescription: "));
+        assert!(content.contains("globs:\nalwaysApply: false"));
+        assert!(!content.contains("\nname: shadowdroid\n"));
+    }
 }
 
 /// Render the live command catalog as a grouped markdown reference.
