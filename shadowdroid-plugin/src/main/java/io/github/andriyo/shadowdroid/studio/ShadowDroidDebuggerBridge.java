@@ -41,6 +41,8 @@ import com.intellij.xdebugger.breakpoints.XLineBreakpoint;
 import com.intellij.xdebugger.frame.XExecutionStack;
 import com.intellij.xdebugger.frame.XStackFrame;
 import com.intellij.xdebugger.frame.XSuspendContext;
+import com.sun.jdi.ArrayReference;
+import com.sun.jdi.Field;
 import com.sun.jdi.Location;
 import com.sun.jdi.ObjectReference;
 import com.sun.jdi.StringReference;
@@ -63,9 +65,11 @@ import java.nio.file.Files;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicReference;
@@ -248,24 +252,24 @@ public final class ShadowDroidDebuggerBridge implements ProjectActivity {
         if (!(frame instanceof JavaStackFrame javaFrame)) {
             return ok("ok", true, "session", sessionInfo(sessionIndex(session), session), "variables", Collections.emptyList(), "warning", "current frame is not a Java/Kotlin frame");
         }
+        ValueRenderOptions renderOptions = new ValueRenderOptions(
+            intParam(query, "depth", 0, 0, 8),
+            intParam(query, "max_fields", 64, 1, 512),
+            intParam(query, "max_array_items", 32, 0, 512)
+        );
         try {
             return onDebuggerThread(session, () -> {
                 StackFrameProxyImpl proxy = javaFrame.getStackFrameProxy();
                 List<Object> locals = new ArrayList<>();
                 for (LocalVariableProxyImpl local : proxy.visibleVariables()) {
                     Value value = proxy.getValue(local);
-                    locals.add(map(
-                        "name", local.name(),
-                        "declared_type", local.typeName(),
-                        "type", value == null ? null : value.type().name(),
-                        "value", valueText(value)
-                    ));
+                    locals.add(valueToMap(local.name(), value, local.typeName(), renderOptions, new HashSet<>()));
                 }
                 ObjectReference thisObject = proxy.thisObject();
                 return ok(
                     "ok", true,
                     "session", sessionInfo(sessionIndex(session), session),
-                    "this", thisObject == null ? null : valueToMap("this", thisObject),
+                    "this", thisObject == null ? null : valueToMap("this", thisObject, null, renderOptions, new HashSet<>()),
                     "variables", locals
                 );
             });
@@ -282,6 +286,8 @@ public final class ShadowDroidDebuggerBridge implements ProjectActivity {
         if (line < 1) return bad("missing or invalid line");
         boolean enabled = booleanParam(query, "enabled", true);
         boolean temporary = booleanParam(query, "temporary", false);
+        String condition = query.get("condition");
+        boolean clearCondition = booleanParam(query, "clear_condition", false);
         Project project = selectProject(query, file);
         if (project == null) return bad("no project");
         try {
@@ -297,10 +303,18 @@ public final class ShadowDroidDebuggerBridge implements ProjectActivity {
                 }
                 if (type == null) throw new IllegalStateException("Java line breakpoint type is not available");
                 JavaLineBreakpointProperties props = type.createBreakpointProperties(virtualFile, line - 1);
-                XLineBreakpoint<?> created = XDebuggerManager.getInstance(project).getBreakpointManager()
-                    .addLineBreakpoint(type, virtualFile.getUrl(), line - 1, props, temporary);
-                created.setEnabled(enabled);
-                return created;
+                XLineBreakpoint<?> target = findLineBreakpoint(project, virtualFile.getUrl(), line - 1);
+                if (target == null) {
+                    target = XDebuggerManager.getInstance(project).getBreakpointManager()
+                        .addLineBreakpoint(type, virtualFile.getUrl(), line - 1, props, temporary);
+                }
+                target.setEnabled(enabled);
+                if (clearCondition) {
+                    target.setCondition(null);
+                } else if (condition != null) {
+                    target.setCondition(condition.isBlank() ? null : condition);
+                }
+                return target;
             });
             return ok("ok", true, "breakpoint", breakpointInfo(project, breakpoint));
         } catch (Throwable t) {
@@ -318,6 +332,17 @@ public final class ShadowDroidDebuggerBridge implements ProjectActivity {
             }
         }
         return ok("ok", true, "breakpoints", payload);
+    }
+
+    private static XLineBreakpoint<?> findLineBreakpoint(Project project, String fileUrl, int zeroBasedLine) {
+        for (XBreakpoint<?> breakpoint : XDebuggerManager.getInstance(project).getBreakpointManager().getAllBreakpoints()) {
+            if (breakpoint instanceof XLineBreakpoint<?> lineBreakpoint
+                && fileUrl.equals(lineBreakpoint.getFileUrl())
+                && lineBreakpoint.getLine() == zeroBasedLine) {
+                return lineBreakpoint;
+            }
+        }
+        return null;
     }
 
     private static Response androidClients(Map<String, String> query) {
@@ -518,13 +543,105 @@ public final class ShadowDroidDebuggerBridge implements ProjectActivity {
     }
 
     private static Map<String, Object> valueToMap(String name, Value value) {
-        return map("name", name, "type", value == null ? null : value.type().name(), "value", valueText(value));
+        return valueToMap(name, value, null, ValueRenderOptions.shallow(), new HashSet<>());
+    }
+
+    private static Map<String, Object> valueToMap(
+        String name,
+        Value value,
+        String declaredType,
+        ValueRenderOptions options,
+        Set<Long> visiting
+    ) {
+        Map<String, Object> payload = map(
+            "name", name,
+            "declared_type", declaredType,
+            "type", valueTypeName(value),
+            "value", valueText(value)
+        );
+        if (!(value instanceof ObjectReference objectReference)) {
+            return payload;
+        }
+
+        long objectId = objectReference.uniqueID();
+        payload.put("object_id", objectId);
+        if (options.depth <= 0) {
+            return payload;
+        }
+        if (!visiting.add(objectId)) {
+            payload.put("cycle", true);
+            return payload;
+        }
+        try {
+            if (objectReference instanceof StringReference stringReference) {
+                payload.put("string", stringReference.value());
+            } else if (objectReference instanceof ArrayReference arrayReference) {
+                payload.put("length", arrayReference.length());
+                payload.put("items", arrayItems(arrayReference, options.child(), visiting));
+                int truncated = Math.max(0, arrayReference.length() - options.maxArrayItems);
+                if (truncated > 0) payload.put("truncated_items", truncated);
+            } else {
+                payload.put("fields", objectFields(objectReference, options.child(), visiting));
+            }
+            return payload;
+        } catch (Throwable t) {
+            payload.put("error", t.getMessage());
+            return payload;
+        } finally {
+            visiting.remove(objectId);
+        }
     }
 
     private static String valueText(Value value) {
         if (value == null) return null;
         if (value instanceof StringReference stringReference) return stringReference.value();
         return value.toString();
+    }
+
+    private static String valueTypeName(Value value) {
+        if (value == null) return null;
+        try {
+            return value.type().name();
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static List<Object> arrayItems(ArrayReference arrayReference, ValueRenderOptions options, Set<Long> visiting) {
+        List<Object> items = new ArrayList<>();
+        int count = Math.min(arrayReference.length(), options.maxArrayItems);
+        for (int i = 0; i < count; i++) {
+            items.add(valueToMap("[" + i + "]", arrayReference.getValue(i), null, options, visiting));
+        }
+        return items;
+    }
+
+    private static List<Object> objectFields(ObjectReference objectReference, ValueRenderOptions options, Set<Long> visiting) {
+        List<Object> fields = new ArrayList<>();
+        int instanceFieldCount = 0;
+        for (Field field : objectReference.referenceType().allFields()) {
+            if (field.isStatic()) continue;
+            instanceFieldCount++;
+            if (fields.size() >= options.maxFields) continue;
+            fields.add(fieldToMap(objectReference, field, options, visiting));
+        }
+        int truncated = instanceFieldCount - fields.size();
+        if (truncated > 0) {
+            fields.add(map("name", "<truncated>", "truncated_fields", truncated));
+        }
+        return fields;
+    }
+
+    private static Map<String, Object> fieldToMap(ObjectReference objectReference, Field field, ValueRenderOptions options, Set<Long> visiting) {
+        try {
+            return valueToMap(field.name(), objectReference.getValue(field), field.typeName(), options, visiting);
+        } catch (Throwable t) {
+            return map(
+                "name", field.name(),
+                "declared_type", field.typeName(),
+                "error", t.getMessage()
+            );
+        }
     }
 
     private static Map<String, Object> sessionInfo(int index, XDebugSession session) {
@@ -560,6 +677,7 @@ public final class ShadowDroidDebuggerBridge implements ProjectActivity {
             "type", breakpoint.getType().getId(),
             "enabled", breakpoint.isEnabled(),
             "temporary", breakpoint.isTemporary(),
+            "condition", breakpoint.getConditionExpression() == null ? null : breakpoint.getConditionExpression().getExpression(),
             "file", pos == null ? null : pos.getFile().getPath(),
             "url", breakpoint.getFileUrl(),
             "line", breakpoint.getLine() + 1
@@ -874,6 +992,16 @@ public final class ShadowDroidDebuggerBridge implements ProjectActivity {
     }
 
     private record AttachClient(IDevice device, Client client) {
+    }
+
+    private record ValueRenderOptions(int depth, int maxFields, int maxArrayItems) {
+        static ValueRenderOptions shallow() {
+            return new ValueRenderOptions(0, 64, 32);
+        }
+
+        ValueRenderOptions child() {
+            return new ValueRenderOptions(Math.max(0, depth - 1), maxFields, maxArrayItems);
+        }
     }
 
     private interface ThrowingSupplier<T> {

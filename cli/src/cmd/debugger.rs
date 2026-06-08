@@ -76,7 +76,7 @@ pub enum DebuggerCmd {
     /// Print debugger threads and their stack frames.
     Threads(StackArgs),
     /// Print visible variables for the selected suspended frame.
-    Variables(SessionSelector),
+    Variables(VariablesArgs),
 }
 
 #[derive(Subcommand)]
@@ -98,6 +98,12 @@ pub enum BreakCmd {
         /// Create a temporary breakpoint.
         #[arg(long)]
         temporary: bool,
+        /// Breakpoint condition expression evaluated by Android Studio.
+        #[arg(long, conflicts_with = "clear_condition")]
+        condition: Option<String>,
+        /// Clear any condition on an existing breakpoint at this file/line.
+        #[arg(long)]
+        clear_condition: bool,
     },
 }
 
@@ -116,6 +122,22 @@ pub struct StackArgs {
     /// Maximum number of frames per stack.
     #[arg(long, default_value_t = 64)]
     pub limit: u32,
+}
+
+#[derive(Args)]
+pub struct VariablesArgs {
+    /// Debug session index from `debugger sessions`.
+    #[arg(long)]
+    pub session: Option<usize>,
+    /// Object expansion depth. 0 prints only local values, 1 prints direct fields.
+    #[arg(long, default_value_t = 0)]
+    pub depth: u32,
+    /// Maximum instance fields to include per object.
+    #[arg(long, default_value_t = 64)]
+    pub max_fields: u32,
+    /// Maximum array/list items to include per array.
+    #[arg(long, default_value_t = 32)]
+    pub max_array_items: u32,
 }
 
 #[derive(Args)]
@@ -177,17 +199,22 @@ pub async fn run(args: &DebuggerArgs) -> Result<()> {
             project,
             disabled,
             temporary,
+            condition,
+            clear_condition,
         }) => {
             let canonical = canonicalize_for_bridge(file)?;
             let line_s = line.to_string();
             let enabled_s = (!*disabled).to_string();
             let temporary_s = temporary.to_string();
+            let clear_condition_s = clear_condition.to_string();
             let params = [
                 ("file", Some(canonical.as_str())),
                 ("line", Some(line_s.as_str())),
                 ("project", project.as_deref()),
                 ("enabled", Some(enabled_s.as_str())),
                 ("temporary", Some(temporary_s.as_str())),
+                ("condition", condition.as_deref()),
+                ("clear_condition", Some(clear_condition_s.as_str())),
             ];
             bridge.get("/v1/breakpoints/line", &params).await?
         }
@@ -216,9 +243,17 @@ pub async fn run(args: &DebuggerArgs) -> Result<()> {
             ];
             bridge.get("/v1/session/threads", &params).await?
         }
-        DebuggerCmd::Variables(selector) => {
-            let session_s = selector.session.map(|s| s.to_string());
-            let params = [("session", session_s.as_deref())];
+        DebuggerCmd::Variables(args) => {
+            let session_s = args.session.map(|s| s.to_string());
+            let depth_s = args.depth.to_string();
+            let max_fields_s = args.max_fields.to_string();
+            let max_array_items_s = args.max_array_items.to_string();
+            let params = [
+                ("session", session_s.as_deref()),
+                ("depth", Some(depth_s.as_str())),
+                ("max_fields", Some(max_fields_s.as_str())),
+                ("max_array_items", Some(max_array_items_s.as_str())),
+            ];
             bridge.get("/v1/session/variables", &params).await?
         }
     };
