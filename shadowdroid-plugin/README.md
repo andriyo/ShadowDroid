@@ -22,7 +22,7 @@ A generated project contains the following content structure:
 │   ├── libs.versions.toml  Version catalog
 ├── src                     Plugin sources
 │   ├── main
-│   │   ├── kotlin/         Kotlin production sources
+│   │   ├── java/           Production sources
 │   │   └── resources/      Resources - plugin.xml, icons, messages
 ├── .gitignore              Git ignoring rules
 ├── build.gradle.kts        Gradle build configuration
@@ -35,9 +35,6 @@ A generated project contains the following content structure:
 
 In addition to the configuration files, the most crucial part is the `src` directory, which contains our implementation
 and the manifest for our plugin – [plugin.xml][file:plugin.xml].
-
-> [!NOTE]
-> To use Java in your plugin, create the `/src/main/java` directory.
 
 ## Plugin configuration file
 
@@ -80,6 +77,30 @@ Android Studio user plugin directory:
 ./gradlew -Pversion=0.1.4 buildPlugin verifyPluginStructure
 shadowdroid studio install --plugin build/distributions/shadowdroid-plugin-0.1.4.zip
 ```
+
+## Debugger bridge
+
+When Android Studio starts with the plugin installed, it opens a localhost bridge
+and writes its URL to `~/.shadowdroid/studio-debugger.json`. The CLI uses that
+bridge for source-aware agent debugging:
+
+- `shadowdroid debugger attach` attaches Studio's Android debugger to a process.
+- `debugger break ...` creates, updates, and removes line, exception, method,
+  and field breakpoints with stable IDs.
+- `debugger stack`, `threads`, `variables`, `eval`, and `watch` expose bounded
+  JSON state for suspended sessions.
+- `shadowdroid debug snapshot` enriches device/UI snapshots with Studio debugger
+  state when the bridge is available.
+- `shadowdroid layout snapshot --compose --semantics --source-map`,
+  `layout source --draw-id=...`, and `layout recompositions --reset` read
+  Android Studio's active Layout Inspector model when it is connected to the
+  running app.
+
+The bridge implementation is Java for now because the plugin build does not
+apply the Kotlin JVM plugin, and Java keeps calls into Android Studio's bundled
+debugger/Layout Inspector APIs independent from Kotlin compiler metadata drift.
+Keep bridge classes small and split by API area; migrate to Kotlin only after
+the Gradle plugin setup and target Android Studio version are verified together.
 
 ## Publishing the plugin
 

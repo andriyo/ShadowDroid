@@ -10,10 +10,12 @@
 
 pub mod app_install;
 pub mod collect;
+pub mod debug;
 pub mod debugger;
 pub mod device_profile;
 pub mod doctor;
 pub mod introspect;
+pub mod layout;
 pub mod permissions;
 pub mod scroll;
 pub mod skill;

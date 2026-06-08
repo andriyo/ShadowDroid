@@ -170,6 +170,36 @@ shadowdroid watch --app com.example.app | jq -c .
 # emits ready → screen_compact → … and a structured `crash` event on a stack trace
 ```
 
+## Debugging for agents
+
+Use a bounded snapshot when you need causality, not just the screen:
+
+```bash
+shadowdroid debug snapshot --app com.example.app --depth 1 | jq
+```
+
+With the Android Studio plugin installed and Studio restarted, use `debugger`
+for attach, breakpoints, stack, threads, variables, deterministic eval, and
+watches:
+
+```bash
+shadowdroid debugger attach --project /path/to/app --package com.example.app
+shadowdroid debugger break line --file app/src/main/java/Foo.kt --line 42
+shadowdroid debugger variables --thread 0 --frame 0 --depth 2 --timeout-ms 2500
+shadowdroid debugger eval 'this.state' --thread 0 --frame 0 --depth 2 --timeout-ms 5000
+shadowdroid debugger watch add 'this.state'
+```
+
+Prefer `debug record` for longer investigations; it writes a JSONL timeline of
+screen changes, logcat, debugger snapshots, screenshots, and app lifecycle.
+Use `layout snapshot --compose --semantics --source-map` when the question is
+visual structure or Compose source; use `layout source` to map a node back to
+code (`--id` for UIAutomator nodes, `--draw-id` for Android Studio Layout
+Inspector nodes) and `layout recompositions --reset` to isolate Compose
+recomposition counts during one interaction. Debugger read commands are bounded
+and return structured JSON warnings/errors instead of waiting indefinitely when
+the app is running or stopped on a frame without debug information.
+
 ## Make a device deterministic before driving
 
 ```bash

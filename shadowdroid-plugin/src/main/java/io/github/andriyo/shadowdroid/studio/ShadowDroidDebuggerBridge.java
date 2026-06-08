@@ -1,84 +1,70 @@
 package io.github.andriyo.shadowdroid.studio;
 
-import com.android.ddmlib.AndroidDebugBridge;
-import com.android.ddmlib.Client;
-import com.android.ddmlib.ClientData;
-import com.android.ddmlib.IDevice;
-import com.android.tools.idea.execution.common.debug.AndroidDebugger;
-import com.android.tools.idea.execution.common.debug.RunConfigurationWithDebugger;
-import com.android.tools.idea.execution.common.debug.utils.AndroidConnectDebugger;
-import com.intellij.execution.RunManager;
-import com.intellij.execution.RunnerAndConfigurationSettings;
-import com.intellij.execution.configurations.RunConfiguration;
-import com.intellij.debugger.engine.DebuggerManagerThreadImpl;
-import com.intellij.debugger.engine.JavaDebugProcess;
+import static io.github.andriyo.shadowdroid.studio.BridgeProtocol.bad;
+import static io.github.andriyo.shadowdroid.studio.BridgeProtocol.debuggerTimeoutMs;
+import static io.github.andriyo.shadowdroid.studio.BridgeProtocol.intParam;
+import static io.github.andriyo.shadowdroid.studio.BridgeProtocol.map;
+import static io.github.andriyo.shadowdroid.studio.BridgeProtocol.nowMs;
+import static io.github.andriyo.shadowdroid.studio.BridgeProtocol.obj;
+import static io.github.andriyo.shadowdroid.studio.BridgeProtocol.ok;
+import static io.github.andriyo.shadowdroid.studio.BridgeProtocol.parseQuery;
+import static io.github.andriyo.shadowdroid.studio.BridgeProtocol.send;
+import static io.github.andriyo.shadowdroid.studio.StudioThreading.onDebuggerThread;
+import static io.github.andriyo.shadowdroid.studio.StudioThreading.onIdeaThread;
+
 import com.intellij.debugger.engine.JavaStackFrame;
-import com.intellij.debugger.engine.events.DebuggerCommandImpl;
 import com.intellij.debugger.jdi.LocalVariableProxyImpl;
 import com.intellij.debugger.jdi.StackFrameProxyImpl;
-import com.intellij.debugger.jdi.ThreadReferenceProxyImpl;
-import com.intellij.debugger.ui.breakpoints.JavaLineBreakpointType;
-import com.intellij.openapi.actionSystem.ActionManager;
-import com.intellij.openapi.actionSystem.ActionPlaces;
-import com.intellij.openapi.actionSystem.AnAction;
-import com.intellij.openapi.actionSystem.AnActionEvent;
-import com.intellij.openapi.actionSystem.CommonDataKeys;
-import com.intellij.openapi.actionSystem.DataContext;
-import com.intellij.openapi.actionSystem.impl.SimpleDataContext;
-import com.intellij.openapi.application.Application;
-import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.diagnostic.Logger;
 import com.intellij.openapi.project.Project;
 import com.intellij.openapi.startup.ProjectActivity;
-import com.intellij.openapi.vfs.LocalFileSystem;
-import com.intellij.openapi.vfs.VirtualFile;
 import com.intellij.xdebugger.XDebugSession;
+import com.intellij.xdebugger.XDebugSessionListener;
 import com.intellij.xdebugger.XDebuggerManager;
+import com.intellij.xdebugger.XDebuggerManagerListener;
 import com.intellij.xdebugger.XSourcePosition;
 import com.intellij.xdebugger.breakpoints.XBreakpoint;
-import com.intellij.xdebugger.breakpoints.XBreakpointType;
+import com.intellij.xdebugger.breakpoints.XBreakpointListener;
 import com.intellij.xdebugger.breakpoints.XLineBreakpoint;
 import com.intellij.xdebugger.frame.XExecutionStack;
 import com.intellij.xdebugger.frame.XStackFrame;
 import com.intellij.xdebugger.frame.XSuspendContext;
-import com.sun.jdi.ArrayReference;
-import com.sun.jdi.Field;
-import com.sun.jdi.Location;
 import com.sun.jdi.ObjectReference;
-import com.sun.jdi.StringReference;
 import com.sun.jdi.Value;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import kotlin.Unit;
 import kotlin.coroutines.Continuation;
-import org.jetbrains.android.sdk.AndroidSdkUtils;
-import org.jetbrains.java.debugger.breakpoints.properties.JavaLineBreakpointProperties;
 
 import java.io.File;
 import java.io.IOException;
 import java.net.HttpURLConnection;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
-import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicReference;
 
 public final class ShadowDroidDebuggerBridge implements ProjectActivity {
     private static final Logger LOG = Logger.getInstance(ShadowDroidDebuggerBridge.class);
     private static final int DEFAULT_PORT = 50576;
     private static final int API_VERSION = 1;
     private static final CopyOnWriteArrayList<Project> PROJECTS = new CopyOnWriteArrayList<>();
+    private static final CopyOnWriteArrayList<WatchSpec> WATCHES = new CopyOnWriteArrayList<>();
+    private static final Set<String> LISTENED_PROJECTS = ConcurrentHashMap.newKeySet();
+    private static final Set<String> LISTENED_SESSIONS = ConcurrentHashMap.newKeySet();
+    private static final ConcurrentMap<String, WatchValue> WATCH_VALUES = new ConcurrentHashMap<>();
     private static final Object LOCK = new Object();
 
     private static volatile HttpServer server;
@@ -94,9 +80,132 @@ public final class ShadowDroidDebuggerBridge implements ProjectActivity {
         if (!PROJECTS.contains(project)) {
             PROJECTS.add(project);
         }
+        installProjectListeners(project);
+        installSessionListeners(project);
         ensureStarted();
         writeRegistry();
         LOG.info("ShadowDroid debugger bridge registered project " + project.getName() + " at " + serverUrl);
+    }
+
+    private static void installProjectListeners(Project project) {
+        String key = projectKey(project);
+        if (!LISTENED_PROJECTS.add(key)) return;
+        project.getMessageBus().connect(project).subscribe(XDebuggerManager.TOPIC, new XDebuggerManagerListener() {
+            @Override
+            public void processStarted(com.intellij.xdebugger.XDebugProcess debugProcess) {
+                installSessionListeners(project);
+            }
+
+            @Override
+            public void currentSessionChanged(XDebugSession previousSession, XDebugSession currentSession) {
+                installSessionListeners(project);
+                if (currentSession != null && currentSession.isSuspended()) {
+                    recordSessionPause(currentSession);
+                }
+            }
+        });
+        project.getMessageBus().connect(project).subscribe(XBreakpointListener.TOPIC, new XBreakpointListener<XBreakpoint<?>>() {
+            @Override
+            public void breakpointLogMessage(XBreakpoint<?> breakpoint, XDebugSession session, String message) {
+                recordBreakpointHit(project, breakpoint);
+            }
+        });
+    }
+
+    private static void installSessionListeners(Project project) {
+        for (XDebugSession session : XDebuggerManager.getInstance(project).getDebugSessions()) {
+            String key = sessionKey(session);
+            if (!LISTENED_SESSIONS.add(key)) continue;
+            session.addSessionListener(new XDebugSessionListener() {
+                @Override
+                public void sessionPaused() {
+                    recordSessionPause(session);
+                }
+
+                @Override
+                public void stackFrameChanged() {
+                    if (session.isSuspended()) {
+                        refreshWatchesForSession(session);
+                    }
+                }
+
+                @Override
+                public void sessionStopped() {
+                    LISTENED_SESSIONS.remove(key);
+                }
+            }, project);
+            if (session.isSuspended()) {
+                recordSessionPause(session);
+            }
+        }
+    }
+
+    private static void installAllSessionListeners() {
+        for (Project project : liveProjects()) {
+            installSessionListeners(project);
+        }
+    }
+
+    private static void recordSessionPause(XDebugSession session) {
+        try {
+            recordLineBreakpointHit(session);
+        } catch (Throwable t) {
+            LOG.debug("Unable to record breakpoint hit", t);
+        }
+        try {
+            refreshWatchesForSession(session);
+        } catch (Throwable t) {
+            LOG.debug("Unable to refresh watches", t);
+        }
+    }
+
+    private static void recordLineBreakpointHit(XDebugSession session) throws Exception {
+        XSourcePosition pos = session.getCurrentPosition();
+        if (pos == null && session.getCurrentStackFrame() != null) {
+            pos = session.getCurrentStackFrame().getSourcePosition();
+        }
+        if (pos == null || pos.getFile() == null) return;
+        String fileUrl = pos.getFile().getUrl();
+        int line = pos.getLine();
+        Project project = session.getProject();
+        onIdeaThread(() -> {
+            for (XBreakpoint<?> breakpoint : XDebuggerManager.getInstance(project).getBreakpointManager().getAllBreakpoints()) {
+                if (breakpoint instanceof XLineBreakpoint<?> lineBreakpoint
+                    && fileUrl.equals(lineBreakpoint.getFileUrl())
+                    && lineBreakpoint.getLine() == line) {
+                    recordBreakpointHit(project, breakpoint);
+                }
+            }
+            return null;
+        });
+    }
+
+    private static void recordBreakpointHit(Project project, XBreakpoint<?> breakpoint) {
+        BreakpointBridge.recordHit(project, breakpoint);
+    }
+
+    private static void refreshWatchesForSession(XDebugSession session) {
+        if (!session.isSuspended()) return;
+        Project project = session.getProject();
+        String projectKey = projectKey(project);
+        DebuggerValues.RenderOptions renderOptions = new DebuggerValues.RenderOptions(1, 64, 32);
+        for (WatchSpec watch : WATCHES) {
+            if (watch.project != null && !watch.project.equals(projectKey)) continue;
+            try {
+                WatchValue value = onDebuggerThread(session, () -> {
+                    DebuggerValues.SelectedFrame selected = DebuggerValues.selectedFrame(session, Collections.emptyMap());
+                    if (selected == null) {
+                        return WatchValue.error(nowMs(), sessionInfo(sessionIndex(session), session), null, "current frame is not a Java/Kotlin frame");
+                    }
+                    DebuggerValues.EvaluationResult result = DebuggerValues.evaluatePath(selected.proxy(), watch.expression);
+                    Object rendered = DebuggerValues.valueToMap(watch.expression, result.value(), result.declaredType(), renderOptions, new HashSet<>());
+                    return WatchValue.ok(nowMs(), sessionInfo(sessionIndex(session), session), selected.info(), rendered);
+                });
+                WATCH_VALUES.put(watch.id, value);
+            } catch (Throwable t) {
+                WATCH_VALUES.put(watch.id, WatchValue.error(nowMs(), sessionInfo(sessionIndex(session), session), null, t.getMessage()));
+            }
+        }
     }
 
     private static void ensureStarted() {
@@ -146,8 +255,8 @@ public final class ShadowDroidDebuggerBridge implements ProjectActivity {
         try {
             String path = exchange.getRequestURI().getPath();
             Map<String, String> query = parseQuery(exchange.getRequestURI().getRawQuery());
-            Response response = onIdeaThread(() -> dispatch(path, query));
-            send(exchange, response.status, response.body);
+            Response response = dispatch(path, query);
+            send(exchange, response.status(), response.body());
         } catch (Throwable t) {
             send(exchange, HttpURLConnection.HTTP_INTERNAL_ERROR, obj("ok", false, "error", t.getMessage() == null ? t.getClass().getName() : t.getMessage()));
         }
@@ -161,15 +270,29 @@ public final class ShadowDroidDebuggerBridge implements ProjectActivity {
             case "/v1/session/stack" -> currentStack(query);
             case "/v1/session/threads" -> threads(query);
             case "/v1/session/variables" -> variables(query);
-            case "/v1/clients" -> androidClients(query);
+            case "/v1/session/evaluate" -> evaluate(query);
+            case "/v1/watches" -> watches(query);
+            case "/v1/watches/add" -> addWatch(query);
+            case "/v1/watches/remove" -> removeWatch(query);
+            case "/v1/watches/clear" -> clearWatches();
+            case "/v1/clients" -> AndroidAttachBridge.clients(selectProject(query, null), query);
             case "/v1/breakpoints" -> breakpoints();
-            case "/v1/breakpoints/line" -> addLineBreakpoint(query);
-            case "/v1/attach" -> openAndroidAttachDebugger(query);
+            case "/v1/breakpoints/line" -> BreakpointBridge.addLine(query, selectProject(query, query.get("file")));
+            case "/v1/breakpoints/exception" -> BreakpointBridge.addException(query, selectProject(query, null));
+            case "/v1/breakpoints/method" -> BreakpointBridge.addMethod(query, selectProject(query, null));
+            case "/v1/breakpoints/field" -> BreakpointBridge.addField(query, selectProject(query, query.get("file")));
+            case "/v1/breakpoints/update" -> BreakpointBridge.update(query, liveProjects(), selectProject(query, null));
+            case "/v1/breakpoints/remove" -> BreakpointBridge.remove(query, liveProjects(), selectProject(query, null));
+            case "/v1/attach" -> AndroidAttachBridge.attach(selectProject(query, null), query);
+            case "/v1/layout/snapshot" -> LayoutInspectorBridge.snapshot(selectProject(query, null), query);
+            case "/v1/layout/recompositions" -> LayoutInspectorBridge.recompositions(selectProject(query, null), query);
+            case "/v1/layout/source" -> LayoutInspectorBridge.source(selectProject(query, null), query);
             default -> new Response(HttpURLConnection.HTTP_NOT_FOUND, obj("ok", false, "error", "not_found", "path", path));
         };
     }
 
     private static Response status() {
+        installAllSessionListeners();
         List<Object> sessionPayload = new ArrayList<>();
         List<XDebugSession> sessions = allSessions();
         for (int i = 0; i < sessions.size(); i++) {
@@ -179,6 +302,7 @@ public final class ShadowDroidDebuggerBridge implements ProjectActivity {
     }
 
     private static Response sessions() {
+        installAllSessionListeners();
         List<Object> payload = new ArrayList<>();
         List<XDebugSession> sessions = allSessions();
         for (int i = 0; i < sessions.size(); i++) {
@@ -214,13 +338,17 @@ public final class ShadowDroidDebuggerBridge implements ProjectActivity {
     private static Response currentStack(Map<String, String> query) {
         XDebugSession session = selectSession(query);
         if (session == null) return bad("no debugger session");
+        if (!session.isSuspended()) {
+            return ok("ok", true, "session", sessionInfo(sessionIndex(session), session), "frames", Collections.emptyList(), "warning", "session is not suspended");
+        }
         int limit = intParam(query, "limit", 64, 1, 512);
+        int timeoutMs = debuggerTimeoutMs(query);
         XStackFrame frame = session.getCurrentStackFrame();
         List<Object> frames = new ArrayList<>();
         if (frame instanceof JavaStackFrame javaFrame) {
-            frames.addAll(javaFrames(session, javaFrame, limit));
+            frames.addAll(DebuggerValues.javaFrames(session, javaFrame, limit, timeoutMs));
         } else if (frame != null) {
-            frames.add(frameInfo(frame, 0));
+            frames.add(DebuggerValues.frameInfo(frame, 0));
         }
         return ok("ok", true, "session", sessionInfo(sessionIndex(session), session), "frames", frames);
     }
@@ -228,7 +356,11 @@ public final class ShadowDroidDebuggerBridge implements ProjectActivity {
     private static Response threads(Map<String, String> query) {
         XDebugSession session = selectSession(query);
         if (session == null) return bad("no debugger session");
+        if (!session.isSuspended()) {
+            return ok("ok", true, "session", sessionInfo(sessionIndex(session), session), "threads", Collections.emptyList(), "warning", "session is not suspended");
+        }
         int limit = intParam(query, "limit", 32, 1, 128);
+        int timeoutMs = debuggerTimeoutMs(query);
         XSuspendContext context = session.getSuspendContext();
         XExecutionStack[] stacks = context == null ? XExecutionStack.EMPTY_ARRAY : context.getExecutionStacks();
         List<Object> payload = new ArrayList<>();
@@ -236,11 +368,11 @@ public final class ShadowDroidDebuggerBridge implements ProjectActivity {
             XStackFrame top = stacks[i].getTopFrame();
             List<Object> frames = new ArrayList<>();
             if (top instanceof JavaStackFrame javaFrame) {
-                frames.addAll(javaFrames(session, javaFrame, limit));
+                frames.addAll(DebuggerValues.javaFrames(session, javaFrame, limit, timeoutMs));
             } else if (top != null) {
-                frames.add(frameInfo(top, 0));
+                frames.add(DebuggerValues.frameInfo(top, 0));
             }
-            payload.add(map("index", i, "name", stacks[i].getDisplayName(), "top_frame", top == null ? null : frameInfo(top, 0), "frames", frames));
+            payload.add(map("index", i, "name", stacks[i].getDisplayName(), "top_frame", top == null ? null : DebuggerValues.frameInfo(top, 0), "frames", frames));
         }
         return ok("ok", true, "session", sessionInfo(sessionIndex(session), session), "threads", payload);
     }
@@ -248,28 +380,33 @@ public final class ShadowDroidDebuggerBridge implements ProjectActivity {
     private static Response variables(Map<String, String> query) {
         XDebugSession session = selectSession(query);
         if (session == null) return bad("no debugger session");
-        XStackFrame frame = session.getCurrentStackFrame();
-        if (!(frame instanceof JavaStackFrame javaFrame)) {
-            return ok("ok", true, "session", sessionInfo(sessionIndex(session), session), "variables", Collections.emptyList(), "warning", "current frame is not a Java/Kotlin frame");
+        if (!session.isSuspended()) {
+            return ok("ok", true, "session", sessionInfo(sessionIndex(session), session), "variables", Collections.emptyList(), "warning", "session is not suspended");
         }
-        ValueRenderOptions renderOptions = new ValueRenderOptions(
+        DebuggerValues.RenderOptions renderOptions = new DebuggerValues.RenderOptions(
             intParam(query, "depth", 0, 0, 8),
             intParam(query, "max_fields", 64, 1, 512),
             intParam(query, "max_array_items", 32, 0, 512)
         );
+        int timeoutMs = debuggerTimeoutMs(query);
         try {
-            return onDebuggerThread(session, () -> {
-                StackFrameProxyImpl proxy = javaFrame.getStackFrameProxy();
+            return onDebuggerThread(session, timeoutMs, () -> {
+                DebuggerValues.SelectedFrame selected = DebuggerValues.selectedFrame(session, query);
+                if (selected == null) {
+                    return ok("ok", true, "session", sessionInfo(sessionIndex(session), session), "variables", Collections.emptyList(), "warning", "current frame is not a Java/Kotlin frame");
+                }
+                StackFrameProxyImpl proxy = selected.proxy();
                 List<Object> locals = new ArrayList<>();
                 for (LocalVariableProxyImpl local : proxy.visibleVariables()) {
                     Value value = proxy.getValue(local);
-                    locals.add(valueToMap(local.name(), value, local.typeName(), renderOptions, new HashSet<>()));
+                    locals.add(DebuggerValues.valueToMap(local.name(), value, local.typeName(), renderOptions, new HashSet<>()));
                 }
                 ObjectReference thisObject = proxy.thisObject();
                 return ok(
                     "ok", true,
                     "session", sessionInfo(sessionIndex(session), session),
-                    "this", thisObject == null ? null : valueToMap("this", thisObject, null, renderOptions, new HashSet<>()),
+                    "selected_frame", selected.info(),
+                    "this", thisObject == null ? null : DebuggerValues.valueToMap("this", thisObject, null, renderOptions, new HashSet<>()),
                     "variables", locals
                 );
             });
@@ -278,376 +415,138 @@ public final class ShadowDroidDebuggerBridge implements ProjectActivity {
         }
     }
 
-    @SuppressWarnings({"unchecked", "rawtypes"})
-    private static Response addLineBreakpoint(Map<String, String> query) {
-        String file = query.get("file");
-        if (file == null || file.isBlank()) return bad("missing file");
-        int line = intParam(query, "line", -1, 1, Integer.MAX_VALUE);
-        if (line < 1) return bad("missing or invalid line");
-        boolean enabled = booleanParam(query, "enabled", true);
-        boolean temporary = booleanParam(query, "temporary", false);
-        String condition = query.get("condition");
-        boolean clearCondition = booleanParam(query, "clear_condition", false);
-        Project project = selectProject(query, file);
-        if (project == null) return bad("no project");
+    private static Response evaluate(Map<String, String> query) {
+        String expression = query.get("expression");
+        if (expression == null || expression.isBlank()) return bad("missing expression");
+        XDebugSession session = selectSession(query);
+        if (session == null) return bad("no debugger session");
+        if (!session.isSuspended()) return bad("session is not suspended");
+        DebuggerValues.RenderOptions renderOptions = new DebuggerValues.RenderOptions(
+            intParam(query, "depth", 1, 0, 8),
+            intParam(query, "max_fields", 64, 1, 512),
+            intParam(query, "max_array_items", 32, 0, 512)
+        );
+        int timeoutMs = debuggerTimeoutMs(query);
         try {
-            XLineBreakpoint<?> breakpoint = onIdeaThread(() -> {
-                VirtualFile virtualFile = LocalFileSystem.getInstance().refreshAndFindFileByIoFile(new File(file));
-                if (virtualFile == null) throw new IllegalArgumentException("file not found in IDE VFS: " + file);
-                JavaLineBreakpointType type = null;
-                for (XBreakpointType<?, ?> candidate : XBreakpointType.EXTENSION_POINT_NAME.getExtensionList()) {
-                    if (candidate instanceof JavaLineBreakpointType javaType) {
-                        type = javaType;
-                        break;
-                    }
-                }
-                if (type == null) throw new IllegalStateException("Java line breakpoint type is not available");
-                JavaLineBreakpointProperties props = type.createBreakpointProperties(virtualFile, line - 1);
-                XLineBreakpoint<?> target = findLineBreakpoint(project, virtualFile.getUrl(), line - 1);
-                if (target == null) {
-                    target = XDebuggerManager.getInstance(project).getBreakpointManager()
-                        .addLineBreakpoint(type, virtualFile.getUrl(), line - 1, props, temporary);
-                }
-                target.setEnabled(enabled);
-                if (clearCondition) {
-                    target.setCondition(null);
-                } else if (condition != null) {
-                    target.setCondition(condition.isBlank() ? null : condition);
-                }
-                return target;
+            return onDebuggerThread(session, timeoutMs, () -> {
+                DebuggerValues.SelectedFrame selected = DebuggerValues.selectedFrame(session, query);
+                if (selected == null) throw new IllegalArgumentException("current frame is not a Java/Kotlin frame");
+                DebuggerValues.EvaluationResult result = DebuggerValues.evaluatePath(selected.proxy(), expression);
+                return ok(
+                    "ok", true,
+                    "session", sessionInfo(sessionIndex(session), session),
+                    "selected_frame", selected.info(),
+                    "expression", expression,
+                    "mode", "jdi_path",
+                    "result", DebuggerValues.valueToMap(expression, result.value(), result.declaredType(), renderOptions, new HashSet<>())
+                );
             });
-            return ok("ok", true, "breakpoint", breakpointInfo(project, breakpoint));
         } catch (Throwable t) {
             return bad(t.getMessage());
         }
+    }
+
+    private static Response addWatch(Map<String, String> query) {
+        String expression = query.get("expression");
+        if (expression == null || expression.isBlank()) return bad("missing expression");
+        Project project = selectProject(query, null);
+        String projectKey = project == null ? null : projectKey(project);
+        String name = query.get("name");
+        if (name == null || name.isBlank()) name = expression;
+        WatchSpec watch = new WatchSpec(watchId(projectKey, name, expression), projectKey, name, expression, true);
+        WATCHES.removeIf(existing -> existing.id.equals(watch.id));
+        WATCHES.add(watch);
+        installAllSessionListeners();
+        return ok("ok", true, "watch", watchInfo(watch, null));
+    }
+
+    private static Response removeWatch(Map<String, String> query) {
+        String id = query.get("id");
+        if (id == null || id.isBlank()) return bad("missing id");
+        boolean removed = WATCHES.removeIf(watch -> watch.id.equals(id));
+        WATCH_VALUES.remove(id);
+        return ok("ok", true, "id", id, "removed", removed);
+    }
+
+    private static Response clearWatches() {
+        int removed = WATCHES.size();
+        WATCHES.clear();
+        WATCH_VALUES.clear();
+        return ok("ok", true, "removed", removed);
+    }
+
+    private static Response watches(Map<String, String> query) {
+        installAllSessionListeners();
+        XDebugSession session = selectSession(query);
+        DebuggerValues.RenderOptions renderOptions = new DebuggerValues.RenderOptions(
+            intParam(query, "depth", 1, 0, 8),
+            intParam(query, "max_fields", 64, 1, 512),
+            intParam(query, "max_array_items", 32, 0, 512)
+        );
+        int timeoutMs = debuggerTimeoutMs(query);
+        List<Object> payload = new ArrayList<>();
+        for (WatchSpec watch : WATCHES) {
+            Object value = null;
+            if (session != null && session.isSuspended() && session.getCurrentStackFrame() instanceof JavaStackFrame javaFrame) {
+                try {
+                    value = onDebuggerThread(session, timeoutMs, () -> {
+                        DebuggerValues.EvaluationResult result = DebuggerValues.evaluatePath(javaFrame.getStackFrameProxy(), watch.expression);
+                        Object rendered = DebuggerValues.valueToMap(watch.expression, result.value(), result.declaredType(), renderOptions, new HashSet<>());
+                        WATCH_VALUES.put(watch.id, WatchValue.ok(nowMs(), sessionInfo(sessionIndex(session), session), null, rendered));
+                        return rendered;
+                    });
+                } catch (Throwable t) {
+                    value = map("ok", false, "error", t.getMessage());
+                }
+            }
+            payload.add(watchInfo(watch, value));
+        }
+        return ok(
+            "ok", true,
+            "session", session == null ? null : sessionInfo(sessionIndex(session), session),
+            "warning", session != null && !session.isSuspended() ? "session is not suspended; returning cached watch values" : null,
+            "watches", payload
+        );
     }
 
     private static Response breakpoints() {
-        List<Object> payload = new ArrayList<>();
-        for (Project project : liveProjects()) {
-            for (XBreakpoint<?> breakpoint : XDebuggerManager.getInstance(project).getBreakpointManager().getAllBreakpoints()) {
-                if (breakpoint instanceof XLineBreakpoint<?> lineBreakpoint) {
-                    payload.add(breakpointInfo(project, lineBreakpoint));
-                }
-            }
-        }
-        return ok("ok", true, "breakpoints", payload);
+        installAllSessionListeners();
+        return BreakpointBridge.list(liveProjects());
     }
 
-    private static XLineBreakpoint<?> findLineBreakpoint(Project project, String fileUrl, int zeroBasedLine) {
-        for (XBreakpoint<?> breakpoint : XDebuggerManager.getInstance(project).getBreakpointManager().getAllBreakpoints()) {
-            if (breakpoint instanceof XLineBreakpoint<?> lineBreakpoint
-                && fileUrl.equals(lineBreakpoint.getFileUrl())
-                && lineBreakpoint.getLine() == zeroBasedLine) {
-                return lineBreakpoint;
-            }
-        }
-        return null;
-    }
-
-    private static Response androidClients(Map<String, String> query) {
-        Project project = selectProject(query, null);
-        if (project == null) return bad("no project");
-        try {
-            List<Object> payload = new ArrayList<>();
-            for (AttachClient candidate : matchingClients(project, query)) {
-                payload.add(clientInfo(candidate));
-            }
-            return ok("ok", true, "project", projectInfo(project), "clients", payload);
-        } catch (Throwable t) {
-            return bad(t.getMessage());
-        }
-    }
-
-    private static Response openAndroidAttachDebugger(Map<String, String> query) {
-        if (booleanParam(query, "dialog", false)) {
-            return openAndroidAttachDebuggerDialog(query);
-        }
-
-        Project project = selectProject(query, null);
-        if (project == null) return bad("no project");
-        try {
-            AttachClient selected = selectAttachClient(project, query);
-            RunConfigurationWithDebugger runConfiguration = selectRunConfiguration(project, query);
-            AndroidDebugger<?> debugger = selectAndroidDebugger(project, query);
-            if (debugger == null) return bad("no supported Android debugger");
-
-            AndroidConnectDebugger.closeOldSessionAndRun(project, debugger, selected.client, runConfiguration);
-            return ok(
-                "ok", true,
-                "action", "attach",
-                "project", projectInfo(project),
-                "client", clientInfo(selected),
-                "debugger", debuggerInfo(debugger),
-                "run_configuration", runConfigurationInfo(runConfiguration)
-            );
-        } catch (Throwable t) {
-            return bad(t.getMessage());
-        }
-    }
-
-    private static Response openAndroidAttachDebuggerDialog(Map<String, String> query) {
-        Project project = selectProject(query, null);
-        if (project == null) return bad("no project");
-        AnAction action = ActionManager.getInstance().getAction("AndroidConnectDebuggerAction");
-        if (action == null) return bad("AndroidConnectDebuggerAction is not available");
-        ApplicationManager.getApplication().invokeLater(() -> {
-            DataContext dataContext = SimpleDataContext.builder()
-                .add(CommonDataKeys.PROJECT, project)
-                .build();
-            AnActionEvent event = AnActionEvent.createFromAnAction(action, null, ActionPlaces.UNKNOWN, dataContext);
-            action.actionPerformed(event);
-        });
-        return ok("ok", true, "action", "AndroidConnectDebuggerAction", "project", projectInfo(project));
-    }
-
-    private static AttachClient selectAttachClient(Project project, Map<String, String> query) {
-        List<AttachClient> candidates = matchingClients(project, query);
-        if (candidates.isEmpty()) {
-            throw new IllegalArgumentException("no matching Android process; use debugger clients to inspect attachable processes");
-        }
-        if (candidates.size() > 1) {
-            throw new IllegalArgumentException("multiple matching Android processes; pass package, pid, or device");
-        }
-        return candidates.get(0);
-    }
-
-    private static List<AttachClient> matchingClients(Project project, Map<String, String> query) {
-        AndroidDebugBridge bridge = AndroidSdkUtils.getDebugBridge(project);
-        if (bridge == null) {
-            throw new IllegalStateException("Android debug bridge is not available for project");
-        }
-        String requestedDevice = query.get("device");
-        String requestedPackage = query.get("package");
-        Integer requestedPid = optionalInt(query.get("pid"));
-
-        List<AttachClient> candidates = new ArrayList<>();
-        for (IDevice device : bridge.getDevices()) {
-            if (!deviceMatches(device, requestedDevice)) continue;
-            if (!device.isOnline()) continue;
-            for (Client client : device.getClients()) {
-                if (!clientMatches(client, requestedPackage, requestedPid)) continue;
-                candidates.add(new AttachClient(device, client));
-            }
-        }
-        return candidates;
-    }
-
-    private static boolean deviceMatches(IDevice device, String requestedDevice) {
-        if (requestedDevice == null || requestedDevice.isBlank()) return true;
-        return requestedDevice.equals(device.getSerialNumber()) || requestedDevice.equals(device.getAvdName());
-    }
-
-    private static boolean clientMatches(Client client, String requestedPackage, Integer requestedPid) {
-        if (!client.isValid()) return false;
-        ClientData data = client.getClientData();
-        if (requestedPid != null && data.getPid() != requestedPid) return false;
-        if (requestedPackage == null || requestedPackage.isBlank()) return true;
-        String packageName = data.getPackageName();
-        String processName = data.getProcessName();
-        return requestedPackage.equals(packageName)
-            || requestedPackage.equals(processName)
-            || (processName != null && processName.startsWith(requestedPackage + ":"));
-    }
-
-    private static Integer optionalInt(String value) {
-        if (value == null || value.isBlank()) return null;
-        try {
-            return Integer.parseInt(value);
-        } catch (NumberFormatException e) {
-            throw new IllegalArgumentException("invalid integer: " + value);
-        }
-    }
-
-    private static RunConfigurationWithDebugger selectRunConfiguration(Project project, Map<String, String> query) {
-        String requested = query.get("configuration");
-        RunManager runManager = RunManager.getInstance(project);
-        if (requested != null && !requested.isBlank()) {
-            for (RunConfiguration configuration : runManager.getAllConfigurationsList()) {
-                if (configuration instanceof RunConfigurationWithDebugger withDebugger
-                    && requested.equals(configuration.getName())) {
-                    return withDebugger;
-                }
-            }
-            throw new IllegalArgumentException("Android run configuration not found: " + requested);
-        }
-
-        RunnerAndConfigurationSettings selected = runManager.getSelectedConfiguration();
-        if (selected != null && selected.getConfiguration() instanceof RunConfigurationWithDebugger withDebugger) {
-            return withDebugger;
-        }
-        return null;
-    }
-
-    private static AndroidDebugger<?> selectAndroidDebugger(Project project, Map<String, String> query) {
-        String requested = query.get("debugger");
-        AndroidDebugger<?> fallback = null;
-        AndroidDebugger<?> defaultDebugger = null;
-        for (AndroidDebugger<?> debugger : AndroidDebugger.EP_NAME.getExtensionList()) {
-            if (!debugger.supportsProject(project)) continue;
-            if (fallback == null) fallback = debugger;
-            if (debugger.shouldBeDefault()) defaultDebugger = debugger;
-            if (requested != null && !requested.isBlank()
-                && (requested.equals(debugger.getId()) || requested.equals(debugger.getDisplayName()))) {
-                return debugger;
-            }
-        }
-        if (requested != null && !requested.isBlank()) {
-            throw new IllegalArgumentException("Android debugger not found: " + requested);
-        }
-        return defaultDebugger != null ? defaultDebugger : fallback;
-    }
-
-    private static List<Object> javaFrames(XDebugSession session, JavaStackFrame frame, int limit) {
-        try {
-            return onDebuggerThread(session, () -> {
-                ThreadReferenceProxyImpl thread = frame.getStackFrameProxy().threadProxy();
-                List<Object> frames = new ArrayList<>();
-                int index = 0;
-                for (StackFrameProxyImpl stackFrame : thread.frames()) {
-                    if (index >= limit) break;
-                    frames.add(frameInfo(stackFrame.location(), index, thread.name()));
-                    index++;
-                }
-                return frames;
-            });
-        } catch (Throwable t) {
-            return List.of(map("error", t.getMessage()));
-        }
-    }
-
-    private static Map<String, Object> frameInfo(XStackFrame frame, int index) {
-        XSourcePosition pos = frame.getSourcePosition();
+    private static Map<String, Object> watchInfo(WatchSpec watch, Object value) {
+        WatchValue cached = WATCH_VALUES.get(watch.id);
+        Object effectiveValue = value != null ? value : cached == null ? null : cached.value;
         return map(
-            "index", index,
-            "kind", frame.getClass().getName(),
-            "file", pos == null ? null : pos.getFile().getPath(),
-            "line", pos == null ? null : pos.getLine() + 1
+            "id", watch.id,
+            "project", watch.project,
+            "name", watch.name,
+            "expression", watch.expression,
+            "enabled", watch.enabled,
+            "value", effectiveValue,
+            "updated_at", cached == null ? null : cached.updatedAt,
+            "session", cached == null ? null : cached.session,
+            "selected_frame", cached == null ? null : cached.selectedFrame,
+            "error", cached == null ? null : cached.error
         );
     }
 
-    private static Map<String, Object> frameInfo(Location location, int index, String threadName) {
-        String source = null;
-        try {
-            source = location.sourceName();
-        } catch (Throwable ignored) {
-        }
-        return map(
-            "index", index,
-            "thread", threadName,
-            "class", location.declaringType() == null ? null : location.declaringType().name(),
-            "method", location.method() == null ? null : location.method().name(),
-            "line", location.lineNumber() >= 0 ? location.lineNumber() : null,
-            "source", source
-        );
-    }
-
-    private static Map<String, Object> valueToMap(String name, Value value) {
-        return valueToMap(name, value, null, ValueRenderOptions.shallow(), new HashSet<>());
-    }
-
-    private static Map<String, Object> valueToMap(
-        String name,
-        Value value,
-        String declaredType,
-        ValueRenderOptions options,
-        Set<Long> visiting
-    ) {
-        Map<String, Object> payload = map(
-            "name", name,
-            "declared_type", declaredType,
-            "type", valueTypeName(value),
-            "value", valueText(value)
-        );
-        if (!(value instanceof ObjectReference objectReference)) {
-            return payload;
-        }
-
-        long objectId = objectReference.uniqueID();
-        payload.put("object_id", objectId);
-        if (options.depth <= 0) {
-            return payload;
-        }
-        if (!visiting.add(objectId)) {
-            payload.put("cycle", true);
-            return payload;
-        }
-        try {
-            if (objectReference instanceof StringReference stringReference) {
-                payload.put("string", stringReference.value());
-            } else if (objectReference instanceof ArrayReference arrayReference) {
-                payload.put("length", arrayReference.length());
-                payload.put("items", arrayItems(arrayReference, options.child(), visiting));
-                int truncated = Math.max(0, arrayReference.length() - options.maxArrayItems);
-                if (truncated > 0) payload.put("truncated_items", truncated);
-            } else {
-                payload.put("fields", objectFields(objectReference, options.child(), visiting));
-            }
-            return payload;
-        } catch (Throwable t) {
-            payload.put("error", t.getMessage());
-            return payload;
-        } finally {
-            visiting.remove(objectId);
-        }
-    }
-
-    private static String valueText(Value value) {
-        if (value == null) return null;
-        if (value instanceof StringReference stringReference) return stringReference.value();
-        return value.toString();
-    }
-
-    private static String valueTypeName(Value value) {
-        if (value == null) return null;
-        try {
-            return value.type().name();
-        } catch (Throwable t) {
-            return null;
-        }
-    }
-
-    private static List<Object> arrayItems(ArrayReference arrayReference, ValueRenderOptions options, Set<Long> visiting) {
-        List<Object> items = new ArrayList<>();
-        int count = Math.min(arrayReference.length(), options.maxArrayItems);
-        for (int i = 0; i < count; i++) {
-            items.add(valueToMap("[" + i + "]", arrayReference.getValue(i), null, options, visiting));
-        }
-        return items;
-    }
-
-    private static List<Object> objectFields(ObjectReference objectReference, ValueRenderOptions options, Set<Long> visiting) {
-        List<Object> fields = new ArrayList<>();
-        int instanceFieldCount = 0;
-        for (Field field : objectReference.referenceType().allFields()) {
-            if (field.isStatic()) continue;
-            instanceFieldCount++;
-            if (fields.size() >= options.maxFields) continue;
-            fields.add(fieldToMap(objectReference, field, options, visiting));
-        }
-        int truncated = instanceFieldCount - fields.size();
-        if (truncated > 0) {
-            fields.add(map("name", "<truncated>", "truncated_fields", truncated));
-        }
-        return fields;
-    }
-
-    private static Map<String, Object> fieldToMap(ObjectReference objectReference, Field field, ValueRenderOptions options, Set<Long> visiting) {
-        try {
-            return valueToMap(field.name(), objectReference.getValue(field), field.typeName(), options, visiting);
-        } catch (Throwable t) {
-            return map(
-                "name", field.name(),
-                "declared_type", field.typeName(),
-                "error", t.getMessage()
-            );
-        }
+    private static String watchId(String project, String name, String expression) {
+        String raw = (project == null ? "" : project) + "|" + name + "|" + expression;
+        return "watch_" + Base64.getUrlEncoder().withoutPadding().encodeToString(raw.getBytes(StandardCharsets.UTF_8));
     }
 
     private static Map<String, Object> sessionInfo(int index, XDebugSession session) {
-        XSourcePosition pos = session.getCurrentPosition();
-        if (pos == null && session.getCurrentStackFrame() != null) {
-            pos = session.getCurrentStackFrame().getSourcePosition();
+        XSourcePosition pos = null;
+        if (session.isSuspended()) {
+            try {
+                pos = session.getCurrentPosition();
+                if (pos == null && session.getCurrentStackFrame() != null) {
+                    pos = session.getCurrentStackFrame().getSourcePosition();
+                }
+            } catch (Throwable t) {
+                LOG.debug("Unable to read current debugger source position", t);
+            }
         }
         return map(
             "index", index,
@@ -670,73 +569,20 @@ public final class ShadowDroidDebuggerBridge implements ProjectActivity {
         );
     }
 
-    private static Map<String, Object> breakpointInfo(Project project, XLineBreakpoint<?> breakpoint) {
-        XSourcePosition pos = breakpoint.getSourcePosition();
-        return map(
-            "project", projectInfo(project),
-            "type", breakpoint.getType().getId(),
-            "enabled", breakpoint.isEnabled(),
-            "temporary", breakpoint.isTemporary(),
-            "condition", breakpoint.getConditionExpression() == null ? null : breakpoint.getConditionExpression().getExpression(),
-            "file", pos == null ? null : pos.getFile().getPath(),
-            "url", breakpoint.getFileUrl(),
-            "line", breakpoint.getLine() + 1
-        );
-    }
-
-    private static Map<String, Object> clientInfo(AttachClient attachClient) {
-        Client client = attachClient.client;
-        ClientData data = client.getClientData();
-        return map(
-            "device", deviceInfo(attachClient.device),
-            "pid", data.getPid(),
-            "package", data.getPackageName(),
-            "process", data.getProcessName(),
-            "vm_identifier", data.getVmIdentifier(),
-            "abi", data.getAbi(),
-            "native_debuggable", data.isNativeDebuggable(),
-            "debugger_attached", client.isDebuggerAttached(),
-            "debugger_port", client.getDebuggerListenPort(),
-            "debugger_status", data.getDebuggerConnectionStatus() == null ? null : data.getDebuggerConnectionStatus().name(),
-            "valid", client.isValid()
-        );
-    }
-
-    private static Map<String, Object> deviceInfo(IDevice device) {
-        return map(
-            "serial", device.getSerialNumber(),
-            "avd", device.getAvdName(),
-            "state", device.getState() == null ? null : device.getState().name(),
-            "online", device.isOnline(),
-            "emulator", device.isEmulator()
-        );
-    }
-
-    private static Map<String, Object> debuggerInfo(AndroidDebugger<?> debugger) {
-        return map(
-            "id", debugger.getId(),
-            "display_name", debugger.getDisplayName(),
-            "default", debugger.shouldBeDefault()
-        );
-    }
-
-    private static Map<String, Object> runConfigurationInfo(RunConfigurationWithDebugger runConfiguration) {
-        if (runConfiguration == null) {
-            return map("source", "default");
-        }
-        return map(
-            "source", "run_configuration",
-            "name", runConfiguration.getName(),
-            "type", runConfiguration.getType().getDisplayName()
-        );
-    }
-
     private static Map<String, Object> projectInfo(Project project) {
         return map(
             "name", project.getName(),
             "base_path", project.getBasePath(),
             "disposed", project.isDisposed()
         );
+    }
+
+    private static String projectKey(Project project) {
+        return project.getBasePath() == null ? project.getName() : project.getBasePath();
+    }
+
+    private static String sessionKey(XDebugSession session) {
+        return projectKey(session.getProject()) + "|" + session.getSessionName() + "|" + System.identityHashCode(session);
     }
 
     private static XDebugSession selectSession(Map<String, String> query) {
@@ -833,178 +679,16 @@ public final class ShadowDroidDebuggerBridge implements ProjectActivity {
         }
     }
 
-    private static <T> T onIdeaThread(ThrowingSupplier<T> supplier) throws Exception {
-        Application app = ApplicationManager.getApplication();
-        if (app.isDispatchThread()) return supplier.get();
-        AtomicReference<T> value = new AtomicReference<>();
-        AtomicReference<Exception> error = new AtomicReference<>();
-        app.invokeAndWait(() -> {
-            try {
-                value.set(supplier.get());
-            } catch (Exception e) {
-                error.set(e);
-            }
-        });
-        if (error.get() != null) throw error.get();
-        return value.get();
+    private record WatchSpec(String id, String project, String name, String expression, boolean enabled) {
     }
 
-    private static <T> T onDebuggerThread(XDebugSession session, ThrowingSupplier<T> supplier) throws Exception {
-        if (DebuggerManagerThreadImpl.isManagerThread()) return supplier.get();
-        if (!(session.getDebugProcess() instanceof JavaDebugProcess javaProcess)) return supplier.get();
-
-        DebuggerManagerThreadImpl managerThread = javaProcess.getDebuggerSession().getProcess().getManagerThread();
-        AtomicReference<T> value = new AtomicReference<>();
-        AtomicReference<Throwable> error = new AtomicReference<>();
-        managerThread.invokeAndWait(new DebuggerCommandImpl() {
-            @Override
-            protected void action() {
-                try {
-                    value.set(supplier.get());
-                } catch (Throwable t) {
-                    error.set(t);
-                }
-            }
-        });
-        if (error.get() instanceof Exception e) throw e;
-        if (error.get() instanceof Error e) throw e;
-        if (error.get() != null) throw new RuntimeException(error.get());
-        return value.get();
-    }
-
-    private static Response ok(Object... fields) {
-        return new Response(HttpURLConnection.HTTP_OK, obj(fields));
-    }
-
-    private static Response bad(String message) {
-        return new Response(HttpURLConnection.HTTP_BAD_REQUEST, obj("ok", false, "error", message));
-    }
-
-    private static void send(HttpExchange exchange, int status, String body) {
-        try {
-            byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
-            exchange.getResponseHeaders().set("content-type", "application/json; charset=utf-8");
-            exchange.sendResponseHeaders(status, bytes.length);
-            try (var out = exchange.getResponseBody()) {
-                out.write(bytes);
-            }
-        } catch (IOException ignored) {
-        }
-    }
-
-    private static Map<String, String> parseQuery(String raw) {
-        if (raw == null || raw.isBlank()) return Collections.emptyMap();
-        Map<String, String> params = new LinkedHashMap<>();
-        for (String part : raw.split("&")) {
-            int index = part.indexOf('=');
-            if (index < 0) continue;
-            params.put(decode(part.substring(0, index)), decode(part.substring(index + 1)));
-        }
-        return params;
-    }
-
-    private static String decode(String value) {
-        return URLDecoder.decode(value, StandardCharsets.UTF_8);
-    }
-
-    private static int intParam(Map<String, String> query, String key, int defaultValue, int min, int max) {
-        String value = query.get(key);
-        if (value == null) return defaultValue;
-        try {
-            int parsed = Integer.parseInt(value);
-            return Math.max(min, Math.min(max, parsed));
-        } catch (NumberFormatException ignored) {
-            return defaultValue;
-        }
-    }
-
-    private static boolean booleanParam(Map<String, String> query, String key, boolean defaultValue) {
-        String value = query.get(key);
-        return value == null ? defaultValue : Boolean.parseBoolean(value);
-    }
-
-    private static Map<String, Object> map(Object... fields) {
-        Map<String, Object> map = new LinkedHashMap<>();
-        for (int i = 0; i + 1 < fields.length; i += 2) {
-            map.put(fields[i].toString(), fields[i + 1]);
-        }
-        return map;
-    }
-
-    private static String obj(Object... fields) {
-        return json(map(fields));
-    }
-
-    @SuppressWarnings("unchecked")
-    private static String json(Object value) {
-        if (value == null) return "null";
-        if (value instanceof String string) return "\"" + escape(string) + "\"";
-        if (value instanceof Number || value instanceof Boolean) return value.toString();
-        if (value instanceof Map<?, ?> map) {
-            StringBuilder builder = new StringBuilder("{");
-            boolean first = true;
-            for (Map.Entry<?, ?> entry : map.entrySet()) {
-                if (!first) builder.append(',');
-                first = false;
-                builder.append(json(String.valueOf(entry.getKey()))).append(':').append(json(entry.getValue()));
-            }
-            return builder.append('}').toString();
-        }
-        if (value instanceof Iterable<?> iterable) {
-            StringBuilder builder = new StringBuilder("[");
-            boolean first = true;
-            for (Object item : iterable) {
-                if (!first) builder.append(',');
-                first = false;
-                builder.append(json(item));
-            }
-            return builder.append(']').toString();
-        }
-        if (value.getClass().isArray()) {
-            List<Object> list = new ArrayList<>();
-            Object[] array = (Object[]) value;
-            Collections.addAll(list, array);
-            return json(list);
-        }
-        return json(value.toString());
-    }
-
-    private static String escape(String value) {
-        StringBuilder builder = new StringBuilder(value.length() + 16);
-        for (int i = 0; i < value.length(); i++) {
-            char c = value.charAt(i);
-            switch (c) {
-                case '\\' -> builder.append("\\\\");
-                case '"' -> builder.append("\\\"");
-                case '\n' -> builder.append("\\n");
-                case '\r' -> builder.append("\\r");
-                case '\t' -> builder.append("\\t");
-                default -> {
-                    if (c < 0x20) builder.append(String.format("\\u%04x", (int) c));
-                    else builder.append(c);
-                }
-            }
-        }
-        return builder.toString();
-    }
-
-    private record Response(int status, String body) {
-    }
-
-    private record AttachClient(IDevice device, Client client) {
-    }
-
-    private record ValueRenderOptions(int depth, int maxFields, int maxArrayItems) {
-        static ValueRenderOptions shallow() {
-            return new ValueRenderOptions(0, 64, 32);
+    private record WatchValue(long updatedAt, Object session, Object selectedFrame, Object value, String error) {
+        static WatchValue ok(long updatedAt, Object session, Object selectedFrame, Object value) {
+            return new WatchValue(updatedAt, session, selectedFrame, value, null);
         }
 
-        ValueRenderOptions child() {
-            return new ValueRenderOptions(Math.max(0, depth - 1), maxFields, maxArrayItems);
+        static WatchValue error(long updatedAt, Object session, Object selectedFrame, String error) {
+            return new WatchValue(updatedAt, session, selectedFrame, null, error);
         }
-    }
-
-    private interface ThrowingSupplier<T> {
-        T get() throws Exception;
     }
 }

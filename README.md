@@ -119,6 +119,15 @@ shadowdroid skill cursor   --install      # → .cursor/rules/shadowdroid.mdc
 shadowdroid skill codex                   # → prints an AGENTS.md section to stdout
 ```
 
+## Agent debugging
+
+ShadowDroid also exposes an agent-first debugging surface:
+`debug snapshot` for one-shot state, `debug record` / `debug replay` for JSONL
+timelines, `debugger` for Android Studio-backed attach/breakpoints/stack/vars/eval,
+and `layout` for UI-tree snapshots, diffs, and Android Studio Layout
+Inspector-backed Compose/source/recomposition enrichment. See
+[docs/agent-debugging.md](docs/agent-debugging.md).
+
 ## Status
 
 M5 distribution wiring is implemented. See [docs/architecture.md](docs/architecture.md), [docs/protocol.md](docs/protocol.md), and [docs/delivery-plan.md](docs/delivery-plan.md).

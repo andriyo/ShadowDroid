@@ -108,8 +108,9 @@ pub enum Cmd {
     Skill(crate::cmd::skill::SkillArgs),
     /// Detect Android Studio and install the ShadowDroid Android Studio plugin.
     Studio(crate::cmd::studio::StudioArgs),
+    /// Agent-first debug snapshots, timelines, and replays.
+    Debug(crate::cmd::debug::DebugArgs),
     /// Operate Android Studio debugger sessions through the ShadowDroid plugin.
-    #[command(alias = "debug")]
     Debugger(crate::cmd::debugger::DebuggerArgs),
 
     // ── resource namespaces (nested) ──────────────────────────
@@ -131,6 +132,8 @@ pub enum Cmd {
     /// On-device file operations.
     #[command(subcommand)]
     Files(FilesCmd),
+    /// Agent-first layout snapshots and diffs.
+    Layout(crate::cmd::layout::LayoutArgs),
 
     // ── UI read (flat) ────────────────────────────────────────
     /// Dump the current UI as a flat element list.
@@ -498,6 +501,8 @@ pub async fn run() -> Result<()> {
         Cmd::App(app_cmd) => dispatch_app(app_cmd, &client).await?,
         Cmd::Device(device_cmd) => dispatch_device(device_cmd, &client, &serial).await?,
         Cmd::Files(files_cmd) => dispatch_files(files_cmd, &client, &serial).await?,
+        Cmd::Debug(args) => crate::cmd::debug::run(&serial, &client, args).await?,
+        Cmd::Layout(args) => crate::cmd::layout::run(&serial, &client, args).await?,
 
         // ── UI read ────────────────────────────────────────────
         Cmd::Screen => emit(&client.screen().await?),
