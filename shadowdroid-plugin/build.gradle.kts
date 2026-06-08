@@ -1,6 +1,8 @@
 import org.jetbrains.intellij.platform.gradle.TestFrameworkType
 
 plugins {
+    id("java")
+    id("org.jetbrains.kotlin.jvm")
     id("org.jetbrains.changelog")
     id("org.jetbrains.intellij.platform")
 }
@@ -17,5 +19,18 @@ dependencies {
         // Add plugin dependencies for compilation here:
         bundledPlugin("org.jetbrains.android")
         bundledPlugin("com.intellij.java")
+    }
+}
+
+tasks {
+    withType<JavaCompile> {
+        sourceCompatibility = "21"
+        targetCompatibility = "21"
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21)
     }
 }
