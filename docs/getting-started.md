@@ -40,6 +40,47 @@ ShadowDroid also needs Android Platform Tools (`adb`) on PATH before
 is missing. On macOS, use `brew install --cask android-platform-tools`; on
 Windows with Scoop, use `scoop install adb`.
 
+## Initialize host integrations
+
+Run the first-run check:
+
+```bash
+shadowdroid init
+```
+
+This detects Android Studio installations, reports whether the ShadowDroid
+Android Studio plugin is installed, and checks whether the debugger bridge has
+registered recently.
+
+To install or update the plugin automatically:
+
+```bash
+shadowdroid init --install-studio-plugin
+# equivalent:
+shadowdroid studio install
+```
+
+If several Android Studio installations are detected, choose one explicitly:
+
+```bash
+shadowdroid studio install --studio "/Applications/Android Studio.app"
+```
+
+`studio install` resolves the plugin ZIP in this order:
+
+1. `--plugin PATH`
+2. `SHADOWDROID_STUDIO_PLUGIN`
+3. repo build outputs under `shadowdroid-plugin/build/distributions/...`
+4. `~/.shadowdroid/plugins/local/*.zip`
+5. `~/.shadowdroid/plugins/<version>/shadowdroid-studio-plugin.zip`
+6. GitHub Release asset: `shadowdroid-studio-plugin.zip`
+
+Release downloads are verified with `SHA256SUMS` before they are cached. The
+installer unpacks the plugin into Android Studio's user plugin directory and
+prints a restart reminder. If Android Studio cannot be found automatically,
+pass `--studio` with the `.app`, install directory, `product-info.json`, or
+launcher path.
+
 ## Keep the CLI updated
 
 Check the latest GitHub Release and the right updater for your install method:
@@ -163,6 +204,7 @@ Every GitHub Release contains:
 - `shadowdroid-x86_64-pc-windows-msvc.zip`
 - `shadowdroid-server-main.apk`
 - `shadowdroid-server-test.apk`
+- `shadowdroid-studio-plugin.zip`
 - `SHA256SUMS`
 - `shadowdroid-installer.sh`
 - `shadowdroid-installer.ps1`

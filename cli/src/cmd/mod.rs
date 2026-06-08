@@ -17,3 +17,4 @@ pub mod introspect;
 pub mod permissions;
 pub mod scroll;
 pub mod skill;
+pub mod studio;

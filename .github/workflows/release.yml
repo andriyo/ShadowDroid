@@ -54,9 +54,49 @@ jobs:
           path: dist/*.apk
           if-no-files-found: error
 
+  build-studio-plugin:
+    name: Build Android Studio plugin
+    runs-on: ubuntu-24.04
+    outputs:
+      plugin_sha256: ${{ steps.checksums.outputs.plugin_sha256 }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Build plugin ZIP
+        working-directory: shadowdroid-plugin
+        shell: bash
+        run: |
+          ./gradlew --no-daemon -Pversion="${GITHUB_REF_NAME#v}" buildPlugin verifyPluginStructure
+
+      - name: Stage plugin asset
+        id: checksums
+        shell: bash
+        run: |
+          mkdir -p dist
+          plugin_zip="$(find shadowdroid-plugin/build/distributions -maxdepth 1 -type f -name '*.zip' | head -1)"
+          test -n "$plugin_zip"
+          cp "$plugin_zip" dist/shadowdroid-studio-plugin.zip
+          plugin_sha256="$(shasum -a 256 dist/shadowdroid-studio-plugin.zip | awk '{print $1}')"
+          echo "plugin_sha256=$plugin_sha256" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: android-studio-plugin
+          path: dist/shadowdroid-studio-plugin.zip
+          if-no-files-found: error
+
   build-cli:
     name: Build ${{ matrix.target }}
-    needs: build-apks
+    needs:
+      - build-apks
+      - build-studio-plugin
     strategy:
       fail-fast: false
       matrix:
@@ -94,6 +134,7 @@ jobs:
           SHADOWDROID_RELEASE_BASE_URL: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}
           SHADOWDROID_RELEASE_MAIN_APK_SHA256: ${{ needs.build-apks.outputs.main_sha256 }}
           SHADOWDROID_RELEASE_TEST_APK_SHA256: ${{ needs.build-apks.outputs.test_sha256 }}
+          SHADOWDROID_RELEASE_STUDIO_PLUGIN_SHA256: ${{ needs.build-studio-plugin.outputs.plugin_sha256 }}
         run: cargo build --release --locked --target "${{ matrix.target }}"
 
       - name: Package CLI archive
@@ -119,6 +160,7 @@ jobs:
     name: Publish GitHub Release
     needs:
       - build-apks
+      - build-studio-plugin
       - build-cli
     runs-on: ubuntu-24.04
     env:

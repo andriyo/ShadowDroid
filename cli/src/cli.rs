@@ -72,6 +72,8 @@ pub enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect first-run host setup and optionally install the Android Studio plugin.
+    Init(crate::cmd::studio::InitArgs),
     /// Diagnose (and optionally repair) the host↔device pipe: device state,
     /// APK version, port forward, server reachability, UiAutomation owners.
     Doctor {
@@ -104,6 +106,8 @@ pub enum Cmd {
     },
     /// Generate an agent-integration file (Claude Code / Cursor / Codex).
     Skill(crate::cmd::skill::SkillArgs),
+    /// Detect Android Studio and install the ShadowDroid Android Studio plugin.
+    Studio(crate::cmd::studio::StudioArgs),
     /// Operate Android Studio debugger sessions through the ShadowDroid plugin.
     #[command(alias = "debug")]
     Debugger(crate::cmd::debugger::DebuggerArgs),
@@ -424,9 +428,11 @@ pub async fn run() -> Result<()> {
     match &cmd {
         Cmd::Devices => return cmd_devices().await,
         Cmd::Update { check, json } => return crate::update::cmd_update(*check, *json).await,
+        Cmd::Init(args) => return crate::cmd::studio::run_init(args).await,
         // Pure self-introspection / file generation — no device needed.
         Cmd::Commands { json } => return crate::cmd::introspect::run(*json),
         Cmd::Skill(args) => return crate::cmd::skill::run(args),
+        Cmd::Studio(args) => return crate::cmd::studio::run(args).await,
         Cmd::Debugger(args) => return crate::cmd::debugger::run(args).await,
         Cmd::Connect => {
             return cmd_connect(device.as_deref(), apk.as_deref(), any_apk_version).await
@@ -477,10 +483,12 @@ pub async fn run() -> Result<()> {
         | Cmd::Connect
         | Cmd::Disconnect
         | Cmd::Update { .. }
+        | Cmd::Init(_)
         | Cmd::Doctor { .. }
         | Cmd::Collect { .. }
         | Cmd::Commands { .. }
         | Cmd::Skill(_)
+        | Cmd::Studio(_)
         | Cmd::Debugger(_)
         | Cmd::Perm(_)
         | Cmd::Appops(_)

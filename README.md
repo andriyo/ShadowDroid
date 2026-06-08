@@ -69,6 +69,13 @@ print a hint if `adb` is missing; on macOS you can install it with
 `brew install --cask android-platform-tools`, and on Windows with
 `scoop install adb`.
 
+Initialize optional host integrations:
+
+```bash
+shadowdroid init                         # detect Android Studio + plugin state
+shadowdroid init --install-studio-plugin # install/update the Android Studio plugin
+```
+
 Then connect to an attached Android device or emulator:
 
 ```bash
@@ -85,6 +92,12 @@ The installer only installs the host CLI. On first `connect`, ShadowDroid
 downloads the matching instrumentation APKs from the same GitHub Release,
 verifies them with SHA-256, caches them under `~/.shadowdroid/apks/<version>/`,
 and installs them on the device.
+
+The Android Studio plugin is shipped as `shadowdroid-studio-plugin.zip` in the
+same GitHub Release. `shadowdroid studio install` detects Android Studio,
+downloads/verifies/caches the plugin under `~/.shadowdroid/plugins/<version>/`,
+unpacks it into Studio's user plugin directory, and tells you when a restart is
+required.
 
 See [docs/getting-started.md](docs/getting-started.md) for manual downloads
 and pinned versions. Maintainers can use [docs/release.md](docs/release.md) to

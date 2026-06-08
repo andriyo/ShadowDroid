@@ -5,6 +5,7 @@ ShadowDroid releases are tag-driven. A `v*` tag builds and publishes:
 - host CLI archives for macOS, Linux, and Windows
 - `shadowdroid-server-main.apk`
 - `shadowdroid-server-test.apk`
+- `shadowdroid-studio-plugin.zip`
 - `SHA256SUMS`
 - copy-paste installer scripts
 - installer smoke tests on macOS, Linux, and Windows
@@ -18,16 +19,18 @@ ShadowDroid releases are tag-driven. A `v*` tag builds and publishes:
 2. Run local checks:
 
    ```bash
+   tag=v0.1.4
    cargo test --manifest-path cli/Cargo.toml --locked
    cargo package --manifest-path cli/Cargo.toml
    (cd server && ./gradlew --no-daemon :app:assembleDebug :app:assembleDebugAndroidTest)
+   (cd shadowdroid-plugin && ./gradlew --no-daemon -Pversion="${tag#v}" buildPlugin verifyPluginStructure)
    ```
 
 3. Tag and push:
 
    ```bash
-   git tag v0.1.3
-   git push origin v0.1.3
+   git tag "$tag"
+   git push origin "$tag"
    ```
 
 4. Watch the `Release` workflow. It creates or updates the matching GitHub
@@ -45,13 +48,14 @@ The release workflow runs this automatically when
 
 ```bash
 tmpdir="$(mktemp -d)"
-gh release download v0.1.3 \
+tag=v0.1.4
+gh release download "$tag" \
   --repo andriyo/ShadowDroid \
   --pattern SHA256SUMS \
   --dir "$tmpdir"
 
 python3 scripts/update-package-managers.py \
-  --version v0.1.3 \
+  --version "$tag" \
   --checksums "$tmpdir/SHA256SUMS" \
   --homebrew-path /Users/andrii/Work/homebrew-tap \
   --scoop-path /Users/andrii/Work/scoop-bucket
@@ -72,7 +76,8 @@ shadowdroid update --check --json
 
 Publish after the GitHub Release exists, because a `cargo install` build fetches
 the version-matched APKs from the matching release tag on first
-`shadowdroid connect`.
+`shadowdroid connect`, and the Android Studio plugin on first
+`shadowdroid studio install`.
 
 ```bash
 cargo publish --manifest-path cli/Cargo.toml --locked
@@ -83,12 +88,24 @@ cargo publish --manifest-path cli/Cargo.toml --locked
 Use a clean cache to force the GitHub Release APK download:
 
 ```bash
-rm -rf ~/.shadowdroid/apks/0.1.3
+tag=v0.1.4
+rm -rf ~/.shadowdroid/apks/"${tag#v}"
 SHADOWDROID_DISABLE_DEV_SOURCES=1 shadowdroid connect
 ```
 
 The connect log should mention the GitHub Release download once, then future
-runs should use `~/.shadowdroid/apks/0.1.3/`.
+runs should use `~/.shadowdroid/apks/<version>/`.
+
+Use a clean plugin cache to force the GitHub Release plugin download:
+
+```bash
+tag=v0.1.4
+rm -rf ~/.shadowdroid/plugins/"${tag#v}"
+SHADOWDROID_DISABLE_DEV_SOURCES=1 shadowdroid studio install --studio "/Applications/Android Studio.app"
+```
+
+The install output should mention the GitHub Release source once, then future
+runs should use `~/.shadowdroid/plugins/<version>/`.
 
 You can also rerun installer-only checks from GitHub Actions with the
-`Installer Smoke` workflow and a release tag such as `v0.1.3`.
+`Installer Smoke` workflow and a release tag such as `v0.1.4`.

@@ -63,6 +63,24 @@ configurations* that expose corresponding Gradle tasks:
 > [!NOTE]
 > You can find the logs from the running task in the `idea.log` tab.
 
+## Distribution through ShadowDroid
+
+The root release workflow builds this plugin and publishes it as
+`shadowdroid-studio-plugin.zip` next to the CLI archives and Android server
+APKs. End users do not need to open this Gradle project; they can run:
+
+```bash
+shadowdroid init --install-studio-plugin
+```
+
+For local testing, build the ZIP and ask the CLI to install it into the detected
+Android Studio user plugin directory:
+
+```bash
+./gradlew -Pversion=0.1.4 buildPlugin verifyPluginStructure
+shadowdroid studio install --plugin build/distributions/shadowdroid-plugin-0.1.4.zip
+```
+
 ## Publishing the plugin
 
 > [!TIP]
