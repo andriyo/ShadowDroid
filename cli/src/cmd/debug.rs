@@ -5,6 +5,7 @@
 //! into deterministic artifacts an agent can consume or replay.
 
 use crate::cmd::debugger::BridgeClient;
+use crate::cmd::studio_contract::{query, route, session_action};
 use crate::device::adb;
 use crate::device::client::ServerClient;
 use anyhow::{Context, Result};
@@ -243,36 +244,36 @@ async fn debugger_snapshot(studio_url: Option<&str>, depth: u32) -> Value {
     let depth_s = depth.to_string();
     let max_fields_s = "48".to_string();
     let max_array_items_s = "24".to_string();
-    let status = match bridge.get("/v1/status", &[]).await {
+    let status = match bridge.get(route::STATUS, &[]).await {
         Ok(value) => value,
         Err(err) => return json!({"available": false, "error": err.to_string()}),
     };
     let breakpoints = bridge
-        .get("/v1/breakpoints", &[])
+        .get(route::BREAKPOINTS, &[])
         .await
         .unwrap_or_else(|err| json!({"ok": false, "error": err.to_string()}));
     let stack = bridge
-        .get("/v1/session/stack", &[("limit", Some("24"))])
+        .get(route::SESSION_STACK, &[(query::LIMIT, Some("24"))])
         .await
         .unwrap_or_else(|err| json!({"ok": false, "error": err.to_string()}));
     let variables = bridge
         .get(
-            "/v1/session/variables",
+            route::SESSION_VARIABLES,
             &[
-                ("depth", Some(depth_s.as_str())),
-                ("max_fields", Some(max_fields_s.as_str())),
-                ("max_array_items", Some(max_array_items_s.as_str())),
+                (query::DEPTH, Some(depth_s.as_str())),
+                (query::MAX_FIELDS, Some(max_fields_s.as_str())),
+                (query::MAX_ARRAY_ITEMS, Some(max_array_items_s.as_str())),
             ],
         )
         .await
         .unwrap_or_else(|err| json!({"ok": false, "error": err.to_string()}));
     let watches = bridge
         .get(
-            "/v1/watches",
+            route::WATCHES,
             &[
-                ("depth", Some(depth_s.as_str())),
-                ("max_fields", Some(max_fields_s.as_str())),
-                ("max_array_items", Some(max_array_items_s.as_str())),
+                (query::DEPTH, Some(depth_s.as_str())),
+                (query::MAX_FIELDS, Some(max_fields_s.as_str())),
+                (query::MAX_ARRAY_ITEMS, Some(max_array_items_s.as_str())),
             ],
         )
         .await
@@ -602,7 +603,7 @@ async fn step_until_screen_change(
             return Ok(());
         }
 
-        studio_control(&bridge, "step_over", session_s.as_deref()).await?;
+        studio_control(&bridge, session_action::STEP_OVER, session_s.as_deref()).await?;
         steps += 1;
         tokio::time::sleep(Duration::from_millis(args.poll_ms.max(25))).await;
         let screen = client.screen().await.context("reading screen after step")?;
@@ -657,7 +658,7 @@ async fn step_until_log(serial: &str, client: &ServerClient, args: StepUntilLogA
             return Ok(());
         }
 
-        studio_control(&bridge, "step_over", session_s.as_deref()).await?;
+        studio_control(&bridge, session_action::STEP_OVER, session_s.as_deref()).await?;
         steps += 1;
         let step_deadline = Instant::now() + Duration::from_millis(args.wait.poll_ms.max(25));
         while Instant::now() < step_deadline {
@@ -702,7 +703,7 @@ async fn run_until_crash(
     let session_s = args.session.map(|s| s.to_string());
     let (log_tx, mut log_rx) = mpsc::channel(256);
     spawn_logcat(serial.to_string(), log_tx);
-    let _ = studio_control(&bridge, "resume", session_s.as_deref()).await;
+    let _ = studio_control(&bridge, session_action::RESUME, session_s.as_deref()).await;
     let deadline = Instant::now() + Duration::from_millis(args.timeout_ms);
 
     loop {
@@ -783,8 +784,8 @@ async fn studio_control(
 ) -> Result<Value> {
     bridge
         .get(
-            "/v1/session/control",
-            &[("action", Some(action)), ("session", session)],
+            route::SESSION_CONTROL,
+            &[(query::ACTION, Some(action)), (query::SESSION, session)],
         )
         .await
 }

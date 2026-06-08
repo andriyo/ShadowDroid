@@ -49,7 +49,7 @@ internal object BridgeProtocol {
 
     @JvmStatic
     fun debuggerTimeoutMs(query: Map<String, String>): Int =
-        intParam(query, "timeout_ms", DEFAULT_DEBUGGER_TIMEOUT_MS, 50, 30_000)
+        intParam(query, BridgeQuery.TIMEOUT_MS, DEFAULT_DEBUGGER_TIMEOUT_MS, 50, 30_000)
 
     @JvmStatic
     fun booleanParam(query: Map<String, String>, key: String, defaultValue: Boolean): Boolean =

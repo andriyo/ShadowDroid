@@ -35,7 +35,7 @@ internal object AndroidAttachBridge {
 
     @JvmStatic
     fun attach(project: Project?, query: Map<String, String>): Response {
-        if (BridgeProtocol.booleanParam(query, "dialog", false)) {
+        if (BridgeProtocol.booleanParam(query, BridgeQuery.DIALOG, false)) {
             return openDialog(project)
         }
         if (project == null) return BridgeProtocol.bad("no project")
@@ -49,7 +49,7 @@ internal object AndroidAttachBridge {
                 AndroidConnectDebugger.closeOldSessionAndRun(project, debugger, selected.client, runConfiguration)
                 BridgeProtocol.ok(
                     "ok", true,
-                    "action", "attach",
+                    "action", BridgeValues.ACTION_ATTACH,
                     "project", projectInfo(project),
                     "client", clientInfo(selected),
                     "debugger", debuggerInfo(debugger),
@@ -63,8 +63,8 @@ internal object AndroidAttachBridge {
 
     private fun openDialog(project: Project?): Response {
         if (project == null) return BridgeProtocol.bad("no project")
-        val action = ActionManager.getInstance().getAction("AndroidConnectDebuggerAction")
-            ?: return BridgeProtocol.bad("AndroidConnectDebuggerAction is not available")
+        val action = ActionManager.getInstance().getAction(BridgeValues.ANDROID_CONNECT_DEBUGGER_ACTION)
+            ?: return BridgeProtocol.bad("${BridgeValues.ANDROID_CONNECT_DEBUGGER_ACTION} is not available")
         ApplicationManager.getApplication().invokeLater {
             val dataContext = SimpleDataContext.builder()
                 .add(CommonDataKeys.PROJECT, project)
@@ -73,7 +73,7 @@ internal object AndroidAttachBridge {
             val event = AnActionEvent.createFromAnAction(action, null, ActionPlaces.UNKNOWN, dataContext)
             action.actionPerformed(event)
         }
-        return BridgeProtocol.ok("ok", true, "action", "AndroidConnectDebuggerAction", "project", projectInfo(project))
+        return BridgeProtocol.ok("ok", true, "action", BridgeValues.ANDROID_CONNECT_DEBUGGER_ACTION, "project", projectInfo(project))
     }
 
     private fun selectAttachClient(project: Project, query: Map<String, String>): AttachClient {
@@ -90,9 +90,9 @@ internal object AndroidAttachBridge {
     private fun matchingClients(project: Project, query: Map<String, String>): List<AttachClient> {
         val bridge: AndroidDebugBridge = AndroidSdkUtils.getDebugBridge(project)
             ?: throw IllegalStateException("Android debug bridge is not available for project")
-        val requestedDevice = query["device"]
-        val requestedPackage = query["package"]
-        val requestedPid = optionalInt(query["pid"])
+        val requestedDevice = query[BridgeQuery.DEVICE]
+        val requestedPackage = query[BridgeQuery.PACKAGE]
+        val requestedPid = optionalInt(query[BridgeQuery.PID])
 
         val candidates = mutableListOf<AttachClient>()
         for (device in bridge.devices) {
@@ -129,7 +129,7 @@ internal object AndroidAttachBridge {
     }
 
     private fun selectRunConfiguration(project: Project, query: Map<String, String>): RunConfigurationWithDebugger? {
-        val requested = query["configuration"]
+        val requested = query[BridgeQuery.CONFIGURATION]
         val runManager = RunManager.getInstance(project)
         if (!requested.isNullOrBlank()) {
             for (configuration: RunConfiguration in runManager.allConfigurationsList) {
@@ -146,7 +146,7 @@ internal object AndroidAttachBridge {
     }
 
     private fun selectAndroidDebugger(project: Project, query: Map<String, String>): AndroidDebugger<*>? {
-        val requested = query["debugger"]
+        val requested = query[BridgeQuery.DEBUGGER]
         var fallback: AndroidDebugger<*>? = null
         var defaultDebugger: AndroidDebugger<*>? = null
         for (debugger in AndroidDebugger.EP_NAME.extensionList) {

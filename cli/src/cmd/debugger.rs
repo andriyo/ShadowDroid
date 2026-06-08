@@ -9,8 +9,8 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const DEFAULT_URL: &str = "http://127.0.0.1:50576";
-const REGISTRY_PATH: &str = ".shadowdroid/studio-debugger.json";
+use crate::cmd::studio_contract::{self, query, route, session_action};
+
 const DEFAULT_BRIDGE_TIMEOUT_MS: u64 = 10_000;
 
 #[derive(Args)]
@@ -407,17 +407,17 @@ pub struct AndroidClientArgs {
 pub async fn run(args: &DebuggerArgs) -> Result<()> {
     let bridge = BridgeClient::new(args.url.as_deref())?;
     let value = match &args.cmd {
-        DebuggerCmd::Status => bridge.get("/v1/status", &[]).await?,
-        DebuggerCmd::Sessions => bridge.get("/v1/sessions", &[]).await?,
+        DebuggerCmd::Status => bridge.get(route::STATUS, &[]).await?,
+        DebuggerCmd::Sessions => bridge.get(route::SESSIONS, &[]).await?,
         DebuggerCmd::Clients(filter) => {
             let pid_s = filter.pid.map(|pid| pid.to_string());
             let params = [
-                ("project", filter.project.as_deref()),
-                ("package", filter.package.as_deref()),
-                ("pid", pid_s.as_deref()),
-                ("device", filter.device.as_deref()),
+                (query::PROJECT, filter.project.as_deref()),
+                (query::PACKAGE, filter.package.as_deref()),
+                (query::PID, pid_s.as_deref()),
+                (query::DEVICE, filter.device.as_deref()),
             ];
-            bridge.get("/v1/clients", &params).await?
+            bridge.get(route::CLIENTS, &params).await?
         }
         DebuggerCmd::Attach {
             project,
@@ -431,15 +431,15 @@ pub async fn run(args: &DebuggerArgs) -> Result<()> {
             let pid_s = pid.map(|pid| pid.to_string());
             let dialog_s = dialog.to_string();
             let params = [
-                ("project", project.as_deref()),
-                ("package", package.as_deref()),
-                ("pid", pid_s.as_deref()),
-                ("device", device.as_deref()),
-                ("debugger", debugger.as_deref()),
-                ("configuration", configuration.as_deref()),
-                ("dialog", Some(dialog_s.as_str())),
+                (query::PROJECT, project.as_deref()),
+                (query::PACKAGE, package.as_deref()),
+                (query::PID, pid_s.as_deref()),
+                (query::DEVICE, device.as_deref()),
+                (query::DEBUGGER, debugger.as_deref()),
+                (query::CONFIGURATION, configuration.as_deref()),
+                (query::DIALOG, Some(dialog_s.as_str())),
             ];
-            bridge.get("/v1/attach", &params).await?
+            bridge.get(route::ATTACH, &params).await?
         }
         DebuggerCmd::Break(BreakCmd::Line {
             file,
@@ -456,15 +456,15 @@ pub async fn run(args: &DebuggerArgs) -> Result<()> {
             let temporary_s = temporary.to_string();
             let clear_condition_s = clear_condition.to_string();
             let params = [
-                ("file", Some(canonical.as_str())),
-                ("line", Some(line_s.as_str())),
-                ("project", project.as_deref()),
-                ("enabled", Some(enabled_s.as_str())),
-                ("temporary", Some(temporary_s.as_str())),
-                ("condition", condition.as_deref()),
-                ("clear_condition", Some(clear_condition_s.as_str())),
+                (query::FILE, Some(canonical.as_str())),
+                (query::LINE, Some(line_s.as_str())),
+                (query::PROJECT, project.as_deref()),
+                (query::ENABLED, Some(enabled_s.as_str())),
+                (query::TEMPORARY, Some(temporary_s.as_str())),
+                (query::CONDITION, condition.as_deref()),
+                (query::CLEAR_CONDITION, Some(clear_condition_s.as_str())),
             ];
-            bridge.get("/v1/breakpoints/line", &params).await?
+            bridge.get(route::BREAKPOINT_LINE, &params).await?
         }
         DebuggerCmd::Break(BreakCmd::Exception {
             exception,
@@ -477,13 +477,13 @@ pub async fn run(args: &DebuggerArgs) -> Result<()> {
             let caught_s = caught.to_string();
             let uncaught_s = uncaught.to_string();
             let params = [
-                ("exception", Some(exception.as_str())),
-                ("project", project.as_deref()),
-                ("enabled", Some(enabled_s.as_str())),
-                ("caught", Some(caught_s.as_str())),
-                ("uncaught", Some(uncaught_s.as_str())),
+                (query::EXCEPTION, Some(exception.as_str())),
+                (query::PROJECT, project.as_deref()),
+                (query::ENABLED, Some(enabled_s.as_str())),
+                (query::CAUGHT, Some(caught_s.as_str())),
+                (query::UNCAUGHT, Some(uncaught_s.as_str())),
             ];
-            bridge.get("/v1/breakpoints/exception", &params).await?
+            bridge.get(route::BREAKPOINT_EXCEPTION, &params).await?
         }
         DebuggerCmd::Break(BreakCmd::Method {
             class,
@@ -497,14 +497,14 @@ pub async fn run(args: &DebuggerArgs) -> Result<()> {
             let entry_s = entry.to_string();
             let exit_s = exit.to_string();
             let params = [
-                ("class", Some(class.as_str())),
-                ("method", Some(method.as_str())),
-                ("project", project.as_deref()),
-                ("enabled", Some(enabled_s.as_str())),
-                ("entry", Some(entry_s.as_str())),
-                ("exit", Some(exit_s.as_str())),
+                (query::CLASS, Some(class.as_str())),
+                (query::METHOD, Some(method.as_str())),
+                (query::PROJECT, project.as_deref()),
+                (query::ENABLED, Some(enabled_s.as_str())),
+                (query::ENTRY, Some(entry_s.as_str())),
+                (query::EXIT, Some(exit_s.as_str())),
             ];
-            bridge.get("/v1/breakpoints/method", &params).await?
+            bridge.get(route::BREAKPOINT_METHOD, &params).await?
         }
         DebuggerCmd::Break(BreakCmd::Field {
             file,
@@ -524,17 +524,17 @@ pub async fn run(args: &DebuggerArgs) -> Result<()> {
             let access_s = access.to_string();
             let modification_s = modification.to_string();
             let params = [
-                ("file", Some(canonical.as_str())),
-                ("line", Some(line_s.as_str())),
-                ("class", Some(class.as_str())),
-                ("field", Some(field.as_str())),
-                ("project", project.as_deref()),
-                ("enabled", Some(enabled_s.as_str())),
-                ("temporary", Some(temporary_s.as_str())),
-                ("access", Some(access_s.as_str())),
-                ("modification", Some(modification_s.as_str())),
+                (query::FILE, Some(canonical.as_str())),
+                (query::LINE, Some(line_s.as_str())),
+                (query::CLASS, Some(class.as_str())),
+                (query::FIELD, Some(field.as_str())),
+                (query::PROJECT, project.as_deref()),
+                (query::ENABLED, Some(enabled_s.as_str())),
+                (query::TEMPORARY, Some(temporary_s.as_str())),
+                (query::ACCESS, Some(access_s.as_str())),
+                (query::MODIFICATION, Some(modification_s.as_str())),
             ];
-            bridge.get("/v1/breakpoints/field", &params).await?
+            bridge.get(route::BREAKPOINT_FIELD, &params).await?
         }
         DebuggerCmd::Break(BreakCmd::Update(args)) => {
             let enabled_s = args.enabled.map(|v| v.to_string());
@@ -546,46 +546,55 @@ pub async fn run(args: &DebuggerArgs) -> Result<()> {
             let suspend_s = args.suspend.map(SuspendArg::as_bridge);
             let pass_count_s = args.pass_count.map(|v| v.to_string());
             let params = [
-                ("id", Some(args.id.as_str())),
-                ("project", args.project.as_deref()),
-                ("enabled", enabled_s.as_deref()),
-                ("temporary", temporary_s.as_deref()),
-                ("condition", args.condition.as_deref()),
-                ("clear_condition", Some(clear_condition_s.as_str())),
-                ("log_expression", args.log_expression.as_deref()),
+                (query::ID, Some(args.id.as_str())),
+                (query::PROJECT, args.project.as_deref()),
+                (query::ENABLED, enabled_s.as_deref()),
+                (query::TEMPORARY, temporary_s.as_deref()),
+                (query::CONDITION, args.condition.as_deref()),
+                (query::CLEAR_CONDITION, Some(clear_condition_s.as_str())),
+                (query::LOG_EXPRESSION, args.log_expression.as_deref()),
                 (
-                    "clear_log_expression",
+                    query::CLEAR_LOG_EXPRESSION,
                     Some(clear_log_expression_s.as_str()),
                 ),
-                ("log_message", log_message_s.as_deref()),
-                ("log_stack", log_stack_s.as_deref()),
-                ("suspend", suspend_s),
-                ("pass_count", pass_count_s.as_deref()),
+                (query::LOG_MESSAGE, log_message_s.as_deref()),
+                (query::LOG_STACK, log_stack_s.as_deref()),
+                (query::SUSPEND, suspend_s),
+                (query::PASS_COUNT, pass_count_s.as_deref()),
             ];
-            bridge.get("/v1/breakpoints/update", &params).await?
+            bridge.get(route::BREAKPOINT_UPDATE, &params).await?
         }
         DebuggerCmd::Break(BreakCmd::Remove { id, project }) => {
-            let params = [("id", Some(id.as_str())), ("project", project.as_deref())];
-            bridge.get("/v1/breakpoints/remove", &params).await?
+            let params = [
+                (query::ID, Some(id.as_str())),
+                (query::PROJECT, project.as_deref()),
+            ];
+            bridge.get(route::BREAKPOINT_REMOVE, &params).await?
         }
-        DebuggerCmd::Breakpoints => bridge.get("/v1/breakpoints", &[]).await?,
-        DebuggerCmd::Pause(selector) => control(&bridge, "pause", selector).await?,
-        DebuggerCmd::Resume(selector) => control(&bridge, "resume", selector).await?,
-        DebuggerCmd::StepIn(selector) => control(&bridge, "step_into", selector).await?,
-        DebuggerCmd::StepOver(selector) => control(&bridge, "step_over", selector).await?,
-        DebuggerCmd::StepOut(selector) => control(&bridge, "step_out", selector).await?,
-        DebuggerCmd::Stop(selector) => control(&bridge, "stop", selector).await?,
+        DebuggerCmd::Breakpoints => bridge.get(route::BREAKPOINTS, &[]).await?,
+        DebuggerCmd::Pause(selector) => control(&bridge, session_action::PAUSE, selector).await?,
+        DebuggerCmd::Resume(selector) => control(&bridge, session_action::RESUME, selector).await?,
+        DebuggerCmd::StepIn(selector) => {
+            control(&bridge, session_action::STEP_INTO, selector).await?
+        }
+        DebuggerCmd::StepOver(selector) => {
+            control(&bridge, session_action::STEP_OVER, selector).await?
+        }
+        DebuggerCmd::StepOut(selector) => {
+            control(&bridge, session_action::STEP_OUT, selector).await?
+        }
+        DebuggerCmd::Stop(selector) => control(&bridge, session_action::STOP, selector).await?,
         DebuggerCmd::Stack(args) => {
             let session_s = args.session.map(|s| s.to_string());
             let limit_s = args.limit.to_string();
             let timeout_ms_s = args.timeout_ms.to_string();
             let params = [
-                ("session", session_s.as_deref()),
-                ("limit", Some(limit_s.as_str())),
-                ("timeout_ms", Some(timeout_ms_s.as_str())),
+                (query::SESSION, session_s.as_deref()),
+                (query::LIMIT, Some(limit_s.as_str())),
+                (query::TIMEOUT_MS, Some(timeout_ms_s.as_str())),
             ];
             bridge
-                .get("/v1/session/stack", &params)
+                .get(route::SESSION_STACK, &params)
                 .await
                 .unwrap_or_else(|err| read_error_json("debugger_stack", err))
         }
@@ -594,12 +603,12 @@ pub async fn run(args: &DebuggerArgs) -> Result<()> {
             let limit_s = args.limit.to_string();
             let timeout_ms_s = args.timeout_ms.to_string();
             let params = [
-                ("session", session_s.as_deref()),
-                ("limit", Some(limit_s.as_str())),
-                ("timeout_ms", Some(timeout_ms_s.as_str())),
+                (query::SESSION, session_s.as_deref()),
+                (query::LIMIT, Some(limit_s.as_str())),
+                (query::TIMEOUT_MS, Some(timeout_ms_s.as_str())),
             ];
             bridge
-                .get("/v1/session/threads", &params)
+                .get(route::SESSION_THREADS, &params)
                 .await
                 .unwrap_or_else(|err| read_error_json("debugger_threads", err))
         }
@@ -611,16 +620,16 @@ pub async fn run(args: &DebuggerArgs) -> Result<()> {
             let max_array_items_s = args.max_array_items.to_string();
             let timeout_ms_s = args.timeout_ms.to_string();
             let params = [
-                ("session", session_s.as_deref()),
-                ("thread", args.thread.as_deref()),
-                ("frame", frame_s.as_deref()),
-                ("depth", Some(depth_s.as_str())),
-                ("max_fields", Some(max_fields_s.as_str())),
-                ("max_array_items", Some(max_array_items_s.as_str())),
-                ("timeout_ms", Some(timeout_ms_s.as_str())),
+                (query::SESSION, session_s.as_deref()),
+                (query::THREAD, args.thread.as_deref()),
+                (query::FRAME, frame_s.as_deref()),
+                (query::DEPTH, Some(depth_s.as_str())),
+                (query::MAX_FIELDS, Some(max_fields_s.as_str())),
+                (query::MAX_ARRAY_ITEMS, Some(max_array_items_s.as_str())),
+                (query::TIMEOUT_MS, Some(timeout_ms_s.as_str())),
             ];
             bridge
-                .get("/v1/session/variables", &params)
+                .get(route::SESSION_VARIABLES, &params)
                 .await
                 .unwrap_or_else(|err| read_error_json("debugger_variables", err))
         }
@@ -632,18 +641,18 @@ pub async fn run(args: &DebuggerArgs) -> Result<()> {
             let max_array_items_s = args.max_array_items.to_string();
             let timeout_ms_s = args.timeout_ms.to_string();
             let params = [
-                ("session", session_s.as_deref()),
-                ("thread", args.thread.as_deref()),
-                ("frame", frame_s.as_deref()),
-                ("expression", Some(args.expression.as_str())),
-                ("depth", Some(depth_s.as_str())),
-                ("max_fields", Some(max_fields_s.as_str())),
-                ("max_array_items", Some(max_array_items_s.as_str())),
-                ("timeout_ms", Some(timeout_ms_s.as_str())),
+                (query::SESSION, session_s.as_deref()),
+                (query::THREAD, args.thread.as_deref()),
+                (query::FRAME, frame_s.as_deref()),
+                (query::EXPRESSION, Some(args.expression.as_str())),
+                (query::DEPTH, Some(depth_s.as_str())),
+                (query::MAX_FIELDS, Some(max_fields_s.as_str())),
+                (query::MAX_ARRAY_ITEMS, Some(max_array_items_s.as_str())),
+                (query::TIMEOUT_MS, Some(timeout_ms_s.as_str())),
             ];
             match tokio::time::timeout(
                 std::time::Duration::from_millis(args.timeout_ms as u64),
-                bridge.get("/v1/session/evaluate", &params),
+                bridge.get(route::SESSION_EVALUATE, &params),
             )
             .await
             {
@@ -670,11 +679,11 @@ pub async fn run(args: &DebuggerArgs) -> Result<()> {
             project,
         }) => {
             let params = [
-                ("expression", Some(expression.as_str())),
-                ("name", name.as_deref()),
-                ("project", project.as_deref()),
+                (query::EXPRESSION, Some(expression.as_str())),
+                (query::NAME, name.as_deref()),
+                (query::PROJECT, project.as_deref()),
             ];
-            bridge.get("/v1/watches/add", &params).await?
+            bridge.get(route::WATCHES_ADD, &params).await?
         }
         DebuggerCmd::Watch(WatchCmd::List(args)) => {
             let session_s = args.session.map(|s| s.to_string());
@@ -683,22 +692,22 @@ pub async fn run(args: &DebuggerArgs) -> Result<()> {
             let max_array_items_s = args.max_array_items.to_string();
             let timeout_ms_s = args.timeout_ms.to_string();
             let params = [
-                ("session", session_s.as_deref()),
-                ("depth", Some(depth_s.as_str())),
-                ("max_fields", Some(max_fields_s.as_str())),
-                ("max_array_items", Some(max_array_items_s.as_str())),
-                ("timeout_ms", Some(timeout_ms_s.as_str())),
+                (query::SESSION, session_s.as_deref()),
+                (query::DEPTH, Some(depth_s.as_str())),
+                (query::MAX_FIELDS, Some(max_fields_s.as_str())),
+                (query::MAX_ARRAY_ITEMS, Some(max_array_items_s.as_str())),
+                (query::TIMEOUT_MS, Some(timeout_ms_s.as_str())),
             ];
             bridge
-                .get("/v1/watches", &params)
+                .get(route::WATCHES, &params)
                 .await
                 .unwrap_or_else(|err| read_error_json("debugger_watches", err))
         }
         DebuggerCmd::Watch(WatchCmd::Remove { id }) => {
-            let params = [("id", Some(id.as_str()))];
-            bridge.get("/v1/watches/remove", &params).await?
+            let params = [(query::ID, Some(id.as_str()))];
+            bridge.get(route::WATCHES_REMOVE, &params).await?
         }
-        DebuggerCmd::Watch(WatchCmd::Clear) => bridge.get("/v1/watches/clear", &[]).await?,
+        DebuggerCmd::Watch(WatchCmd::Clear) => bridge.get(route::WATCHES_CLEAR, &[]).await?,
     };
     emit(&value)?;
     Ok(())
@@ -716,7 +725,7 @@ async fn continue_until(bridge: &BridgeClient, args: &ContinueUntilArgs) -> Resu
     loop {
         control(
             bridge,
-            "resume",
+            session_action::RESUME,
             &SessionSelector {
                 session: args.session,
             },
@@ -735,14 +744,17 @@ async fn continue_until(bridge: &BridgeClient, args: &ContinueUntilArgs) -> Resu
                 }));
             }
             tokio::time::sleep(std::time::Duration::from_millis(args.poll_ms.max(25))).await;
-            let status = bridge.get("/v1/status", &[]).await?;
+            let status = bridge.get(route::STATUS, &[]).await?;
             if !selected_session_suspended(&status, args.session) {
                 continue;
             }
             let stack = bridge
                 .get(
-                    "/v1/session/stack",
-                    &[("session", session_s.as_deref()), ("limit", Some("4"))],
+                    route::SESSION_STACK,
+                    &[
+                        (query::SESSION, session_s.as_deref()),
+                        (query::LIMIT, Some("4")),
+                    ],
                 )
                 .await?;
             let location_matches = match (&canonical_file, args.line) {
@@ -753,11 +765,11 @@ async fn continue_until(bridge: &BridgeClient, args: &ContinueUntilArgs) -> Resu
                 Some(condition) => {
                     let eval = bridge
                         .get(
-                            "/v1/session/evaluate",
+                            route::SESSION_EVALUATE,
                             &[
-                                ("session", session_s.as_deref()),
-                                ("expression", Some(condition.as_str())),
-                                ("depth", Some("0")),
+                                (query::SESSION, session_s.as_deref()),
+                                (query::EXPRESSION, Some(condition.as_str())),
+                                (query::DEPTH, Some("0")),
                             ],
                         )
                         .await?;
@@ -832,8 +844,11 @@ async fn control(
     selector: &SessionSelector,
 ) -> Result<Value> {
     let session_s = selector.session.map(|s| s.to_string());
-    let params = [("action", Some(action)), ("session", session_s.as_deref())];
-    bridge.get("/v1/session/control", &params).await
+    let params = [
+        (query::ACTION, Some(action)),
+        (query::SESSION, session_s.as_deref()),
+    ];
+    bridge.get(route::SESSION_CONTROL, &params).await
 }
 
 fn emit(value: &Value) -> Result<()> {
@@ -932,12 +947,12 @@ fn resolve_url(explicit_url: Option<&str>) -> Result<String> {
     if let Some(url) = registry_url()? {
         return Ok(url);
     }
-    Ok(DEFAULT_URL.to_string())
+    Ok(studio_contract::DEFAULT_URL.to_string())
 }
 
 fn registry_url() -> Result<Option<String>> {
     let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
-    let path = PathBuf::from(home).join(REGISTRY_PATH);
+    let path = PathBuf::from(home).join(studio_contract::REGISTRY_PATH);
     if !path.exists() {
         return Ok(None);
     }

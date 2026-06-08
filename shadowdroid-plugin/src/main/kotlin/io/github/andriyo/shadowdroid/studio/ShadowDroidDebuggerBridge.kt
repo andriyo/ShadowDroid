@@ -207,7 +207,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                 val created = createServer(preferredPort) ?: createServer(0)
                     ?: throw IllegalStateException("unable to start ShadowDroid debugger bridge")
 
-                created.createContext("/", ::handle)
+                created.createContext(BridgeConfig.ROOT_CONTEXT, ::handle)
                 created.executor = Executors.newCachedThreadPool { runnable ->
                     Thread(runnable, "ShadowDroid debugger bridge").apply { isDaemon = true }
                 }
@@ -218,9 +218,9 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
         }
 
         private fun preferredPort(): Int {
-            val property = System.getProperty("shadowdroid.debugger.port")
+            val property = System.getProperty(BridgeConfig.PORT_PROPERTY)
                 ?.takeUnless { it.isBlank() }
-                ?: System.getenv("SHADOWDROID_STUDIO_DEBUGGER_PORT")
+                ?: System.getenv(BridgeConfig.PORT_ENV)
             return property?.toIntOrNull() ?: DEFAULT_PORT
         }
 
@@ -248,29 +248,29 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
 
         private fun dispatch(path: String, query: Map<String, String>): Response =
             when (path) {
-                "/v1/status" -> status()
-                "/v1/sessions" -> sessions()
-                "/v1/session/control" -> controlSession(query)
-                "/v1/session/stack" -> currentStack(query)
-                "/v1/session/threads" -> threads(query)
-                "/v1/session/variables" -> variables(query)
-                "/v1/session/evaluate" -> evaluate(query)
-                "/v1/watches" -> watches(query)
-                "/v1/watches/add" -> addWatch(query)
-                "/v1/watches/remove" -> removeWatch(query)
-                "/v1/watches/clear" -> clearWatches()
-                "/v1/clients" -> AndroidAttachBridge.clients(selectProject(query, null), query)
-                "/v1/breakpoints" -> breakpoints()
-                "/v1/breakpoints/line" -> BreakpointBridge.addLine(query, selectProject(query, query["file"]))
-                "/v1/breakpoints/exception" -> BreakpointBridge.addException(query, selectProject(query, null))
-                "/v1/breakpoints/method" -> BreakpointBridge.addMethod(query, selectProject(query, null))
-                "/v1/breakpoints/field" -> BreakpointBridge.addField(query, selectProject(query, query["file"]))
-                "/v1/breakpoints/update" -> BreakpointBridge.update(query, liveProjects(), selectProject(query, null))
-                "/v1/breakpoints/remove" -> BreakpointBridge.remove(query, liveProjects(), selectProject(query, null))
-                "/v1/attach" -> AndroidAttachBridge.attach(selectProject(query, null), query)
-                "/v1/layout/snapshot" -> LayoutInspectorBridge.snapshot(selectProject(query, null), query)
-                "/v1/layout/recompositions" -> LayoutInspectorBridge.recompositions(selectProject(query, null), query)
-                "/v1/layout/source" -> LayoutInspectorBridge.source(selectProject(query, null), query)
+                BridgeRoutes.STATUS -> status()
+                BridgeRoutes.SESSIONS -> sessions()
+                BridgeRoutes.SESSION_CONTROL -> controlSession(query)
+                BridgeRoutes.SESSION_STACK -> currentStack(query)
+                BridgeRoutes.SESSION_THREADS -> threads(query)
+                BridgeRoutes.SESSION_VARIABLES -> variables(query)
+                BridgeRoutes.SESSION_EVALUATE -> evaluate(query)
+                BridgeRoutes.WATCHES -> watches(query)
+                BridgeRoutes.WATCHES_ADD -> addWatch(query)
+                BridgeRoutes.WATCHES_REMOVE -> removeWatch(query)
+                BridgeRoutes.WATCHES_CLEAR -> clearWatches()
+                BridgeRoutes.CLIENTS -> AndroidAttachBridge.clients(selectProject(query, null), query)
+                BridgeRoutes.BREAKPOINTS -> breakpoints()
+                BridgeRoutes.BREAKPOINT_LINE -> BreakpointBridge.addLine(query, selectProject(query, query[BridgeQuery.FILE]))
+                BridgeRoutes.BREAKPOINT_EXCEPTION -> BreakpointBridge.addException(query, selectProject(query, null))
+                BridgeRoutes.BREAKPOINT_METHOD -> BreakpointBridge.addMethod(query, selectProject(query, null))
+                BridgeRoutes.BREAKPOINT_FIELD -> BreakpointBridge.addField(query, selectProject(query, query[BridgeQuery.FILE]))
+                BridgeRoutes.BREAKPOINT_UPDATE -> BreakpointBridge.update(query, liveProjects(), selectProject(query, null))
+                BridgeRoutes.BREAKPOINT_REMOVE -> BreakpointBridge.remove(query, liveProjects(), selectProject(query, null))
+                BridgeRoutes.ATTACH -> AndroidAttachBridge.attach(selectProject(query, null), query)
+                BridgeRoutes.LAYOUT_SNAPSHOT -> LayoutInspectorBridge.snapshot(selectProject(query, null), query)
+                BridgeRoutes.LAYOUT_RECOMPOSITIONS -> LayoutInspectorBridge.recompositions(selectProject(query, null), query)
+                BridgeRoutes.LAYOUT_SOURCE -> LayoutInspectorBridge.source(selectProject(query, null), query)
                 else -> Response(
                     HttpURLConnection.HTTP_NOT_FOUND,
                     BridgeProtocol.obj("ok", false, "error", "not_found", "path", path),
@@ -297,17 +297,17 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
         }
 
         private fun controlSession(query: Map<String, String>): Response {
-            val action = query["action"] ?: return BridgeProtocol.bad("missing action")
+            val action = query[BridgeQuery.ACTION] ?: return BridgeProtocol.bad("missing action")
             val session = selectSession(query) ?: return BridgeProtocol.bad("no debugger session")
             return try {
                 StudioThreading.onIdeaThread {
                     when (action) {
-                        "pause" -> session.pause()
-                        "resume" -> session.resume()
-                        "step_over" -> session.stepOver(false)
-                        "step_into" -> session.stepInto()
-                        "step_out" -> session.stepOut()
-                        "stop" -> session.stop()
+                        BridgeValues.ACTION_PAUSE -> session.pause()
+                        BridgeValues.ACTION_RESUME -> session.resume()
+                        BridgeValues.ACTION_STEP_OVER -> session.stepOver(false)
+                        BridgeValues.ACTION_STEP_INTO -> session.stepInto()
+                        BridgeValues.ACTION_STEP_OUT -> session.stepOut()
+                        BridgeValues.ACTION_STOP -> session.stop()
                         else -> throw IllegalArgumentException("unsupported action: $action")
                     }
                     null
@@ -328,7 +328,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                     "warning", "session is not suspended",
                 )
             }
-            val limit = BridgeProtocol.intParam(query, "limit", 64, 1, 512)
+            val limit = BridgeProtocol.intParam(query, BridgeQuery.LIMIT, 64, 1, 512)
             val timeoutMs = BridgeProtocol.debuggerTimeoutMs(query)
             val frame = session.currentStackFrame
             val frames = mutableListOf<Any>()
@@ -350,7 +350,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                     "warning", "session is not suspended",
                 )
             }
-            val limit = BridgeProtocol.intParam(query, "limit", 32, 1, 128)
+            val limit = BridgeProtocol.intParam(query, BridgeQuery.LIMIT, 32, 1, 128)
             val timeoutMs = BridgeProtocol.debuggerTimeoutMs(query)
             val stacks = session.suspendContext?.executionStacks ?: XExecutionStack.EMPTY_ARRAY
             val payload = mutableListOf<Any>()
@@ -383,9 +383,9 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                 )
             }
             val renderOptions = DebuggerValues.RenderOptions(
-                BridgeProtocol.intParam(query, "depth", 0, 0, 8),
-                BridgeProtocol.intParam(query, "max_fields", 64, 1, 512),
-                BridgeProtocol.intParam(query, "max_array_items", 32, 0, 512),
+                BridgeProtocol.intParam(query, BridgeQuery.DEPTH, 0, 0, 8),
+                BridgeProtocol.intParam(query, BridgeQuery.MAX_FIELDS, 64, 1, 512),
+                BridgeProtocol.intParam(query, BridgeQuery.MAX_ARRAY_ITEMS, 32, 0, 512),
             )
             val timeoutMs = BridgeProtocol.debuggerTimeoutMs(query)
             return try {
@@ -420,14 +420,14 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
         }
 
         private fun evaluate(query: Map<String, String>): Response {
-            val expression = query["expression"]
+            val expression = query[BridgeQuery.EXPRESSION]
             if (expression.isNullOrBlank()) return BridgeProtocol.bad("missing expression")
             val session = selectSession(query) ?: return BridgeProtocol.bad("no debugger session")
             if (!session.isSuspended) return BridgeProtocol.bad("session is not suspended")
             val renderOptions = DebuggerValues.RenderOptions(
-                BridgeProtocol.intParam(query, "depth", 1, 0, 8),
-                BridgeProtocol.intParam(query, "max_fields", 64, 1, 512),
-                BridgeProtocol.intParam(query, "max_array_items", 32, 0, 512),
+                BridgeProtocol.intParam(query, BridgeQuery.DEPTH, 1, 0, 8),
+                BridgeProtocol.intParam(query, BridgeQuery.MAX_FIELDS, 64, 1, 512),
+                BridgeProtocol.intParam(query, BridgeQuery.MAX_ARRAY_ITEMS, 32, 0, 512),
             )
             val timeoutMs = BridgeProtocol.debuggerTimeoutMs(query)
             return try {
@@ -440,7 +440,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                         "session", sessionInfo(sessionIndex(session), session),
                         "selected_frame", selected.info(),
                         "expression", expression,
-                        "mode", "jdi_path",
+                        "mode", BridgeValues.EVAL_MODE_JDI_PATH,
                         "result", DebuggerValues.valueToMap(
                             expression,
                             result.value,
@@ -456,11 +456,11 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
         }
 
         private fun addWatch(query: Map<String, String>): Response {
-            val expression = query["expression"]
+            val expression = query[BridgeQuery.EXPRESSION]
             if (expression.isNullOrBlank()) return BridgeProtocol.bad("missing expression")
             val project = selectProject(query, null)
             val projectKey = project?.let(::projectKey)
-            val name = query["name"]?.takeUnless { it.isBlank() } ?: expression
+            val name = query[BridgeQuery.NAME]?.takeUnless { it.isBlank() } ?: expression
             val watch = WatchSpec(watchId(projectKey, name, expression), projectKey, name, expression, true)
             watches.removeIf { it.id == watch.id }
             watches += watch
@@ -469,7 +469,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
         }
 
         private fun removeWatch(query: Map<String, String>): Response {
-            val id = query["id"]
+            val id = query[BridgeQuery.ID]
             if (id.isNullOrBlank()) return BridgeProtocol.bad("missing id")
             val removed = watches.removeIf { it.id == id }
             watchValues.remove(id)
@@ -487,9 +487,9 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
             installAllSessionListeners()
             val session = selectSession(query)
             val renderOptions = DebuggerValues.RenderOptions(
-                BridgeProtocol.intParam(query, "depth", 1, 0, 8),
-                BridgeProtocol.intParam(query, "max_fields", 64, 1, 512),
-                BridgeProtocol.intParam(query, "max_array_items", 32, 0, 512),
+                BridgeProtocol.intParam(query, BridgeQuery.DEPTH, 1, 0, 8),
+                BridgeProtocol.intParam(query, BridgeQuery.MAX_FIELDS, 64, 1, 512),
+                BridgeProtocol.intParam(query, BridgeQuery.MAX_ARRAY_ITEMS, 32, 0, 512),
             )
             val timeoutMs = BridgeProtocol.debuggerTimeoutMs(query)
             val payload = mutableListOf<Any>()
@@ -601,7 +601,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
 
         private fun selectSession(query: Map<String, String>): XDebugSession? {
             val sessions = allSessions()
-            query["session"]?.toIntOrNull()?.let { index ->
+            query[BridgeQuery.SESSION]?.toIntOrNull()?.let { index ->
                 if (index in sessions.indices) return sessions[index]
             }
             for (project in liveProjects()) {
@@ -611,7 +611,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
         }
 
         private fun selectProject(query: Map<String, String>, file: String?): Project? {
-            val requested = query["project"]
+            val requested = query[BridgeQuery.PROJECT]
             if (requested != null) {
                 for (project in liveProjects()) {
                     if (requested == project.name || requested == project.basePath) return project
@@ -651,7 +651,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
         private fun writeRegistry() {
             val url = serverUrl ?: return
             try {
-                val dir = File(System.getProperty("user.home"), ".shadowdroid")
+                val dir = File(System.getProperty("user.home"), BridgeConfig.REGISTRY_DIR)
                 Files.createDirectories(dir.toPath())
                 val body = BridgeProtocol.obj(
                     "api_version", API_VERSION,
@@ -660,7 +660,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                     "updated_at", Instant.now().toString(),
                     "projects", projectPayload(),
                 )
-                Files.writeString(File(dir, "studio-debugger.json").toPath(), body, StandardCharsets.UTF_8)
+                Files.writeString(File(dir, BridgeConfig.REGISTRY_FILE).toPath(), body, StandardCharsets.UTF_8)
             } catch (_: Throwable) {
             }
         }

@@ -35,14 +35,14 @@ internal object BreakpointBridge {
 
     @JvmStatic
     fun addLine(query: Map<String, String>, project: Project?): Response {
-        val file = query["file"]
+        val file = query[BridgeQuery.FILE]
         if (file.isNullOrBlank()) return BridgeProtocol.bad("missing file")
-        val line = BridgeProtocol.intParam(query, "line", -1, 1, Int.MAX_VALUE)
+        val line = BridgeProtocol.intParam(query, BridgeQuery.LINE, -1, 1, Int.MAX_VALUE)
         if (line < 1) return BridgeProtocol.bad("missing or invalid line")
-        val enabled = BridgeProtocol.booleanParam(query, "enabled", true)
-        val temporary = BridgeProtocol.booleanParam(query, "temporary", false)
-        val condition = query["condition"]
-        val clearCondition = BridgeProtocol.booleanParam(query, "clear_condition", false)
+        val enabled = BridgeProtocol.booleanParam(query, BridgeQuery.ENABLED, true)
+        val temporary = BridgeProtocol.booleanParam(query, BridgeQuery.TEMPORARY, false)
+        val condition = query[BridgeQuery.CONDITION]
+        val clearCondition = BridgeProtocol.booleanParam(query, BridgeQuery.CLEAR_CONDITION, false)
         if (project == null) return BridgeProtocol.bad("no project")
         return try {
             val breakpoint = StudioThreading.onIdeaThread {
@@ -73,7 +73,7 @@ internal object BreakpointBridge {
     @Suppress("UNCHECKED_CAST")
     @JvmStatic
     fun addException(query: Map<String, String>, project: Project?): Response {
-        val exception = query["exception"]
+        val exception = query[BridgeQuery.EXCEPTION]
         if (exception.isNullOrBlank()) return BridgeProtocol.bad("missing exception")
         if (project == null) return BridgeProtocol.bad("no project")
         return try {
@@ -81,11 +81,11 @@ internal object BreakpointBridge {
                 val type = breakpointType(JavaExceptionBreakpointType::class.java)
                     ?: throw IllegalStateException("Java exception breakpoint type is not available")
                 val props = JavaExceptionBreakpointProperties(exception)
-                props.NOTIFY_CAUGHT = BridgeProtocol.booleanParam(query, "caught", true)
-                props.NOTIFY_UNCAUGHT = BridgeProtocol.booleanParam(query, "uncaught", true)
+                props.NOTIFY_CAUGHT = BridgeProtocol.booleanParam(query, BridgeQuery.CAUGHT, true)
+                props.NOTIFY_UNCAUGHT = BridgeProtocol.booleanParam(query, BridgeQuery.UNCAUGHT, true)
                 val created = XDebuggerManager.getInstance(project).breakpointManager
                     .addBreakpoint(type as XBreakpointType<XBreakpoint<JavaExceptionBreakpointProperties>, JavaExceptionBreakpointProperties>, props)
-                created.setEnabled(BridgeProtocol.booleanParam(query, "enabled", true))
+                created.setEnabled(BridgeProtocol.booleanParam(query, BridgeQuery.ENABLED, true))
                 created
             }
             BridgeProtocol.ok("ok", true, "breakpoint", breakpointInfo(project, breakpoint))
@@ -97,8 +97,8 @@ internal object BreakpointBridge {
     @Suppress("UNCHECKED_CAST")
     @JvmStatic
     fun addMethod(query: Map<String, String>, project: Project?): Response {
-        val classPattern = query["class"]
-        val method = query["method"]
+        val classPattern = query[BridgeQuery.CLASS]
+        val method = query[BridgeQuery.METHOD]
         if (classPattern.isNullOrBlank()) return BridgeProtocol.bad("missing class")
         if (method.isNullOrBlank()) return BridgeProtocol.bad("missing method")
         if (project == null) return BridgeProtocol.bad("no project")
@@ -107,11 +107,11 @@ internal object BreakpointBridge {
                 val type = breakpointType(JavaWildcardMethodBreakpointType::class.java)
                     ?: throw IllegalStateException("Java wildcard method breakpoint type is not available")
                 val props = JavaMethodBreakpointProperties(classPattern, method)
-                props.WATCH_ENTRY = BridgeProtocol.booleanParam(query, "entry", true)
-                props.WATCH_EXIT = BridgeProtocol.booleanParam(query, "exit", false)
+                props.WATCH_ENTRY = BridgeProtocol.booleanParam(query, BridgeQuery.ENTRY, true)
+                props.WATCH_EXIT = BridgeProtocol.booleanParam(query, BridgeQuery.EXIT, false)
                 val created = XDebuggerManager.getInstance(project).breakpointManager
                     .addBreakpoint(type as XBreakpointType<XBreakpoint<JavaMethodBreakpointProperties>, JavaMethodBreakpointProperties>, props)
-                created.setEnabled(BridgeProtocol.booleanParam(query, "enabled", true))
+                created.setEnabled(BridgeProtocol.booleanParam(query, BridgeQuery.ENABLED, true))
                 created
             }
             BridgeProtocol.ok("ok", true, "breakpoint", breakpointInfo(project, breakpoint))
@@ -122,15 +122,15 @@ internal object BreakpointBridge {
 
     @JvmStatic
     fun addField(query: Map<String, String>, project: Project?): Response {
-        val file = query["file"]
-        val className = query["class"]
-        val field = query["field"]
+        val file = query[BridgeQuery.FILE]
+        val className = query[BridgeQuery.CLASS]
+        val field = query[BridgeQuery.FIELD]
         if (file.isNullOrBlank()) return BridgeProtocol.bad("missing file")
         if (className.isNullOrBlank()) return BridgeProtocol.bad("missing class")
         if (field.isNullOrBlank()) return BridgeProtocol.bad("missing field")
-        val line = BridgeProtocol.intParam(query, "line", -1, 1, Int.MAX_VALUE)
+        val line = BridgeProtocol.intParam(query, BridgeQuery.LINE, -1, 1, Int.MAX_VALUE)
         if (line < 1) return BridgeProtocol.bad("missing or invalid line")
-        val temporary = BridgeProtocol.booleanParam(query, "temporary", false)
+        val temporary = BridgeProtocol.booleanParam(query, BridgeQuery.TEMPORARY, false)
         if (project == null) return BridgeProtocol.bad("no project")
         return try {
             val target = StudioThreading.onIdeaThread {
@@ -139,14 +139,14 @@ internal object BreakpointBridge {
                 val virtualFile = LocalFileSystem.getInstance().refreshAndFindFileByIoFile(File(file))
                     ?: throw IllegalArgumentException("file not found in IDE VFS: $file")
                 val props = JavaFieldBreakpointProperties(className, field)
-                props.WATCH_ACCESS = BridgeProtocol.booleanParam(query, "access", false)
-                props.WATCH_MODIFICATION = BridgeProtocol.booleanParam(query, "modification", true)
+                props.WATCH_ACCESS = BridgeProtocol.booleanParam(query, BridgeQuery.ACCESS, false)
+                props.WATCH_MODIFICATION = BridgeProtocol.booleanParam(query, BridgeQuery.MODIFICATION, true)
                 var breakpoint = findLineBreakpoint(project, virtualFile.url, line - 1, type.id)
                 if (breakpoint == null) {
                     breakpoint = XDebuggerManager.getInstance(project).breakpointManager
                         .addLineBreakpoint(type, virtualFile.url, line - 1, props, temporary)
                 }
-                breakpoint.setEnabled(BridgeProtocol.booleanParam(query, "enabled", true))
+                breakpoint.setEnabled(BridgeProtocol.booleanParam(query, BridgeQuery.ENABLED, true))
                 breakpoint.setTemporary(temporary)
                 breakpoint
             }
@@ -175,26 +175,26 @@ internal object BreakpointBridge {
         val breakpoint = selected.breakpoint
         return try {
             StudioThreading.onIdeaThread {
-                if (query.containsKey("enabled")) breakpoint.setEnabled(BridgeProtocol.booleanParam(query, "enabled", breakpoint.isEnabled))
-                if (breakpoint is XLineBreakpoint<*> && query.containsKey("temporary")) {
-                    breakpoint.setTemporary(BridgeProtocol.booleanParam(query, "temporary", breakpoint.isTemporary))
+                if (query.containsKey(BridgeQuery.ENABLED)) breakpoint.setEnabled(BridgeProtocol.booleanParam(query, BridgeQuery.ENABLED, breakpoint.isEnabled))
+                if (breakpoint is XLineBreakpoint<*> && query.containsKey(BridgeQuery.TEMPORARY)) {
+                    breakpoint.setTemporary(BridgeProtocol.booleanParam(query, BridgeQuery.TEMPORARY, breakpoint.isTemporary))
                 }
-                if (BridgeProtocol.booleanParam(query, "clear_condition", false)) {
+                if (BridgeProtocol.booleanParam(query, BridgeQuery.CLEAR_CONDITION, false)) {
                     breakpoint.setCondition(null)
-                } else if (query.containsKey("condition")) {
-                    breakpoint.setCondition(query["condition"]?.ifBlank { null })
+                } else if (query.containsKey(BridgeQuery.CONDITION)) {
+                    breakpoint.setCondition(query[BridgeQuery.CONDITION]?.ifBlank { null })
                 }
-                if (BridgeProtocol.booleanParam(query, "clear_log_expression", false)) {
+                if (BridgeProtocol.booleanParam(query, BridgeQuery.CLEAR_LOG_EXPRESSION, false)) {
                     breakpoint.setLogExpression(null)
-                } else if (query.containsKey("log_expression")) {
-                    breakpoint.setLogExpression(query["log_expression"]?.ifBlank { null })
+                } else if (query.containsKey(BridgeQuery.LOG_EXPRESSION)) {
+                    breakpoint.setLogExpression(query[BridgeQuery.LOG_EXPRESSION]?.ifBlank { null })
                 }
-                if (query.containsKey("log_message")) breakpoint.setLogMessage(BridgeProtocol.booleanParam(query, "log_message", breakpoint.isLogMessage))
-                if (query.containsKey("log_stack")) breakpoint.setLogStack(BridgeProtocol.booleanParam(query, "log_stack", breakpoint.isLogStack))
-                if (query.containsKey("suspend")) breakpoint.setSuspendPolicy(SuspendPolicy.valueOf(query.getValue("suspend")))
+                if (query.containsKey(BridgeQuery.LOG_MESSAGE)) breakpoint.setLogMessage(BridgeProtocol.booleanParam(query, BridgeQuery.LOG_MESSAGE, breakpoint.isLogMessage))
+                if (query.containsKey(BridgeQuery.LOG_STACK)) breakpoint.setLogStack(BridgeProtocol.booleanParam(query, BridgeQuery.LOG_STACK, breakpoint.isLogStack))
+                if (query.containsKey(BridgeQuery.SUSPEND)) breakpoint.setSuspendPolicy(SuspendPolicy.valueOf(query.getValue(BridgeQuery.SUSPEND)))
                 val props = breakpoint.properties
-                if (query.containsKey("pass_count") && props is JavaBreakpointProperties<*>) {
-                    val count = BridgeProtocol.intParam(query, "pass_count", 0, 0, Int.MAX_VALUE)
+                if (query.containsKey(BridgeQuery.PASS_COUNT) && props is JavaBreakpointProperties<*>) {
+                    val count = BridgeProtocol.intParam(query, BridgeQuery.PASS_COUNT, 0, 0, Int.MAX_VALUE)
                     props.setCOUNT_FILTER_ENABLED(count > 0)
                     props.setCOUNT_FILTER(count)
                 }
@@ -214,14 +214,14 @@ internal object BreakpointBridge {
                 XDebuggerManager.getInstance(selected.project).breakpointManager.removeBreakpoint(selected.breakpoint)
                 null
             }
-            BridgeProtocol.ok("ok", true, "removed", true, "id", query["id"])
+            BridgeProtocol.ok("ok", true, "removed", true, "id", query[BridgeQuery.ID])
         } catch (t: Throwable) {
             BridgeProtocol.bad(t.message)
         }
     }
 
     private fun findBreakpoint(query: Map<String, String>, projects: List<Project>, requestedProject: Project?): ProjectBreakpoint? {
-        val id = query["id"]
+        val id = query[BridgeQuery.ID]
         if (id.isNullOrBlank()) return null
         for (project in projects) {
             if (requestedProject != null && requestedProject != project) continue

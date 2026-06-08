@@ -123,8 +123,8 @@ internal object DebuggerValues {
     @JvmStatic
     @Throws(Exception::class)
     fun selectedFrame(session: XDebugSession, query: Map<String, String>): SelectedFrame? {
-        val requestedFrame = BridgeProtocol.intParam(query, "frame", 0, 0, 512)
-        val requestedThread = query["thread"]
+        val requestedFrame = BridgeProtocol.intParam(query, BridgeQuery.FRAME, 0, 0, 512)
+        val requestedThread = query[BridgeQuery.THREAD]
         val currentFrame = session.currentStackFrame
         if (requestedThread.isNullOrBlank()) {
             val javaFrame = currentFrame as? JavaStackFrame ?: return null

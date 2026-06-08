@@ -22,6 +22,8 @@ use std::process::Stdio;
 use tracing::info;
 use zip::ZipArchive;
 
+use crate::cmd::studio_contract;
+
 const EXPECTED_PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RELEASE_PLUGIN_ASSET: &str = "shadowdroid-studio-plugin.zip";
 const RELEASE_CHECKSUMS_ASSET: &str = "SHA256SUMS";
@@ -727,7 +729,7 @@ fn ensure_zip(path: &Path) -> Result<()> {
 }
 
 fn bridge_status() -> Result<BridgeInfo> {
-    let registry = shadowdroid_home()?.join("studio-debugger.json");
+    let registry = shadowdroid_home()?.join(studio_contract::REGISTRY_FILE);
     if !registry.is_file() {
         return Ok(BridgeInfo {
             registry: registry.display().to_string(),

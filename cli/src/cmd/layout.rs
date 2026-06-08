@@ -5,6 +5,7 @@
 //! and active inspector model are available.
 
 use crate::cmd::debugger::BridgeClient;
+use crate::cmd::studio_contract::{query, route, value};
 use crate::device::client::ServerClient;
 use crate::proto::{Element, ScreenResponse};
 use anyhow::{Context, Result};
@@ -128,7 +129,7 @@ fn layout_snapshot_value(
     args: &LayoutSnapshotArgs,
 ) -> Value {
     json!({
-        "type": "layout_snapshot",
+        "type": value::LAYOUT_SNAPSHOT,
         "schema_version": 1,
         "ts": now_ms(),
         "device": serial,
@@ -205,8 +206,8 @@ async fn recompositions_cmd(args: RecompositionArgs) -> Result<()> {
     let value = match BridgeClient::new(args.studio_url.as_deref()) {
         Ok(bridge) => match bridge
             .get(
-                "/v1/layout/recompositions",
-                &[("reset", Some(reset_s.as_str()))],
+                route::LAYOUT_RECOMPOSITIONS,
+                &[(query::RESET, Some(reset_s.as_str()))],
             )
             .await
         {
@@ -258,7 +259,7 @@ async fn source_cmd(serial: &str, client: &ServerClient, args: LayoutSourceArgs)
     println!(
         "{}",
         serde_json::to_string(&json!({
-            "type": "layout_source",
+            "type": value::LAYOUT_SOURCE,
             "schema_version": 1,
             "device": serial,
             "screen_hash": screen.screen_hash,
@@ -272,7 +273,7 @@ async fn source_cmd(serial: &str, client: &ServerClient, args: LayoutSourceArgs)
 
 async fn studio_layout_snapshot(studio_url: Option<&str>) -> Result<Value> {
     let bridge = BridgeClient::new(studio_url)?;
-    bridge.get("/v1/layout/snapshot", &[]).await
+    bridge.get(route::LAYOUT_SNAPSHOT, &[]).await
 }
 
 async fn studio_layout_source(
@@ -295,13 +296,13 @@ async fn studio_layout_source(
     let class = element.and_then(|element| element.klass.as_deref());
     let draw_id = args.draw_id.map(|draw_id| draw_id.to_string());
     let params = [
-        ("draw_id", draw_id.as_deref()),
-        ("text", text),
-        ("rid", rid),
-        ("class", class),
-        ("desc", args.desc.as_deref()),
+        (query::DRAW_ID, draw_id.as_deref()),
+        (query::TEXT, text),
+        (query::RID, rid),
+        (query::CLASS, class),
+        (query::DESC, args.desc.as_deref()),
     ];
-    match bridge.get("/v1/layout/source", &params).await {
+    match bridge.get(route::LAYOUT_SOURCE, &params).await {
         Ok(value) => value,
         Err(err) => json!({"available": false, "error": err.to_string()}),
     }
@@ -332,7 +333,7 @@ fn merge_studio_layout(value: &mut Value, studio: Result<Value>) {
 
 fn studio_layout_unavailable(reset: bool, reason: String) -> Value {
     json!({
-        "type": "layout_recompositions",
+        "type": value::LAYOUT_RECOMPOSITIONS,
         "ok": true,
         "available": false,
         "reset_requested": reset,

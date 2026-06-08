@@ -33,7 +33,7 @@ internal object LayoutInspectorBridge {
                 if (!state.available) {
                     return@onIdeaThread BridgeProtocol.ok(
                         "ok", true,
-                        "type", "layout_snapshot",
+                        "type", BridgeValues.LAYOUT_SNAPSHOT,
                         "available", false,
                         "reason", state.reason,
                         "project", projectInfo(project),
@@ -49,7 +49,7 @@ internal object LayoutInspectorBridge {
                 val hasSource = windows.any { windowHas(it as Map<*, *>, "source") }
                 BridgeProtocol.ok(
                     "ok", true,
-                    "type", "layout_snapshot",
+                    "type", BridgeValues.LAYOUT_SNAPSHOT,
                     "available", true,
                     "project", projectInfo(project),
                     "client", layoutClientInfo(state.client),
@@ -67,7 +67,7 @@ internal object LayoutInspectorBridge {
     @JvmStatic
     fun recompositions(project: Project?, query: Map<String, String>): Response {
         if (project == null) return BridgeProtocol.bad("no project")
-        val reset = BridgeProtocol.booleanParam(query, "reset", false)
+        val reset = BridgeProtocol.booleanParam(query, BridgeQuery.RESET, false)
         return try {
             val sourceResolver = sourceResolver(project)
             StudioThreading.onIdeaThread {
@@ -75,7 +75,7 @@ internal object LayoutInspectorBridge {
                 if (!state.available) {
                     return@onIdeaThread BridgeProtocol.ok(
                         "ok", true,
-                        "type", "layout_recompositions",
+                        "type", BridgeValues.LAYOUT_RECOMPOSITIONS,
                         "available", false,
                         "reset_requested", reset,
                         "reason", state.reason,
@@ -104,7 +104,7 @@ internal object LayoutInspectorBridge {
                 }
                 BridgeProtocol.ok(
                     "ok", true,
-                    "type", "layout_recompositions",
+                    "type", BridgeValues.LAYOUT_RECOMPOSITIONS,
                     "available", true,
                     "reset_requested", reset,
                     "project", projectInfo(project),
@@ -127,7 +127,7 @@ internal object LayoutInspectorBridge {
                 if (!state.available) {
                     return@onIdeaThread BridgeProtocol.ok(
                         "ok", true,
-                        "type", "layout_source",
+                        "type", BridgeValues.LAYOUT_SOURCE,
                         "available", false,
                         "reason", state.reason,
                         "project", projectInfo(project),
@@ -138,7 +138,7 @@ internal object LayoutInspectorBridge {
                     val source = layoutSourceInfo(project, node, sourceResolver)
                     return@onIdeaThread BridgeProtocol.ok(
                         "ok", true,
-                        "type", "layout_source",
+                        "type", BridgeValues.LAYOUT_SOURCE,
                         "available", source["available"] == true,
                         "project", projectInfo(project),
                         "matched", layoutNodeInfo(project, node, sourceResolver),
@@ -147,7 +147,7 @@ internal object LayoutInspectorBridge {
                 }
                 BridgeProtocol.ok(
                     "ok", true,
-                    "type", "layout_source",
+                    "type", BridgeValues.LAYOUT_SOURCE,
                     "available", false,
                     "reason", "no matching Android Studio Layout Inspector node",
                     "project", projectInfo(project),
@@ -379,9 +379,9 @@ internal object LayoutInspectorBridge {
 
     private fun layoutFeatures(compose: Boolean, semantics: Boolean, sourceMap: Boolean): Map<String, Any?> =
         BridgeProtocol.map(
-            "compose", BridgeProtocol.map("available", compose, "source", "android_studio_layout_inspector"),
-            "semantics", BridgeProtocol.map("available", semantics, "source", "android_studio_layout_inspector"),
-            "source_map", BridgeProtocol.map("available", sourceMap, "source", "android_studio_layout_inspector"),
+            "compose", BridgeProtocol.map("available", compose, "source", BridgeValues.LAYOUT_INSPECTOR_SOURCE),
+            "semantics", BridgeProtocol.map("available", semantics, "source", BridgeValues.LAYOUT_INSPECTOR_SOURCE),
+            "source_map", BridgeProtocol.map("available", sourceMap, "source", BridgeValues.LAYOUT_INSPECTOR_SOURCE),
         )
 
     private fun windowHas(window: Map<*, *>, feature: String): Boolean {
@@ -403,13 +403,13 @@ internal object LayoutInspectorBridge {
         query: Map<String, String>,
         sourceResolver: SourceResolver,
     ): Boolean {
-        val drawId = optionalLong(query["draw_id"])
+        val drawId = optionalLong(query[BridgeQuery.DRAW_ID])
         if (drawId != null && node.drawId != drawId) return false
-        if (!containsIgnoreCase(node.textValue, query["text"])) return false
-        if (!containsIgnoreCase(resourceSearchText(node.viewId), query["rid"])) return false
-        if (!containsIgnoreCase(node.qualifiedName, query["class"])) return false
+        if (!containsIgnoreCase(node.textValue, query[BridgeQuery.TEXT])) return false
+        if (!containsIgnoreCase(resourceSearchText(node.viewId), query[BridgeQuery.RID])) return false
+        if (!containsIgnoreCase(node.qualifiedName, query[BridgeQuery.CLASS])) return false
 
-        val file = query["file"]
+        val file = query[BridgeQuery.FILE]
         if (!file.isNullOrBlank()) {
             val sourceFile = layoutSourceInfo(project, node, sourceResolver)["file"] as? String
             if (sourceFile == null || !sourceFile.endsWith(file)) return false
