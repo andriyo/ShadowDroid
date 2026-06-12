@@ -215,3 +215,46 @@ pub fn screen_event(device: &str, screen: ScreenResponse, format: ScreenFormat) 
 pub fn emit(e: &Event) {
     println!("{}", serde_json::to_string(e).unwrap());
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::Element;
+
+    fn full() -> Element {
+        Element {
+            id: 1,
+            text: Some("Hi".into()),
+            desc: None,
+            klass: Some("android.widget.Button".into()),
+            rid: None,
+            bounds: [0, 0, 4, 4],
+            tap: [2, 2],
+            clickable: true,
+            long_clickable: true,
+            scrollable: false,
+            checkable: true,
+            focusable: true,
+            enabled: false,
+            selected: false,
+            checked: false,
+            focused: true,
+            password: true,
+            input: false,
+        }
+    }
+
+    #[test]
+    fn compact_element_drops_bounds_and_false_flags() {
+        let json = serde_json::to_string(&CompactElement::from(full())).unwrap();
+        // Bounds and the extra UIAutomator flags are not part of the compact shape.
+        assert!(!json.contains("bounds"), "{json}");
+        assert!(!json.contains("long_clickable"), "{json}");
+        assert!(!json.contains("focusable"), "{json}");
+        // False flags inside the compact shape are still omitted.
+        assert!(!json.contains("scrollable"), "{json}");
+        // The actionable bits survive.
+        assert!(json.contains("\"clickable\":true"), "{json}");
+        assert!(json.contains("\"tap\":[2,2]"), "{json}");
+    }
+}
