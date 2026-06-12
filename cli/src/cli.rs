@@ -104,7 +104,8 @@ pub enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Generate an agent-integration file (Claude Code / Cursor / Codex).
+    /// Generate or refresh an agent-integration file (claude-code / cursor /
+    /// codex / gemini / antigravity); `skill --sync` updates installed ones.
     Skill(crate::cmd::skill::SkillArgs),
     /// Detect Android Studio and install the ShadowDroid Android Studio plugin.
     Studio(crate::cmd::studio::StudioArgs),
@@ -1176,7 +1177,7 @@ async fn cmd_connect(
     let stylus_tutorial_disabled =
         crate::cmd::device_profile::disable_stylus_tutorial(&serial).await;
     let state = client.state().await?;
-    let out = json!({
+    let mut out = json!({
         "type": "connected",
         "device": serial,
         "server_version": state.server_version,
@@ -1188,6 +1189,11 @@ async fn cmd_connect(
         "current_app": state.current_app,
         "device_prep": {"stylus_tutorial_disabled": stylus_tutorial_disabled},
     });
+    // After a CLI upgrade, bring installed skills up to date — pristine ones are
+    // rewritten silently; anything hand-edited is flagged for `skill sync`.
+    if let Some(skills) = crate::cmd::skill::refresh_for_connect() {
+        out["skills"] = skills;
+    }
     println!("{}", serde_json::to_string(&out).unwrap());
     Ok(())
 }
