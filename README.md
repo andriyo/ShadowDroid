@@ -111,11 +111,15 @@ the machine-readable counterpart to `--help` that an agent can read once to
 discover the whole tool.
 
 `shadowdroid skill <agent>` generates a ready-to-drop integration file for a
-coding agent, with driving guidance and an auto-generated command reference:
+coding agent, with driving guidance and an auto-generated command reference.
+Supported agents: `claude-code`, `cursor`, `codex`, `gemini`, `antigravity`
+(the last four match the set Android's own CLI installs skills for).
 
 ```bash
 shadowdroid skill claude-code --install   # → ~/.claude/skills/shadowdroid/SKILL.md
-shadowdroid skill cursor   --install      # → ~/.cursor/skills/shadowdroid/SKILL.md
+shadowdroid skill cursor      --install   # → ~/.cursor/skills/shadowdroid/SKILL.md
+shadowdroid skill gemini      --install   # → ~/.gemini/skills/shadowdroid/SKILL.md
+shadowdroid skill antigravity --install   # → ~/.gemini/antigravity*/skills/shadowdroid/SKILL.md
 shadowdroid skill codex                   # → prints an AGENTS.md section to stdout
 ```
 
@@ -125,6 +129,17 @@ To write a project-scoped Cursor rule instead:
 ```bash
 shadowdroid skill cursor --out /path/to/project/.cursor/rules/shadowdroid.mdc
 ```
+
+Each installed skill is stamped with a version marker. After you upgrade the
+CLI, refresh them in one shot — unmodified skills are rewritten in place, and
+any you've hand-edited are left alone (pass `--force` to overwrite those too):
+
+```bash
+shadowdroid skill --sync          # refresh every installed skill to this version
+```
+
+`connect` also runs this refresh automatically (pristine skills only), so an
+upgraded CLI keeps its installed skills current with no extra step.
 
 ## Agent debugging
 

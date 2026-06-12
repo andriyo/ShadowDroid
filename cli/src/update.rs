@@ -123,8 +123,17 @@ fn print_human(check: &UpdateCheck) {
 
 fn detect_install_method(path: &Path) -> InstallMethod {
     let normalized = normalize_path(path);
-    if normalized.contains("/cellar/shadowdroid/")
+    // current_exe() can hand us a symlink rather than its target: Homebrew
+    // exposes …/Cellar/shadowdroid/<v>/bin/shadowdroid as a …/bin/shadowdroid
+    // shim, so resolve it before matching the Cellar path. Fall back to the raw
+    // path (plus the shim-prefix check) when the target can't be resolved.
+    let resolved = std::fs::canonicalize(path)
+        .map(|p| normalize_path(&p))
+        .unwrap_or_else(|_| normalized.clone());
+    if resolved.contains("/cellar/shadowdroid/")
+        || normalized.contains("/cellar/shadowdroid/")
         || normalized.contains("/homebrew/cellar/shadowdroid/")
+        || is_homebrew_shim(&normalized)
     {
         return InstallMethod::Homebrew;
     }
@@ -144,6 +153,15 @@ fn detect_install_method(path: &Path) -> InstallMethod {
     InstallMethod::Unknown
 }
 
+/// Homebrew `bin` shim locations (Apple Silicon + Linuxbrew). Intel's
+/// `/usr/local/bin` is intentionally excluded — it's shared with manual
+/// installs, so that case is covered by canonicalizing the shim to its Cellar
+/// target instead.
+fn is_homebrew_shim(p: &str) -> bool {
+    p.ends_with("/opt/homebrew/bin/shadowdroid")
+        || p.ends_with("/home/linuxbrew/.linuxbrew/bin/shadowdroid")
+}
+
 fn normalize_path(path: &Path) -> String {
     path.display()
         .to_string()
@@ -153,12 +171,15 @@ fn normalize_path(path: &Path) -> String {
 
 fn update_command(method: InstallMethod) -> String {
     match method {
-        InstallMethod::Homebrew => "brew upgrade shadowdroid".to_string(),
+        // `brew update` first so the tap actually sees the new release — a bare
+        // `brew upgrade` runs against the cached formula and silently no-ops
+        // right after a release.
+        InstallMethod::Homebrew => "brew update && brew upgrade shadowdroid".to_string(),
         InstallMethod::Scoop => "scoop update shadowdroid".to_string(),
         InstallMethod::Cargo => "cargo install shadowdroid --locked --force".to_string(),
         InstallMethod::Direct => direct_update_command(),
         InstallMethod::Unknown => format!(
-            "brew upgrade shadowdroid  # or: scoop update shadowdroid  # or: {}",
+            "brew update && brew upgrade shadowdroid  # or: scoop update shadowdroid  # or: {}",
             direct_update_command()
         ),
     }
@@ -230,6 +251,29 @@ mod tests {
         assert_eq!(
             detect_install_method(Path::new("/Users/me/.local/bin/shadowdroid")),
             InstallMethod::Direct
+        );
+    }
+
+    #[test]
+    fn detects_homebrew_from_bin_shim() {
+        // current_exe() may report the `bin` shim rather than the Cellar target;
+        // detection must still resolve to Homebrew (regression: previously these
+        // fell through to Unknown and emitted the generic 3-way command).
+        assert_eq!(
+            detect_install_method(Path::new("/opt/homebrew/bin/shadowdroid")),
+            InstallMethod::Homebrew
+        );
+        assert_eq!(
+            detect_install_method(Path::new("/home/linuxbrew/.linuxbrew/bin/shadowdroid")),
+            InstallMethod::Homebrew
+        );
+    }
+
+    #[test]
+    fn homebrew_update_command_refreshes_tap_first() {
+        assert_eq!(
+            update_command(InstallMethod::Homebrew),
+            "brew update && brew upgrade shadowdroid"
         );
     }
 }
