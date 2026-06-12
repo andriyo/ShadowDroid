@@ -6,7 +6,7 @@ package io.github.andriyo.shadowdroid
  * with the matching values in cli/Cargo.toml + server/app/build.gradle.kts.
  */
 object BuildInfo {
-    const val SERVER_VERSION: String = "0.1.6"
+    const val SERVER_VERSION: String = "0.1.7"
     const val API_VERSION: String = "1"
     const val UI_AUTOMATOR_VERSION: String = "2.3.0"
 }

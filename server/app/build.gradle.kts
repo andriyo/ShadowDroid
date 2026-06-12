@@ -20,8 +20,8 @@ android {
         applicationId = "io.github.andriyo.shadowdroid"
         minSdk = 24 // covers ~98% of in-use devices; UA 2.3 requires 24+
         targetSdk = 36
-        versionCode = 7
-        versionName = "0.1.6"
+        versionCode = 8
+        versionName = "0.1.7"
 
         // Use the standard AndroidJUnitRunner. We start the HTTP server from a
         // normal @Test method (see ShadowDroidServerTest.kt) rather than from a

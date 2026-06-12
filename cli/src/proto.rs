@@ -54,32 +54,45 @@ pub struct Element {
     pub rid: Option<String>,
     pub bounds: [i32; 4],
     pub tap: [i32; 2],
-    #[serde(default)]
+    // Flags are omitted from serialized `screen --full` / `find --full` output
+    // when they hold their default, so the agent only pays tokens for what's
+    // set. `enabled` defaults to true, so it's the inverse — emitted only when an
+    // element is disabled. Deserialization is unaffected (the server, with
+    // encodeDefaults, sends every flag).
+    #[serde(default, skip_serializing_if = "is_false")]
     pub clickable: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub long_clickable: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub scrollable: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub checkable: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub focusable: bool,
-    #[serde(default = "_true")]
+    #[serde(default = "_true", skip_serializing_if = "is_true")]
     pub enabled: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub selected: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub checked: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub focused: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub password: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub input: bool,
 }
 
 fn _true() -> bool {
     true
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 // ── /v1/app/* ────────────────────────────────────────────────────────
@@ -238,4 +251,64 @@ pub struct ErrorBody {
     pub code: String,
     pub message: String,
     pub detail: Option<serde_json::Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> Element {
+        Element {
+            id: 3,
+            text: Some("Go".into()),
+            desc: None,
+            klass: None,
+            rid: None,
+            bounds: [0, 0, 10, 10],
+            tap: [5, 5],
+            clickable: true,
+            long_clickable: false,
+            scrollable: false,
+            checkable: false,
+            focusable: false,
+            enabled: true,
+            selected: false,
+            checked: false,
+            focused: false,
+            password: false,
+            input: false,
+        }
+    }
+
+    #[test]
+    fn serialized_element_drops_default_flags() {
+        let json = serde_json::to_string(&sample()).unwrap();
+        // Truthy flags stay…
+        assert!(json.contains("\"clickable\":true"), "{json}");
+        // …falsy flags and the redundant enabled:true are omitted.
+        assert!(!json.contains("long_clickable"), "{json}");
+        assert!(!json.contains("focusable"), "{json}");
+        assert!(!json.contains("\"input\""), "{json}");
+        assert!(!json.contains("\"enabled\""), "{json}");
+    }
+
+    #[test]
+    fn disabled_element_still_serializes_enabled_false() {
+        let mut el = sample();
+        el.enabled = false;
+        let json = serde_json::to_string(&el).unwrap();
+        assert!(json.contains("\"enabled\":false"), "{json}");
+    }
+
+    #[test]
+    fn serialized_element_round_trips_through_defaults() {
+        // The on-device server sends every flag; the compacted form we emit must
+        // still deserialize back to the same element.
+        let el = sample();
+        let json = serde_json::to_string(&el).unwrap();
+        let back: Element = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.enabled, el.enabled);
+        assert_eq!(back.clickable, el.clickable);
+        assert_eq!(back.input, el.input);
+    }
 }

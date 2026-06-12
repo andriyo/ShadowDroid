@@ -207,29 +207,98 @@ mod tests {
         assert!(content.contains("globs:\nalwaysApply: false"));
         assert!(!content.contains("\nname: shadowdroid\n"));
     }
+
+    #[test]
+    fn command_reference_expands_core_and_points_to_catalog_for_tail() {
+        let r = command_reference();
+        // Core driving verbs are expanded with detail…
+        assert!(r.contains("- **`tap`**"), "{r}");
+        assert!(r.contains("- **`screen`**"), "{r}");
+        // …and a previously blank gesture now carries help text.
+        assert!(r.contains("- **`swipe`** — Swipe"), "{r}");
+        // The advanced long tail is not expanded inline (no subcommands)…
+        assert!(!r.contains("debugger variables"), "{r}");
+        // …but stays discoverable via the pointer line.
+        assert!(r.contains("commands --json"));
+        assert!(r.contains("debugger"));
+    }
 }
 
 /// Render the live command catalog as a grouped markdown reference.
+///
+/// Only the verbs an agent reaches for in the observe→act loop are expanded in
+/// full. The advanced long tail (`debugger`, `layout`, `appops`, …) is named
+/// with a pointer to `commands --json`, so the skill stays lean in context
+/// without losing discoverability. Still generated from the live catalog, so it
+/// never drifts from the actual CLI.
 fn command_reference() -> String {
+    // The core driving surface, expanded with subcommands. Anything else is
+    // listed by name only. Matched against the live catalog, so a renamed verb
+    // falls through to the pointer line rather than silently vanishing.
+    const CORE: &[&str] = &[
+        "devices",
+        "connect",
+        "disconnect",
+        "doctor",
+        "collect",
+        "screen",
+        "screenshot",
+        "find",
+        "tap",
+        "double-tap",
+        "long-tap",
+        "swipe",
+        "drag",
+        "swipe-ext",
+        "pinch",
+        "scroll-to",
+        "text",
+        "key",
+        "back",
+        "home",
+        "wait",
+        "toast",
+        "watch",
+        "app",
+        "perm",
+        "device",
+    ];
+
     let root = Cli::command();
     let catalog = crate::cmd::introspect::catalog(&root);
-    let mut out =
-        String::from("## Command reference\n\nGenerated from `shadowdroid commands --json`.\n\n");
+    let mut core = String::new();
+    let mut tail: Vec<String> = Vec::new();
+
     if let Some(cmds) = catalog["commands"].as_array() {
         for c in cmds {
             let name = c["name"].as_str().unwrap_or("");
+            if !CORE.contains(&name) {
+                tail.push(name.to_string());
+                continue;
+            }
             let about = c["about"].as_str().unwrap_or("");
+            core.push_str(&format!("- **`{name}`** — {about}\n"));
             if let Some(subs) = c["subcommands"].as_array() {
-                out.push_str(&format!("- **`{name}`** — {about}\n"));
                 for s in subs {
                     let sn = s["name"].as_str().unwrap_or("");
                     let sa = s["about"].as_str().unwrap_or("");
-                    out.push_str(&format!("  - `{name} {sn}` — {sa}\n"));
+                    core.push_str(&format!("  - `{name} {sn}` — {sa}\n"));
                 }
-            } else {
-                out.push_str(&format!("- **`{name}`** — {about}\n"));
             }
         }
+    }
+
+    let mut out = String::from(
+        "## Command reference\n\nCore driving verbs below — run \
+         `shadowdroid commands --json` for the full catalog (every command, \
+         subcommand, and flag).\n\n",
+    );
+    out.push_str(&core);
+    if !tail.is_empty() {
+        out.push_str(&format!(
+            "\nOther commands (`shadowdroid commands --json` for details): {}.\n",
+            tail.join(", ")
+        ));
     }
     out
 }

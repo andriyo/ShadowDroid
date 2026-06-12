@@ -23,7 +23,7 @@ use crate::cmd::device_profile::ProfileApplyArgs;
 use crate::cmd::scroll::ScrollArgs;
 use crate::device::client::ServerClient;
 use crate::device::{adb, installer};
-use crate::events::ScreenFormat;
+use crate::events::{CompactElement, ScreenFormat};
 use crate::proto::{Element, SelectorQuery};
 use crate::watch::watcher::PermissionDialogPolicy;
 
@@ -137,7 +137,12 @@ pub enum Cmd {
 
     // ── UI read (flat) ────────────────────────────────────────
     /// Dump the current UI as a flat element list.
-    Screen,
+    Screen {
+        /// Emit the full element set (bounds + every UIAutomator flag). Default
+        /// is the compact agent shape: selector fields + tap, false flags omitted.
+        #[arg(long)]
+        full: bool,
+    },
     /// Capture a screenshot to a file.
     Screenshot {
         path: Option<String>,
@@ -168,16 +173,16 @@ pub enum Cmd {
         #[arg(long)]
         xpath: Option<String>,
     },
-    DoubleTap {
-        x: i32,
-        y: i32,
-    },
+    /// Double-tap at <x> <y> coordinates.
+    DoubleTap { x: i32, y: i32 },
+    /// Long-press at <x> <y> coordinates (hold for --duration-ms).
     LongTap {
         x: i32,
         y: i32,
         #[arg(long, default_value_t = 600)]
         duration_ms: u32,
     },
+    /// Swipe from (x1,y1) to (x2,y2).
     Swipe {
         x1: i32,
         y1: i32,
@@ -186,6 +191,7 @@ pub enum Cmd {
         #[arg(long, default_value_t = 200)]
         duration_ms: u32,
     },
+    /// Drag from (x1,y1) to (x2,y2) — slower than swipe, for drag-and-drop / reorder.
     Drag {
         x1: i32,
         y1: i32,
@@ -194,6 +200,7 @@ pub enum Cmd {
         #[arg(long, default_value_t = 500)]
         duration_ms: u32,
     },
+    /// Swipe a fraction (--scale) of the screen in a direction (up/down/left/right).
     SwipeExt {
         #[arg(value_parser = ["up", "down", "left", "right"])]
         direction: String,
@@ -232,6 +239,9 @@ pub enum Cmd {
         /// Return all matches instead of the first.
         #[arg(long)]
         all: bool,
+        /// Emit the full element set instead of the compact agent shape.
+        #[arg(long)]
+        full: bool,
     },
 
     // ── input (flat) ──────────────────────────────────────────
@@ -242,10 +252,10 @@ pub enum Cmd {
         clear: bool,
     },
     /// Press a named key or keycode.
-    Key {
-        name: String,
-    },
+    Key { name: String },
+    /// Press the Back button.
     Back,
+    /// Press the Home button.
     Home,
 
     // ── sync / stream / capture (flat) ────────────────────────
@@ -505,7 +515,7 @@ pub async fn run() -> Result<()> {
         Cmd::Layout(args) => crate::cmd::layout::run(&serial, &client, args).await?,
 
         // ── UI read ────────────────────────────────────────────
-        Cmd::Screen => emit(&client.screen().await?),
+        Cmd::Screen { full } => cmd_screen(&client, full).await?,
         Cmd::Screenshot {
             path,
             format,
@@ -597,6 +607,7 @@ pub async fn run() -> Result<()> {
             desc,
             xpath,
             all,
+            full,
         } => {
             let query = SelectorQuery {
                 text,
@@ -607,7 +618,14 @@ pub async fn run() -> Result<()> {
                 ..Default::default()
             };
             let r = client.find(&query).await?;
-            emit_action("find", &json!({"matched":r.matched,"elements":r.elements}));
+            if full {
+                emit_action("find", &json!({"matched":r.matched,"elements":r.elements}));
+            } else {
+                let matched = r.matched.map(CompactElement::from);
+                let elements: Vec<CompactElement> =
+                    r.elements.into_iter().map(CompactElement::from).collect();
+                emit_action("find", &json!({"matched":matched,"elements":elements}));
+            }
         }
 
         // ── input ──────────────────────────────────────────────
@@ -915,6 +933,30 @@ async fn cmd_device_info(client: &ServerClient, serial: &str) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// `screen` defaults to the compact agent shape (no bounds, false flags
+/// omitted) — the loop reads this every iteration, so it pays for itself in
+/// tokens. `--full` restores the complete UIAutomator element set.
+async fn cmd_screen(client: &ServerClient, full: bool) -> Result<()> {
+    let screen = client.screen().await?;
+    if full {
+        emit(&screen);
+        return Ok(());
+    }
+    let elements: Vec<CompactElement> = screen
+        .elements
+        .into_iter()
+        .map(CompactElement::from)
+        .collect();
+    emit(&json!({
+        "screen_hash": screen.screen_hash,
+        "viewport": screen.viewport,
+        "current_app": screen.current_app,
+        "element_count": screen.element_count,
+        "elements": elements,
+    }));
     Ok(())
 }
 
