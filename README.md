@@ -1,41 +1,84 @@
 # ShadowDroid
 
-Drive Android apps with **structured output** and **agent-friendly latency**.
+**A fast Android IDE for your AI agents** — because your coding agent deserves the
+best, fastest, most reliable tools to drive and debug Android apps.
 
-ShadowDroid is a two-piece system:
+ShadowDroid turns a real Android device or emulator into a structured surface an
+AI agent can read and act on. It pairs a single static binary on your laptop
+with a tiny Kotlin instrumentation service on the device, and exposes the whole
+app UI as JSON. Your agent reads the screen as a flat list of elements, taps /
+types / swipes / scrolls **by selector**, waits for state to settle, streams
+crashes and toasts as events, and drops into Android Studio-backed debugging and
+layout inspection — all at roughly **25 ms per UI dump**, fast enough that the
+agent loop never stalls.
 
-- **`shadowdroid`** — a single static **Rust** binary on the laptop that gives you a streaming JSON-line view of the device UI and a set of CLI verbs: flat interaction primitives (`tap`, `swipe`, `text`, `find`, `scroll-to`, `screen`, `watch`, …) plus nested resource namespaces (`app`, `perm`, `appops`, `profile`, `device`, `files`).
-- **`io.github.andriyo.shadowdroid`** — a tiny **Kotlin Instrumentation APK** on the device that wraps **AndroidX UI Automator 2.3.0** behind a localhost HTTP service.
+There's no test DSL and no extra runtime to babysit — just the CLI and `adb`.
+Every action is one subcommand that prints one line of JSON: `shadowdroid <verb>`
+in, a JSON event out. That makes it trivial to wire into any agent — point it at
+the command catalog and let it drive.
 
-The two talk over `adb forward` + HTTP. No Python anywhere. No Appium server. No `uiautomator2` Python package.
+```jsonc
+$ shadowdroid screen
+{"screen_hash":"a1b2…","viewport":{"w":1080,"h":2424},"current_app":{…},"element_count":42,
+ "elements":[{"id":7,"rid":"main_tab_profile","tap":[980,2256],"clickable":true}, …]}
 
-ShadowDroid is intentionally self-contained: no Python dependency tree, current UI Automator, and a single binary distribution.
+$ shadowdroid tap --rid main_tab_profile
+{"type":"action","cmd":"tap","via":"selector","x":980,"y":2256,"matched":true}
+
+$ shadowdroid wait --text "Welcome back" --timeout-ms 5000
+{"type":"action","cmd":"wait","matched":true,"gone":false,"screen_hash":"c3d4…"}
+```
+
+> Android-only by design, and not a test framework — ShadowDroid is the fast,
+> observable layer an agent drives directly.
 
 ## Why it exists
 
-The state of the art for "have an LLM drive an Android app" looks like one of these:
+To drive a *running* app in a tight agent loop, the tools you'd otherwise reach
+for each fall short:
 
-| Tool                                   | Problem                                                                     |
-| -------------------------------------- | --------------------------------------------------------------------------- |
-| Raw `adb shell uiautomator dump`       | ~500ms-1s per dump. Agents stall, the loop feels dead.                      |
-| Appium                                 | Heavy. Java/Node server on the laptop. Selenium-WebDriver API mismatch.     |
-| openatx + uiautomator2 (Python)        | Fast, but Python toolchain + Go binary + bundled jars. Hard to package.     |
-| `adb shell input tap`                  | Stateless. No knowledge of what's on screen. Fragile to layout changes.     |
+| Tool                              | Gap for a live agent loop                                                          |
+| --------------------------------- | --------------------------------------------------------------------------------- |
+| `adb shell uiautomator dump`      | ~500ms–1s per dump — the loop stalls between every step.                           |
+| `adb shell input tap`             | Stateless: no idea what's on screen, fragile to any layout change.                 |
+| `android` CLI (`layout`/`screen`) | Built for project create / build / run / SDK — and great at it. But for live UI, each `layout` call runs a fresh `ui-dump` (the slow path): no persistent service, no streaming loop, no interaction-by-selector, no crash/popup events, no agent debugger. |
 
-ShadowDroid keeps the speed of openatx (persistent on-device HTTP service, ~25ms dumps) without the Python deps and without the maintenance opacity. The on-device side is small Kotlin we own; the laptop side is one Rust binary.
+ShadowDroid is the **complement, not a replacement**. Keep using the `android`
+CLI to scaffold, build, deploy, and manage the SDK — then hand the *running* app
+to ShadowDroid. A persistent on-device service keeps dumps at ~25ms, a streaming
+JSON event model lets the agent follow the app live, and it ships with
+**first-class Jetpack Compose support** (AndroidX UI Automator 2.3.0+),
+**built-in crash detection**, **declarative popup watchers**, and — uniquely — an
+**agent-facing Android Studio debugger** (see [Agent debugging](#agent-debugging)).
+It even follows the `android` CLI's own conventions (`init`, `skills`, `layout`,
+`studio`), so it slots in right beside it.
 
-## Repo layout
+## How it works
 
 ```
-ShadowDroid/
-├── cli/                  # Rust workspace — the `shadowdroid` binary
-├── server/               # Gradle project — io.github.andriyo.shadowdroid Instrumentation APK
-├── docs/                 # Architecture + HTTP protocol spec + design notes
-├── proto/                # Shared schema (OpenAPI today; could codegen later)
-├── scripts/              # Dev helpers (boot emulator, install APK, release builder)
-├── examples/             # Sample flows + watcher rule files
-└── README.md
+        Laptop                         adb forward                Android device
+  ┌───────────────────────┐         tcp:7912 ⇆ 7912        ┌───────────────────────────┐
+  │  shadowdroid (Rust)   │  ── HTTP + JSON (loopback) ──▶  │  instrumentation APK      │
+  │  • clap CLI           │                                 │  • Ktor 3 / CIO server    │
+  │  • XML → element JSON  │ ◀────────  adb logcat  ──────── │  • UiDevice (AndroidX     │
+  │  • watch/crash/watcher │                                 │    UI Automator 2.3.0+)   │
+  └───────────────────────┘                                 └───────────────────────────┘
 ```
+
+The on-device APK is a **stateless RPC over UI Automator** — it just exposes
+`UiDevice.click / swipe / dump` and a toast monitor over HTTP. All *policy* lives
+on the laptop: the dump-then-diff watch loop, crash parsing from logcat, the
+watcher rule engine, and the XML→JSON transform. That keeps the APK tiny and lets
+it rev independently of the CLI.
+
+On the first `connect`, the CLI auto-installs a **version-matched APK pair**
+(downloaded from the matching GitHub Release, SHA-256 verified, cached under
+`~/.shadowdroid/`), runs `adb forward`, and starts the instrumentation. Later
+calls just probe `GET /v1/state` and reuse the live server, so steady-state
+latency stays low.
+
+See [docs/architecture.md](docs/architecture.md) for the full design and
+[docs/protocol.md](docs/protocol.md) for the HTTP wire format.
 
 ## Install
 
@@ -64,56 +107,115 @@ Windows PowerShell:
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/andriyo/ShadowDroid/releases/latest/download/shadowdroid-installer.ps1 | iex"
 ```
 
-ShadowDroid requires Android Platform Tools (`adb`) on PATH. The installers
-print a hint if `adb` is missing; on macOS you can install it with
-`brew install --cask android-platform-tools`, and on Windows with
+The installer only installs the host CLI. ShadowDroid also requires Android
+Platform Tools (`adb`) on PATH — the installers print a hint if it's missing. On
+macOS: `brew install --cask android-platform-tools`; on Windows:
 `scoop install adb`.
 
-Initialize optional host integrations:
+See [docs/getting-started.md](docs/getting-started.md) for pinned versions,
+custom install dirs, manual downloads, and uninstall.
+
+## Connect
+
+Start an emulator or plug in a device with USB debugging, then:
 
 ```bash
-shadowdroid init                         # detect Android Studio + plugin state
-shadowdroid init --install-studio-plugin # install/update the Android Studio plugin
+shadowdroid devices        # list attached devices / emulators
+shadowdroid connect        # install the on-device server, forward, and verify
 ```
 
-Then connect to an attached Android device or emulator:
+On first `connect`, the CLI downloads the matching instrumentation APKs from the
+GitHub Release, verifies them with SHA-256, caches them under
+`~/.shadowdroid/apks/<version>/`, and installs them on the device. (When working
+inside this repo it auto-discovers your local build instead — see
+[docs/development.md](docs/development.md).)
+
+Keep the CLI current and diagnose a flaky pipe:
 
 ```bash
-shadowdroid connect
+shadowdroid update --check  # compare against the latest GitHub Release
+shadowdroid doctor          # diagnose device state, APK version, forward, server
+shadowdroid doctor --fix    # attempt repairs (reinstall, re-forward, restart)
+shadowdroid collect         # bundle a self-contained diagnostic snapshot
 ```
 
-Check for CLI updates:
+Optional host integrations (Android Studio plugin for debugger + layout):
 
 ```bash
-shadowdroid update --check
+shadowdroid init                          # detect Android Studio + plugin state
+shadowdroid init --install-studio-plugin  # install/update the Studio plugin
 ```
 
-The installer only installs the host CLI. On first `connect`, ShadowDroid
-downloads the matching instrumentation APKs from the same GitHub Release,
-verifies them with SHA-256, caches them under `~/.shadowdroid/apks/<version>/`,
-and installs them on the device.
+## What you can drive
 
-The Android Studio plugin is shipped as `shadowdroid-studio-plugin.zip` in the
-same GitHub Release. `shadowdroid studio install` detects Android Studio,
-downloads/verifies/caches the plugin under `~/.shadowdroid/plugins/<version>/`,
-unpacks it into Studio's user plugin directory, and tells you when a restart is
-required.
+Every verb prints a single JSON event. Selectors are consistent across commands:
+`--text`, `--rid` (resource id), `--desc` (content description), and `--xpath`.
+A typical agent reads `screen` once, acts by `--rid`/`--text`, and re-reads only
+when `screen_hash` changes.
 
-See [docs/getting-started.md](docs/getting-started.md) for manual downloads
-and pinned versions. Maintainers can use [docs/release.md](docs/release.md) to
-cut a release.
+| Group            | Commands                                                                                          |
+| ---------------- | ------------------------------------------------------------------------------------------------- |
+| **Observe**      | `screen` (flat element list), `screenshot`, `find` (by selector), `layout snapshot` / `layout diff` |
+| **Interact**     | `tap` (by id / coords / selector), `double-tap`, `long-tap`, `swipe`, `drag`, `swipe-ext`, `pinch`, `scroll-to` |
+| **Input**        | `text`, `key`, `back`, `home`                                                                      |
+| **Synchronize**  | `wait` (element / activity / package, or `--gone`), `toast`, `watch` (stream events + declarative watchers) |
+| **App**          | `app start` / `stop` / `install` / `reinstall` / `clear` / `info` / `wait` / `current`             |
+| **Permissions**  | `perm grant` / `revoke` / `list` / `reset`, `appops get` / `set`                                   |
+| **Device**       | `device info` / `shell` / `wake` / `sleep` / `unlock` / `orientation` / `clipboard` / `notifications` / `quick-settings` / `open-url` |
+| **Files**        | `files ls` / `push` / `pull`                                                                       |
+| **Display**      | `profile snapshot` / `apply` / `reset` (animations, font, density, size, rotation)                 |
+| **Debug**        | `debug snapshot` / `record` / `replay`, `debugger` (attach / breakpoints / stack / vars / eval), `debug run-until-crash` |
+| **Session**      | `devices`, `connect`, `disconnect`, `doctor`, `collect`, `update`, `commands`, `skill`, `studio`, `init` |
+
+`watch` is the streaming workhorse — it emits debounced, hash-diffed `screen`
+events plus `crash`, `toast`, and `watcher_fired` events as JSON lines, so an
+agent can follow a live app and react to popups and crashes without polling.
+
+Run `shadowdroid commands` for the full command tree, or `shadowdroid --help` on
+any subcommand for its flags.
+
+## Agent debugging
+
+**This is the part nothing else gives an agent.** Driving a UI tells an agent
+*what* happened on screen; debugging tells it *why*. ShadowDroid hands a coding
+agent a live Android Studio debugger as plain JSON — so when a tap doesn't do
+what the agent expected, it can set a breakpoint and read the actual program
+state instead of guessing from screenshots. It's a bounded, read-only surface
+designed for autonomous use, not a remote shell.
+
+Backed by an optional Android Studio plugin:
+
+- **`debugger`** — attach to the running app; set breakpoints (line, exception,
+  method, field watchpoint; conditional, temporary, logpoints); read the call
+  stack, local variables, and watches; evaluate read-only expressions (`this`,
+  locals, fields, array indexes). Requests are bounded — they return a structured
+  `ok:false` instead of blocking when no suspended frame is available.
+- **`debug snapshot`** — one shot: device + build, foreground app, screen tree,
+  screenshot, recent logcat, and the live debugger stack / variables / breakpoints
+  in a single JSON object.
+- **`debug record` / `debug replay`** — JSONL timelines of screen changes,
+  lifecycle, logcat, and replayable actions (taps, text, keys, swipes, drags).
+- **`debug run-until-crash` / `step-until-screen-change` / `step-until-log`** —
+  let the app run until something interesting happens, then return a full snapshot.
+- **`layout`** — UI-tree snapshots and diffs, enriched (when Studio's Layout
+  Inspector is live) with Compose source locations, semantics, and recomposition
+  counters.
+
+Everything degrades gracefully: with no Studio plugin running, the device and UI
+commands still work and the debugger section just reports `available:false`.
+
+See [docs/agent-debugging.md](docs/agent-debugging.md).
 
 ## Agent integration
 
 ShadowDroid is self-describing. `shadowdroid commands --json` emits the full
 command catalog (names, nesting, args, help) straight from the CLI definition —
-the machine-readable counterpart to `--help` that an agent can read once to
-discover the whole tool.
+the machine-readable counterpart to `--help` that an agent reads once to discover
+the whole tool.
 
 `shadowdroid skill <agent>` generates a ready-to-drop integration file for a
 coding agent, with driving guidance and an auto-generated command reference.
-Supported agents: `claude-code`, `cursor`, `codex`, `gemini`, `antigravity`
-(the last four match the set Android's own CLI installs skills for).
+Supported agents: `claude-code`, `cursor`, `codex`, `gemini`, `antigravity`.
 
 ```bash
 shadowdroid skill claude-code --install   # → ~/.claude/skills/shadowdroid/SKILL.md
@@ -123,36 +225,21 @@ shadowdroid skill antigravity --install   # → ~/.gemini/antigravity*/skills/sh
 shadowdroid skill codex                   # → prints an AGENTS.md section to stdout
 ```
 
-Cursor `--install` creates a personal skill that is available across projects.
-To write a project-scoped Cursor rule instead:
+Cursor `--install` creates a personal skill available across projects; pass
+`--out /path/to/project/.cursor/rules/shadowdroid.mdc` to write a project-scoped
+Cursor rule instead.
+
+Installed skills are version-stamped. After upgrading the CLI, refresh them in
+one shot — unmodified skills are rewritten in place, hand-edited ones are left
+alone (pass `--force` to overwrite those too):
 
 ```bash
-shadowdroid skill cursor --out /path/to/project/.cursor/rules/shadowdroid.mdc
+shadowdroid skill --sync   # refresh every installed skill to this version
 ```
 
-Each installed skill is stamped with a version marker. After you upgrade the
-CLI, refresh them in one shot — unmodified skills are rewritten in place, and
-any you've hand-edited are left alone (pass `--force` to overwrite those too):
+`connect` runs this refresh automatically (pristine skills only), so an upgraded
+CLI keeps its installed skills current with no extra step.
 
-```bash
-shadowdroid skill --sync          # refresh every installed skill to this version
-```
-
-`connect` also runs this refresh automatically (pristine skills only), so an
-upgraded CLI keeps its installed skills current with no extra step.
-
-## Agent debugging
-
-ShadowDroid also exposes an agent-first debugging surface:
-`debug snapshot` for one-shot state, `debug record` / `debug replay` for JSONL
-timelines, `debugger` for Android Studio-backed attach/breakpoints/stack/vars/eval,
-and `layout` for UI-tree snapshots, diffs, and Android Studio Layout
-Inspector-backed Compose/source/recomposition enrichment. See
-[docs/agent-debugging.md](docs/agent-debugging.md).
-
-## Status
-
-M5 distribution wiring is implemented. See [docs/architecture.md](docs/architecture.md), [docs/protocol.md](docs/protocol.md), and [docs/delivery-plan.md](docs/delivery-plan.md).
 
 ## License
 
