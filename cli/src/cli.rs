@@ -1094,8 +1094,19 @@ async fn dispatch_device(c: DeviceCmd, client: &ServerClient, serial: &str) -> R
 async fn dispatch_files(c: FilesCmd, client: &ServerClient, serial: &str) -> Result<()> {
     match c {
         FilesCmd::Ls { remote } => {
-            let r = client.list_dir(&remote).await?;
-            emit_action("ls", &json!({"remote":remote,"entries":r.entries}));
+            // Server first (app-accessible storage); fall back to `adb shell ls`
+            // for paths the instrumentation uid can't see (e.g. /sdcard under
+            // scoped storage) — mirrors the push/pull fallback below.
+            match client.list_dir(&remote).await {
+                Ok(r) => emit_action(
+                    "ls",
+                    &json!({"remote":remote,"entries":r.entries,"via":"server"}),
+                ),
+                Err(_) => {
+                    let entries = adb::list_dir(serial, &remote).await?;
+                    emit_action("ls", &json!({"remote":remote,"entries":entries,"via":"adb"}));
+                }
+            }
         }
         FilesCmd::Push {
             local,

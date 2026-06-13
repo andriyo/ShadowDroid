@@ -11,7 +11,7 @@
 use adb_client::server::ADBServer;
 use adb_client::server_device::ADBServerDevice;
 use adb_client::ADBDeviceExt;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::path::PathBuf;
 use tokio::task::spawn_blocking;
 use tracing::debug;
@@ -256,6 +256,60 @@ pub async fn pm_version(
         .filter(|s| !s.is_empty()))
 }
 
+/// List a directory via `adb shell ls` — the host-side fallback for `files ls`
+/// when the on-device server can only reach its scoped-storage sandbox. `-L`
+/// dereferences symlinks (so `/sdcard` resolves to its target), and the long
+/// format is parsed into the same `{name, size, is_dir}` shape the server
+/// returns. `ls` reports failures as `ls: <path>: <reason>`; we merge stderr
+/// (`2>&1`, honoured because `adb shell` runs through the device's real sh) so
+/// those surface as an error instead of an empty listing.
+pub async fn list_dir(
+    serial: impl Into<String>,
+    remote: impl AsRef<str>,
+) -> Result<Vec<crate::proto::FileEntry>> {
+    let remote = remote.as_ref();
+    let out = shell(serial, format!("ls -lLA {} 2>&1", sh_single_quote(remote))).await?;
+    if let Some(err) = out.lines().find(|l| l.trim_start().starts_with("ls:")) {
+        bail!("{}", err.trim());
+    }
+    Ok(parse_ls_long(&out))
+}
+
+/// Parse `ls -l` long-format output into `{name, size, is_dir}` entries.
+/// Pure (no I/O) so it can be unit-tested against toybox sample output.
+fn parse_ls_long(out: &str) -> Vec<crate::proto::FileEntry> {
+    let mut entries = Vec::new();
+    for line in out.lines() {
+        let line = line.trim_end();
+        // Skip the `total N` header and blank lines.
+        if line.is_empty() || line.starts_with("total ") {
+            continue;
+        }
+        // perms links owner group size date time name…
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 8 {
+            continue;
+        }
+        let is_dir = line.starts_with('d');
+        let size = cols[4].parse::<u64>().unwrap_or(0);
+        let mut name = cols[7..].join(" ");
+        // Symlinks render as `name -> target`; keep just the name.
+        if let Some(idx) = name.find(" -> ") {
+            name.truncate(idx);
+        }
+        if name.is_empty() {
+            continue;
+        }
+        entries.push(crate::proto::FileEntry { name, size, is_dir });
+    }
+    entries
+}
+
+/// Single-quote a string for the device shell, escaping embedded quotes.
+fn sh_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// Return installed package names. Used by low-friction app-name resolution
 /// when a user types `Livd` instead of `com.livd`.
 pub async fn list_packages(serial: impl Into<String>) -> Result<Vec<String>> {
@@ -371,7 +425,32 @@ fn parse_getprop_line(line: &str) -> Option<(&str, &str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_getprop_line;
+    use super::{parse_getprop_line, parse_ls_long};
+
+    #[test]
+    fn parses_ls_long_format() {
+        // Real toybox `ls -lLA /sdcard/` sample: total header, dirs, a file,
+        // a name with spaces, and a symlink with a ` -> target` suffix.
+        let out = "total 136\n\
+            drwxrws--- 2 u0_a205  media_rw 4096 2026-05-29 15:53 Alarms\n\
+            drwxrws--x 5 media_rw media_rw 4096 2026-05-29 15:53 Android\n\
+            -rw-rw---- 1 u0_a205  media_rw   33 2026-06-13 00:31 sd_push_test.txt\n\
+            -rw-rw---- 1 u0_a205  media_rw   12 2026-06-13 00:31 My Notes.txt\n\
+            lrwxrwxrwx 1 root     root        7 2026-06-13 00:31 link -> Android\n";
+        let entries = parse_ls_long(out);
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries[0].name, "Alarms");
+        assert!(entries[0].is_dir);
+        assert_eq!(entries[0].size, 4096);
+        assert_eq!(entries[2].name, "sd_push_test.txt");
+        assert!(!entries[2].is_dir);
+        assert_eq!(entries[2].size, 33);
+        // name with spaces is preserved (everything after the time column)
+        assert_eq!(entries[3].name, "My Notes.txt");
+        // symlink keeps just the name, drops ` -> target`
+        assert_eq!(entries[4].name, "link");
+        assert!(!entries[4].is_dir);
+    }
 
     #[test]
     fn parses_getprop_lines() {
