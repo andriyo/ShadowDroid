@@ -459,9 +459,19 @@ pub async fn ensure_ready(
     // <100ms.
     adb::forward(serial, DEFAULT_PORT, DEFAULT_PORT).await.ok();
     let client = ServerClient::new(DEFAULT_PORT)?;
-    if probe(&client, any_apk_version).await {
-        info!("server already up — reusing");
-        return Ok(client);
+    match probe(&client, any_apk_version).await {
+        ProbeResult::Ready => {
+            info!("server already up — reusing");
+            return Ok(client);
+        }
+        ProbeResult::VersionMismatch { found } => {
+            warn!(
+                "server version mismatch: expected {EXPECTED_APK_VERSION}, got {found}; \
+                 stopping stale server before reconnect"
+            );
+            cleanup_stale_server(serial).await?;
+        }
+        ProbeResult::Down => {}
     }
     // Cold path: resolve + install + start. May need a retry with longer
     // cooldown if Android's system_server hasn't released the UiAutomation
@@ -494,6 +504,15 @@ async fn long_cooldown(serial: &str) -> Result<()> {
     adb::am_force_stop(serial, APP_PACKAGE).await?;
     adb::kill_instrument_zombies(serial).await?;
     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    Ok(())
+}
+
+async fn cleanup_stale_server(serial: &str) -> Result<()> {
+    adb::forward_remove(serial, DEFAULT_PORT).await.ok();
+    adb::kill_instrument_zombies(serial).await?;
+    adb::am_force_stop(serial, TEST_PACKAGE).await.ok();
+    adb::am_force_stop(serial, APP_PACKAGE).await.ok();
+    adb::forward(serial, DEFAULT_PORT, DEFAULT_PORT).await.ok();
     Ok(())
 }
 
@@ -578,17 +597,22 @@ async fn start_instrumentation(serial: &str) -> Result<()> {
     Ok(())
 }
 
-async fn probe(client: &ServerClient, any_apk_version: bool) -> bool {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProbeResult {
+    Ready,
+    VersionMismatch { found: String },
+    Down,
+}
+
+async fn probe(client: &ServerClient, any_apk_version: bool) -> ProbeResult {
     match client.state().await {
-        Ok(state) if any_apk_version || state.server_version == EXPECTED_APK_VERSION => true,
-        Ok(state) => {
-            warn!(
-                "server version mismatch: expected {EXPECTED_APK_VERSION}, got {}",
-                state.server_version
-            );
-            false
+        Ok(state) if any_apk_version || state.server_version == EXPECTED_APK_VERSION => {
+            ProbeResult::Ready
         }
-        Err(_) => false,
+        Ok(state) => ProbeResult::VersionMismatch {
+            found: state.server_version,
+        },
+        Err(_) => ProbeResult::Down,
     }
 }
 
@@ -597,11 +621,29 @@ async fn wait_for_server(serial: &str, client: &ServerClient, any_apk_version: b
     // emulators (Android 16 emulator with fresh APK install can take ~3s
     // for the test framework to fully initialise before our @Before runs).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut last_mismatch: Option<String> = None;
     while std::time::Instant::now() < deadline {
-        if probe(client, any_apk_version).await {
-            return Ok(());
+        match probe(client, any_apk_version).await {
+            ProbeResult::Ready => return Ok(()),
+            ProbeResult::VersionMismatch { found } => {
+                if last_mismatch.as_deref() != Some(found.as_str()) {
+                    warn!(
+                        "waiting for server version {EXPECTED_APK_VERSION}; \
+                         still seeing stale version {found}"
+                    );
+                    last_mismatch = Some(found);
+                }
+            }
+            ProbeResult::Down => {}
         }
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+    if let Some(found) = last_mismatch {
+        bail!(
+            "server stayed on stale version {found}; expected {EXPECTED_APK_VERSION}. \
+             ShadowDroid stopped the stale process and retried, but the old server is still \
+             reachable. Try `shadowdroid disconnect`, then `shadowdroid connect --apk <local-test-apk>`."
+        );
     }
     if let Some(hint) = ui_automation_failure_hint(serial).await {
         bail!("server did not become ready within 10s after `am instrument`.\n{hint}")

@@ -16,6 +16,7 @@ use reqwest::{Client, Response};
 use serde::Serialize;
 use std::time::Duration;
 
+#[derive(Clone)]
 pub struct ServerClient {
     base: String, // e.g. "http://127.0.0.1:7912/v1"
     http: Client,
@@ -40,6 +41,27 @@ impl ServerClient {
             .send()
             .await?;
         check_then_json(resp).await
+    }
+
+    async fn get_retry<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        attempts: usize,
+        initial_delay: Duration,
+    ) -> Result<T> {
+        debug_assert!(attempts > 0);
+        let mut delay = initial_delay;
+        for attempt in 1..=attempts {
+            match self.get(path).await {
+                Ok(value) => return Ok(value),
+                Err(err) if attempt < attempts && is_transient_transport_error(&err) => {
+                    tokio::time::sleep(delay).await;
+                    delay = delay.saturating_mul(2);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        unreachable!("attempts > 0 and loop always returns")
     }
 
     async fn post<B: Serialize, T: serde::de::DeserializeOwned>(
@@ -79,7 +101,8 @@ impl ServerClient {
     }
 
     pub async fn screen(&self) -> Result<ScreenResponse> {
-        self.get("/screen").await
+        self.get_retry("/screen", 4, Duration::from_millis(75))
+            .await
     }
 
     pub async fn screen_xml(&self) -> Result<String> {
@@ -455,6 +478,21 @@ impl ServerClient {
     }
 }
 
+pub(crate) fn is_transient_transport_error(err: &anyhow::Error) -> bool {
+    if let Some(reqwest) = err.downcast_ref::<reqwest::Error>() {
+        if reqwest.is_connect() || reqwest.is_timeout() || reqwest.is_request() || reqwest.is_body()
+        {
+            return true;
+        }
+    }
+    let message = err.to_string();
+    message.contains("connection closed before message completed")
+        || message.contains("error sending request")
+        || message.contains("connection reset")
+        || message.contains("connection refused")
+        || message.contains("operation timed out")
+}
+
 /// Check response status; on non-2xx, try to parse our wire-error envelope
 /// for a useful Rust error instead of just `error decoding response body`.
 async fn check_then_json<T: serde::de::DeserializeOwned>(resp: Response) -> Result<T> {
@@ -502,4 +540,21 @@ fn file_path(path: &str) -> String {
         .collect::<Vec<_>>()
         .join("/");
     format!("/files/{encoded}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_screen_transport_errors_as_transient() {
+        let closed = anyhow!(
+            "error sending request for url (http://127.0.0.1:7912/v1/screen): \
+             connection closed before message completed"
+        );
+        assert!(is_transient_transport_error(&closed));
+
+        let server = anyhow!("server error 500 Internal Server Error: boom");
+        assert!(!is_transient_transport_error(&server));
+    }
 }
