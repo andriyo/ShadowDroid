@@ -648,16 +648,16 @@ pub async fn run() -> Result<()> {
 
         // ── input ──────────────────────────────────────────────
         Cmd::Back => {
-            client.key("back").await?;
-            emit_action("key", &json!({"name":"back"}));
+            let injected = client.key("back").await?;
+            emit_action("key", &json!({"name":"back","injected":injected}));
         }
         Cmd::Home => {
-            client.key("home").await?;
-            emit_action("key", &json!({"name":"home"}));
+            let injected = client.key("home").await?;
+            emit_action("key", &json!({"name":"home","injected":injected}));
         }
         Cmd::Key { name } => {
-            client.key(&name).await?;
-            emit_action("key", &json!({"name":name}));
+            let injected = client.key(&name).await?;
+            emit_action("key", &json!({"name":name,"injected":injected}));
         }
         Cmd::Text { value, clear } => {
             client.text(&value, clear).await?;

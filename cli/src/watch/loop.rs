@@ -416,8 +416,8 @@ async fn dispatch_command(
         }
         "key" => {
             let name = req_str(cmd, "name")?;
-            cfg.client.key(name).await?;
-            emit_json(json!({"type":"action","cmd":"key","name":name}));
+            let injected = cfg.client.key(name).await?;
+            emit_json(json!({"type":"action","cmd":"key","name":name,"injected":injected}));
         }
         "text" => {
             let value = req_str(cmd, "value")?;

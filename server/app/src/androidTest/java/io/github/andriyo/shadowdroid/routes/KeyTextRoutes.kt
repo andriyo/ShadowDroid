@@ -19,14 +19,21 @@ object KeyTextRoutes {
     ) {
         route.post("/key") {
             val r: KeyReq = call.receive()
-            val ok =
+            val injected =
                 when {
                     r.code != null -> uiDevice.pressKeyCode(r.code)
                     r.name != null -> pressNamed(uiDevice, r.name)
                     else -> throw BadRequest("missing_key", "either 'name' or 'code' required")
                 }
-            if (!ok) throw BadRequest("key_failed", "UiDevice.pressKey returned false")
-            call.respond(OkResponse())
+            // UiDevice.pressBack/pressHome/pressKeyCode return false on Android
+            // 14+ even when the key event is delivered and handled — the boolean
+            // reflects an injection-reporting quirk, not whether the action
+            // happened (verified: `back` navigates correctly while still
+            // returning false). Re-pressing would double-navigate, so we report
+            // the raw result via `ok` rather than treating false as a hard
+            // failure. Genuinely bad input (unknown name, or neither name nor
+            // code) still errors above with unknown_key / missing_key.
+            call.respond(OkResponse(ok = injected))
         }
         route.post("/text") {
             val r: TextReq = call.receive()

@@ -1715,7 +1715,7 @@ async fn perform_action(client: &ServerClient, value: &Value) -> Result<()> {
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            client.key(name).await
+            client.key(name).await.map(|_| ())
         }
         "swipe" | "drag" => {
             let from = value.get("from").and_then(Value::as_array);
