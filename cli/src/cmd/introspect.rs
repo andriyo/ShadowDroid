@@ -44,6 +44,7 @@ fn command_json(cmd: &Command) -> serde_json::Value {
     o.insert("name".into(), cmd.get_name().into());
     if let Some(about) = cmd.get_about() {
         o.insert("about".into(), about.to_string().into());
+        o.insert("summary".into(), about.to_string().into());
     }
     let subs = subcommands(cmd);
     if subs.is_empty() {
@@ -52,6 +53,24 @@ fn command_json(cmd: &Command) -> serde_json::Value {
         o.insert("subcommands".into(), serde_json::json!(subs));
     }
     serde_json::Value::Object(o)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::Cli;
+
+    #[test]
+    fn catalog_includes_summary_alias_for_agent_discovery() {
+        let root = Cli::command();
+        let catalog = catalog(&root);
+        let commands = catalog["commands"].as_array().unwrap();
+        let watch = commands
+            .iter()
+            .find(|command| command["name"] == "watch")
+            .unwrap();
+        assert_eq!(watch["summary"], watch["about"]);
+    }
 }
 
 fn args(cmd: &Command) -> Vec<serde_json::Value> {

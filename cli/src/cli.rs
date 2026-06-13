@@ -26,7 +26,7 @@ use crate::cmd::layout::{LayoutArgs, LayoutCmd};
 use crate::cmd::scroll::ScrollArgs;
 use crate::cmd::studio::{StudioArgs, StudioCmd};
 use crate::config::{expand_config_path, ShadowDroidConfig};
-use crate::device::client::ServerClient;
+use crate::device::client::{is_transient_transport_error, ServerClient};
 use crate::device::{adb, installer};
 use crate::events::{CompactElement, ScreenFormat};
 use crate::proto::{Element, SelectorQuery};
@@ -166,6 +166,9 @@ pub enum Cmd {
     // ── gestures (flat) ───────────────────────────────────────
     /// Tap by element id, coordinates, or a selector (--text/--rid/--desc/--xpath).
     Tap {
+        /// Element id from a fresh `screen` dump. Equivalent to positional `tap <id>`.
+        #[arg(long)]
+        id: Option<u32>,
         /// Element id (from `screen`) or X coordinate.
         a: Option<i32>,
         /// Y coordinate (with X for a coordinate tap).
@@ -293,6 +296,7 @@ pub enum Cmd {
     },
     /// Stream UI/crash/toast events as JSON lines.
     Watch {
+        /// Only emit app-scoped events for this package. Permission dialogs are still allowed.
         #[arg(long)]
         app: Option<String>,
         #[arg(long, default_value_t = 1000)]
@@ -526,7 +530,9 @@ pub async fn run() -> Result<()> {
         Cmd::Layout(args) => crate::cmd::layout::run(&serial, &client, args).await?,
 
         // ── UI read ────────────────────────────────────────────
-        Cmd::Screen { full } => cmd_screen(&client, full).await?,
+        Cmd::Screen { full } => {
+            cmd_screen(&serial, apk.as_deref(), any_apk_version, &client, full).await?
+        }
         Cmd::Screenshot {
             path,
             format,
@@ -536,13 +542,14 @@ pub async fn run() -> Result<()> {
 
         // ── gestures ───────────────────────────────────────────
         Cmd::Tap {
+            id,
             a,
             b,
             text,
             rid,
             desc,
             xpath,
-        } => cmd_tap(&client, a, b, text, rid, desc, xpath).await?,
+        } => cmd_tap(&client, id, a, b, text, rid, desc, xpath).await?,
         Cmd::DoubleTap { x, y } => {
             client.double_tap(x, y).await?;
             emit_action("double_tap", &json!({"x":x,"y":y}));
@@ -682,6 +689,9 @@ pub async fn run() -> Result<()> {
                 gone,
                 timeout_ms,
                 poll_ms,
+                &serial,
+                apk.as_deref(),
+                any_apk_version,
             )
             .await?;
         }
@@ -1173,8 +1183,14 @@ async fn cmd_device_info(client: &ServerClient, serial: &str) -> Result<()> {
 /// `screen` defaults to the compact agent shape (no bounds, false flags
 /// omitted) — the loop reads this every iteration, so it pays for itself in
 /// tokens. `--full` restores the complete UIAutomator element set.
-async fn cmd_screen(client: &ServerClient, full: bool) -> Result<()> {
-    let screen = client.screen().await?;
+async fn cmd_screen(
+    serial: &str,
+    apk: Option<&std::path::Path>,
+    any_apk_version: bool,
+    client: &ServerClient,
+    full: bool,
+) -> Result<()> {
+    let screen = read_screen_with_reconnect(serial, apk, any_apk_version, client).await?;
     if full {
         emit(&screen);
         return Ok(());
@@ -1228,6 +1244,7 @@ async fn cmd_screenshot(
 #[allow(clippy::too_many_arguments)]
 async fn cmd_tap(
     client: &ServerClient,
+    id: Option<u32>,
     a: Option<i32>,
     b: Option<i32>,
     text: Option<String>,
@@ -1260,31 +1277,44 @@ async fn cmd_tap(
         return Ok(());
     }
     // Coordinate / id modes.
-    match (a, b) {
-        (Some(x), Some(y)) => {
+    match (id, a, b) {
+        (Some(id), None, None) => {
+            tap_element_id(client, id).await?;
+        }
+        (Some(_), Some(_), _) | (Some(_), None, Some(_)) => {
+            bail!("tap --id cannot be combined with positional coordinates or element id")
+        }
+        (None, Some(x), Some(y)) => {
             client.tap_xy(x, y).await?;
             emit_action("tap", &json!({"via":"coords","x":x,"y":y}));
         }
-        (Some(a), None) => {
+        (None, Some(a), None) => {
             let id = u32::try_from(a).map_err(|_| anyhow!("element id must be >= 0, got {a}"))?;
-            let screen = client.screen().await?;
-            let el = screen.elements.iter().find(|e| e.id == id).ok_or_else(|| {
-                anyhow!("element id {id} out of range (0..{})", screen.element_count)
-            })?;
-            let [x, y] = el.tap;
-            client.tap_xy(x, y).await?;
-            emit_action(
-                "tap",
-                &json!({
-                    "via":"id","id": id, "x": x, "y": y,
-                    "matched": {"text": el.text, "rid": el.rid, "desc": el.desc}
-                }),
-            );
+            tap_element_id(client, id).await?;
         }
-        (None, _) => {
+        (None, None, _) => {
             bail!("tap needs a target: <id>, <x> <y>, or --text/--rid/--desc/--xpath <value>")
         }
     }
+    Ok(())
+}
+
+async fn tap_element_id(client: &ServerClient, id: u32) -> Result<()> {
+    let screen = client.screen().await?;
+    let el = screen
+        .elements
+        .iter()
+        .find(|e| e.id == id)
+        .ok_or_else(|| anyhow!("element id {id} out of range (0..{})", screen.element_count))?;
+    let [x, y] = el.tap;
+    client.tap_xy(x, y).await?;
+    emit_action(
+        "tap",
+        &json!({
+            "via":"id","id": id, "x": x, "y": y,
+            "matched": {"text": el.text, "rid": el.rid, "desc": el.desc}
+        }),
+    );
     Ok(())
 }
 
@@ -1317,10 +1347,23 @@ async fn cmd_wait(
     gone: bool,
     timeout_ms: u32,
     poll_ms: u32,
+    serial: &str,
+    apk: Option<&std::path::Path>,
+    any_apk_version: bool,
 ) -> Result<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+    let mut client = client.clone();
     loop {
-        let screen = client.screen().await?;
+        let screen = match client.screen().await {
+            Ok(screen) => screen,
+            Err(err)
+                if is_transient_transport_error(&err) && std::time::Instant::now() < deadline =>
+            {
+                client = reconnect_after_screen_error(serial, apk, any_apk_version, &err).await?;
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         let matched = wait_query_matches(&query, &screen.current_app, &screen.elements);
         let screen_hash = screen.screen_hash;
         if matched != gone {
@@ -1339,6 +1382,33 @@ async fn cmd_wait(
         }
         tokio::time::sleep(std::time::Duration::from_millis(poll_ms.max(1) as u64)).await;
     }
+}
+
+async fn read_screen_with_reconnect(
+    serial: &str,
+    apk: Option<&std::path::Path>,
+    any_apk_version: bool,
+    client: &ServerClient,
+) -> Result<crate::proto::ScreenResponse> {
+    match client.screen().await {
+        Ok(screen) => Ok(screen),
+        Err(err) if is_transient_transport_error(&err) => {
+            let client = reconnect_after_screen_error(serial, apk, any_apk_version, &err).await?;
+            client.screen().await
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn reconnect_after_screen_error(
+    serial: &str,
+    apk: Option<&std::path::Path>,
+    any_apk_version: bool,
+    err: &anyhow::Error,
+) -> Result<ServerClient> {
+    installer::ensure_ready(serial, apk, any_apk_version)
+        .await
+        .with_context(|| format!("screen request failed ({err}); reconnect failed"))
 }
 
 fn wait_query_matches(query: &WaitQuery, app: &crate::proto::AppRef, elements: &[Element]) -> bool {

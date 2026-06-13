@@ -1137,9 +1137,10 @@ async fn run_until_crash(
 
     loop {
         if Instant::now() >= deadline {
-            let snapshot =
-                final_snapshot(serial, client, &args.app, studio_url, args.depth, args.logs)
-                    .await?;
+            let (snapshot, snapshot_error) = final_snapshot_best_effort(
+                serial, client, &args.app, studio_url, args.depth, args.logs,
+            )
+            .await;
             let result = json!({
                 "type": "run_until_crash",
                 "schema_version": 1,
@@ -1151,15 +1152,20 @@ async fn run_until_crash(
                 },
                 "snapshot": snapshot,
             });
+            let mut result = result;
+            if let Some(error) = snapshot_error {
+                result["snapshot_error"] = json!(error);
+            }
             emit_or_write_json(args.out.as_deref(), &result)?;
             return Ok(());
         }
 
         match tokio::time::timeout(Duration::from_millis(100), crash_rx.recv()).await {
             Ok(Some(crash)) => {
-                let snapshot =
-                    final_snapshot(serial, client, &args.app, studio_url, args.depth, args.logs)
-                        .await?;
+                let (snapshot, snapshot_error) = final_snapshot_best_effort(
+                    serial, client, &args.app, studio_url, args.depth, args.logs,
+                )
+                .await;
                 let correlation = crash_correlation(&crash, &snapshot);
                 let bundle = if args.bundle.is_some() {
                     Some(
@@ -1194,6 +1200,9 @@ async fn run_until_crash(
                     "correlation": correlation,
                     "snapshot": snapshot,
                 });
+                if let Some(error) = snapshot_error {
+                    result["snapshot_error"] = json!(error);
+                }
                 if let Some(bundle) = bundle {
                     result["bundle"] = bundle;
                 }
@@ -1201,6 +1210,37 @@ async fn run_until_crash(
                 return Ok(());
             }
             Ok(None) | Err(_) => {}
+        }
+    }
+}
+
+async fn final_snapshot_best_effort(
+    serial: &str,
+    client: &ServerClient,
+    app: &Option<String>,
+    studio_url: Option<&str>,
+    depth: u32,
+    logs: u32,
+) -> (Value, Option<String>) {
+    match final_snapshot(serial, client, app, studio_url, depth, logs).await {
+        Ok(snapshot) => (snapshot, None),
+        Err(err) => {
+            let error = err.to_string();
+            (
+                json!({
+                    "type": "debug_snapshot",
+                    "schema_version": 1,
+                    "ok": false,
+                    "error": error,
+                    "device": {
+                        "serial": serial,
+                    },
+                    "app": {
+                        "requested": app.clone(),
+                    },
+                }),
+                Some(error),
+            )
         }
     }
 }
