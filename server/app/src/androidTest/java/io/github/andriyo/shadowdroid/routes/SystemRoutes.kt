@@ -6,6 +6,8 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
+import android.os.ParcelFileDescriptor
 import androidx.test.uiautomator.UiDevice
 import io.github.andriyo.shadowdroid.BadRequest
 import io.github.andriyo.shadowdroid.proto.OkResponse
@@ -111,17 +113,114 @@ object SystemRoutes {
 
         route.post("/shell") {
             val r: ShellReq = call.receive()
-            // UiDevice.executeShellCommand runs as shell uid (2000) — same as `adb shell`.
-            // Doesn't return exit code; runs the cmd via su-bin pipe and returns stdout.
-            val output =
+            val (output, exitCode) =
                 try {
-                    uiDevice.executeShellCommand(r.cmd)
+                    runShell(instr, uiDevice, r.cmd, r.timeout_ms)
+                } catch (t: ShellTimeout) {
+                    throw BadRequest("shell_timeout", t.message ?: "shell command timed out")
                 } catch (t: Throwable) {
                     throw BadRequest("shell_failed", t.message ?: "shell exec threw")
                 }
-            call.respond(ShellResp(input = r.cmd, output = output, exit_code = null))
+            call.respond(ShellResp(input = r.cmd, output = output, exit_code = exitCode))
         }
     }
+}
+
+/** Signals that a shell command outlived its timeout budget. */
+private class ShellTimeout(
+    message: String,
+) : RuntimeException(message)
+
+private const val SHELL_RC_MARKER = "__SD_RC__"
+
+/**
+ * Run a device shell command and return (output, exit_code).
+ *
+ * On Android 12+ (API 31) this feeds a real `sh` script to
+ * `UiAutomation.executeShellCommandRwe` over stdin, so the command runs as the
+ * shell uid (like `adb shell`) AND gets full shell semantics (pipes, `;`,
+ * `$()`, redirects), stderr (folded into stdout via `exec 2>&1`), and an exit
+ * code — none of which the plain `executeShellCommand` API can provide. Older
+ * devices, or any failure of the Rwe path, fall back to the legacy stdout-only
+ * executor (exit_code null).
+ */
+private fun runShell(
+    instr: Instrumentation,
+    uiDevice: UiDevice,
+    cmd: String,
+    timeoutMs: Int,
+): Pair<String, Int?> {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        try {
+            return runShellViaSh(instr, cmd, timeoutMs)
+        } catch (t: ShellTimeout) {
+            throw t
+        } catch (_: Throwable) {
+            // executeShellCommandRwe unavailable on this build — degrade below.
+        }
+    }
+    return uiDevice.executeShellCommand(cmd) to null
+}
+
+private fun runShellViaSh(
+    instr: Instrumentation,
+    cmd: String,
+    timeoutMs: Int,
+): Pair<String, Int?> {
+    // [stdout(read), stdin(write), stderr(read)]
+    val fds = instr.uiAutomation.executeShellCommandRwe("sh")
+    val stdoutFd = fds[0]
+    val stdinFd = fds[1]
+    val stderrFd = fds[2]
+    // Capture the command's own exit status before anything else runs, then
+    // emit it behind a marker on its own line. `exec 2>&1` folds stderr into the
+    // single stdout stream we drain (so there's no second pipe to deadlock on).
+    val script =
+        buildString {
+            append("exec 2>&1\n")
+            append(cmd)
+            append("\n__sd_rc=\$?\n")
+            append("echo \"\"\n")
+            append("echo \"$SHELL_RC_MARKER\${__sd_rc}__\"\n")
+        }
+
+    val out = arrayOfNulls<ByteArray>(1)
+    val failure = arrayOfNulls<Throwable>(1)
+    val worker =
+        Thread {
+            try {
+                ParcelFileDescriptor.AutoCloseOutputStream(stdinFd).use {
+                    it.write(script.toByteArray())
+                    it.flush()
+                }
+                out[0] = ParcelFileDescriptor.AutoCloseInputStream(stdoutFd).use { it.readBytes() }
+                // stderr was redirected into stdout; just drain + close fd2.
+                ParcelFileDescriptor.AutoCloseInputStream(stderrFd).use { it.readBytes() }
+            } catch (t: Throwable) {
+                failure[0] = t
+            }
+        }
+    worker.start()
+    worker.join(if (timeoutMs > 0) timeoutMs.toLong() else 0L)
+    if (worker.isAlive) {
+        // Unblock the pending read by closing the fds, then report the timeout.
+        runCatching { stdoutFd.close() }
+        runCatching { stdinFd.close() }
+        runCatching { stderrFd.close() }
+        worker.join(500)
+        throw ShellTimeout("command exceeded ${timeoutMs}ms")
+    }
+    failure[0]?.let { throw it }
+    return parseShellOutput(out[0]?.toString(Charsets.UTF_8) ?: "")
+}
+
+/** Split the trailing `\n__SD_RC__<code>__` marker off the captured output. */
+private fun parseShellOutput(raw: String): Pair<String, Int?> {
+    val marker = "\n$SHELL_RC_MARKER"
+    val idx = raw.lastIndexOf(marker)
+    if (idx < 0) return raw to null
+    val code = raw.substring(idx + marker.length).trim().removeSuffix("__").toIntOrNull()
+    return raw.substring(0, idx) to code
 }
 
 @Serializable
