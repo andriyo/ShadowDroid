@@ -14,6 +14,7 @@
 
 mod cli;
 mod cmd;
+mod config;
 mod device;
 mod dump;
 mod events;

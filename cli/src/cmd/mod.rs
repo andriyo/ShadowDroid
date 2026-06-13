@@ -10,6 +10,7 @@
 
 pub mod app_install;
 pub mod collect;
+pub mod config;
 pub mod debug;
 pub mod debugger;
 pub mod device_profile;

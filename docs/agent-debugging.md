@@ -6,8 +6,16 @@ bounded view of a running Android app without scraping Android Studio UI panes.
 ## One-shot State
 
 ```bash
+shadowdroid debug auto Livd | jq
 shadowdroid debug snapshot --app com.example.app --depth 1 | jq
 ```
+
+`debug auto` is the low-effort entry point. It accepts a config alias, package,
+or installed app label; with no argument it uses config and then the foreground
+app. It launches the app, asks Android Studio to attach its debugger when the
+bridge is available, then returns a full `debug_snapshot`. If Studio or the
+plugin is missing, the response includes `available:false`, `shadowdroid init`,
+and `shadowdroid doctor` guidance instead of failing the device/UI snapshot.
 
 The snapshot includes device/build info, foreground app/activity/PID, screen
 hash and element tree, screenshot path/hash, recent logcat, Android Studio
@@ -30,6 +38,8 @@ text, keys, swipes, drags, and app starts.
 ## Android Studio Debugger Bridge
 
 ```bash
+shadowdroid init
+shadowdroid doctor
 shadowdroid debug clients --project /path/to/app --package com.example.app
 shadowdroid debug attach --project /path/to/app --package com.example.app
 shadowdroid debug break line --file app/src/main/java/Foo.kt --line 42 --condition 'state != null'
@@ -67,6 +77,29 @@ when a suspended frame is available.
 Debugger read commands use bounded IDE/JDI requests. When a session is running,
 missing, or stopped on a frame without debug information, stack/threads/variables
 and eval return structured `ok: false` JSON or a warning instead of blocking.
+
+Put repeated debugger values in `~/.shadowdroid/config.json` or a project
+`.shadowdroid.json` so agents can use shorter commands:
+
+```bash
+shadowdroid config schema --json
+shadowdroid config init --project --app Example --package com.example.app --project-path /path/to/app
+shadowdroid config validate --json
+shadowdroid debug auto
+```
+
+```json
+{
+  "app": "Example",
+  "project": "/path/to/app",
+  "apps": {
+    "Example": {
+      "package": "com.example.app",
+      "run_configuration": "app"
+    }
+  }
+}
+```
 
 ## Continue-until Primitives
 

@@ -33,7 +33,9 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/andriyo/ShadowDroi
 
 The shell installer writes to `~/.local/bin` by default. The PowerShell
 installer writes to `%LOCALAPPDATA%\ShadowDroid\bin` and adds that directory to
-the user PATH.
+the user PATH. Those direct installers also seed global agent skills. If you
+install with Homebrew, Scoop, or Cargo, run `shadowdroid init` once after
+install.
 
 ShadowDroid also needs Android Platform Tools (`adb`) on PATH before
 `shadowdroid connect` can talk to a device. The installers print a hint if `adb`
@@ -48,16 +50,13 @@ Run the first-run check:
 shadowdroid init
 ```
 
-This detects Android Studio installations, reports whether the ShadowDroid
-Android Studio plugin is installed, and checks whether the debugger bridge has
-registered recently.
-
-To install or update the plugin automatically:
+This installs or updates global agent skills, installs/updates the Android
+Studio plugin when Android Studio is detected, reports Studio/plugin state, and
+checks whether the debugger bridge has registered recently. To skip Studio
+plugin installation and only inspect Studio while installing skills:
 
 ```bash
-shadowdroid init --install-studio-plugin
-# equivalent:
-shadowdroid studio install
+shadowdroid init --no-studio-plugin
 ```
 
 If several Android Studio installations are detected, choose one explicitly:
@@ -80,6 +79,37 @@ installer unpacks the plugin into Android Studio's user plugin directory and
 prints a restart reminder. If Android Studio cannot be found automatically,
 pass `--studio` with the `.app`, install directory, `product-info.json`, or
 launcher path.
+
+## Configure repeated defaults
+
+ShadowDroid loads JSON config from `~/.shadowdroid/config.json`, then from every
+`.shadowdroid.json` in the current directory's ancestor chain. Project config
+wins over user config, so agents can omit repeated flags:
+
+```bash
+shadowdroid config paths --json
+shadowdroid config schema --json
+shadowdroid config init --project --app Livd --package com.livd --project-path /Users/you/Work/Livd
+shadowdroid config validate --json
+```
+
+```json
+{
+  "device": "emulator-5554",
+  "app": "Livd",
+  "project": "/Users/you/Work/Livd",
+  "apps": {
+    "Livd": {
+      "package": "com.livd",
+      "run_configuration": "app",
+      "debugger": "Android Debugger"
+    }
+  }
+}
+```
+
+With that file in place, `shadowdroid debug auto` can resolve the app, launch
+it, attach the Studio debugger if available, and return a full snapshot.
 
 ## Keep the CLI updated
 

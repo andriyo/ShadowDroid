@@ -18,6 +18,7 @@ use anyhow::Result;
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::cmd::studio;
 use crate::device::adb;
 use crate::device::client::ServerClient;
 use crate::device::installer::{
@@ -89,6 +90,7 @@ impl DoctorReport {
 /// Run the read-only checks. Never starts the server or kills anything.
 pub async fn gather(device: Option<&str>) -> DoctorReport {
     let mut checks = Vec::new();
+    checks.extend(studio_checks());
 
     // ── C1: adb reachable + device inventory ───────────────────────────────
     let devices = match adb::list_devices_with_state().await {
@@ -476,6 +478,94 @@ async fn apply_fix(device: Option<&str>, report: DoctorReport, force: bool) -> D
 /// `clock` drift) are advisory — surfaced, but not something we auto-fix.
 fn is_fixable(code: &str) -> bool {
     matches!(code, "apk" | "server" | "owners")
+}
+
+fn studio_checks() -> Vec<Check> {
+    let mut checks = Vec::new();
+    match studio::status_report(None) {
+        Ok(report) => {
+            if report.android_studios.is_empty() {
+                checks.push(Check {
+                    code: "studio",
+                    status: Status::Warn,
+                    detail: "Android Studio was not detected.".into(),
+                    remedy: Some("run `shadowdroid init` after installing Android Studio, or configure android_studio in .shadowdroid.json".into()),
+                });
+            } else {
+                let installed = report
+                    .android_studios
+                    .iter()
+                    .filter(|studio| studio.shadowdroid_plugin_installed)
+                    .count();
+                checks.push(Check {
+                    code: "studio",
+                    status: Status::Ok,
+                    detail: format!(
+                        "{} Android Studio install(s), ShadowDroid plugin installed in {installed}",
+                        report.android_studios.len()
+                    ),
+                    remedy: None,
+                });
+                if installed == 0 {
+                    checks.push(Check {
+                        code: "studio_plugin",
+                        status: Status::Warn,
+                        detail: "ShadowDroid Android Studio plugin is not installed.".into(),
+                        remedy: Some(
+                            "run `shadowdroid init` to install the plugin and skills".into(),
+                        ),
+                    });
+                } else if installed < report.android_studios.len() {
+                    checks.push(Check {
+                        code: "studio_plugin",
+                        status: Status::Warn,
+                        detail: "ShadowDroid plugin is installed in only some detected Android Studio installs.".into(),
+                        remedy: Some("run `shadowdroid studio install --studio <path>` for the Android Studio you use".into()),
+                    });
+                } else {
+                    checks.push(Check {
+                        code: "studio_plugin",
+                        status: Status::Ok,
+                        detail: "ShadowDroid Android Studio plugin installed".into(),
+                        remedy: None,
+                    });
+                }
+            }
+
+            if report.bridge.running {
+                checks.push(Check {
+                    code: "debugger_bridge",
+                    status: Status::Ok,
+                    detail: format!(
+                        "registered at {}",
+                        report.bridge.url.as_deref().unwrap_or("unknown URL")
+                    ),
+                    remedy: None,
+                });
+            } else if report.bridge.present {
+                checks.push(Check {
+                    code: "debugger_bridge",
+                    status: Status::Warn,
+                    detail: "bridge registry exists, but the recorded Android Studio process is not running.".into(),
+                    remedy: Some("restart Android Studio and open an Android project; then run `shadowdroid debug status`".into()),
+                });
+            } else {
+                checks.push(Check {
+                    code: "debugger_bridge",
+                    status: Status::Warn,
+                    detail: "debugger bridge is not registered.".into(),
+                    remedy: Some("run `shadowdroid init`, restart Android Studio, and open an Android project".into()),
+                });
+            }
+        }
+        Err(err) => checks.push(Check {
+            code: "studio",
+            status: Status::Warn,
+            detail: format!("could not inspect Android Studio: {err}"),
+            remedy: Some("run `shadowdroid init` to retry setup".into()),
+        }),
+    }
+    checks
 }
 
 fn print_human(report: &DoctorReport, fix: bool) {
