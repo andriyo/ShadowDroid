@@ -22,6 +22,7 @@ use std::process::Stdio;
 use tracing::info;
 use zip::ZipArchive;
 
+use crate::cmd::skill;
 use crate::cmd::studio_contract;
 
 const EXPECTED_PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -31,9 +32,15 @@ const PLUGIN_DIR_NAME: &str = "shadowdroid-plugin";
 
 #[derive(Args, Debug)]
 pub struct InitArgs {
-    /// Install or update the ShadowDroid Android Studio plugin if Android Studio is detected.
-    #[arg(long)]
+    /// Deprecated: `shadowdroid init` installs the Studio plugin by default.
+    #[arg(long, conflicts_with = "no_studio_plugin")]
     pub install_studio_plugin: bool,
+    /// Only inspect Android Studio; do not install/update the plugin.
+    #[arg(long)]
+    pub no_studio_plugin: bool,
+    /// Do not install/update agent skill files.
+    #[arg(long)]
+    pub no_skills: bool,
     /// Android Studio installation path, .app bundle, product-info.json, or launcher.
     #[arg(long, env = "SHADOWDROID_ANDROID_STUDIO", value_name = "PATH")]
     pub studio: Option<PathBuf>,
@@ -185,14 +192,54 @@ pub async fn run(args: &StudioArgs) -> Result<()> {
 }
 
 pub async fn run_init(args: &InitArgs) -> Result<()> {
-    if args.install_studio_plugin {
-        install(args.studio.as_deref(), args.plugin.as_deref(), args.json).await
+    let install_studio = !args.no_studio_plugin || args.install_studio_plugin;
+    if install_studio {
+        if let Err(err) = install(args.studio.as_deref(), args.plugin.as_deref(), args.json).await {
+            if args.json {
+                print_json(&serde_json::json!({
+                    "type": "init_step",
+                    "step": "studio_plugin",
+                    "ok": false,
+                    "error": err.to_string(),
+                    "next_command": "shadowdroid init --no-studio-plugin",
+                }));
+            } else {
+                eprintln!("Studio plugin: {err}");
+                eprintln!(
+                    "Next: install Android Studio or pass --studio, then rerun `shadowdroid init`."
+                );
+            }
+        }
     } else {
-        status(args.studio.as_deref(), args.json).await
+        status(args.studio.as_deref(), args.json).await?;
     }
+
+    if !args.no_skills {
+        let skills = skill::install_default_skills();
+        if args.json {
+            println!("{}", serde_json::to_string(&skills)?);
+        } else {
+            print_skill_install_human(&skills);
+        }
+    }
+
+    if install_studio {
+        status(args.studio.as_deref(), args.json).await?;
+    }
+    Ok(())
 }
 
 async fn status(explicit_studio: Option<&Path>, json: bool) -> Result<()> {
+    let report = status_report(explicit_studio)?;
+    if json {
+        print_json(&report);
+    } else {
+        print_status_human(&report);
+    }
+    Ok(())
+}
+
+pub fn status_report(explicit_studio: Option<&Path>) -> Result<StudioReport> {
     let studios = discover_android_studios(explicit_studio)?;
     let bridge = bridge_status()?;
     let mut guidance = Vec::new();
@@ -213,12 +260,7 @@ async fn status(explicit_studio: Option<&Path>, json: bool) -> Result<()> {
         bridge,
         guidance,
     };
-    if json {
-        print_json(&report);
-    } else {
-        print_status_human(&report);
-    }
-    Ok(())
+    Ok(report)
 }
 
 async fn install(
@@ -971,6 +1013,55 @@ fn print_install_human(report: &InstallReport) {
     println!("  destination: {}", report.installed_dir);
     for item in &report.guidance {
         println!("Next: {item}");
+    }
+}
+
+fn print_skill_install_human(value: &serde_json::Value) {
+    let installed = value
+        .get("installed")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let skipped = value
+        .get("skipped")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let failed = value
+        .get("failed")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    println!("Agent skills: installed/updated {installed}, skipped {skipped}, failed {failed}");
+    if let Some(items) = value.get("skipped").and_then(serde_json::Value::as_array) {
+        for item in items {
+            let agent = item
+                .get("agent")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            let path = item
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            let reason = item
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("skipped");
+            println!("  - skipped {agent}: {path} ({reason})");
+        }
+    }
+    if let Some(items) = value.get("failed").and_then(serde_json::Value::as_array) {
+        for item in items {
+            let agent = item
+                .get("agent")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            let error = item
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown error");
+            println!("  - failed {agent}: {error}");
+        }
     }
 }
 

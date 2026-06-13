@@ -206,8 +206,15 @@ mkdir -p "$INSTALL_DIR"
 cp "$tmp/$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
 chmod 755 "$INSTALL_DIR/$BIN_NAME"
 
+if "$INSTALL_DIR/$BIN_NAME" init --no-studio-plugin >/dev/null 2>&1; then
+  skills_msg="Agent skills installed/updated."
+else
+  skills_msg="Agent skill install skipped. Run: shadowdroid init"
+fi
+
 cat <<EOF
 shadowdroid installed to $INSTALL_DIR/$BIN_NAME
+$skills_msg
 Run:
   shadowdroid connect
 EOF

@@ -19,8 +19,13 @@ use serde_json::json;
 use std::path::PathBuf;
 
 use crate::cmd::app_install::AppInstallArgs;
+use crate::cmd::debug::{DebugArgs, DebugCmd};
+use crate::cmd::debugger::DebuggerCmd;
 use crate::cmd::device_profile::ProfileApplyArgs;
+use crate::cmd::layout::{LayoutArgs, LayoutCmd};
 use crate::cmd::scroll::ScrollArgs;
+use crate::cmd::studio::{StudioArgs, StudioCmd};
+use crate::config::{expand_config_path, ShadowDroidConfig};
 use crate::device::client::ServerClient;
 use crate::device::{adb, installer};
 use crate::events::{CompactElement, ScreenFormat};
@@ -72,7 +77,7 @@ pub enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Inspect first-run host setup and optionally install the Android Studio plugin.
+    /// Initialize host setup: agent skills, Android Studio plugin, and bridge diagnostics.
     Init(crate::cmd::studio::InitArgs),
     /// Diagnose (and optionally repair) the host↔device pipe: device state,
     /// APK version, port forward, server reachability, UiAutomation owners.
@@ -104,6 +109,8 @@ pub enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect, generate, and validate user/project JSON config.
+    Config(crate::cmd::config::ConfigArgs),
     /// Generate or refresh an agent-integration file (claude-code / cursor /
     /// codex / gemini / antigravity); `skill --sync` updates installed ones.
     Skill(crate::cmd::skill::SkillArgs),
@@ -428,10 +435,12 @@ pub enum FilesCmd {
 
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
-    let device = cli.device;
+    let config = ShadowDroidConfig::load()?;
+    let device = cli.device.or_else(|| config.device.clone());
     let apk = cli.apk;
     let any_apk_version = cli.any_apk_version;
-    let cmd = cli.cmd;
+    let mut cmd = cli.cmd;
+    apply_config_defaults(&mut cmd, &config);
 
     // ── Phase 1: commands that do NOT need the on-device server ──
     // doctor diagnoses the very server `ensure_ready` would start; collect does
@@ -443,6 +452,7 @@ pub async fn run() -> Result<()> {
         Cmd::Init(args) => return crate::cmd::studio::run_init(args).await,
         // Pure self-introspection / file generation — no device needed.
         Cmd::Commands { json } => return crate::cmd::introspect::run(*json),
+        Cmd::Config(args) => return crate::cmd::config::run(args),
         Cmd::Skill(args) => return crate::cmd::skill::run(args),
         Cmd::Studio(args) => return crate::cmd::studio::run(args).await,
         Cmd::Debug(args) if args.is_host_only() => {
@@ -461,8 +471,8 @@ pub async fn run() -> Result<()> {
             no_screenshot,
         } => {
             let serial = resolve_serial(device.as_deref()).await?;
-            return crate::cmd::collect::run(&serial, app.clone(), out.clone(), !*no_screenshot)
-                .await;
+            let app = resolve_app_package(&config, Some(&serial), app.clone()).await?;
+            return crate::cmd::collect::run(&serial, app, out.clone(), !*no_screenshot).await;
         }
         Cmd::Perm(c) => {
             let serial = resolve_serial(device.as_deref()).await?;
@@ -501,6 +511,7 @@ pub async fn run() -> Result<()> {
         | Cmd::Doctor { .. }
         | Cmd::Collect { .. }
         | Cmd::Commands { .. }
+        | Cmd::Config(_)
         | Cmd::Skill(_)
         | Cmd::Studio(_)
         | Cmd::Perm(_)
@@ -685,6 +696,7 @@ pub async fn run() -> Result<()> {
             permission_dialogs,
             watcher_file,
         } => {
+            let app = resolve_app_package(&config, Some(&serial), app).await?;
             crate::watch::r#loop::run(crate::watch::r#loop::WatchConfig {
                 serial,
                 client,
@@ -701,6 +713,199 @@ pub async fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn apply_config_defaults(cmd: &mut Cmd, config: &ShadowDroidConfig) {
+    match cmd {
+        Cmd::Init(args) => {
+            if args.studio.is_none() {
+                args.studio = expand_config_path(&config.android_studio);
+            }
+            if args.plugin.is_none() {
+                args.plugin = expand_config_path(&config.studio_plugin);
+            }
+        }
+        Cmd::Studio(args) => apply_studio_config(args, config),
+        Cmd::Collect { app, .. } => fill_app(app, config),
+        Cmd::Debug(args) => apply_debug_config(args, config),
+        Cmd::Layout(args) => apply_layout_config(args, config),
+        _ => {}
+    }
+}
+
+fn apply_studio_config(args: &mut StudioArgs, config: &ShadowDroidConfig) {
+    match &mut args.cmd {
+        StudioCmd::Status(args) => {
+            if args.studio.is_none() {
+                args.studio = expand_config_path(&config.android_studio);
+            }
+        }
+        StudioCmd::Install(args) => {
+            if args.studio.is_none() {
+                args.studio = expand_config_path(&config.android_studio);
+            }
+            if args.plugin.is_none() {
+                args.plugin = expand_config_path(&config.studio_plugin);
+            }
+        }
+    }
+}
+
+fn apply_layout_config(args: &mut LayoutArgs, config: &ShadowDroidConfig) {
+    match &mut args.cmd {
+        LayoutCmd::Snapshot(args) => fill_studio_url(&mut args.studio_url, config),
+        LayoutCmd::Recompositions(args) => fill_studio_url(&mut args.studio_url, config),
+        LayoutCmd::Source(args) => fill_studio_url(&mut args.studio_url, config),
+        LayoutCmd::Diff(_) => {}
+    }
+}
+
+fn apply_debug_config(args: &mut DebugArgs, config: &ShadowDroidConfig) {
+    fill_studio_url(&mut args.studio_url, config);
+    match &mut args.cmd {
+        DebugCmd::Auto(args) => {
+            if args.package.is_none() && args.app.is_none() && args.target.is_none() {
+                fill_app(&mut args.app, config);
+            }
+            if args.project.is_none() {
+                args.project = args
+                    .package
+                    .as_deref()
+                    .or(args.app.as_deref())
+                    .or(args.target.as_deref())
+                    .and_then(|app| config.default_project_for(Some(app)))
+                    .or_else(|| config.project.clone());
+            }
+            if args.debugger.is_none() {
+                args.debugger = args
+                    .package
+                    .as_deref()
+                    .or(args.app.as_deref())
+                    .or(args.target.as_deref())
+                    .and_then(|app| config.default_debugger_for(Some(app)))
+                    .or_else(|| config.debugger.clone());
+            }
+            if args.configuration.is_none() {
+                args.configuration = args
+                    .package
+                    .as_deref()
+                    .or(args.app.as_deref())
+                    .or(args.target.as_deref())
+                    .and_then(|app| config.default_run_configuration_for(Some(app)))
+                    .or_else(|| config.run_configuration.clone());
+            }
+        }
+        DebugCmd::Snapshot(args) => fill_app(&mut args.app, config),
+        DebugCmd::Record(args) => fill_app(&mut args.app, config),
+        DebugCmd::StepUntilScreenChange(args) => fill_app(&mut args.app, config),
+        DebugCmd::StepUntilLog(args) => fill_app(&mut args.wait.app, config),
+        DebugCmd::RunUntilCrash(args) => fill_app(&mut args.app, config),
+        DebugCmd::Studio(cmd) => apply_debugger_config(cmd, config),
+        DebugCmd::Replay(_) => {}
+    }
+}
+
+fn apply_debugger_config(cmd: &mut DebuggerCmd, config: &ShadowDroidConfig) {
+    match cmd {
+        DebuggerCmd::Clients(filter) => {
+            if filter.project.is_none() {
+                filter.project = config.project.clone();
+            }
+            if filter.package.is_none() {
+                filter.package = config
+                    .default_app()
+                    .and_then(|app| config.configured_package_for(&app));
+            }
+            if filter.device.is_none() {
+                filter.device = config.device.clone();
+            }
+        }
+        DebuggerCmd::Attach {
+            project,
+            package,
+            device,
+            debugger,
+            configuration,
+            ..
+        } => {
+            if package.is_none() {
+                *package = config
+                    .default_app()
+                    .and_then(|app| config.configured_package_for(&app));
+            }
+            if project.is_none() {
+                *project = package
+                    .as_deref()
+                    .and_then(|app| config.default_project_for(Some(app)))
+                    .or_else(|| config.project.clone());
+            }
+            if device.is_none() {
+                *device = config.device.clone();
+            }
+            if debugger.is_none() {
+                *debugger = package
+                    .as_deref()
+                    .and_then(|app| config.default_debugger_for(Some(app)))
+                    .or_else(|| config.debugger.clone());
+            }
+            if configuration.is_none() {
+                *configuration = package
+                    .as_deref()
+                    .and_then(|app| config.default_run_configuration_for(Some(app)))
+                    .or_else(|| config.run_configuration.clone());
+            }
+        }
+        DebuggerCmd::Break(break_cmd) => match break_cmd {
+            crate::cmd::debugger::BreakCmd::Line { project, .. }
+            | crate::cmd::debugger::BreakCmd::Exception { project, .. }
+            | crate::cmd::debugger::BreakCmd::Method { project, .. }
+            | crate::cmd::debugger::BreakCmd::Field { project, .. } => {
+                if project.is_none() {
+                    *project = config.project.clone();
+                }
+            }
+            crate::cmd::debugger::BreakCmd::Update(args) => {
+                if args.project.is_none() {
+                    args.project = config.project.clone();
+                }
+            }
+            crate::cmd::debugger::BreakCmd::Remove { project, .. } => {
+                if project.is_none() {
+                    *project = config.project.clone();
+                }
+            }
+        },
+        DebuggerCmd::Watch(crate::cmd::debugger::WatchCmd::Add { project, .. }) => {
+            if project.is_none() {
+                *project = config.project.clone();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn fill_app(app: &mut Option<String>, config: &ShadowDroidConfig) {
+    if app.is_none() {
+        *app = config.default_app();
+    }
+}
+
+fn fill_studio_url(studio_url: &mut Option<String>, config: &ShadowDroidConfig) {
+    if studio_url.is_none() {
+        *studio_url = config.studio_url.clone();
+    }
+}
+
+async fn resolve_app_package(
+    config: &ShadowDroidConfig,
+    serial: Option<&str>,
+    app: Option<String>,
+) -> Result<Option<String>> {
+    let Some(app) = app else {
+        return Ok(None);
+    };
+    let resolved = config.resolve_app(serial, Some(&app)).await?;
+    Ok(resolved.package.or(Some(app)))
 }
 
 // ── namespace sub-dispatchers ─────────────────────────────────

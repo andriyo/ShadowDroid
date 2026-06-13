@@ -6,7 +6,9 @@
 //! agent can consume or replay.
 
 use crate::cmd::debugger::{self, BridgeClient, DebuggerCmd};
+use crate::cmd::studio;
 use crate::cmd::studio_contract::{query, route, session_action};
+use crate::config::{ResolvedApp, ShadowDroidConfig};
 use crate::device::adb;
 use crate::device::client::ServerClient;
 use anyhow::{Context, Result};
@@ -40,6 +42,8 @@ pub struct DebugArgs {
 
 #[derive(Subcommand)]
 pub enum DebugCmd {
+    /// Start an app, attach Studio debugger when available, and return a snapshot.
+    Auto(AutoArgs),
     /// Capture one bounded debug state object for an agent.
     Snapshot(SnapshotArgs),
     /// Record a JSONL debug timeline: screen/app/logcat/debugger/screenshot events.
@@ -55,6 +59,48 @@ pub enum DebugCmd {
     StepUntilLog(StepUntilLogArgs),
     /// Resume and wait for a Java/native crash or ANR, then return a final snapshot.
     RunUntilCrash(RunUntilCrashArgs),
+}
+
+#[derive(Args, Clone)]
+pub struct AutoArgs {
+    /// App alias, package, or installed app name. Defaults to config, then foreground app.
+    pub target: Option<String>,
+    /// App alias or installed app name. Useful when the target would be parsed as an option.
+    #[arg(long)]
+    pub app: Option<String>,
+    /// Exact package/process name. Overrides target and --app.
+    #[arg(long)]
+    pub package: Option<String>,
+    /// Project name or absolute project path when multiple projects are open.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Android debugger id/display name.
+    #[arg(long)]
+    pub debugger: Option<String>,
+    /// Android Studio run configuration whose debugger settings should be reused.
+    #[arg(long)]
+    pub configuration: Option<String>,
+    /// Do not launch the app before attaching/snapshotting.
+    #[arg(long)]
+    pub no_start: bool,
+    /// Do not attach Android Studio's debugger; only resolve, launch, and snapshot.
+    #[arg(long)]
+    pub no_attach: bool,
+    /// App foreground wait timeout after launch.
+    #[arg(long, default_value_t = 20000)]
+    pub timeout_ms: u32,
+    /// Number of recent logcat lines to include.
+    #[arg(long, default_value_t = 200)]
+    pub logs: u32,
+    /// Include expanded top-frame variables when the debugger is suspended.
+    #[arg(long, default_value_t = 1)]
+    pub depth: u32,
+    /// Directory for screenshot artifacts.
+    #[arg(long)]
+    pub screenshot_dir: Option<PathBuf>,
+    /// Skip screenshot capture.
+    #[arg(long)]
+    pub no_screenshot: bool,
 }
 
 #[derive(Args, Clone)]
@@ -179,6 +225,7 @@ pub async fn run_host_only(args: &DebugArgs) -> Result<()> {
 pub async fn run(serial: &str, client: &ServerClient, args: DebugArgs) -> Result<()> {
     let studio_url = args.studio_url;
     match args.cmd {
+        DebugCmd::Auto(args) => debug_auto(serial, client, args, studio_url.as_deref()).await,
         DebugCmd::Snapshot(args) => snapshot_cmd(serial, client, args, studio_url.as_deref()).await,
         DebugCmd::Record(args) => record_cmd(serial, client, args, studio_url.as_deref()).await,
         DebugCmd::Replay(args) => replay_cmd(client, args).await,
@@ -192,6 +239,245 @@ pub async fn run(serial: &str, client: &ServerClient, args: DebugArgs) -> Result
         DebugCmd::RunUntilCrash(args) => {
             run_until_crash(serial, client, args, studio_url.as_deref()).await
         }
+    }
+}
+
+async fn debug_auto(
+    serial: &str,
+    client: &ServerClient,
+    args: AutoArgs,
+    studio_url: Option<&str>,
+) -> Result<()> {
+    let config = ShadowDroidConfig::load()?;
+    let requested = args
+        .package
+        .as_deref()
+        .or(args.app.as_deref())
+        .or(args.target.as_deref());
+    let (resolved, app_label) = resolve_auto_app(serial, client, &config, requested).await?;
+    let package = resolved.package.clone();
+    let mut steps = Vec::new();
+    let mut ok = package.is_some();
+
+    steps.push(json!({
+        "step": "resolve_app",
+        "ok": package.is_some(),
+        "requested": requested,
+        "resolved": resolved,
+        "label": app_label,
+    }));
+
+    if let Some(package) = &package {
+        if args.no_start {
+            steps.push(json!({
+                "step": "app_start",
+                "skipped": true,
+                "reason": "--no-start",
+                "package": package,
+            }));
+        } else {
+            match client.app_start(package).await {
+                Ok(()) => steps.push(json!({
+                    "step": "app_start",
+                    "ok": true,
+                    "package": package,
+                })),
+                Err(err) => {
+                    ok = false;
+                    steps.push(json!({
+                        "step": "app_start",
+                        "ok": false,
+                        "package": package,
+                        "error": err.to_string(),
+                    }));
+                }
+            }
+
+            match client.app_wait(package, args.timeout_ms, true).await {
+                Ok(wait) => {
+                    ok &= wait.matched;
+                    steps.push(json!({
+                        "step": "app_wait",
+                        "ok": wait.matched,
+                        "package": package,
+                        "timeout_ms": args.timeout_ms,
+                        "current": wait.current,
+                    }));
+                }
+                Err(err) => {
+                    ok = false;
+                    steps.push(json!({
+                        "step": "app_wait",
+                        "ok": false,
+                        "package": package,
+                        "timeout_ms": args.timeout_ms,
+                        "error": err.to_string(),
+                    }));
+                }
+            }
+        }
+    }
+
+    let attach = if args.no_attach {
+        json!({
+            "skipped": true,
+            "reason": "--no-attach",
+        })
+    } else if let Some(package) = &package {
+        let value = auto_attach_debugger(serial, package, &resolved, &args, studio_url).await;
+        ok &= value.get("ok").and_then(Value::as_bool).unwrap_or(false);
+        value
+    } else {
+        json!({
+            "ok": false,
+            "skipped": true,
+            "reason": "no package resolved",
+            "next_command": "shadowdroid debug auto --app <app alias or package>",
+        })
+    };
+
+    let snapshot = snapshot_value(
+        serial,
+        client,
+        &SnapshotArgs {
+            app: package.clone().or_else(|| requested.map(str::to_string)),
+            out: None,
+            screenshot_dir: args.screenshot_dir.clone(),
+            no_screenshot: args.no_screenshot,
+            logs: args.logs,
+            depth: args.depth,
+        },
+        studio_url,
+    )
+    .await?;
+
+    emit_json(&json!({
+        "type": "debug_auto",
+        "schema_version": 1,
+        "ok": ok,
+        "device": serial,
+        "app": {
+            "requested": requested,
+            "package": package,
+            "label": app_label,
+            "resolution": resolved,
+        },
+        "steps": steps,
+        "attach": attach,
+        "snapshot": snapshot,
+    }))
+}
+
+async fn resolve_auto_app(
+    serial: &str,
+    client: &ServerClient,
+    config: &ShadowDroidConfig,
+    requested: Option<&str>,
+) -> Result<(ResolvedApp, Option<String>)> {
+    let mut resolved = config.resolve_app(Some(serial), requested).await?;
+    let mut app_label = None;
+
+    if resolved.package.is_none() {
+        if let Some(input) = resolved.input.clone() {
+            if let Some((package, label)) = resolve_app_by_label(serial, client, &input).await? {
+                resolved.package = Some(package);
+                resolved.source = "installed_app_label_match".into();
+                app_label = Some(label);
+            }
+        }
+    }
+
+    if resolved.package.is_none() && resolved.input.is_none() {
+        if let Ok(current) = client.app_current().await {
+            if let Some(package) = current.package {
+                app_label = client.app_info(&package).await.ok().map(|info| info.label);
+                resolved.package = Some(package);
+                resolved.source = "foreground_app".into();
+            }
+        }
+    }
+
+    Ok((resolved, app_label))
+}
+
+async fn resolve_app_by_label(
+    serial: &str,
+    client: &ServerClient,
+    requested: &str,
+) -> Result<Option<(String, String)>> {
+    let needle = lookup_key(requested);
+    if needle.is_empty() {
+        return Ok(None);
+    }
+    let packages = adb::list_packages(serial).await?;
+    let mut matches = Vec::new();
+    for package in packages {
+        let Ok(info) = client.app_info(&package).await else {
+            continue;
+        };
+        let label_key = lookup_key(&info.label);
+        if label_key == needle || label_key.contains(&needle) {
+            matches.push((package, info.label));
+        }
+    }
+
+    match matches.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some(one.clone())),
+        many => anyhow::bail!(
+            "app name `{}` matched multiple installed labels: {}. Add an alias to .shadowdroid.json.",
+            requested,
+            many.iter()
+                .map(|(package, label)| format!("{label} ({package})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+async fn auto_attach_debugger(
+    serial: &str,
+    package: &str,
+    resolved: &ResolvedApp,
+    args: &AutoArgs,
+    studio_url: Option<&str>,
+) -> Value {
+    let bridge = match BridgeClient::new(studio_url) {
+        Ok(bridge) => bridge,
+        Err(err) => return studio_problem_value("resolve_bridge", err),
+    };
+    let project = args.project.as_deref().or(resolved.project.as_deref());
+    let debugger = args.debugger.as_deref().or(resolved.debugger.as_deref());
+    let configuration = args
+        .configuration
+        .as_deref()
+        .or(resolved.run_configuration.as_deref());
+    match bridge
+        .get(
+            route::ATTACH,
+            &[
+                (query::PACKAGE, Some(package)),
+                (query::DEVICE, Some(serial)),
+                (query::PROJECT, project),
+                (query::DEBUGGER, debugger),
+                (query::CONFIGURATION, configuration),
+                (query::DIALOG, Some("false")),
+            ],
+        )
+        .await
+    {
+        Ok(response) => {
+            let ok = response.get("ok").and_then(Value::as_bool).unwrap_or(true);
+            json!({
+                "ok": ok,
+                "package": package,
+                "project": project,
+                "debugger": debugger,
+                "configuration": configuration,
+                "response": response,
+            })
+        }
+        Err(err) => studio_problem_value("attach", err),
     }
 }
 
@@ -270,14 +556,14 @@ async fn snapshot_value(
 async fn debugger_snapshot(studio_url: Option<&str>, depth: u32) -> Value {
     let bridge = match BridgeClient::new(studio_url) {
         Ok(bridge) => bridge,
-        Err(err) => return json!({"available": false, "error": err.to_string()}),
+        Err(err) => return studio_problem_value("resolve_bridge", err),
     };
     let depth_s = depth.to_string();
     let max_fields_s = "48".to_string();
     let max_array_items_s = "24".to_string();
     let status = match bridge.get(route::STATUS, &[]).await {
         Ok(value) => value,
-        Err(err) => return json!({"available": false, "error": err.to_string()}),
+        Err(err) => return studio_problem_value("status", err),
     };
     let breakpoints = bridge
         .get(route::BREAKPOINTS, &[])
@@ -316,6 +602,19 @@ async fn debugger_snapshot(studio_url: Option<&str>, depth: u32) -> Value {
         "stack": stack,
         "variables": variables,
         "watches": watches,
+    })
+}
+
+fn studio_problem_value(stage: &str, err: anyhow::Error) -> Value {
+    json!({
+        "available": false,
+        "ok": false,
+        "type": "studio_debugger_unavailable",
+        "stage": stage,
+        "error": err.to_string(),
+        "next_command": "shadowdroid doctor",
+        "setup_command": "shadowdroid init",
+        "studio": studio::status_report(None).ok(),
     })
 }
 
@@ -804,6 +1103,14 @@ async fn studio_control(
 
 fn is_crash_line(line: &str) -> bool {
     line.contains("FATAL EXCEPTION") || line.contains("Fatal signal") || line.contains(" ANR in ")
+}
+
+fn lookup_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn is_replayable_action(value: &Value) -> bool {

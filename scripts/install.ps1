@@ -141,7 +141,15 @@ try {
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     Copy-Item -Path (Join-Path $tmp "shadowdroid.exe") -Destination $exe -Force
 
+    try {
+        & $exe init --no-studio-plugin *> $null
+        $skillsMessage = "Agent skills installed/updated."
+    } catch {
+        $skillsMessage = "Agent skill install skipped. Run: shadowdroid init"
+    }
+
     Write-Host "shadowdroid installed to $exe"
+    Write-Host $skillsMessage
     Write-Host "Run: shadowdroid connect"
     if (-not $NoPathUpdate) {
         Write-Host (Update-UserPath $InstallDir)

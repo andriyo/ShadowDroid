@@ -256,6 +256,19 @@ pub async fn pm_version(
         .filter(|s| !s.is_empty()))
 }
 
+/// Return installed package names. Used by low-friction app-name resolution
+/// when a user types `Livd` instead of `com.livd`.
+pub async fn list_packages(serial: impl Into<String>) -> Result<Vec<String>> {
+    let out = shell(serial, "pm list packages").await?;
+    Ok(out
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("package:"))
+        .map(str::trim)
+        .filter(|package| !package.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 /// Like `list_devices` but returns **every** device paired with its connection
 /// state string (`"device"`, `"offline"`, `"unauthorized"`, `"noperm"`, …),
 /// unfiltered. `list_devices` hides anything that isn't fully "device"; the

@@ -92,6 +92,78 @@ pub fn run(args: &SkillArgs) -> Result<()> {
     Ok(())
 }
 
+/// Install the conventional ShadowDroid skill files that are safe to manage
+/// automatically. Global skill locations are always created/updated. Codex's
+/// `AGENTS.md` is project-scoped, so this only refreshes it when it already
+/// exists and is ShadowDroid-generated.
+pub fn install_default_skills() -> Value {
+    let mut installed = Vec::new();
+    let mut skipped = Vec::new();
+    let mut failed = Vec::new();
+
+    for agent in ["claude-code", "cursor", "gemini", "antigravity"] {
+        match conventional_path(agent)
+            .and_then(|path| install_skill_at(agent, &path, true).map(|bytes| (path, bytes)))
+        {
+            Ok((path, bytes)) => installed.push(json!({
+                "agent": agent,
+                "path": path.display().to_string(),
+                "bytes": bytes,
+            })),
+            Err(err) => failed.push(json!({"agent": agent, "error": err.to_string()})),
+        }
+    }
+
+    let codex_path = PathBuf::from("AGENTS.md");
+    if codex_path.exists() {
+        match inspect("codex", &codex_path) {
+            Ok((Decision::UpToDate, _)) => installed.push(json!({
+                "agent": "codex",
+                "path": codex_path.display().to_string(),
+                "bytes": std::fs::metadata(&codex_path).map(|m| m.len()).unwrap_or(0),
+                "already_current": true,
+            })),
+            Ok((Decision::NormalizeMarker | Decision::StalePristine(_), expected)) => {
+                match write_skill(&codex_path, &expected) {
+                    Ok(()) => installed.push(json!({
+                        "agent": "codex",
+                        "path": codex_path.display().to_string(),
+                        "bytes": expected.len(),
+                    })),
+                    Err(err) => failed.push(json!({"agent": "codex", "error": err.to_string()})),
+                }
+            }
+            Ok((Decision::Customized | Decision::Untracked, _)) => skipped.push(json!({
+                "agent": "codex",
+                "path": codex_path.display().to_string(),
+                "reason": "existing AGENTS.md is not ShadowDroid-generated",
+            })),
+            Err(err) => failed.push(json!({"agent": "codex", "error": err.to_string()})),
+        }
+    } else {
+        skipped.push(json!({
+            "agent": "codex",
+            "path": codex_path.display().to_string(),
+            "reason": "AGENTS.md is project-scoped; run `shadowdroid skill codex --install` from the repo root to create it",
+        }));
+    }
+
+    json!({
+        "type": "action",
+        "cmd": "skill_install_defaults",
+        "installed": installed,
+        "skipped": skipped,
+        "failed": failed,
+    })
+}
+
+fn install_skill_at(agent: &str, path: &Path, install: bool) -> Result<usize> {
+    let content = generated_content(agent, Some(path), install)?;
+    let bytes = content.len();
+    write_skill(path, &content)?;
+    Ok(bytes)
+}
+
 fn absolute_path(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
         return Ok(path.to_path_buf());
@@ -556,6 +628,7 @@ fn command_reference() -> String {
         "disconnect",
         "doctor",
         "collect",
+        "config",
         "screen",
         "screenshot",
         "find",
@@ -637,11 +710,41 @@ flow, or inspect what's on screen. It is *not* for building/compiling the app
 shadowdroid devices                 # attached devices/emulators
 shadowdroid connect                 # install + start the on-device service
 shadowdroid commands --json         # the full command catalog, for discovery
+shadowdroid config schema --json    # config format, paths, fields, example
 shadowdroid screen | jq             # current UI as a flat element list
 ```
 
 If no device is attached, ask the user to start one — don't boot an emulator
 silently. With multiple devices, pass `-d <serial>`.
+
+## Low-token project config
+
+Use config when the same device/app/project/package flags would repeat across
+commands. Prefer `config init` over hand-writing JSON, then validate before
+relying on it:
+
+```bash
+shadowdroid config paths --json
+shadowdroid config init --project --app Example --package com.example.app --project-path /path/to/app
+shadowdroid config validate --json
+```
+
+Project config lives in `.shadowdroid.json`; user config lives in
+`~/.shadowdroid/config.json`. Project config wins over user config. Minimal
+project config:
+
+```json
+{
+  "app": "Example",
+  "apps": {
+    "Example": {
+      "package": "com.example.app",
+      "project": "/path/to/app",
+      "run_configuration": "app"
+    }
+  }
+}
+```
 
 ## The driving loop
 
@@ -669,14 +772,18 @@ shadowdroid watch --app com.example.app | jq -c .
 Use a bounded snapshot when you need causality, not just the screen:
 
 ```bash
-shadowdroid debug snapshot --app com.example.app --depth 1 | jq
+shadowdroid debug auto Example | jq
+shadowdroid debug snapshot --depth 1 | jq
 ```
 
-With the Android Studio plugin installed and Studio restarted, use `debug` for
-attach, breakpoints, stack, threads, variables, deterministic eval, and watches:
+`debug auto` resolves the configured/default app, launches it, attaches the
+Android Studio debugger when the bridge is available, and returns a full
+snapshot. With the Android Studio plugin installed and Studio restarted, use
+lower-level `debug` commands for attach, breakpoints, stack, threads, variables,
+deterministic eval, and watches:
 
 ```bash
-shadowdroid debug attach --project /path/to/app --package com.example.app
+shadowdroid debug attach
 shadowdroid debug break line --file app/src/main/java/Foo.kt --line 42
 shadowdroid debug variables --thread 0 --frame 0 --depth 2 --timeout-ms 2500
 shadowdroid debug eval 'this.state' --thread 0 --frame 0 --depth 2 --timeout-ms 5000
