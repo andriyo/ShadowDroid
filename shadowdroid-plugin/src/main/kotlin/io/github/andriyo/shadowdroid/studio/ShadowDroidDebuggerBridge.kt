@@ -17,6 +17,7 @@ import com.intellij.xdebugger.breakpoints.XBreakpointListener
 import com.intellij.xdebugger.breakpoints.XLineBreakpoint
 import com.intellij.xdebugger.frame.XExecutionStack
 import com.intellij.xdebugger.frame.XStackFrame
+import com.sun.jdi.Field
 import com.sun.jdi.ObjectReference
 import com.sun.jdi.Value
 import com.sun.net.httpserver.HttpExchange
@@ -49,6 +50,8 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
         private val listenedProjects = ConcurrentHashMap.newKeySet<String>()
         private val listenedSessions = ConcurrentHashMap.newKeySet<String>()
         private val watchValues = ConcurrentHashMap<String, WatchValue>()
+        private val objectHandles = ConcurrentHashMap<String, ObjectHandleEntry>()
+        private val sessionHandleEpochs = ConcurrentHashMap<String, Int>()
         private val lock = Any()
 
         @Volatile
@@ -101,12 +104,14 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
 
                     override fun stackFrameChanged() {
                         if (session.isSuspended) {
+                            advanceHandleEpoch(session)
                             refreshWatchesForSession(session)
                         }
                     }
 
                     override fun sessionStopped() {
                         listenedSessions.remove(key)
+                        advanceHandleEpoch(session)
                     }
                 }, project)
                 if (session.isSuspended) {
@@ -120,6 +125,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
         }
 
         private fun recordSessionPause(session: XDebugSession) {
+            advanceHandleEpoch(session)
             try {
                 recordLineBreakpointHit(session)
             } catch (t: Throwable) {
@@ -163,7 +169,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
             if (!session.isSuspended) return
             val project = session.project
             val projectKey = projectKey(project)
-            val renderOptions = DebuggerValues.RenderOptions(1, 64, 32)
+            val renderOptions = DebuggerValues.RenderOptions(1, 64, 32, handleProvider(session))
             for (watch in watches) {
                 if (watch.project != null && watch.project != projectKey) continue
                 try {
@@ -255,6 +261,11 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                 BridgeRoutes.SESSION_THREADS -> threads(query)
                 BridgeRoutes.SESSION_VARIABLES -> variables(query)
                 BridgeRoutes.SESSION_EVALUATE -> evaluate(query)
+                BridgeRoutes.SESSION_INSPECT -> inspect(query)
+                BridgeRoutes.SESSION_COROUTINES -> coroutines(query)
+                BridgeRoutes.SESSION_COROUTINES_THREADS -> coroutineThreads(query)
+                BridgeRoutes.SESSION_COROUTINES_CONTINUATION -> coroutineContinuation(query)
+                BridgeRoutes.SESSION_COROUTINES_FLOW -> coroutineFlow(query)
                 BridgeRoutes.WATCHES -> watches(query)
                 BridgeRoutes.WATCHES_ADD -> addWatch(query)
                 BridgeRoutes.WATCHES_REMOVE -> removeWatch(query)
@@ -311,6 +322,9 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                         else -> throw IllegalArgumentException("unsupported action: $action")
                     }
                     null
+                }
+                if (action == BridgeValues.ACTION_RESUME || action == BridgeValues.ACTION_STOP) {
+                    advanceHandleEpoch(session)
                 }
                 BridgeProtocol.ok("ok", true, "action", action, "session", sessionInfo(sessionIndex(session), session))
             } catch (t: Throwable) {
@@ -386,6 +400,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                 BridgeProtocol.intParam(query, BridgeQuery.DEPTH, 0, 0, 8),
                 BridgeProtocol.intParam(query, BridgeQuery.MAX_FIELDS, 64, 1, 512),
                 BridgeProtocol.intParam(query, BridgeQuery.MAX_ARRAY_ITEMS, 32, 0, 512),
+                handleProvider(session),
             )
             val timeoutMs = BridgeProtocol.debuggerTimeoutMs(query)
             return try {
@@ -428,6 +443,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                 BridgeProtocol.intParam(query, BridgeQuery.DEPTH, 1, 0, 8),
                 BridgeProtocol.intParam(query, BridgeQuery.MAX_FIELDS, 64, 1, 512),
                 BridgeProtocol.intParam(query, BridgeQuery.MAX_ARRAY_ITEMS, 32, 0, 512),
+                handleProvider(session),
             )
             val timeoutMs = BridgeProtocol.debuggerTimeoutMs(query)
             return try {
@@ -448,6 +464,200 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                             renderOptions,
                             hashSetOf(),
                         ),
+                    )
+                }
+            } catch (t: Throwable) {
+                BridgeProtocol.bad(t.message)
+            }
+        }
+
+        private fun inspect(query: Map<String, String>): Response {
+            val expression = query[BridgeQuery.EXPRESSION]?.takeUnless { it.isBlank() }
+            val handle = query[BridgeQuery.HANDLE]?.takeUnless { it.isBlank() }
+            if (expression == null && handle == null) return BridgeProtocol.bad("missing expression or handle")
+            if (expression != null && handle != null) return BridgeProtocol.bad("use expression or handle, not both")
+            val session = selectSession(query) ?: return BridgeProtocol.bad("no debugger session")
+            if (!session.isSuspended) return BridgeProtocol.bad("session is not suspended")
+            val renderOptions = DebuggerValues.RenderOptions(
+                BridgeProtocol.intParam(query, BridgeQuery.DEPTH, 1, 0, 8),
+                BridgeProtocol.intParam(query, BridgeQuery.MAX_FIELDS, 64, 1, 512),
+                BridgeProtocol.intParam(query, BridgeQuery.MAX_ARRAY_ITEMS, 32, 0, 512),
+                handleProvider(session),
+            )
+            val timeoutMs = BridgeProtocol.debuggerTimeoutMs(query)
+            return try {
+                StudioThreading.onDebuggerThread(session, timeoutMs) {
+                    val selected = if (handle == null) {
+                        DebuggerValues.selectedFrame(session, query)
+                            ?: throw IllegalArgumentException("current frame is not a Java/Kotlin frame")
+                    } else {
+                        null
+                    }
+                    val result = if (handle != null) {
+                        val entry = resolveObjectHandle(session, handle)
+                            ?: throw IllegalArgumentException("stale or unknown object handle: $handle")
+                        DebuggerValues.evaluateRelativePath(
+                            entry.reference,
+                            DebuggerValues.valueTypeName(entry.reference),
+                            query[BridgeQuery.PATH],
+                        )
+                    } else {
+                        DebuggerValues.evaluatePath(selected!!.proxy, expression!!)
+                    }
+                    val name = handle ?: expression ?: "result"
+                    BridgeProtocol.ok(
+                        "ok", true,
+                        "type", "debug_inspect",
+                        "schema_version", 2,
+                        "mode", if (handle != null) BridgeValues.EVAL_MODE_OBJECT_HANDLE else BridgeValues.EVAL_MODE_JDI_PATH,
+                        "session", sessionInfo(sessionIndex(session), session),
+                        "selected_frame", selected?.info(),
+                        "expression", expression,
+                        "handle", handle,
+                        "path", query[BridgeQuery.PATH],
+                        "handle_scope", handleScope(session),
+                        "limits", BridgeProtocol.map(
+                            "depth", renderOptions.depth,
+                            "max_fields", renderOptions.maxFields,
+                            "max_array_items", renderOptions.maxArrayItems,
+                        ),
+                        "result", DebuggerValues.valueToMap(
+                            name,
+                            result.value,
+                            result.declaredType,
+                            renderOptions,
+                            hashSetOf(),
+                        ),
+                    )
+                }
+            } catch (t: Throwable) {
+                BridgeProtocol.bad(t.message)
+            }
+        }
+
+        private fun coroutines(query: Map<String, String>): Response {
+            val session = selectSession(query) ?: return BridgeProtocol.bad("no debugger session")
+            if (!session.isSuspended) {
+                return BridgeProtocol.ok(
+                    "ok", true,
+                    "available", false,
+                    "type", "coroutine_snapshot",
+                    "reason", "session is not suspended",
+                    "session", sessionInfo(sessionIndex(session), session),
+                )
+            }
+            val limit = BridgeProtocol.intParam(query, BridgeQuery.LIMIT, 64, 1, 256)
+            val renderOptions = DebuggerValues.RenderOptions(
+                BridgeProtocol.intParam(query, BridgeQuery.DEPTH, 1, 0, 8),
+                48,
+                24,
+                handleProvider(session),
+            )
+            val timeoutMs = BridgeProtocol.debuggerTimeoutMs(query)
+            return try {
+                StudioThreading.onDebuggerThread(session, timeoutMs) {
+                    val threads = coroutineThreadsPayload(session, limit, timeoutMs)
+                    val continuations = continuationPayload(session, query, renderOptions, limit)
+                    BridgeProtocol.ok(
+                        "ok", true,
+                        "available", true,
+                        "type", "coroutine_snapshot",
+                        "schema_version", 1,
+                        "source", "jdi_suspended_frame",
+                        "session", sessionInfo(sessionIndex(session), session),
+                        "summary", BridgeProtocol.map(
+                            "threads", threads.size,
+                            "continuations", continuations.size,
+                        ),
+                        "threads", threads,
+                        "continuations", continuations,
+                    )
+                }
+            } catch (t: Throwable) {
+                BridgeProtocol.bad(t.message)
+            }
+        }
+
+        private fun coroutineThreads(query: Map<String, String>): Response {
+            val session = selectSession(query) ?: return BridgeProtocol.bad("no debugger session")
+            if (!session.isSuspended) return BridgeProtocol.bad("session is not suspended")
+            val limit = BridgeProtocol.intParam(query, BridgeQuery.LIMIT, 32, 1, 128)
+            val timeoutMs = BridgeProtocol.debuggerTimeoutMs(query)
+            return try {
+                StudioThreading.onDebuggerThread(session, timeoutMs) {
+                    BridgeProtocol.ok(
+                        "ok", true,
+                        "type", "coroutine_threads",
+                        "schema_version", 1,
+                        "session", sessionInfo(sessionIndex(session), session),
+                        "threads", coroutineThreadsPayload(session, limit, timeoutMs),
+                    )
+                }
+            } catch (t: Throwable) {
+                BridgeProtocol.bad(t.message)
+            }
+        }
+
+        private fun coroutineContinuation(query: Map<String, String>): Response {
+            val session = selectSession(query) ?: return BridgeProtocol.bad("no debugger session")
+            if (!session.isSuspended) return BridgeProtocol.bad("session is not suspended")
+            val renderOptions = DebuggerValues.RenderOptions(
+                BridgeProtocol.intParam(query, BridgeQuery.DEPTH, 2, 0, 8),
+                48,
+                24,
+                handleProvider(session),
+            )
+            val timeoutMs = BridgeProtocol.debuggerTimeoutMs(query)
+            return try {
+                StudioThreading.onDebuggerThread(session, timeoutMs) {
+                    val selected = DebuggerValues.selectedFrame(session, query)
+                        ?: throw IllegalArgumentException("current frame is not a Java/Kotlin frame")
+                    val continuations = continuationCandidates(selected.proxy, renderOptions, 64)
+                    BridgeProtocol.ok(
+                        "ok", true,
+                        "type", "coroutine_continuation",
+                        "schema_version", 1,
+                        "source", "jdi_suspended_frame",
+                        "session", sessionInfo(sessionIndex(session), session),
+                        "selected_frame", selected.info(),
+                        "continuations", continuations,
+                    )
+                }
+            } catch (t: Throwable) {
+                BridgeProtocol.bad(t.message)
+            }
+        }
+
+        private fun coroutineFlow(query: Map<String, String>): Response {
+            val expression = query[BridgeQuery.EXPRESSION]
+            if (expression.isNullOrBlank()) return BridgeProtocol.bad("missing expression")
+            val session = selectSession(query) ?: return BridgeProtocol.bad("no debugger session")
+            if (!session.isSuspended) return BridgeProtocol.bad("session is not suspended")
+            val renderOptions = DebuggerValues.RenderOptions(
+                BridgeProtocol.intParam(query, BridgeQuery.DEPTH, 2, 0, 8),
+                64,
+                32,
+                handleProvider(session),
+            )
+            val timeoutMs = BridgeProtocol.debuggerTimeoutMs(query)
+            return try {
+                StudioThreading.onDebuggerThread(session, timeoutMs) {
+                    val selected = DebuggerValues.selectedFrame(session, query)
+                        ?: throw IllegalArgumentException("current frame is not a Java/Kotlin frame")
+                    val result = DebuggerValues.evaluatePath(selected.proxy, expression)
+                    val type = DebuggerValues.valueTypeName(result.value)
+                    BridgeProtocol.ok(
+                        "ok", true,
+                        "type", "coroutine_flow",
+                        "schema_version", 1,
+                        "source", "jdi_field_only",
+                        "session", sessionInfo(sessionIndex(session), session),
+                        "selected_frame", selected.info(),
+                        "expression", expression,
+                        "kind", flowKind(type),
+                        "confidence", if (flowKind(type) != null) "medium" else "low",
+                        "observation", "field_only_no_collection_no_getters",
+                        "value", DebuggerValues.valueToMap(expression, result.value, result.declaredType, renderOptions, hashSetOf()),
                     )
                 }
             } catch (t: Throwable) {
@@ -555,6 +765,187 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
             val raw = "${project ?: ""}|$name|$expression"
             return "watch_" + Base64.getUrlEncoder().withoutPadding()
                 .encodeToString(raw.toByteArray(StandardCharsets.UTF_8))
+        }
+
+        private fun handleProvider(session: XDebugSession): (ObjectReference) -> String =
+            { reference -> registerObjectHandle(session, reference) }
+
+        private fun registerObjectHandle(session: XDebugSession, reference: ObjectReference): String {
+            val key = sessionKey(session)
+            val epoch = sessionHandleEpochs[key] ?: 0
+            val handle = "obj_s${sessionIndex(session)}_e${epoch}_${reference.uniqueID()}"
+            objectHandles[handle] = ObjectHandleEntry(key, epoch, reference)
+            return handle
+        }
+
+        private fun resolveObjectHandle(session: XDebugSession, handle: String): ObjectHandleEntry? {
+            val entry = objectHandles[handle] ?: return null
+            val key = sessionKey(session)
+            val epoch = sessionHandleEpochs[key] ?: 0
+            if (entry.sessionKey != key || entry.epoch != epoch) {
+                objectHandles.remove(handle)
+                return null
+            }
+            return entry
+        }
+
+        private fun advanceHandleEpoch(session: XDebugSession) {
+            val key = sessionKey(session)
+            objectHandles.entries.removeIf { it.value.sessionKey == key }
+            sessionHandleEpochs.compute(key) { _, current -> (current ?: 0) + 1 }
+        }
+
+        private fun handleScope(session: XDebugSession): Map<String, Any?> =
+            BridgeProtocol.map(
+                "session", sessionIndex(session),
+                "suspend_epoch", sessionHandleEpochs[sessionKey(session)] ?: 0,
+                "valid_until", "resume",
+            )
+
+        private fun coroutineThreadsPayload(session: XDebugSession, limit: Int, timeoutMs: Int): List<Any> {
+            val stacks = session.suspendContext?.executionStacks ?: XExecutionStack.EMPTY_ARRAY
+            val payload = mutableListOf<Any>()
+            for (index in stacks.indices) {
+                if (payload.size >= limit) break
+                val top = stacks[index].topFrame
+                val frames = mutableListOf<Any>()
+                if (top is JavaStackFrame) {
+                    frames.addAll(DebuggerValues.javaFrames(session, top, limit, timeoutMs))
+                } else if (top != null) {
+                    frames += DebuggerValues.frameInfo(top, 0)
+                }
+                payload += BridgeProtocol.map(
+                    "index", index,
+                    "name", stacks[index].displayName,
+                    "dispatcher", dispatcherHint(stacks[index].displayName),
+                    "top_frame", top?.let { DebuggerValues.frameInfo(it, 0) },
+                    "frames", frames,
+                )
+            }
+            return payload
+        }
+
+        private fun continuationPayload(
+            session: XDebugSession,
+            query: Map<String, String>,
+            renderOptions: DebuggerValues.RenderOptions,
+            limit: Int,
+        ): List<Any> {
+            val selected = DebuggerValues.selectedFrame(session, query)
+            if (selected != null) {
+                return continuationCandidates(selected.proxy, renderOptions, limit)
+            }
+            val stacks = session.suspendContext?.executionStacks ?: XExecutionStack.EMPTY_ARRAY
+            val payload = mutableListOf<Any>()
+            for (stack in stacks) {
+                if (payload.size >= limit) break
+                val top = stack.topFrame as? JavaStackFrame ?: continue
+                payload.addAll(continuationCandidates(top.stackFrameProxy, renderOptions, limit - payload.size))
+            }
+            return payload
+        }
+
+        private fun continuationCandidates(
+            proxy: StackFrameProxyImpl,
+            renderOptions: DebuggerValues.RenderOptions,
+            limit: Int,
+        ): List<Any> {
+            val payload = mutableListOf<Any>()
+            val thisObject = proxy.thisObject()
+            continuationInfo("this", thisObject, DebuggerValues.valueTypeName(thisObject), renderOptions)?.let {
+                payload += it
+            }
+            for (local in proxy.visibleVariables()) {
+                if (payload.size >= limit) break
+                val value = proxy.getValue(local)
+                continuationInfo(local.name(), value, local.typeName(), renderOptions)?.let {
+                    payload += it
+                }
+            }
+            return payload
+        }
+
+        private fun continuationInfo(
+            name: String,
+            value: Value?,
+            declaredType: String?,
+            renderOptions: DebuggerValues.RenderOptions,
+        ): Map<String, Any?>? {
+            val reference = value as? ObjectReference ?: return null
+            val type = DebuggerValues.valueTypeName(reference)
+            val fields = try {
+                reference.referenceType().allFields()
+            } catch (_: Throwable) {
+                emptyList<Field>()
+            }
+            val fieldNames = fields.map { it.name() }.toSet()
+            val continuationLike = type?.contains("Continuation") == true ||
+                (fieldNames.contains("label") && fieldNames.contains("completion")) ||
+                fields.any { isSpilledCoroutineField(it.name()) }
+            if (!continuationLike) return null
+            val label = readField(reference, fields, "label")?.toString()
+            val completion = readField(reference, fields, "completion") as? ObjectReference
+            val spilled = fields
+                .filter { isSpilledCoroutineField(it.name()) }
+                .take(renderOptions.maxFields)
+                .map { field ->
+                    try {
+                        DebuggerValues.valueToMap(
+                            field.name(),
+                            reference.getValue(field),
+                            field.typeName(),
+                            renderOptions.child(),
+                            hashSetOf(),
+                        )
+                    } catch (t: Throwable) {
+                        BridgeProtocol.map("name", field.name(), "error", t.message)
+                    }
+                }
+            return BridgeProtocol.map(
+                "name", name,
+                "class", type,
+                "declared_type", declaredType,
+                "object_id", reference.uniqueID(),
+                "object_handle", renderOptions.handleProvider?.invoke(reference),
+                "label", label,
+                "completion_handle", completion?.let { renderOptions.handleProvider?.invoke(it) },
+                "spilled_locals", spilled,
+                "confidence", if (type?.contains("Continuation") == true) "medium" else "low",
+            )
+        }
+
+        private fun readField(reference: ObjectReference, fields: List<Field>, name: String): Value? =
+            try {
+                fields.firstOrNull { it.name() == name }?.let { reference.getValue(it) }
+            } catch (_: Throwable) {
+                null
+            }
+
+        private fun isSpilledCoroutineField(name: String): Boolean {
+            if (name.length < 3 || name[1] != '$') return false
+            if (name[0] !in charArrayOf('L', 'I', 'J', 'F', 'D', 'Z')) return false
+            return name.substring(2).all { it.isDigit() }
+        }
+
+        private fun dispatcherHint(threadName: String?): Map<String, Any?> {
+            val lower = threadName?.lowercase().orEmpty()
+            return when {
+                lower.contains("main") -> BridgeProtocol.map("name", "Dispatchers.Main", "confidence", "medium")
+                lower.contains("defaultdispatcher") || lower.contains("default") ->
+                    BridgeProtocol.map("name", "Dispatchers.Default", "confidence", "low")
+                lower.contains("io") -> BridgeProtocol.map("name", "Dispatchers.IO", "confidence", "low")
+                else -> BridgeProtocol.map("name", null, "confidence", "none")
+            }
+        }
+
+        private fun flowKind(type: String?): String? {
+            val value = type ?: return null
+            return when {
+                value.contains("StateFlow") -> "StateFlow"
+                value.contains("SharedFlow") -> "SharedFlow"
+                value.endsWith("Flow") || value.contains(".Flow") -> "Flow"
+                else -> null
+            }
         }
 
         private fun sessionInfo(index: Int, session: XDebugSession): Map<String, Any?> {
@@ -689,4 +1080,10 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                 WatchValue(updatedAt, session, selectedFrame, null, error)
         }
     }
+
+    private data class ObjectHandleEntry(
+        val sessionKey: String,
+        val epoch: Int,
+        val reference: ObjectReference,
+    )
 }

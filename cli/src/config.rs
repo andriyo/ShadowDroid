@@ -33,6 +33,8 @@ pub struct ShadowDroidConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub debugger: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_configuration: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub apps: BTreeMap<String, AppConfig>,
@@ -51,6 +53,8 @@ pub struct AppConfig {
     pub run_configuration: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub debugger: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -64,6 +68,8 @@ pub struct ResolvedApp {
     pub run_configuration: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debugger: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debug_mode: Option<String>,
 }
 
 impl ShadowDroidConfig {
@@ -106,6 +112,12 @@ impl ShadowDroidConfig {
             .or_else(|| self.debugger.clone())
     }
 
+    pub fn default_debug_mode_for(&self, app: Option<&str>) -> Option<String> {
+        app.and_then(|app| self.app_config(app))
+            .and_then(|entry| entry.debug_mode.clone())
+            .or_else(|| self.debug_mode.clone())
+    }
+
     pub async fn resolve_app(
         &self,
         serial: Option<&str>,
@@ -125,6 +137,7 @@ impl ShadowDroidConfig {
                 project: self.project.clone(),
                 run_configuration: self.run_configuration.clone(),
                 debugger: self.debugger.clone(),
+                debug_mode: self.debug_mode.clone(),
             });
         };
 
@@ -139,6 +152,7 @@ impl ShadowDroidConfig {
                     .clone()
                     .or_else(|| self.run_configuration.clone()),
                 debugger: entry.debugger.clone().or_else(|| self.debugger.clone()),
+                debug_mode: entry.debug_mode.clone().or_else(|| self.debug_mode.clone()),
             });
         }
 
@@ -150,6 +164,7 @@ impl ShadowDroidConfig {
                 project: self.project.clone(),
                 run_configuration: self.run_configuration.clone(),
                 debugger: self.debugger.clone(),
+                debug_mode: self.debug_mode.clone(),
             });
         }
 
@@ -161,6 +176,7 @@ impl ShadowDroidConfig {
                 project: self.project.clone(),
                 run_configuration: self.run_configuration.clone(),
                 debugger: self.debugger.clone(),
+                debug_mode: self.debug_mode.clone(),
             });
         };
 
@@ -178,6 +194,7 @@ impl ShadowDroidConfig {
                 project: self.project.clone(),
                 run_configuration: self.run_configuration.clone(),
                 debugger: self.debugger.clone(),
+                debug_mode: self.debug_mode.clone(),
             }),
             [] => Ok(ResolvedApp {
                 input,
@@ -186,6 +203,7 @@ impl ShadowDroidConfig {
                 project: self.project.clone(),
                 run_configuration: self.run_configuration.clone(),
                 debugger: self.debugger.clone(),
+                debug_mode: self.debug_mode.clone(),
             }),
             many => Err(anyhow!(
                 "app name `{}` matched multiple installed packages: {}. Add an alias to {}.",
@@ -214,6 +232,7 @@ impl ShadowDroidConfig {
         self.android_studio = other.android_studio.or(self.android_studio.take());
         self.studio_plugin = other.studio_plugin.or(self.studio_plugin.take());
         self.debugger = other.debugger.or(self.debugger.take());
+        self.debug_mode = other.debug_mode.or(self.debug_mode.take());
         self.run_configuration = other.run_configuration.or(self.run_configuration.take());
         self.apps.extend(other.apps);
     }

@@ -779,14 +779,17 @@ shadowdroid debug snapshot --depth 1 | jq
 `debug auto` resolves the configured/default app, launches it, attaches the
 Android Studio debugger when the bridge is available, and returns a full
 snapshot. With the Android Studio plugin installed and Studio restarted, use
-lower-level `debug` commands for attach, breakpoints, stack, threads, variables,
-deterministic eval, and watches:
+	lower-level `debug` commands for attach, breakpoints, stack, threads, variables,
+	deterministic eval/inspect, coroutine hints, native status, and watches:
 
 ```bash
 shadowdroid debug attach
 shadowdroid debug break line --file app/src/main/java/Foo.kt --line 42
 shadowdroid debug variables --thread 0 --frame 0 --depth 2 --timeout-ms 2500
 shadowdroid debug eval 'this.state' --thread 0 --frame 0 --depth 2 --timeout-ms 5000
+shadowdroid debug inspect 'this.state' --depth 2
+shadowdroid debug coroutines snapshot --depth 1
+shadowdroid debug native status
 shadowdroid debug watch add 'this.state'
 ```
 

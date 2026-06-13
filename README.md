@@ -192,7 +192,7 @@ when `screen_hash` changes.
 | **Device**       | `device info` / `shell` / `wake` / `sleep` / `unlock` / `orientation` / `clipboard` / `notifications` / `quick-settings` / `open-url` |
 | **Files**        | `files ls` / `push` / `pull`                                                                       |
 | **Display**      | `profile snapshot` / `apply` / `reset` (animations, font, density, size, rotation)                 |
-| **Debug**        | `debug auto` / `snapshot` / `record` / `replay`, `debug attach` / `break` / `stack` / `variables` / `eval`, `debug run-until-crash` |
+| **Debug**        | `debug auto` / `snapshot` / `record` / `replay`, `debug attach` / `break` / `stack` / `variables` / `eval` / `inspect`, `debug native` / `tombstones` / `coroutines`, `debug run-until-crash` |
 | **Session**      | `devices`, `connect`, `disconnect`, `doctor`, `collect`, `config`, `update`, `commands`, `skill`, `studio`, `init` |
 
 `watch` is the streaming workhorse — it emits debounced, hash-diffed `screen`
@@ -218,8 +218,9 @@ Backed by an optional Android Studio plugin:
   snapshot with setup guidance if the bridge is missing.
 - **`debug`** — attach to the running app; set breakpoints (line, exception,
   method, field watchpoint; conditional, temporary, logpoints); read the call
-  stack, local variables, and watches; evaluate read-only expressions (`this`,
-  locals, fields, array indexes). Requests are bounded — they return a structured
+  stack, local variables, and watches; evaluate/inspect read-only expressions
+  (`this`, locals, fields, array indexes) and follow object handles while the
+  session remains suspended. Requests are bounded — they return a structured
   `ok:false` instead of blocking when no suspended frame is available.
 - **`debug snapshot`** — one shot: device + build, foreground app, screen tree,
   screenshot, recent logcat, and the live debugger stack / variables / breakpoints
@@ -227,7 +228,11 @@ Backed by an optional Android Studio plugin:
 - **`debug record` / `debug replay`** — JSONL timelines of screen changes,
   lifecycle, logcat, and replayable actions (taps, text, keys, swipes, drags).
 - **`debug run-until-crash` / `step-until-screen-change` / `step-until-log`** —
-  let the app run until something interesting happens, then return a full snapshot.
+  let the app run until something interesting happens, then return a full snapshot;
+  crash waits emit parsed Java/native/ANR events and can write local bundles.
+- **`debug native` / `debug tombstones` / `debug coroutines`** — native/mixed
+  readiness, tombstone artifacts, and conservative suspended-state coroutine
+  insight without arbitrary code execution.
 - **`layout`** — UI-tree snapshots and diffs, enriched (when Studio's Layout
   Inspector is live) with Compose source locations, semantics, and recomposition
   counters.

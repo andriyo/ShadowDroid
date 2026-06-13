@@ -29,6 +29,21 @@ pub async fn run(
     app_filter: Option<String>,
     out: mpsc::Sender<Event>,
 ) -> Result<()> {
+    let (crash_tx, mut crash_rx) = mpsc::channel(256);
+    tokio::spawn(async move {
+        let _ = run_crashes(serial, app_filter, crash_tx).await;
+    });
+    while let Some(evt) = crash_rx.recv().await {
+        let _ = out.send(Event::Crash(evt)).await;
+    }
+    Ok(())
+}
+
+pub async fn run_crashes(
+    serial: String,
+    app_filter: Option<String>,
+    out: mpsc::Sender<CrashEvent>,
+) -> Result<()> {
     let mut child = Command::new("adb")
         .args([
             "-s",
@@ -85,17 +100,24 @@ pub async fn run(
 async fn emit_if_matches(
     serial: &str,
     app_filter: &Option<String>,
-    out: &mpsc::Sender<Event>,
+    out: &mpsc::Sender<CrashEvent>,
     mut evt: CrashEvent,
 ) {
     if let (Some(filter), Some(package)) = (app_filter, &evt.package) {
-        if package != filter {
+        if !package_matches_filter(package, filter) {
             return;
         }
     }
     evt.context = fetch_context(serial).await;
     evt.device_info = fetch_device_info(serial).await;
-    let _ = out.send(Event::Crash(evt)).await;
+    let _ = out.send(evt).await;
+}
+
+fn package_matches_filter(package: &str, filter: &str) -> bool {
+    package == filter
+        || package
+            .strip_prefix(filter)
+            .is_some_and(|suffix| suffix.starts_with(':'))
 }
 
 #[derive(Default)]
@@ -428,7 +450,7 @@ fn anr_header_re() -> &'static Regex {
 
 #[cfg(test)]
 mod tests {
-    use super::CrashCollector;
+    use super::{package_matches_filter, CrashCollector};
 
     #[test]
     fn parses_java_crash_block() {
@@ -462,5 +484,30 @@ mod tests {
         assert_eq!(evt.signal, Some(11));
         assert_eq!(evt.signal_name.as_deref(), Some("SIGSEGV"));
         assert_eq!(evt.backtrace.len(), 1);
+    }
+
+    #[test]
+    fn package_filter_matches_remote_processes() {
+        assert!(package_matches_filter("com.example", "com.example"));
+        assert!(package_matches_filter("com.example:remote", "com.example"));
+        assert!(!package_matches_filter("com.example.other", "com.example"));
+        assert!(!package_matches_filter("com.other", "com.example"));
+    }
+
+    #[test]
+    fn parses_anr_header() {
+        let mut c = CrashCollector::default();
+        let events = c.handle_line(
+            "05-19 12:00:00.000  1234  5678 E ActivityManager: ANR in com.example (com.example/.MainActivity)",
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "anr");
+        assert_eq!(events[0].package.as_deref(), Some("com.example"));
+        assert_eq!(events[0].pid, Some(1234));
+        assert!(events[0]
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("ANR in com.example"));
     }
 }

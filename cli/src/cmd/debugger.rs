@@ -13,6 +13,35 @@ use crate::cmd::studio_contract::{self, query, route, session_action};
 
 const DEFAULT_BRIDGE_TIMEOUT_MS: u64 = 10_000;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum DebugMode {
+    Auto,
+    Java,
+    Native,
+    Mixed,
+}
+
+impl DebugMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DebugMode::Auto => "auto",
+            DebugMode::Java => "java",
+            DebugMode::Native => "native",
+            DebugMode::Mixed => "mixed",
+        }
+    }
+
+    pub fn from_config(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(DebugMode::Auto),
+            "java" => Some(DebugMode::Java),
+            "native" => Some(DebugMode::Native),
+            "mixed" => Some(DebugMode::Mixed),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub enum DebuggerCmd {
     /// Show bridge status, open projects, and active debugger sessions.
@@ -38,6 +67,9 @@ pub enum DebuggerCmd {
         /// Android debugger id/display name. Defaults to Studio's Java Android debugger.
         #[arg(long)]
         debugger: Option<String>,
+        /// Semantic debugger mode. Use --debugger for an exact Studio debugger id/name.
+        #[arg(long, value_enum)]
+        mode: Option<DebugMode>,
         /// Android Studio run configuration whose debugger settings should be reused.
         #[arg(long)]
         configuration: Option<String>,
@@ -70,6 +102,11 @@ pub enum DebuggerCmd {
     Variables(VariablesArgs),
     /// Evaluate a deterministic JDI path expression in the selected frame.
     Eval(EvalArgs),
+    /// Inspect a deterministic expression or a previously returned object handle.
+    Inspect(InspectArgs),
+    /// Coroutine and async-state inspection for suspended sessions.
+    #[command(subcommand)]
+    Coroutines(CoroutinesCmd),
     /// Resume until a source location or deterministic JDI condition matches.
     ContinueUntil(ContinueUntilArgs),
     /// Watch expression commands.
@@ -257,6 +294,122 @@ pub struct EvalArgs {
 }
 
 #[derive(Args)]
+pub struct InspectArgs {
+    /// Deterministic expression path: `this`, a local name, fields, and array indexes.
+    #[arg(conflicts_with = "handle")]
+    pub expression: Option<String>,
+    /// Object handle returned by `debug variables`, `debug eval`, or `debug inspect`.
+    #[arg(long)]
+    pub handle: Option<String>,
+    /// Relative path from --handle, e.g. `.field[0]`.
+    #[arg(long)]
+    pub path: Option<String>,
+    /// Debug session index from `debug sessions`.
+    #[arg(long)]
+    pub session: Option<usize>,
+    /// Execution stack/thread index from `debug threads`.
+    #[arg(long)]
+    pub thread: Option<String>,
+    /// Frame index within the selected thread.
+    #[arg(long)]
+    pub frame: Option<usize>,
+    /// Object expansion depth. 0 prints only the result value.
+    #[arg(long, default_value_t = 1)]
+    pub depth: u32,
+    /// Maximum instance fields to include per object.
+    #[arg(long, default_value_t = 64)]
+    pub max_fields: u32,
+    /// Maximum array/list items to include per array.
+    #[arg(long, default_value_t = 32)]
+    pub max_array_items: u32,
+    /// Inspection request timeout.
+    #[arg(long, default_value_t = 5000)]
+    pub timeout_ms: u32,
+}
+
+#[derive(Subcommand)]
+pub enum CoroutinesCmd {
+    /// Snapshot coroutine-like state reachable from suspended Java/Kotlin frames.
+    Snapshot(CoroutineSnapshotArgs),
+    /// Print debugger threads with dispatcher hints.
+    Threads(CoroutineThreadsArgs),
+    /// Inspect continuation-like objects in the selected frame.
+    Continuation(CoroutineContinuationArgs),
+    /// Inspect a Flow/StateFlow-like expression without collecting or invoking methods.
+    Flow(CoroutineFlowArgs),
+}
+
+#[derive(Args)]
+pub struct CoroutineSnapshotArgs {
+    /// Debug session index from `debug sessions`.
+    #[arg(long)]
+    pub session: Option<usize>,
+    /// Maximum threads/frames/continuations to include.
+    #[arg(long, default_value_t = 64)]
+    pub limit: u32,
+    /// Object expansion depth for spilled locals.
+    #[arg(long, default_value_t = 1)]
+    pub depth: u32,
+    /// Debugger manager request timeout.
+    #[arg(long, default_value_t = 2500)]
+    pub timeout_ms: u32,
+}
+
+#[derive(Args)]
+pub struct CoroutineThreadsArgs {
+    /// Debug session index from `debug sessions`.
+    #[arg(long)]
+    pub session: Option<usize>,
+    /// Maximum threads to include.
+    #[arg(long, default_value_t = 32)]
+    pub limit: u32,
+    /// Debugger manager request timeout.
+    #[arg(long, default_value_t = 2500)]
+    pub timeout_ms: u32,
+}
+
+#[derive(Args)]
+pub struct CoroutineContinuationArgs {
+    /// Debug session index from `debug sessions`.
+    #[arg(long)]
+    pub session: Option<usize>,
+    /// Execution stack/thread index from `debug threads`.
+    #[arg(long)]
+    pub thread: Option<String>,
+    /// Frame index within the selected thread.
+    #[arg(long)]
+    pub frame: Option<usize>,
+    /// Object expansion depth for spilled locals.
+    #[arg(long, default_value_t = 2)]
+    pub depth: u32,
+    /// Debugger manager request timeout.
+    #[arg(long, default_value_t = 2500)]
+    pub timeout_ms: u32,
+}
+
+#[derive(Args)]
+pub struct CoroutineFlowArgs {
+    /// Deterministic expression path to a Flow/StateFlow-like object.
+    #[arg(long)]
+    pub expr: String,
+    /// Debug session index from `debug sessions`.
+    #[arg(long)]
+    pub session: Option<usize>,
+    /// Execution stack/thread index from `debug threads`.
+    #[arg(long)]
+    pub thread: Option<String>,
+    /// Frame index within the selected thread.
+    #[arg(long)]
+    pub frame: Option<usize>,
+    /// Object expansion depth.
+    #[arg(long, default_value_t = 2)]
+    pub depth: u32,
+    /// Debugger manager request timeout.
+    #[arg(long, default_value_t = 2500)]
+    pub timeout_ms: u32,
+}
+
+#[derive(Args)]
 pub struct ContinueUntilArgs {
     /// Debug session index from `debug sessions`.
     #[arg(long)]
@@ -414,17 +567,20 @@ pub async fn run(cmd: &DebuggerCmd, studio_url: Option<&str>) -> Result<()> {
             pid,
             device,
             debugger,
+            mode,
             configuration,
             dialog,
         } => {
             let pid_s = pid.map(|pid| pid.to_string());
             let dialog_s = dialog.to_string();
+            let mode_s = mode.map(DebugMode::as_str);
             let params = [
                 (query::PROJECT, project.as_deref()),
                 (query::PACKAGE, package.as_deref()),
                 (query::PID, pid_s.as_deref()),
                 (query::DEVICE, device.as_deref()),
                 (query::DEBUGGER, debugger.as_deref()),
+                (query::MODE, mode_s),
                 (query::CONFIGURATION, configuration.as_deref()),
                 (query::DIALOG, Some(dialog_s.as_str())),
             ];
@@ -661,6 +817,124 @@ pub async fn run(cmd: &DebuggerCmd, studio_url: Option<&str>) -> Result<()> {
                 }),
             }
         }
+        DebuggerCmd::Inspect(args) => {
+            if args.expression.is_none() && args.handle.is_none() {
+                serde_json::json!({
+                    "ok": false,
+                    "type": "debug_inspect",
+                    "error": "missing expression or --handle",
+                })
+            } else {
+                let session_s = args.session.map(|s| s.to_string());
+                let frame_s = args.frame.map(|s| s.to_string());
+                let depth_s = args.depth.to_string();
+                let max_fields_s = args.max_fields.to_string();
+                let max_array_items_s = args.max_array_items.to_string();
+                let timeout_ms_s = args.timeout_ms.to_string();
+                let params = [
+                    (query::SESSION, session_s.as_deref()),
+                    (query::THREAD, args.thread.as_deref()),
+                    (query::FRAME, frame_s.as_deref()),
+                    (query::EXPRESSION, args.expression.as_deref()),
+                    (query::HANDLE, args.handle.as_deref()),
+                    (query::PATH, args.path.as_deref()),
+                    (query::DEPTH, Some(depth_s.as_str())),
+                    (query::MAX_FIELDS, Some(max_fields_s.as_str())),
+                    (query::MAX_ARRAY_ITEMS, Some(max_array_items_s.as_str())),
+                    (query::TIMEOUT_MS, Some(timeout_ms_s.as_str())),
+                ];
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(args.timeout_ms as u64),
+                    bridge.get(route::SESSION_INSPECT, &params),
+                )
+                .await
+                {
+                    Ok(Ok(value)) => value,
+                    Ok(Err(err)) => serde_json::json!({
+                        "ok": false,
+                        "type": "debug_inspect",
+                        "error": err.to_string(),
+                        "expression": args.expression.as_deref(),
+                        "handle": args.handle.as_deref(),
+                    }),
+                    Err(_) => serde_json::json!({
+                        "ok": false,
+                        "type": "debug_inspect",
+                        "timeout": true,
+                        "timeout_ms": args.timeout_ms,
+                        "expression": args.expression.as_deref(),
+                        "handle": args.handle.as_deref(),
+                    }),
+                }
+            }
+        }
+        DebuggerCmd::Coroutines(cmd) => match cmd {
+            CoroutinesCmd::Snapshot(args) => {
+                let session_s = args.session.map(|s| s.to_string());
+                let limit_s = args.limit.to_string();
+                let depth_s = args.depth.to_string();
+                let timeout_ms_s = args.timeout_ms.to_string();
+                let params = [
+                    (query::SESSION, session_s.as_deref()),
+                    (query::LIMIT, Some(limit_s.as_str())),
+                    (query::DEPTH, Some(depth_s.as_str())),
+                    (query::TIMEOUT_MS, Some(timeout_ms_s.as_str())),
+                ];
+                bridge
+                    .get(route::SESSION_COROUTINES, &params)
+                    .await
+                    .unwrap_or_else(|err| read_error_json("debug_coroutines_snapshot", err))
+            }
+            CoroutinesCmd::Threads(args) => {
+                let session_s = args.session.map(|s| s.to_string());
+                let limit_s = args.limit.to_string();
+                let timeout_ms_s = args.timeout_ms.to_string();
+                let params = [
+                    (query::SESSION, session_s.as_deref()),
+                    (query::LIMIT, Some(limit_s.as_str())),
+                    (query::TIMEOUT_MS, Some(timeout_ms_s.as_str())),
+                ];
+                bridge
+                    .get(route::SESSION_COROUTINES_THREADS, &params)
+                    .await
+                    .unwrap_or_else(|err| read_error_json("debug_coroutines_threads", err))
+            }
+            CoroutinesCmd::Continuation(args) => {
+                let session_s = args.session.map(|s| s.to_string());
+                let frame_s = args.frame.map(|f| f.to_string());
+                let depth_s = args.depth.to_string();
+                let timeout_ms_s = args.timeout_ms.to_string();
+                let params = [
+                    (query::SESSION, session_s.as_deref()),
+                    (query::THREAD, args.thread.as_deref()),
+                    (query::FRAME, frame_s.as_deref()),
+                    (query::DEPTH, Some(depth_s.as_str())),
+                    (query::TIMEOUT_MS, Some(timeout_ms_s.as_str())),
+                ];
+                bridge
+                    .get(route::SESSION_COROUTINES_CONTINUATION, &params)
+                    .await
+                    .unwrap_or_else(|err| read_error_json("debug_coroutines_continuation", err))
+            }
+            CoroutinesCmd::Flow(args) => {
+                let session_s = args.session.map(|s| s.to_string());
+                let frame_s = args.frame.map(|f| f.to_string());
+                let depth_s = args.depth.to_string();
+                let timeout_ms_s = args.timeout_ms.to_string();
+                let params = [
+                    (query::SESSION, session_s.as_deref()),
+                    (query::THREAD, args.thread.as_deref()),
+                    (query::FRAME, frame_s.as_deref()),
+                    (query::EXPRESSION, Some(args.expr.as_str())),
+                    (query::DEPTH, Some(depth_s.as_str())),
+                    (query::TIMEOUT_MS, Some(timeout_ms_s.as_str())),
+                ];
+                bridge
+                    .get(route::SESSION_COROUTINES_FLOW, &params)
+                    .await
+                    .unwrap_or_else(|err| read_error_json("debug_coroutines_flow", err))
+            }
+        },
         DebuggerCmd::ContinueUntil(args) => continue_until(&bridge, args).await?,
         DebuggerCmd::Watch(WatchCmd::Add {
             expression,
