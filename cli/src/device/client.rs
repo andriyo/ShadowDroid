@@ -299,17 +299,21 @@ impl ServerClient {
 
     // ── keys + text ────────────────────────────────────────────
 
-    pub async fn key(&self, name: &str) -> Result<()> {
-        let _: OkResponse = self
+    /// Press a named key. Returns the server's raw injection result: on
+    /// Android 14+ `UiDevice.pressKey*` reports `false` even when the key was
+    /// delivered, so this is advisory (`injected`) rather than a success flag —
+    /// the call still resolves `Ok` for any valid key.
+    pub async fn key(&self, name: &str) -> Result<bool> {
+        let r: OkResponse = self
             .post("/key", &serde_json::json!({"name": name}))
             .await?;
-        Ok(())
+        Ok(r.ok)
     }
-    pub async fn key_code(&self, code: i32) -> Result<()> {
-        let _: OkResponse = self
+    pub async fn key_code(&self, code: i32) -> Result<bool> {
+        let r: OkResponse = self
             .post("/key", &serde_json::json!({"code": code}))
             .await?;
-        Ok(())
+        Ok(r.ok)
     }
     pub async fn text(&self, value: &str, clear: bool) -> Result<()> {
         let _: OkResponse = self
