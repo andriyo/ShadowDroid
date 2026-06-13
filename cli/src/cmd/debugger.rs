@@ -13,17 +13,6 @@ use crate::cmd::studio_contract::{self, query, route, session_action};
 
 const DEFAULT_BRIDGE_TIMEOUT_MS: u64 = 10_000;
 
-#[derive(Args)]
-pub struct DebuggerArgs {
-    /// Android Studio plugin bridge URL. Defaults to the plugin registry, then
-    /// http://127.0.0.1:50576.
-    #[arg(long, env = "SHADOWDROID_STUDIO_DEBUGGER_URL")]
-    pub url: Option<String>,
-
-    #[command(subcommand)]
-    pub cmd: DebuggerCmd,
-}
-
 #[derive(Subcommand)]
 pub enum DebuggerCmd {
     /// Show bridge status, open projects, and active debugger sessions.
@@ -186,7 +175,7 @@ pub enum BreakCmd {
     Update(BreakpointUpdateArgs),
     /// Remove a breakpoint by stable id.
     Remove {
-        /// Breakpoint id from `debugger breakpoints`.
+        /// Breakpoint id from `debug breakpoints`.
         #[arg(long)]
         id: String,
         /// Project name or absolute project path when multiple projects are open.
@@ -197,14 +186,14 @@ pub enum BreakCmd {
 
 #[derive(Args)]
 pub struct SessionSelector {
-    /// Debug session index from `debugger sessions`.
+    /// Debug session index from `debug sessions`.
     #[arg(long)]
     pub session: Option<usize>,
 }
 
 #[derive(Args)]
 pub struct StackArgs {
-    /// Debug session index from `debugger sessions`.
+    /// Debug session index from `debug sessions`.
     #[arg(long)]
     pub session: Option<usize>,
     /// Maximum number of frames per stack.
@@ -217,10 +206,10 @@ pub struct StackArgs {
 
 #[derive(Args)]
 pub struct VariablesArgs {
-    /// Debug session index from `debugger sessions`.
+    /// Debug session index from `debug sessions`.
     #[arg(long)]
     pub session: Option<usize>,
-    /// Execution stack/thread index from `debugger threads`.
+    /// Execution stack/thread index from `debug threads`.
     #[arg(long)]
     pub thread: Option<String>,
     /// Frame index within the selected thread.
@@ -244,10 +233,10 @@ pub struct VariablesArgs {
 pub struct EvalArgs {
     /// Deterministic expression path: `this`, a local name, fields, and array indexes.
     pub expression: String,
-    /// Debug session index from `debugger sessions`.
+    /// Debug session index from `debug sessions`.
     #[arg(long)]
     pub session: Option<usize>,
-    /// Execution stack/thread index from `debugger threads`.
+    /// Execution stack/thread index from `debug threads`.
     #[arg(long)]
     pub thread: Option<String>,
     /// Frame index within the selected thread.
@@ -269,7 +258,7 @@ pub struct EvalArgs {
 
 #[derive(Args)]
 pub struct ContinueUntilArgs {
-    /// Debug session index from `debugger sessions`.
+    /// Debug session index from `debug sessions`.
     #[arg(long)]
     pub session: Option<usize>,
     /// Source file path to match against the top frame.
@@ -314,7 +303,7 @@ pub enum WatchCmd {
 
 #[derive(Args)]
 pub struct WatchListArgs {
-    /// Debug session index from `debugger sessions`.
+    /// Debug session index from `debug sessions`.
     #[arg(long)]
     pub session: Option<usize>,
     /// Object expansion depth for evaluated watch values.
@@ -333,7 +322,7 @@ pub struct WatchListArgs {
 
 #[derive(Args)]
 pub struct BreakpointUpdateArgs {
-    /// Breakpoint id from `debugger breakpoints`.
+    /// Breakpoint id from `debug breakpoints`.
     #[arg(long)]
     pub id: String,
     /// Project name or absolute project path when multiple projects are open.
@@ -404,9 +393,9 @@ pub struct AndroidClientArgs {
     pub device: Option<String>,
 }
 
-pub async fn run(args: &DebuggerArgs) -> Result<()> {
-    let bridge = BridgeClient::new(args.url.as_deref())?;
-    let value = match &args.cmd {
+pub async fn run(cmd: &DebuggerCmd, studio_url: Option<&str>) -> Result<()> {
+    let bridge = BridgeClient::new(studio_url)?;
+    let value = match cmd {
         DebuggerCmd::Status => bridge.get(route::STATUS, &[]).await?,
         DebuggerCmd::Sessions => bridge.get(route::SESSIONS, &[]).await?,
         DebuggerCmd::Clients(filter) => {
@@ -895,7 +884,7 @@ impl BridgeClient {
             .await
             .with_context(|| {
                 format!(
-                    "connecting to Android Studio debugger bridge at {}. Install/start the ShadowDroid Android Studio plugin or pass --url.",
+                    "connecting to Android Studio debugger bridge at {}. Install/start the ShadowDroid Android Studio plugin or pass --studio-url.",
                     self.base_url
                 )
             })?;

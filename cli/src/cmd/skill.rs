@@ -480,10 +480,10 @@ mod tests {
         // …and a previously blank gesture now carries help text.
         assert!(r.contains("- **`swipe`** — Swipe"), "{r}");
         // The advanced long tail is not expanded inline (no subcommands)…
-        assert!(!r.contains("debugger variables"), "{r}");
+        assert!(!r.contains("debug variables"), "{r}");
         // …but stays discoverable via the pointer line.
         assert!(r.contains("commands --json"));
-        assert!(r.contains("debugger"));
+        assert!(r.contains("debug"));
     }
 
     #[test]
@@ -542,7 +542,7 @@ mod tests {
 /// Render the live command catalog as a grouped markdown reference.
 ///
 /// Only the verbs an agent reaches for in the observe→act loop are expanded in
-/// full. The advanced long tail (`debugger`, `layout`, `appops`, …) is named
+/// full. The advanced long tail (`debug`, `layout`, `appops`, …) is named
 /// with a pointer to `commands --json`, so the skill stays lean in context
 /// without losing discoverability. Still generated from the live catalog, so it
 /// never drifts from the actual CLI.
@@ -672,16 +672,15 @@ Use a bounded snapshot when you need causality, not just the screen:
 shadowdroid debug snapshot --app com.example.app --depth 1 | jq
 ```
 
-With the Android Studio plugin installed and Studio restarted, use `debugger`
-for attach, breakpoints, stack, threads, variables, deterministic eval, and
-watches:
+With the Android Studio plugin installed and Studio restarted, use `debug` for
+attach, breakpoints, stack, threads, variables, deterministic eval, and watches:
 
 ```bash
-shadowdroid debugger attach --project /path/to/app --package com.example.app
-shadowdroid debugger break line --file app/src/main/java/Foo.kt --line 42
-shadowdroid debugger variables --thread 0 --frame 0 --depth 2 --timeout-ms 2500
-shadowdroid debugger eval 'this.state' --thread 0 --frame 0 --depth 2 --timeout-ms 5000
-shadowdroid debugger watch add 'this.state'
+shadowdroid debug attach --project /path/to/app --package com.example.app
+shadowdroid debug break line --file app/src/main/java/Foo.kt --line 42
+shadowdroid debug variables --thread 0 --frame 0 --depth 2 --timeout-ms 2500
+shadowdroid debug eval 'this.state' --thread 0 --frame 0 --depth 2 --timeout-ms 5000
+shadowdroid debug watch add 'this.state'
 ```
 
 Prefer `debug record` for longer investigations; it writes a JSONL timeline of
