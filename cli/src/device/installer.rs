@@ -524,15 +524,28 @@ async fn install_if_needed(serial: &str, pair: &ApkPair, any_apk_version: bool) 
         return install_pair(serial, pair).await;
     }
     if pair.source.is_dev() {
-        // For dev sources we'd ideally hash-compare. For M1, simplest correct
-        // behaviour: always reinstall when explicit --apk is given (Source 1),
-        // and skip if already installed for the others. Hash comparison is a
-        // later optimisation.
+        // Explicit --apk: the user pointed us at specific bytes, always reinstall.
         if pair.source == ApkSource::Explicit {
             info!("reinstalling APKs (dev mode, explicit --apk)");
             return install_pair(serial, pair).await;
         }
-        return Ok(());
+        // Repo build / local drop-in: reinstall iff the bytes changed since the
+        // last install, so `gradlew assembleDebug` + `connect` reliably picks up
+        // server edits without a manual uninstall. The androidTest APK carries
+        // the server code (and has no versionName), so we key the decision off
+        // its SHA-256. Hashing is best-effort: if we can't read the installed
+        // APK's hash, reinstall rather than risk silently running stale code.
+        return match test_apk_changed(serial, &pair.test).await {
+            Ok(false) => Ok(()),
+            Ok(true) => {
+                info!("reinstalling APKs (dev mode, test APK bytes changed)");
+                install_pair(serial, pair).await
+            }
+            Err(e) => {
+                warn!("could not compare installed test-APK hash ({e}); reinstalling to be safe");
+                install_pair(serial, pair).await
+            }
+        };
     }
     if any_apk_version {
         return Ok(());
@@ -579,6 +592,23 @@ async fn try_install_pair(serial: &str, pair: &ApkPair) -> Result<()> {
     adb::install(serial, pair.main.clone()).await?;
     adb::install(serial, pair.test.clone()).await?;
     Ok(())
+}
+
+/// True when the locally-built test APK differs (by SHA-256) from the copy
+/// installed on the device. Lets the dev loop honour "reinstall iff bytes
+/// changed" for repo/drop-in builds without a manual uninstall.
+async fn test_apk_changed(serial: &str, local_test: &Path) -> Result<bool> {
+    let device_path = adb::pm_path(serial, TEST_PACKAGE)
+        .await?
+        .ok_or_else(|| anyhow!("{TEST_PACKAGE} not installed"))?;
+    let out = adb::shell(serial, format!("sha256sum {device_path}")).await?;
+    let device_hash = out
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| anyhow!("empty sha256sum output for {device_path}"))?
+        .to_lowercase();
+    let local_hash = sha256_file(local_test)?;
+    Ok(device_hash != local_hash)
 }
 
 fn is_signature_mismatch(e: &anyhow::Error) -> bool {
