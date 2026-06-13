@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 use crate::cmd::app_install::AppInstallArgs;
 use crate::cmd::debug::{DebugArgs, DebugCmd};
-use crate::cmd::debugger::DebuggerCmd;
+use crate::cmd::debugger::{DebugMode, DebuggerCmd};
 use crate::cmd::device_profile::ProfileApplyArgs;
 use crate::cmd::layout::{LayoutArgs, LayoutCmd};
 use crate::cmd::scroll::ScrollArgs;
@@ -785,6 +785,16 @@ fn apply_debug_config(args: &mut DebugArgs, config: &ShadowDroidConfig) {
                     .and_then(|app| config.default_debugger_for(Some(app)))
                     .or_else(|| config.debugger.clone());
             }
+            if args.mode.is_none() {
+                args.mode = args
+                    .package
+                    .as_deref()
+                    .or(args.app.as_deref())
+                    .or(args.target.as_deref())
+                    .and_then(|app| config.default_debug_mode_for(Some(app)))
+                    .or_else(|| config.debug_mode.clone())
+                    .and_then(|mode| DebugMode::from_config(&mode));
+            }
             if args.configuration.is_none() {
                 args.configuration = args
                     .package
@@ -801,6 +811,17 @@ fn apply_debug_config(args: &mut DebugArgs, config: &ShadowDroidConfig) {
         DebugCmd::StepUntilLog(args) => fill_app(&mut args.wait.app, config),
         DebugCmd::RunUntilCrash(args) => fill_app(&mut args.app, config),
         DebugCmd::Studio(cmd) => apply_debugger_config(cmd, config),
+        DebugCmd::Native(cmd) => match cmd {
+            crate::cmd::debug::NativeCmd::Status(args) => {
+                if args.package.is_none() && args.app.is_none() && args.target.is_none() {
+                    fill_app(&mut args.app, config);
+                }
+            }
+        },
+        DebugCmd::Tombstones(cmd) => match cmd {
+            crate::cmd::debug::TombstonesCmd::List(args) => fill_app(&mut args.app, config),
+            crate::cmd::debug::TombstonesCmd::Pull(args) => fill_app(&mut args.app, config),
+        },
         DebugCmd::Replay(_) => {}
     }
 }
@@ -825,6 +846,7 @@ fn apply_debugger_config(cmd: &mut DebuggerCmd, config: &ShadowDroidConfig) {
             package,
             device,
             debugger,
+            mode,
             configuration,
             ..
         } => {
@@ -847,6 +869,13 @@ fn apply_debugger_config(cmd: &mut DebuggerCmd, config: &ShadowDroidConfig) {
                     .as_deref()
                     .and_then(|app| config.default_debugger_for(Some(app)))
                     .or_else(|| config.debugger.clone());
+            }
+            if mode.is_none() {
+                *mode = package
+                    .as_deref()
+                    .and_then(|app| config.default_debug_mode_for(Some(app)))
+                    .or_else(|| config.debug_mode.clone())
+                    .and_then(|mode| DebugMode::from_config(&mode));
             }
             if configuration.is_none() {
                 *configuration = package

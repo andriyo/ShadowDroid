@@ -145,7 +145,7 @@ pub enum ActionResult {
     // …etc, one variant per cmd
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CrashEvent {
     pub kind: String, // "java" | "native" | "anr"
     pub ts: f64,
@@ -164,7 +164,7 @@ pub struct CrashEvent {
     pub device_info: serde_json::Value,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CausedBy {
     pub exception: String,
     pub message: Option<String>,

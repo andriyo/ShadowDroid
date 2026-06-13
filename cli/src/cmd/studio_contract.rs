@@ -16,6 +16,11 @@ pub(crate) mod route {
     pub(crate) const SESSION_THREADS: &str = "/v1/session/threads";
     pub(crate) const SESSION_VARIABLES: &str = "/v1/session/variables";
     pub(crate) const SESSION_EVALUATE: &str = "/v1/session/evaluate";
+    pub(crate) const SESSION_INSPECT: &str = "/v1/session/inspect";
+    pub(crate) const SESSION_COROUTINES: &str = "/v1/session/coroutines";
+    pub(crate) const SESSION_COROUTINES_THREADS: &str = "/v1/session/coroutines/threads";
+    pub(crate) const SESSION_COROUTINES_CONTINUATION: &str = "/v1/session/coroutines/continuation";
+    pub(crate) const SESSION_COROUTINES_FLOW: &str = "/v1/session/coroutines/flow";
     pub(crate) const WATCHES: &str = "/v1/watches";
     pub(crate) const WATCHES_ADD: &str = "/v1/watches/add";
     pub(crate) const WATCHES_REMOVE: &str = "/v1/watches/remove";
@@ -57,6 +62,7 @@ pub(crate) mod query {
     pub(crate) const FIELD: &str = "field";
     pub(crate) const FILE: &str = "file";
     pub(crate) const FRAME: &str = "frame";
+    pub(crate) const HANDLE: &str = "handle";
     pub(crate) const ID: &str = "id";
     pub(crate) const LINE: &str = "line";
     pub(crate) const LIMIT: &str = "limit";
@@ -66,10 +72,12 @@ pub(crate) mod query {
     pub(crate) const MAX_ARRAY_ITEMS: &str = "max_array_items";
     pub(crate) const MAX_FIELDS: &str = "max_fields";
     pub(crate) const METHOD: &str = "method";
+    pub(crate) const MODE: &str = "mode";
     pub(crate) const MODIFICATION: &str = "modification";
     pub(crate) const NAME: &str = "name";
     pub(crate) const PACKAGE: &str = "package";
     pub(crate) const PASS_COUNT: &str = "pass_count";
+    pub(crate) const PATH: &str = "path";
     pub(crate) const PID: &str = "pid";
     pub(crate) const PROJECT: &str = "project";
     pub(crate) const RESET: &str = "reset";

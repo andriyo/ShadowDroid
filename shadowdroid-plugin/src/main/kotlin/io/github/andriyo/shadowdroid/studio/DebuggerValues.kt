@@ -86,7 +86,7 @@ internal object DebuggerValues {
 
         val objectId = objectReference.uniqueID()
         payload["object_id"] = objectId
-        payload["object_handle"] = "obj_$objectId"
+        payload["object_handle"] = options.handleProvider?.invoke(objectReference) ?: "obj_$objectId"
         if (options.depth <= 0) return payload
         if (!visiting.add(objectId)) {
             payload["cycle"] = true
@@ -166,13 +166,37 @@ internal object DebuggerValues {
             declaredType = variable.typeName()
         }
 
-        while (pos < expr.length) {
-            when (expr[pos]) {
+        return evaluatePathFrom(value, declaredType, expr, pos, expression)
+    }
+
+    @JvmStatic
+    @Throws(Exception::class)
+    fun evaluateRelativePath(value: Value?, declaredType: String?, path: String?): EvaluationResult {
+        val expr = path?.trim().orEmpty()
+        if (expr.isEmpty()) return EvaluationResult(value, declaredType)
+        if (expr[0] != '.' && expr[0] != '[') {
+            throw IllegalArgumentException("relative path must start with . or [: $path")
+        }
+        return evaluatePathFrom(value, declaredType, expr, 0, expr)
+    }
+
+    private fun evaluatePathFrom(
+        initialValue: Value?,
+        initialDeclaredType: String?,
+        expression: String,
+        start: Int,
+        originalExpression: String,
+    ): EvaluationResult {
+        var value = initialValue
+        var declaredType = initialDeclaredType
+        var pos = start
+        while (pos < expression.length) {
+            when (expression[pos]) {
                 '.' -> {
-                    val start = ++pos
-                    while (pos < expr.length && expr[pos] != '.' && expr[pos] != '[') pos++
-                    val fieldName = expr.substring(start, pos)
-                    if (fieldName.isBlank()) throw IllegalArgumentException("empty field in expression: $expression")
+                    val startField = ++pos
+                    while (pos < expression.length && expression[pos] != '.' && expression[pos] != '[') pos++
+                    val fieldName = expression.substring(startField, pos)
+                    if (fieldName.isBlank()) throw IllegalArgumentException("empty field in expression: $originalExpression")
                     val objectReference = value as? ObjectReference
                         ?: throw IllegalArgumentException("cannot read field $fieldName from non-object value")
                     val field = findField(objectReference, fieldName)
@@ -181,9 +205,9 @@ internal object DebuggerValues {
                     declaredType = field.typeName()
                 }
                 '[' -> {
-                    val end = expr.indexOf(']', pos)
-                    if (end < 0) throw IllegalArgumentException("missing closing ] in expression: $expression")
-                    val index = expr.substring(pos + 1, end).trim().toIntOrNull()
+                    val end = expression.indexOf(']', pos)
+                    if (end < 0) throw IllegalArgumentException("missing closing ] in expression: $originalExpression")
+                    val index = expression.substring(pos + 1, end).trim().toIntOrNull()
                         ?: throw IllegalArgumentException("array index must be an integer")
                     val arrayReference = value as? ArrayReference
                         ?: throw IllegalArgumentException("cannot index non-array value")
@@ -194,7 +218,7 @@ internal object DebuggerValues {
                     declaredType = valueTypeName(value)
                     pos = end + 1
                 }
-                else -> throw IllegalArgumentException("unsupported expression syntax near: ${expr.substring(pos)}")
+                else -> throw IllegalArgumentException("unsupported expression syntax near: ${expression.substring(pos)}")
             }
         }
         return EvaluationResult(value, declaredType)
@@ -278,8 +302,9 @@ internal object DebuggerValues {
         val depth: Int,
         val maxFields: Int,
         val maxArrayItems: Int,
+        val handleProvider: ((ObjectReference) -> String)? = null,
     ) {
-        fun child(): RenderOptions = RenderOptions(max(0, depth - 1), maxFields, maxArrayItems)
+        fun child(): RenderOptions = RenderOptions(max(0, depth - 1), maxFields, maxArrayItems, handleProvider)
 
         companion object {
             @JvmStatic

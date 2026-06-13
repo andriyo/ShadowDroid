@@ -43,7 +43,11 @@ internal object AndroidAttachBridge {
             StudioThreading.onIdeaThread {
                 val selected = selectAttachClient(project, query)
                 val runConfiguration = selectRunConfiguration(project, query)
-                val debugger = selectAndroidDebugger(project, query)
+                val mode = query[BridgeQuery.MODE]?.lowercase()?.takeUnless { it.isBlank() } ?: "auto"
+                if ((mode == "native" || mode == "mixed") && !selected.client.clientData.isNativeDebuggable) {
+                    throw IllegalArgumentException("selected process is not native-debuggable; use --mode java or rebuild with native debugging enabled")
+                }
+                val debugger = selectAndroidDebugger(project, query, mode)
                     ?: throw IllegalStateException("no supported Android debugger")
 
                 AndroidConnectDebugger.closeOldSessionAndRun(project, debugger, selected.client, runConfiguration)
@@ -52,6 +56,7 @@ internal object AndroidAttachBridge {
                     "action", BridgeValues.ACTION_ATTACH,
                     "project", projectInfo(project),
                     "client", clientInfo(selected),
+                    "requested_mode", mode,
                     "debugger", debuggerInfo(debugger),
                     "run_configuration", runConfigurationInfo(runConfiguration),
                 )
@@ -145,10 +150,11 @@ internal object AndroidAttachBridge {
         return configuration as? RunConfigurationWithDebugger
     }
 
-    private fun selectAndroidDebugger(project: Project, query: Map<String, String>): AndroidDebugger<*>? {
+    private fun selectAndroidDebugger(project: Project, query: Map<String, String>, mode: String): AndroidDebugger<*>? {
         val requested = query[BridgeQuery.DEBUGGER]
         var fallback: AndroidDebugger<*>? = null
         var defaultDebugger: AndroidDebugger<*>? = null
+        var modeMatch: AndroidDebugger<*>? = null
         for (debugger in AndroidDebugger.EP_NAME.extensionList) {
             if (!debugger.supportsProject(project)) continue
             if (fallback == null) fallback = debugger
@@ -156,11 +162,25 @@ internal object AndroidAttachBridge {
             if (!requested.isNullOrBlank() && (requested == debugger.id || requested == debugger.displayName)) {
                 return debugger
             }
+            if (modeMatch == null && debuggerMatchesMode(debugger, mode)) {
+                modeMatch = debugger
+            }
         }
         if (!requested.isNullOrBlank()) {
             throw IllegalArgumentException("Android debugger not found: $requested")
         }
-        return defaultDebugger ?: fallback
+        return modeMatch ?: defaultDebugger ?: fallback
+    }
+
+    private fun debuggerMatchesMode(debugger: AndroidDebugger<*>, mode: String): Boolean {
+        if (mode == "auto") return false
+        val text = "${debugger.id} ${debugger.displayName}".lowercase()
+        return when (mode) {
+            "java" -> debugger.shouldBeDefault() || text.contains("java")
+            "native" -> text.contains("native") || text.contains("lldb")
+            "mixed" -> text.contains("native") || text.contains("lldb") || text.contains("dual")
+            else -> false
+        }
     }
 
     private fun clientInfo(attachClient: AttachClient): Map<String, Any?> {
@@ -198,6 +218,9 @@ internal object AndroidAttachBridge {
             "id", debugger.id,
             "display_name", debugger.displayName,
             "default", debugger.shouldBeDefault(),
+            "capabilities", BridgeProtocol.map(
+                "semantic_mode_selection", true,
+            ),
         )
 
     private fun runConfigurationInfo(runConfiguration: RunConfigurationWithDebugger?): Map<String, Any?> {

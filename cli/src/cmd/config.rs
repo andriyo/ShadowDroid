@@ -80,6 +80,9 @@ pub struct ConfigInitArgs {
     /// Android debugger id/display name.
     #[arg(long)]
     pub debugger: Option<String>,
+    /// Default debugger mode: auto, java, native, or mixed.
+    #[arg(long, value_name = "MODE")]
+    pub debug_mode: Option<String>,
     /// Android Studio run configuration whose debugger settings should be reused.
     #[arg(long)]
     pub run_configuration: Option<String>,
@@ -170,6 +173,7 @@ fn init_config(args: &ConfigInitArgs) -> Result<()> {
                     project: None,
                     run_configuration: args.run_configuration.clone(),
                     debugger: args.debugger.clone(),
+                    debug_mode: args.debug_mode.clone(),
                 },
             );
             changed.push(format!("apps.{app}"));
@@ -196,6 +200,12 @@ fn init_config(args: &ConfigInitArgs) -> Result<()> {
             &mut config.debugger,
             &args.debugger,
             "debugger",
+            &mut changed,
+        );
+        apply_top_level(
+            &mut config.debug_mode,
+            &args.debug_mode,
+            "debug_mode",
             &mut changed,
         );
     }
@@ -266,6 +276,7 @@ fn schema_value() -> Value {
             "android_studio": {"type": "string", "optional": true, "description": "Android Studio installation path."},
             "studio_plugin": {"type": "string", "optional": true, "description": "Local Studio plugin ZIP path."},
             "debugger": {"type": "string", "optional": true, "description": "Default Android debugger id/display name."},
+            "debug_mode": {"type": "string", "optional": true, "enum": ["auto", "java", "native", "mixed"], "description": "Default semantic debugger mode."},
             "run_configuration": {"type": "string", "optional": true, "description": "Default Android Studio run configuration."},
             "apps": {
                 "type": "object",
@@ -278,7 +289,8 @@ fn schema_value() -> Value {
             "package": {"type": "string", "required": true, "description": "Android package/process name."},
             "project": {"type": "string", "optional": true, "description": "Project override for this app."},
             "run_configuration": {"type": "string", "optional": true, "description": "Run configuration override for this app."},
-            "debugger": {"type": "string", "optional": true, "description": "Debugger override for this app."}
+            "debugger": {"type": "string", "optional": true, "description": "Debugger override for this app."},
+            "debug_mode": {"type": "string", "optional": true, "enum": ["auto", "java", "native", "mixed"], "description": "Debugger mode override for this app."}
         },
         "example": example_config(),
         "recommended_agent_flow": [
@@ -374,6 +386,9 @@ fn validate_config(
             ));
         }
     }
+    if let Some(mode) = config.debug_mode.as_deref() {
+        validate_debug_mode(path, "debug_mode", mode, errors);
+    }
     for (alias, entry) in &config.apps {
         if alias.trim().is_empty() {
             errors.push(format!("{}: apps contains an empty alias", path.display()));
@@ -390,6 +405,19 @@ fn validate_config(
                 entry.package
             ));
         }
+        if let Some(mode) = entry.debug_mode.as_deref() {
+            validate_debug_mode(path, &format!("apps.{alias}.debug_mode"), mode, errors);
+        }
+    }
+}
+
+fn validate_debug_mode(path: &Path, field: &str, mode: &str, errors: &mut Vec<String>) {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "auto" | "java" | "native" | "mixed" => {}
+        _ => errors.push(format!(
+            "{}: {field} must be one of auto, java, native, mixed",
+            path.display()
+        )),
     }
 }
 

@@ -5,12 +5,14 @@
 //! logcat, and optional Studio debugger state into deterministic artifacts an
 //! agent can consume or replay.
 
-use crate::cmd::debugger::{self, BridgeClient, DebuggerCmd};
+use crate::cmd::debugger::{self, BridgeClient, DebugMode, DebuggerCmd};
 use crate::cmd::studio;
 use crate::cmd::studio_contract::{query, route, session_action};
 use crate::config::{ResolvedApp, ShadowDroidConfig};
 use crate::device::adb;
 use crate::device::client::ServerClient;
+use crate::events::CrashEvent;
+use crate::watch::logcat;
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
@@ -59,6 +61,12 @@ pub enum DebugCmd {
     StepUntilLog(StepUntilLogArgs),
     /// Resume and wait for a Java/native crash or ANR, then return a final snapshot.
     RunUntilCrash(RunUntilCrashArgs),
+    /// Native/mixed-mode readiness and artifact helpers.
+    #[command(subcommand)]
+    Native(NativeCmd),
+    /// List or pull native tombstone files from the device.
+    #[command(subcommand)]
+    Tombstones(TombstonesCmd),
 }
 
 #[derive(Args, Clone)]
@@ -77,6 +85,9 @@ pub struct AutoArgs {
     /// Android debugger id/display name.
     #[arg(long)]
     pub debugger: Option<String>,
+    /// Semantic debugger mode. Use --debugger for an exact Studio debugger id/name.
+    #[arg(long, value_enum)]
+    pub mode: Option<DebugMode>,
     /// Android Studio run configuration whose debugger settings should be reused.
     #[arg(long)]
     pub configuration: Option<String>,
@@ -204,9 +215,67 @@ pub struct RunUntilCrashArgs {
     /// App package used for the final snapshot.
     #[arg(long)]
     pub app: Option<String>,
+    /// Number of recent logcat lines to include in the final snapshot/bundle.
+    #[arg(long, default_value_t = 120)]
+    pub logs: u32,
     /// Include expanded top-frame variables in the final snapshot.
     #[arg(long, default_value_t = 1)]
     pub depth: u32,
+    /// Write the result JSON to a file instead of stdout.
+    #[arg(short = 'o', long)]
+    pub out: Option<PathBuf>,
+    /// Also write a local crash bundle to this directory.
+    #[arg(long)]
+    pub bundle: Option<PathBuf>,
+    /// Collect best-effort ANR/tombstone artifacts when available.
+    #[arg(long)]
+    pub native_artifacts: bool,
+}
+
+#[derive(Subcommand, Clone)]
+pub enum NativeCmd {
+    /// Report native/mixed-mode debugger readiness for an app/process.
+    Status(NativeStatusArgs),
+}
+
+#[derive(Args, Clone)]
+pub struct NativeStatusArgs {
+    /// App alias, package, or installed app name. Defaults to config, then foreground app.
+    pub target: Option<String>,
+    /// App alias or installed app name.
+    #[arg(long)]
+    pub app: Option<String>,
+    /// Exact package/process name. Overrides target and --app.
+    #[arg(long)]
+    pub package: Option<String>,
+    /// Project name or absolute project path when multiple projects are open.
+    #[arg(long)]
+    pub project: Option<String>,
+}
+
+#[derive(Subcommand, Clone)]
+pub enum TombstonesCmd {
+    /// List recent native tombstone files visible through adb.
+    List(TombstoneListArgs),
+    /// Pull recent native tombstone files into a local directory.
+    Pull(TombstonePullArgs),
+}
+
+#[derive(Args, Clone)]
+pub struct TombstoneListArgs {
+    /// App alias/package label for output context.
+    #[arg(long)]
+    pub app: Option<String>,
+}
+
+#[derive(Args, Clone)]
+pub struct TombstonePullArgs {
+    /// Output directory.
+    #[arg(short = 'o', long)]
+    pub out: PathBuf,
+    /// App alias/package label for output context.
+    #[arg(long)]
+    pub app: Option<String>,
 }
 
 impl DebugArgs {
@@ -239,6 +308,8 @@ pub async fn run(serial: &str, client: &ServerClient, args: DebugArgs) -> Result
         DebugCmd::RunUntilCrash(args) => {
             run_until_crash(serial, client, args, studio_url.as_deref()).await
         }
+        DebugCmd::Native(cmd) => native_cmd(serial, client, cmd, studio_url.as_deref()).await,
+        DebugCmd::Tombstones(cmd) => tombstones_cmd(serial, cmd).await,
     }
 }
 
@@ -448,6 +519,7 @@ async fn auto_attach_debugger(
     };
     let project = args.project.as_deref().or(resolved.project.as_deref());
     let debugger = args.debugger.as_deref().or(resolved.debugger.as_deref());
+    let mode = args.mode.map(DebugMode::as_str);
     let configuration = args
         .configuration
         .as_deref()
@@ -460,6 +532,7 @@ async fn auto_attach_debugger(
                 (query::DEVICE, Some(serial)),
                 (query::PROJECT, project),
                 (query::DEBUGGER, debugger),
+                (query::MODE, mode),
                 (query::CONFIGURATION, configuration),
                 (query::DIALOG, Some("false")),
             ],
@@ -473,6 +546,7 @@ async fn auto_attach_debugger(
                 "package": package,
                 "project": project,
                 "debugger": debugger,
+                "mode": mode,
                 "configuration": configuration,
                 "response": response,
             })
@@ -595,6 +669,18 @@ async fn debugger_snapshot(studio_url: Option<&str>, depth: u32) -> Value {
         )
         .await
         .unwrap_or_else(|err| json!({"ok": false, "error": err.to_string()}));
+    let coroutine_depth_s = depth.to_string();
+    let coroutines = bridge
+        .get(
+            route::SESSION_COROUTINES,
+            &[
+                (query::LIMIT, Some("32")),
+                (query::DEPTH, Some(coroutine_depth_s.as_str())),
+                (query::TIMEOUT_MS, Some("2500")),
+            ],
+        )
+        .await
+        .unwrap_or_else(|err| json!({"ok": false, "available": false, "error": err.to_string()}));
     json!({
         "available": true,
         "status": status,
@@ -602,6 +688,7 @@ async fn debugger_snapshot(studio_url: Option<&str>, depth: u32) -> Value {
         "stack": stack,
         "variables": variables,
         "watches": watches,
+        "coroutines": coroutines,
     })
 }
 
@@ -920,7 +1007,7 @@ async fn step_until_screen_change(
     loop {
         if Instant::now() >= deadline {
             let snapshot =
-                final_snapshot(serial, client, &args.app, studio_url, args.depth).await?;
+                final_snapshot(serial, client, &args.app, studio_url, args.depth, 120).await?;
             emit_json(&json!({
                 "type": "step_until_screen_change",
                 "ok": false,
@@ -938,7 +1025,7 @@ async fn step_until_screen_change(
         let screen = client.screen().await.context("reading screen after step")?;
         if screen.screen_hash != initial_hash {
             let snapshot =
-                final_snapshot(serial, client, &args.app, studio_url, args.depth).await?;
+                final_snapshot(serial, client, &args.app, studio_url, args.depth, 120).await?;
             emit_json(&json!({
                 "type": "step_until_screen_change",
                 "ok": true,
@@ -967,8 +1054,15 @@ async fn step_until_log(
 
     loop {
         if Instant::now() >= deadline {
-            let snapshot =
-                final_snapshot(serial, client, &args.wait.app, studio_url, args.wait.depth).await?;
+            let snapshot = final_snapshot(
+                serial,
+                client,
+                &args.wait.app,
+                studio_url,
+                args.wait.depth,
+                120,
+            )
+            .await?;
             emit_json(&json!({
                 "type": "step_until_log",
                 "ok": false,
@@ -997,6 +1091,7 @@ async fn step_until_log(
                             &args.wait.app,
                             studio_url,
                             args.wait.depth,
+                            120,
                         )
                         .await?;
                         emit_json(&json!({
@@ -1022,46 +1117,229 @@ async fn run_until_crash(
     args: RunUntilCrashArgs,
     studio_url: Option<&str>,
 ) -> Result<()> {
-    let bridge = BridgeClient::new(studio_url)?;
+    let started = Instant::now();
+    let (bridge, bridge_error) = match BridgeClient::new(studio_url) {
+        Ok(bridge) => (Some(bridge), None),
+        Err(err) => (None, Some(err.to_string())),
+    };
     let session_s = args.session.map(|s| s.to_string());
-    let (log_tx, mut log_rx) = mpsc::channel(256);
-    spawn_logcat(serial.to_string(), log_tx);
-    let _ = studio_control(&bridge, session_action::RESUME, session_s.as_deref()).await;
+    let (crash_tx, mut crash_rx) = mpsc::channel(32);
+    spawn_crash_logcat(serial.to_string(), args.app.clone(), crash_tx);
+    let resume = if let Some(bridge) = &bridge {
+        match studio_control(bridge, session_action::RESUME, session_s.as_deref()).await {
+            Ok(value) => json!({"attempted": true, "ok": true, "result": value}),
+            Err(err) => json!({"attempted": true, "ok": false, "error": err.to_string()}),
+        }
+    } else {
+        json!({"attempted": false, "ok": false, "error": bridge_error})
+    };
     let deadline = Instant::now() + Duration::from_millis(args.timeout_ms);
 
     loop {
         if Instant::now() >= deadline {
             let snapshot =
-                final_snapshot(serial, client, &args.app, studio_url, args.depth).await?;
-            emit_json(&json!({
+                final_snapshot(serial, client, &args.app, studio_url, args.depth, args.logs)
+                    .await?;
+            let result = json!({
                 "type": "run_until_crash",
+                "schema_version": 1,
                 "ok": false,
                 "timeout": true,
+                "elapsed_ms": started.elapsed().as_millis() as u64,
+                "studio": {
+                    "resume": resume,
+                },
                 "snapshot": snapshot,
-            }))?;
+            });
+            emit_or_write_json(args.out.as_deref(), &result)?;
             return Ok(());
         }
 
-        match tokio::time::timeout(Duration::from_millis(100), log_rx.recv()).await {
-            Ok(Some(event)) => {
-                let line = event
-                    .get("line")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if is_crash_line(line) {
-                    let snapshot =
-                        final_snapshot(serial, client, &args.app, studio_url, args.depth).await?;
-                    emit_json(&json!({
-                        "type": "run_until_crash",
-                        "ok": true,
-                        "logcat": event,
-                        "snapshot": snapshot,
-                    }))?;
-                    return Ok(());
+        match tokio::time::timeout(Duration::from_millis(100), crash_rx.recv()).await {
+            Ok(Some(crash)) => {
+                let snapshot =
+                    final_snapshot(serial, client, &args.app, studio_url, args.depth, args.logs)
+                        .await?;
+                let correlation = crash_correlation(&crash, &snapshot);
+                let bundle = if args.bundle.is_some() {
+                    Some(
+                        write_crash_bundle(
+                            serial,
+                            &args.app,
+                            &crash,
+                            &snapshot,
+                            args.bundle.as_deref(),
+                            args.native_artifacts,
+                            args.logs.max(200),
+                        )
+                        .await,
+                    )
+                } else {
+                    None
+                };
+                let mut result = json!({
+                    "type": "run_until_crash",
+                    "schema_version": 1,
+                    "ok": true,
+                    "timeout": false,
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                    "app": {
+                        "requested": args.app.clone(),
+                        "package": crash.package.clone(),
+                    },
+                    "studio": {
+                        "resume": resume,
+                    },
+                    "crash": crash.clone(),
+                    "correlation": correlation,
+                    "snapshot": snapshot,
+                });
+                if let Some(bundle) = bundle {
+                    result["bundle"] = bundle;
                 }
+                emit_or_write_json(args.out.as_deref(), &result)?;
+                return Ok(());
             }
             Ok(None) | Err(_) => {}
         }
+    }
+}
+
+async fn native_cmd(
+    serial: &str,
+    client: &ServerClient,
+    cmd: NativeCmd,
+    studio_url: Option<&str>,
+) -> Result<()> {
+    match cmd {
+        NativeCmd::Status(args) => native_status(serial, client, args, studio_url).await,
+    }
+}
+
+async fn native_status(
+    serial: &str,
+    client: &ServerClient,
+    args: NativeStatusArgs,
+    studio_url: Option<&str>,
+) -> Result<()> {
+    let config = ShadowDroidConfig::load()?;
+    let requested = args
+        .package
+        .as_deref()
+        .or(args.app.as_deref())
+        .or(args.target.as_deref());
+    let (resolved, label) = resolve_auto_app(serial, client, &config, requested).await?;
+    let package = args.package.clone().or_else(|| resolved.package.clone());
+    let project = args.project.as_deref().or(resolved.project.as_deref());
+    let requested_value = requested.map(str::to_string);
+    let project_value = project.map(str::to_string);
+    let studio = match BridgeClient::new(studio_url) {
+        Ok(bridge) => {
+            let clients = bridge
+                .get(
+                    route::CLIENTS,
+                    &[
+                        (query::PACKAGE, package.as_deref()),
+                        (query::DEVICE, Some(serial)),
+                        (query::PROJECT, project),
+                    ],
+                )
+                .await
+                .unwrap_or_else(|err| json!({"ok": false, "error": err.to_string()}));
+            let sessions = bridge
+                .get(route::SESSIONS, &[])
+                .await
+                .unwrap_or_else(|err| json!({"ok": false, "error": err.to_string()}));
+            json!({
+                "available": true,
+                "clients": clients,
+                "sessions": sessions,
+            })
+        }
+        Err(err) => studio_problem_value("resolve_bridge", err),
+    };
+    let tombstones = tombstone_status(serial).await;
+    let native_debuggable = studio
+        .get("clients")
+        .and_then(|clients| clients.get("clients"))
+        .and_then(Value::as_array)
+        .map(|clients| {
+            clients.iter().any(|client| {
+                client.get("native_debuggable").and_then(Value::as_bool) == Some(true)
+            })
+        })
+        .unwrap_or(false);
+    emit_json(&json!({
+        "type": "debug_native_status",
+        "schema_version": 1,
+        "device": serial,
+        "app": {
+            "requested": requested_value,
+            "label": label,
+            "resolved": resolved,
+            "package": package,
+        },
+        "project": project_value,
+        "native_debuggable": native_debuggable,
+        "studio": studio,
+        "artifacts": {
+            "tombstones": tombstones,
+        },
+        "limits": {
+            "lldb_control": false,
+            "native_variables": false,
+            "note": "native live control is not exposed until Android Studio LLDB APIs are proven stable",
+        },
+    }))
+}
+
+async fn tombstones_cmd(serial: &str, cmd: TombstonesCmd) -> Result<()> {
+    match cmd {
+        TombstonesCmd::List(args) => {
+            let status = tombstone_status(serial).await;
+            emit_json(&json!({
+                "type": "debug_tombstones_list",
+                "schema_version": 1,
+                "device": serial,
+                "app": args.app,
+                "tombstones": status,
+            }))
+        }
+        TombstonesCmd::Pull(args) => {
+            let mut bundle = CrashBundle::new(args.out);
+            collect_matching_device_files(
+                serial,
+                &mut bundle,
+                "tombstone",
+                "ls -1t /data/tombstones/tombstone_* 2>/dev/null | head -n 5",
+            )
+            .await;
+            emit_json(&json!({
+                "type": "debug_tombstones_pull",
+                "schema_version": 1,
+                "device": serial,
+                "app": args.app,
+                "bundle": bundle.summary(),
+            }))
+        }
+    }
+}
+
+async fn tombstone_status(serial: &str) -> Value {
+    match device_file_list(
+        serial,
+        "ls -1t /data/tombstones/tombstone_* 2>/dev/null | head -n 5",
+    )
+    .await
+    {
+        Ok(paths) => json!({
+            "available": !paths.is_empty(),
+            "paths": paths,
+        }),
+        Err(err) => json!({
+            "available": false,
+            "error": err.to_string(),
+        }),
     }
 }
 
@@ -1071,6 +1349,7 @@ async fn final_snapshot(
     app: &Option<String>,
     studio_url: Option<&str>,
     depth: u32,
+    logs: u32,
 ) -> Result<Value> {
     snapshot_value(
         serial,
@@ -1080,12 +1359,29 @@ async fn final_snapshot(
             out: None,
             screenshot_dir: None,
             no_screenshot: false,
-            logs: 120,
+            logs,
             depth,
         },
         studio_url,
     )
     .await
+}
+
+async fn device_file_list(serial: &str, list_cmd: &str) -> Result<Vec<String>> {
+    let out = adb::shell(serial, list_cmd).await?;
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(20)
+        .map(str::to_string)
+        .collect())
+}
+
+fn spawn_crash_logcat(serial: String, app_filter: Option<String>, out: mpsc::Sender<CrashEvent>) {
+    tokio::spawn(async move {
+        let _ = logcat::run_crashes(serial, app_filter, out).await;
+    });
 }
 
 async fn studio_control(
@@ -1101,8 +1397,248 @@ async fn studio_control(
         .await
 }
 
-fn is_crash_line(line: &str) -> bool {
-    line.contains("FATAL EXCEPTION") || line.contains("Fatal signal") || line.contains(" ANR in ")
+fn crash_correlation(crash: &CrashEvent, snapshot: &Value) -> Value {
+    let debugger = snapshot.get("debugger").unwrap_or(&Value::Null);
+    let debugger_available = debugger
+        .get("available")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let session_suspended = debugger
+        .get("status")
+        .and_then(|status| status.get("sessions"))
+        .and_then(Value::as_array)
+        .map(|sessions| {
+            sessions
+                .iter()
+                .any(|session| session.get("suspended").and_then(Value::as_bool) == Some(true))
+        })
+        .unwrap_or(false);
+    json!({
+        "debugger_available": debugger_available,
+        "session_suspended": session_suspended,
+        "source_locations": crash_source_locations(crash),
+    })
+}
+
+fn crash_source_locations(crash: &CrashEvent) -> Vec<Value> {
+    crash
+        .stack
+        .iter()
+        .enumerate()
+        .filter_map(|(index, frame)| java_stack_location(index, frame))
+        .collect()
+}
+
+fn java_stack_location(index: usize, frame: &str) -> Option<Value> {
+    let open = frame.rfind('(')?;
+    let close = frame.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    let symbol = frame[..open].trim();
+    let source = frame[open + 1..close].trim();
+    if source.is_empty()
+        || source == "Native Method"
+        || source == "Unknown Source"
+        || source.starts_with("SourceFile:")
+    {
+        return None;
+    }
+    let (file, line) = match source.rsplit_once(':') {
+        Some((file, line)) => (file, line.parse::<u32>().ok()),
+        None => (source, None),
+    };
+    let (class, method) = symbol
+        .rsplit_once('.')
+        .map(|(class, method)| (Some(class), Some(method)))
+        .unwrap_or((None, Some(symbol)));
+    Some(json!({
+        "crash_frame": index,
+        "class": class,
+        "method": method,
+        "file": file,
+        "line": line,
+    }))
+}
+
+struct CrashBundle {
+    dir: PathBuf,
+    captured: Vec<String>,
+    errors: Vec<String>,
+}
+
+impl CrashBundle {
+    fn new(dir: PathBuf) -> Self {
+        let mut bundle = Self {
+            dir,
+            captured: Vec::new(),
+            errors: Vec::new(),
+        };
+        if let Err(err) = std::fs::create_dir_all(&bundle.dir) {
+            bundle
+                .errors
+                .push(format!("bundle_dir: create failed: {err}"));
+        }
+        bundle
+    }
+
+    fn write_text(&mut self, name: &str, content: &str) {
+        match std::fs::write(self.dir.join(name), content) {
+            Ok(()) => self.captured.push(name.to_string()),
+            Err(err) => self.errors.push(format!("{name}: write failed: {err}")),
+        }
+    }
+
+    fn write_bytes(&mut self, name: &str, content: &[u8]) {
+        match std::fs::write(self.dir.join(name), content) {
+            Ok(()) => self.captured.push(name.to_string()),
+            Err(err) => self.errors.push(format!("{name}: write failed: {err}")),
+        }
+    }
+
+    fn write_json(&mut self, name: &str, value: &Value) {
+        match serde_json::to_vec_pretty(value) {
+            Ok(bytes) => self.write_bytes(name, &bytes),
+            Err(err) => self.errors.push(format!("{name}: serialize failed: {err}")),
+        }
+    }
+
+    fn summary(&self) -> Value {
+        json!({
+            "path": self.dir.display().to_string(),
+            "captured": self.captured,
+            "errors": self.errors,
+        })
+    }
+}
+
+async fn write_crash_bundle(
+    serial: &str,
+    app: &Option<String>,
+    crash: &CrashEvent,
+    snapshot: &Value,
+    out: Option<&Path>,
+    native_artifacts: bool,
+    log_lines: u32,
+) -> Value {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dir = out
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("shadowdroid-crash-{ts}")));
+    let mut bundle = CrashBundle::new(dir);
+    let crash_value = serde_json::to_value(crash).unwrap_or(Value::Null);
+    bundle.write_json("crash.json", &crash_value);
+    bundle.write_json("snapshot.json", snapshot);
+    bundle.write_json("device_info.json", &adb::device_info(serial).await);
+    bundle.write_text(
+        "logcat_main.txt",
+        &adb::recent_logcat(serial, log_lines).await.join("\n"),
+    );
+    match adb::shell(serial, "logcat -d -b crash -v threadtime -t 300").await {
+        Ok(out) if !out.trim().is_empty() => bundle.write_text("logcat_crash.txt", &out),
+        Ok(_) => bundle
+            .errors
+            .push("logcat_crash.txt: crash buffer empty".to_string()),
+        Err(err) => bundle.errors.push(format!("logcat_crash.txt: {err}")),
+    }
+    if native_artifacts || crash.kind == "native" {
+        collect_matching_device_files(
+            serial,
+            &mut bundle,
+            "tombstone",
+            "ls -1t /data/tombstones/tombstone_* 2>/dev/null | head -n 5",
+        )
+        .await;
+    }
+    if native_artifacts || crash.kind == "anr" {
+        collect_matching_device_files(
+            serial,
+            &mut bundle,
+            "anr",
+            "ls -1t /data/anr/* 2>/dev/null | head -n 5",
+        )
+        .await;
+        match adb::shell(serial, "logcat -d -b events -v threadtime -t 300").await {
+            Ok(out) if !out.trim().is_empty() => bundle.write_text("logcat_events.txt", &out),
+            Ok(_) => bundle
+                .errors
+                .push("logcat_events.txt: events buffer empty".to_string()),
+            Err(err) => bundle.errors.push(format!("logcat_events.txt: {err}")),
+        }
+    }
+    let manifest = json!({
+        "type": "crash_bundle",
+        "schema_version": 1,
+        "ts": ts,
+        "device": serial,
+        "app": {
+            "requested": app,
+            "package": crash.package.clone(),
+        },
+        "crash_kind": crash.kind.clone(),
+        "captured": bundle.captured,
+        "errors": bundle.errors,
+    });
+    bundle.write_json("collect.json", &manifest);
+    bundle.summary()
+}
+
+async fn collect_matching_device_files(
+    serial: &str,
+    bundle: &mut CrashBundle,
+    prefix: &str,
+    list_cmd: &str,
+) {
+    match adb::shell(serial, list_cmd).await {
+        Ok(out) => {
+            let paths = out
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .take(5)
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if paths.is_empty() {
+                bundle.errors.push(format!("{prefix}: no matching files"));
+                return;
+            }
+            for remote in paths {
+                let name = device_artifact_name(prefix, &remote);
+                match adb::pull(serial, &remote).await {
+                    Ok(bytes) => bundle.write_bytes(&name, &bytes),
+                    Err(pull_err) => match adb::shell(serial, format!("cat {remote}")).await {
+                        Ok(text) if !text.trim().is_empty() => bundle.write_text(&name, &text),
+                        Ok(_) => bundle.errors.push(format!("{remote}: empty/unreadable")),
+                        Err(cat_err) => bundle.errors.push(format!(
+                            "{remote}: pull failed: {pull_err}; cat failed: {cat_err}"
+                        )),
+                    },
+                }
+            }
+        }
+        Err(err) => bundle.errors.push(format!("{prefix}: list failed: {err}")),
+    }
+}
+
+fn device_artifact_name(prefix: &str, remote: &str) -> String {
+    let basename = remote
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(prefix)
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("{prefix}_{basename}")
 }
 
 fn lookup_key(value: &str) -> String {
@@ -1185,6 +1721,14 @@ fn emit_json(value: &Value) -> Result<()> {
     Ok(())
 }
 
+fn emit_or_write_json(path: Option<&Path>, value: &Value) -> Result<()> {
+    if let Some(path) = path {
+        write_json_file(path, value)
+    } else {
+        emit_json(value)
+    }
+}
+
 async fn write_screenshot(
     client: &ServerClient,
     dir: Option<&Path>,
@@ -1260,12 +1804,27 @@ mod tests {
     }
 
     #[test]
-    fn detects_crash_logcat_lines() {
-        assert!(is_crash_line("AndroidRuntime: FATAL EXCEPTION: main"));
-        assert!(is_crash_line("libc: Fatal signal 11 (SIGSEGV)"));
-        assert!(is_crash_line("ActivityManager: ANR in com.example"));
-        assert!(!is_crash_line(
-            "I ActivityTaskManager: Displayed com.example/.Main"
-        ));
+    fn parses_java_crash_source_locations() {
+        let location =
+            java_stack_location(2, "com.example.MainActivity.onCreate(MainActivity.kt:42)")
+                .unwrap();
+        assert_eq!(location["crash_frame"], 2);
+        assert_eq!(location["class"], "com.example.MainActivity");
+        assert_eq!(location["method"], "onCreate");
+        assert_eq!(location["file"], "MainActivity.kt");
+        assert_eq!(location["line"], 42);
+        assert!(java_stack_location(0, "java.lang.Thread.sleep(Native Method)").is_none());
+    }
+
+    #[test]
+    fn sanitizes_device_artifact_names() {
+        assert_eq!(
+            device_artifact_name("tombstone", "/data/tombstones/tombstone_01"),
+            "tombstone_tombstone_01"
+        );
+        assert_eq!(
+            device_artifact_name("anr", "/data/anr/traces 1.txt"),
+            "anr_traces_1.txt"
+        );
     }
 }
