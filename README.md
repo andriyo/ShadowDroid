@@ -164,7 +164,7 @@ when `screen_hash` changes.
 | **Device**       | `device info` / `shell` / `wake` / `sleep` / `unlock` / `orientation` / `clipboard` / `notifications` / `quick-settings` / `open-url` |
 | **Files**        | `files ls` / `push` / `pull`                                                                       |
 | **Display**      | `profile snapshot` / `apply` / `reset` (animations, font, density, size, rotation)                 |
-| **Debug**        | `debug snapshot` / `record` / `replay`, `debugger` (attach / breakpoints / stack / vars / eval), `debug run-until-crash` |
+| **Debug**        | `debug snapshot` / `record` / `replay`, `debug attach` / `break` / `stack` / `variables` / `eval`, `debug run-until-crash` |
 | **Session**      | `devices`, `connect`, `disconnect`, `doctor`, `collect`, `update`, `commands`, `skill`, `studio`, `init` |
 
 `watch` is the streaming workhorse — it emits debounced, hash-diffed `screen`
@@ -185,7 +185,7 @@ designed for autonomous use, not a remote shell.
 
 Backed by an optional Android Studio plugin:
 
-- **`debugger`** — attach to the running app; set breakpoints (line, exception,
+- **`debug`** — attach to the running app; set breakpoints (line, exception,
   method, field watchpoint; conditional, temporary, logpoints); read the call
   stack, local variables, and watches; evaluate read-only expressions (`this`,
   locals, fields, array indexes). Requests are bounded — they return a structured

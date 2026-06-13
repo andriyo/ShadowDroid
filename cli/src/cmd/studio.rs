@@ -262,7 +262,7 @@ async fn install(
         restart_required: true,
         guidance: vec![
             "Restart Android Studio to load or update the plugin.".into(),
-            "After restart, run `shadowdroid debugger status` to confirm the bridge.".into(),
+            "After restart, run `shadowdroid debug status` to confirm the bridge.".into(),
         ],
     };
 

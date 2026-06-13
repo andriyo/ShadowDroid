@@ -84,10 +84,10 @@ When Android Studio starts with the plugin installed, it opens a localhost bridg
 and writes its URL to `~/.shadowdroid/studio-debugger.json`. The CLI uses that
 bridge for source-aware agent debugging:
 
-- `shadowdroid debugger attach` attaches Studio's Android debugger to a process.
-- `debugger break ...` creates, updates, and removes line, exception, method,
+- `shadowdroid debug attach` attaches Studio's Android debugger to a process.
+- `debug break ...` creates, updates, and removes line, exception, method,
   and field breakpoints with stable IDs.
-- `debugger stack`, `threads`, `variables`, `eval`, and `watch` expose bounded
+- `debug stack`, `threads`, `variables`, `eval`, and `watch` expose bounded
   JSON state for suspended sessions.
 - `shadowdroid debug snapshot` enriches device/UI snapshots with Studio debugger
   state when the bridge is available.

@@ -11,7 +11,7 @@ shadowdroid debug snapshot --app com.example.app --depth 1 | jq
 
 The snapshot includes device/build info, foreground app/activity/PID, screen
 hash and element tree, screenshot path/hash, recent logcat, Android Studio
-debugger sessions, current stack, top-frame variables, watches, and breakpoints.
+debug sessions, current stack, top-frame variables, watches, and breakpoints.
 If the Android Studio plugin is not running, the debugger section reports
 `available: false` while the device/UI portions still work.
 
@@ -30,23 +30,23 @@ text, keys, swipes, drags, and app starts.
 ## Android Studio Debugger Bridge
 
 ```bash
-shadowdroid debugger clients --project /path/to/app --package com.example.app
-shadowdroid debugger attach --project /path/to/app --package com.example.app
-shadowdroid debugger break line --file app/src/main/java/Foo.kt --line 42 --condition 'state != null'
-shadowdroid debugger breakpoints
-shadowdroid debugger stack --limit 32 --timeout-ms 2500
-shadowdroid debugger variables --thread 0 --frame 0 --depth 2 --timeout-ms 2500
-shadowdroid debugger eval 'this.presenter.state' --thread 0 --frame 0 --depth 2 --timeout-ms 5000
-shadowdroid debugger watch add 'this.presenter.state'
-shadowdroid debugger watch list --depth 2 --timeout-ms 2500
+shadowdroid debug clients --project /path/to/app --package com.example.app
+shadowdroid debug attach --project /path/to/app --package com.example.app
+shadowdroid debug break line --file app/src/main/java/Foo.kt --line 42 --condition 'state != null'
+shadowdroid debug breakpoints
+shadowdroid debug stack --limit 32 --timeout-ms 2500
+shadowdroid debug variables --thread 0 --frame 0 --depth 2 --timeout-ms 2500
+shadowdroid debug eval 'this.presenter.state' --thread 0 --frame 0 --depth 2 --timeout-ms 5000
+shadowdroid debug watch add 'this.presenter.state'
+shadowdroid debug watch list --depth 2 --timeout-ms 2500
 ```
 
 Breakpoints have stable IDs and can be updated or removed:
 
 ```bash
-shadowdroid debugger break update --id bp_... --enabled false
-shadowdroid debugger break update --id bp_... --suspend none --log-message true
-shadowdroid debugger break remove --id bp_...
+shadowdroid debug break update --id bp_... --enabled false
+shadowdroid debug break update --id bp_... --suspend none --log-message true
+shadowdroid debug break remove --id bp_...
 ```
 
 Supported breakpoint creation includes line breakpoints, exception breakpoints,
@@ -61,7 +61,7 @@ Expression evaluation is deterministic and read-only: `this`, visible locals,
 fields, and array indexes are supported. Arbitrary code execution is deliberately
 not enabled for the first agent-facing surface. Object values include stable
 per-session `object_handle` values. Watches are cached and refreshed whenever a
-debug session suspends, then also evaluated on demand by `debugger watch list`
+debug session suspends, then also evaluated on demand by `debug watch list`
 when a suspended frame is available.
 
 Debugger read commands use bounded IDE/JDI requests. When a session is running,
@@ -71,8 +71,8 @@ and eval return structured `ok: false` JSON or a warning instead of blocking.
 ## Continue-until Primitives
 
 ```bash
-shadowdroid debugger continue-until --file app/src/main/java/Foo.kt --line 42 --timeout-ms 10000
-shadowdroid debugger continue-until --condition 'state.ready' --timeout-ms 10000
+shadowdroid debug continue-until --file app/src/main/java/Foo.kt --line 42 --timeout-ms 10000
+shadowdroid debug continue-until --condition 'state.ready' --timeout-ms 10000
 shadowdroid debug step-until-screen-change --app com.example.app --timeout-ms 10000
 shadowdroid debug step-until-log --pattern 'Loaded profile' --app com.example.app
 shadowdroid debug run-until-crash --app com.example.app --timeout-ms 30000

@@ -109,10 +109,8 @@ pub enum Cmd {
     Skill(crate::cmd::skill::SkillArgs),
     /// Detect Android Studio and install the ShadowDroid Android Studio plugin.
     Studio(crate::cmd::studio::StudioArgs),
-    /// Agent-first debug snapshots, timelines, and replays.
+    /// Agent-first debug snapshots, timelines, replays, and Studio-backed debugger control.
     Debug(crate::cmd::debug::DebugArgs),
-    /// Operate Android Studio debugger sessions through the ShadowDroid plugin.
-    Debugger(crate::cmd::debugger::DebuggerArgs),
 
     // ── resource namespaces (nested) ──────────────────────────
     /// Application lifecycle, info, and install rituals.
@@ -447,7 +445,9 @@ pub async fn run() -> Result<()> {
         Cmd::Commands { json } => return crate::cmd::introspect::run(*json),
         Cmd::Skill(args) => return crate::cmd::skill::run(args),
         Cmd::Studio(args) => return crate::cmd::studio::run(args).await,
-        Cmd::Debugger(args) => return crate::cmd::debugger::run(args).await,
+        Cmd::Debug(args) if args.is_host_only() => {
+            return crate::cmd::debug::run_host_only(args).await
+        }
         Cmd::Connect => {
             return cmd_connect(device.as_deref(), apk.as_deref(), any_apk_version).await
         }
@@ -503,7 +503,6 @@ pub async fn run() -> Result<()> {
         | Cmd::Commands { .. }
         | Cmd::Skill(_)
         | Cmd::Studio(_)
-        | Cmd::Debugger(_)
         | Cmd::Perm(_)
         | Cmd::Appops(_)
         | Cmd::Profile(_) => unreachable!("handled before ensure_ready"),

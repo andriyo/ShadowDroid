@@ -1,10 +1,11 @@
 //! Agent-first debugging orchestration.
 //!
-//! `debugger` is the thin Android Studio bridge. This module composes the
-//! device server, adb, screenshots, logcat, and optional Studio debugger state
-//! into deterministic artifacts an agent can consume or replay.
+//! Studio-backed debugger commands are the thin Android Studio bridge. The
+//! snapshot/timeline commands compose the device server, adb, screenshots,
+//! logcat, and optional Studio debugger state into deterministic artifacts an
+//! agent can consume or replay.
 
-use crate::cmd::debugger::BridgeClient;
+use crate::cmd::debugger::{self, BridgeClient, DebuggerCmd};
 use crate::cmd::studio_contract::{query, route, session_action};
 use crate::device::adb;
 use crate::device::client::ServerClient;
@@ -23,6 +24,16 @@ use tokio::sync::mpsc;
 
 #[derive(Args)]
 pub struct DebugArgs {
+    /// Android Studio plugin bridge URL. Defaults to the plugin registry, then
+    /// http://127.0.0.1:50576.
+    #[arg(
+        long,
+        alias = "url",
+        global = true,
+        env = "SHADOWDROID_STUDIO_DEBUGGER_URL"
+    )]
+    pub studio_url: Option<String>,
+
     #[command(subcommand)]
     pub cmd: DebugCmd,
 }
@@ -35,6 +46,9 @@ pub enum DebugCmd {
     Record(RecordArgs),
     /// Replay action events from a JSONL timeline.
     Replay(ReplayArgs),
+    /// Show bridge status, attach, break, step, inspect frames, eval, and watch values.
+    #[command(flatten)]
+    Studio(DebuggerCmd),
     /// Step over until the screen hash changes, then return a final snapshot.
     StepUntilScreenChange(StudioWaitArgs),
     /// Step over until logcat emits a matching line, then return a final snapshot.
@@ -60,9 +74,6 @@ pub struct SnapshotArgs {
     /// Number of recent logcat lines to include.
     #[arg(long, default_value_t = 200)]
     pub logs: u32,
-    /// Android Studio plugin bridge URL.
-    #[arg(long, env = "SHADOWDROID_STUDIO_DEBUGGER_URL")]
-    pub studio_url: Option<String>,
     /// Include expanded top-frame variables when the debugger is suspended.
     #[arg(long, default_value_t = 1)]
     pub depth: u32,
@@ -88,9 +99,6 @@ pub struct RecordArgs {
     /// Skip screenshot capture on screen changes.
     #[arg(long)]
     pub no_screenshots: bool,
-    /// Android Studio plugin bridge URL.
-    #[arg(long, env = "SHADOWDROID_STUDIO_DEBUGGER_URL")]
-    pub studio_url: Option<String>,
     /// Include expanded top-frame variables in debugger timeline events.
     #[arg(long, default_value_t = 1)]
     pub depth: u32,
@@ -113,12 +121,9 @@ pub struct ReplayArgs {
 
 #[derive(Args, Clone)]
 pub struct StudioWaitArgs {
-    /// Debug session index from `debugger sessions`.
+    /// Debug session index from `debug sessions`.
     #[arg(long)]
     pub session: Option<usize>,
-    /// Android Studio plugin bridge URL.
-    #[arg(long, env = "SHADOWDROID_STUDIO_DEBUGGER_URL")]
-    pub studio_url: Option<String>,
     /// Stop waiting after this many milliseconds.
     #[arg(long, default_value_t = 10000)]
     pub timeout_ms: u64,
@@ -144,12 +149,9 @@ pub struct StepUntilLogArgs {
 
 #[derive(Args, Clone)]
 pub struct RunUntilCrashArgs {
-    /// Debug session index from `debugger sessions`.
+    /// Debug session index from `debug sessions`.
     #[arg(long)]
     pub session: Option<usize>,
-    /// Android Studio plugin bridge URL.
-    #[arg(long, env = "SHADOWDROID_STUDIO_DEBUGGER_URL")]
-    pub studio_url: Option<String>,
     /// Stop waiting after this many milliseconds.
     #[arg(long, default_value_t = 30000)]
     pub timeout_ms: u64,
@@ -161,21 +163,45 @@ pub struct RunUntilCrashArgs {
     pub depth: u32,
 }
 
-pub async fn run(serial: &str, client: &ServerClient, args: DebugArgs) -> Result<()> {
-    match args.cmd {
-        DebugCmd::Snapshot(args) => snapshot_cmd(serial, client, args).await,
-        DebugCmd::Record(args) => record_cmd(serial, client, args).await,
-        DebugCmd::Replay(args) => replay_cmd(client, args).await,
-        DebugCmd::StepUntilScreenChange(args) => {
-            step_until_screen_change(serial, client, args).await
-        }
-        DebugCmd::StepUntilLog(args) => step_until_log(serial, client, args).await,
-        DebugCmd::RunUntilCrash(args) => run_until_crash(serial, client, args).await,
+impl DebugArgs {
+    pub fn is_host_only(&self) -> bool {
+        matches!(self.cmd, DebugCmd::Studio(_))
     }
 }
 
-async fn snapshot_cmd(serial: &str, client: &ServerClient, args: SnapshotArgs) -> Result<()> {
-    let value = snapshot_value(serial, client, &args).await?;
+pub async fn run_host_only(args: &DebugArgs) -> Result<()> {
+    match &args.cmd {
+        DebugCmd::Studio(cmd) => debugger::run(cmd, args.studio_url.as_deref()).await,
+        _ => anyhow::bail!("debug command requires an Android device connection"),
+    }
+}
+
+pub async fn run(serial: &str, client: &ServerClient, args: DebugArgs) -> Result<()> {
+    let studio_url = args.studio_url;
+    match args.cmd {
+        DebugCmd::Snapshot(args) => snapshot_cmd(serial, client, args, studio_url.as_deref()).await,
+        DebugCmd::Record(args) => record_cmd(serial, client, args, studio_url.as_deref()).await,
+        DebugCmd::Replay(args) => replay_cmd(client, args).await,
+        DebugCmd::Studio(cmd) => debugger::run(&cmd, studio_url.as_deref()).await,
+        DebugCmd::StepUntilScreenChange(args) => {
+            step_until_screen_change(serial, client, args, studio_url.as_deref()).await
+        }
+        DebugCmd::StepUntilLog(args) => {
+            step_until_log(serial, client, args, studio_url.as_deref()).await
+        }
+        DebugCmd::RunUntilCrash(args) => {
+            run_until_crash(serial, client, args, studio_url.as_deref()).await
+        }
+    }
+}
+
+async fn snapshot_cmd(
+    serial: &str,
+    client: &ServerClient,
+    args: SnapshotArgs,
+    studio_url: Option<&str>,
+) -> Result<()> {
+    let value = snapshot_value(serial, client, &args, studio_url).await?;
     if let Some(path) = args.out {
         write_json_file(&path, &value)?;
     } else {
@@ -184,7 +210,12 @@ async fn snapshot_cmd(serial: &str, client: &ServerClient, args: SnapshotArgs) -
     Ok(())
 }
 
-async fn snapshot_value(serial: &str, client: &ServerClient, args: &SnapshotArgs) -> Result<Value> {
+async fn snapshot_value(
+    serial: &str,
+    client: &ServerClient,
+    args: &SnapshotArgs,
+    studio_url: Option<&str>,
+) -> Result<Value> {
     let state = client.state().await.context("reading server state")?;
     let screen = client.screen().await.context("reading screen tree")?;
     let foreground_activity = adb::foreground_activity(serial).await;
@@ -202,7 +233,7 @@ async fn snapshot_value(serial: &str, client: &ServerClient, args: &SnapshotArgs
     } else {
         adb::recent_logcat(serial, args.logs).await
     };
-    let debugger = debugger_snapshot(args.studio_url.as_deref(), args.depth).await;
+    let debugger = debugger_snapshot(studio_url, args.depth).await;
 
     Ok(json!({
         "type": "debug_snapshot",
@@ -288,7 +319,12 @@ async fn debugger_snapshot(studio_url: Option<&str>, depth: u32) -> Value {
     })
 }
 
-async fn record_cmd(serial: &str, client: &ServerClient, args: RecordArgs) -> Result<()> {
+async fn record_cmd(
+    serial: &str,
+    client: &ServerClient,
+    args: RecordArgs,
+    studio_url: Option<&str>,
+) -> Result<()> {
     if let Some(parent) = args.out.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -377,10 +413,9 @@ async fn record_cmd(serial: &str, client: &ServerClient, args: RecordArgs) -> Re
                     screenshot_dir: screenshot_dir.clone(),
                     no_screenshot: true,
                     logs: 0,
-                    studio_url: args.studio_url.clone(),
                     depth: args.depth,
                 };
-                let debugger = debugger_snapshot(snap_args.studio_url.as_deref(), snap_args.depth).await;
+                let debugger = debugger_snapshot(studio_url, snap_args.depth).await;
                 let suspended = debugger_suspended(&debugger);
                 if suspended == Some(true) && last_debugger_suspended != Some(true) {
                     write_event(&mut out, &json!({
@@ -574,8 +609,9 @@ async fn step_until_screen_change(
     serial: &str,
     client: &ServerClient,
     args: StudioWaitArgs,
+    studio_url: Option<&str>,
 ) -> Result<()> {
-    let bridge = BridgeClient::new(args.studio_url.as_deref())?;
+    let bridge = BridgeClient::new(studio_url)?;
     let session_s = args.session.map(|s| s.to_string());
     let initial = client.screen().await.context("reading initial screen")?;
     let initial_hash = initial.screen_hash.clone();
@@ -584,14 +620,8 @@ async fn step_until_screen_change(
 
     loop {
         if Instant::now() >= deadline {
-            let snapshot = final_snapshot(
-                serial,
-                client,
-                &args.app,
-                args.studio_url.as_deref(),
-                args.depth,
-            )
-            .await?;
+            let snapshot =
+                final_snapshot(serial, client, &args.app, studio_url, args.depth).await?;
             emit_json(&json!({
                 "type": "step_until_screen_change",
                 "ok": false,
@@ -608,14 +638,8 @@ async fn step_until_screen_change(
         tokio::time::sleep(Duration::from_millis(args.poll_ms.max(25))).await;
         let screen = client.screen().await.context("reading screen after step")?;
         if screen.screen_hash != initial_hash {
-            let snapshot = final_snapshot(
-                serial,
-                client,
-                &args.app,
-                args.studio_url.as_deref(),
-                args.depth,
-            )
-            .await?;
+            let snapshot =
+                final_snapshot(serial, client, &args.app, studio_url, args.depth).await?;
             emit_json(&json!({
                 "type": "step_until_screen_change",
                 "ok": true,
@@ -629,8 +653,13 @@ async fn step_until_screen_change(
     }
 }
 
-async fn step_until_log(serial: &str, client: &ServerClient, args: StepUntilLogArgs) -> Result<()> {
-    let bridge = BridgeClient::new(args.wait.studio_url.as_deref())?;
+async fn step_until_log(
+    serial: &str,
+    client: &ServerClient,
+    args: StepUntilLogArgs,
+    studio_url: Option<&str>,
+) -> Result<()> {
+    let bridge = BridgeClient::new(studio_url)?;
     let session_s = args.wait.session.map(|s| s.to_string());
     let (log_tx, mut log_rx) = mpsc::channel(256);
     spawn_logcat(serial.to_string(), log_tx);
@@ -639,14 +668,8 @@ async fn step_until_log(serial: &str, client: &ServerClient, args: StepUntilLogA
 
     loop {
         if Instant::now() >= deadline {
-            let snapshot = final_snapshot(
-                serial,
-                client,
-                &args.wait.app,
-                args.wait.studio_url.as_deref(),
-                args.wait.depth,
-            )
-            .await?;
+            let snapshot =
+                final_snapshot(serial, client, &args.wait.app, studio_url, args.wait.depth).await?;
             emit_json(&json!({
                 "type": "step_until_log",
                 "ok": false,
@@ -673,7 +696,7 @@ async fn step_until_log(serial: &str, client: &ServerClient, args: StepUntilLogA
                             serial,
                             client,
                             &args.wait.app,
-                            args.wait.studio_url.as_deref(),
+                            studio_url,
                             args.wait.depth,
                         )
                         .await?;
@@ -698,8 +721,9 @@ async fn run_until_crash(
     serial: &str,
     client: &ServerClient,
     args: RunUntilCrashArgs,
+    studio_url: Option<&str>,
 ) -> Result<()> {
-    let bridge = BridgeClient::new(args.studio_url.as_deref())?;
+    let bridge = BridgeClient::new(studio_url)?;
     let session_s = args.session.map(|s| s.to_string());
     let (log_tx, mut log_rx) = mpsc::channel(256);
     spawn_logcat(serial.to_string(), log_tx);
@@ -708,14 +732,8 @@ async fn run_until_crash(
 
     loop {
         if Instant::now() >= deadline {
-            let snapshot = final_snapshot(
-                serial,
-                client,
-                &args.app,
-                args.studio_url.as_deref(),
-                args.depth,
-            )
-            .await?;
+            let snapshot =
+                final_snapshot(serial, client, &args.app, studio_url, args.depth).await?;
             emit_json(&json!({
                 "type": "run_until_crash",
                 "ok": false,
@@ -732,14 +750,8 @@ async fn run_until_crash(
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 if is_crash_line(line) {
-                    let snapshot = final_snapshot(
-                        serial,
-                        client,
-                        &args.app,
-                        args.studio_url.as_deref(),
-                        args.depth,
-                    )
-                    .await?;
+                    let snapshot =
+                        final_snapshot(serial, client, &args.app, studio_url, args.depth).await?;
                     emit_json(&json!({
                         "type": "run_until_crash",
                         "ok": true,
@@ -770,9 +782,9 @@ async fn final_snapshot(
             screenshot_dir: None,
             no_screenshot: false,
             logs: 120,
-            studio_url: studio_url.map(str::to_string),
             depth,
         },
+        studio_url,
     )
     .await
 }
