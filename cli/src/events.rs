@@ -59,6 +59,60 @@ pub enum Event {
         input: Option<String>,
         ts: f64,
     },
+    /// A completed HTTP(S) transaction through the `net` proxy. Compact by
+    /// design — full headers/bodies are fetched on demand via `net show <id>`.
+    /// Field shape mirrors the `net` capture wire format so the timeline can
+    /// interleave it with `screen`/`crash` events.
+    Http {
+        ts: f64,
+        id: String,
+        method: String,
+        scheme: String,
+        host: String,
+        path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
+        ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dur_ms: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        req_type: Option<String>,
+        req_len: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resp_type: Option<String>,
+        resp_len: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        matched: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        modified: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// A flow paused by `net intercept`, awaiting the agent's `net
+    /// resume`/`drop`/`respond`. Held until acted on or `hold_deadline_ms`.
+    HttpIntercept {
+        ts: f64,
+        id: String,
+        /// "request" (before upstream) or "response" (before returning).
+        phase: String,
+        method: String,
+        scheme: String,
+        host: String,
+        path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        req_type: Option<String>,
+        req_len: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resp_type: Option<String>,
+        resp_len: u64,
+        hold_deadline_ms: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        req_preview: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resp_preview: Option<String>,
+    },
 }
 
 #[derive(Debug, Serialize)]

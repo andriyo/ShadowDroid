@@ -650,6 +650,7 @@ fn command_reference() -> String {
         "app",
         "perm",
         "device",
+        "net",
     ];
 
     let root = Cli::command();

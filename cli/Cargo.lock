@@ -2083,23 +2083,32 @@ dependencies = [
 
 [[package]]
 name = "shadowdroid"
-version = "0.1.9"
+version = "0.2.0"
 dependencies = [
  "adb_client",
  "anyhow",
  "blake3",
+ "bytes",
  "clap",
  "directories",
+ "flate2",
  "futures",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "quick-xml",
+ "rcgen",
  "regex",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
  "urlencoding",

@@ -48,6 +48,8 @@ pub struct WatchConfig {
     pub watcher_files: Vec<String>,
     pub permission_dialog_policy: PermissionDialogPolicy,
     pub screen_format: ScreenFormat,
+    /// Also interleave live `http` events from a running `net` proxy daemon.
+    pub net: bool,
 }
 
 enum WatchMsg {
@@ -77,6 +79,20 @@ pub async fn run(cfg: WatchConfig) -> Result<()> {
         detect_crashes: cfg.detect_crashes,
         ts: now_ts(),
     });
+
+    // `--net`: tail a running net proxy daemon's live HTTP events onto the same
+    // stdout timeline (best-effort; silently no-ops if no `net start` is up).
+    // println! locks stdout per line, so http/screen lines interleave cleanly.
+    if cfg.net {
+        let serial = cfg.serial.clone();
+        tokio::spawn(async move {
+            let _ = crate::net::control::request_stream(
+                &serial,
+                serde_json::json!({"op": "watch", "matcher": {}}),
+            )
+            .await;
+        });
+    }
 
     let (watch_tx, mut watch_rx) = mpsc::channel::<WatchMsg>(128);
     let (event_tx, mut event_rx) = mpsc::channel::<Event>(64);

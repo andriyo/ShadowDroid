@@ -18,6 +18,7 @@ mod config;
 mod device;
 mod dump;
 mod events;
+mod net;
 mod proto;
 mod update;
 mod watch;

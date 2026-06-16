@@ -169,6 +169,9 @@ pub async fn gather(device: Option<&str>) -> DoctorReport {
     // ── C5: device clock vs host (drift breaks TLS, tokens, toast capture) ───
     checks.push(clock_check(&serial).await);
 
+    // ── C6: net proxy state (a dangling http_proxy silently breaks networking)
+    checks.push(net_check(&serial).await);
+
     DoctorReport::from_checks(Some(serial), checks)
 }
 
@@ -402,13 +405,47 @@ async fn clock_check(serial: &str) -> Check {
 }
 
 /// Entry point dispatched from `cli::run`.
-pub async fn run(device: Option<&str>, fix: bool, force: bool, json: bool) -> Result<()> {
+pub async fn run(
+    device: Option<&str>,
+    fix: bool,
+    force: bool,
+    json: bool,
+    app: Option<&str>,
+) -> Result<()> {
     let mut report = gather(device).await;
 
     if fix && !report.healthy {
         report = apply_fix(device, report, force).await;
     } else if fix {
         report.fixed = Some(false);
+    }
+
+    // `doctor --app <pkg>`: append the per-app interceptability verdict (`net
+    // check`). Read-only, so it sits outside the fix flow.
+    if let (Some(app), Some(serial)) = (app, report.target.clone()) {
+        let check = match crate::net::check::inspect(&serial, app).await {
+            Ok(rep) => {
+                let status = match rep.verdict.as_str() {
+                    "interceptable" => Status::Ok,
+                    "conditional" => Status::Warn,
+                    _ => Status::Fail,
+                };
+                Check {
+                    code: "net_app",
+                    status,
+                    detail: format!("{} — {} ({})", rep.package, rep.verdict, rep.reason),
+                    remedy: None,
+                }
+            }
+            Err(e) => Check {
+                code: "net_app",
+                status: Status::Warn,
+                detail: format!("net check {app}: {e}"),
+                remedy: None,
+            },
+        };
+        report.checks.push(check);
+        report.healthy = report.checks.iter().all(|c| c.status == Status::Ok);
     }
 
     if json {
@@ -428,6 +465,13 @@ async fn apply_fix(device: Option<&str>, report: DoctorReport, force: bool) -> D
         return r;
     };
 
+    // Net: a dangling `http_proxy` (set, but no daemon) silently kills the
+    // device's networking. Clearing it is independent of the UiAutomation slot,
+    // so do it first — even if the owner/apk fixes below get gated.
+    if report.checks.iter().any(|c| c.code == "net" && c.status != Status::Ok) {
+        clear_dangling_proxy(&serial).await;
+    }
+
     // Re-read owners fresh: refuse to clobber a foreign owner without --force.
     let owners = adb::ps_ui_automation_owners(&serial)
         .await
@@ -437,7 +481,8 @@ async fn apply_fix(device: Option<&str>, report: DoctorReport, force: bool) -> D
             "doctor --fix: a non-ShadowDroid UiAutomation owner is present. Re-run with --force \
              to kill it and reclaim the slot, or stop it yourself first."
         );
-        let mut r = report;
+        // Re-gather so the report reflects the net clear above.
+        let mut r = gather(device).await;
         r.fixed = Some(false);
         return r;
     }
@@ -477,7 +522,54 @@ async fn apply_fix(device: Option<&str>, report: DoctorReport, force: bool) -> D
 /// Checks `--fix` can actually repair. The rest (`device` offline/unauthorized,
 /// `clock` drift) are advisory — surfaced, but not something we auto-fix.
 fn is_fixable(code: &str) -> bool {
-    matches!(code, "apk" | "server" | "owners")
+    matches!(code, "apk" | "server" | "owners" | "net")
+}
+
+/// Package-agnostic `net` proxy state. The headline value is catching a
+/// **dangling** `http_proxy` (set, but no daemon listening) — that silently
+/// breaks the device's networking, and `--fix` clears it. A clean no-proxy state
+/// is `Ok` ("inactive"), so this never nags people who don't use `net`.
+async fn net_check(serial: &str) -> Check {
+    let running = crate::net::control::is_running(serial).await;
+    let http_proxy = adb::shell(serial, "settings get global http_proxy")
+        .await
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != "null" && s != ":0");
+    match (http_proxy, running) {
+        (Some(hp), true) => Check {
+            code: "net",
+            status: Status::Ok,
+            detail: format!("proxy active; device http_proxy={hp}"),
+            remedy: None,
+        },
+        (Some(hp), false) => Check {
+            code: "net",
+            status: Status::Warn,
+            detail: format!(
+                "dangling http_proxy={hp} but no proxy daemon is running — this silently breaks the device's networking."
+            ),
+            remedy: Some("clear it with `shadowdroid net stop` (or `doctor --fix`)".into()),
+        },
+        (None, true) => Check {
+            code: "net",
+            status: Status::Warn,
+            detail: "a net proxy daemon is running but the device isn't pointed at it.".into(),
+            remedy: Some("`net start` to wire it up, or `net stop` to shut the daemon down".into()),
+        },
+        (None, false) => Check {
+            code: "net",
+            status: Status::Ok,
+            detail: "inactive.".into(),
+            remedy: None,
+        },
+    }
+}
+
+/// Clear a dangling system proxy (and any leftover reverse on the default port).
+async fn clear_dangling_proxy(serial: &str) {
+    let _ = adb::shell(serial, "settings put global http_proxy :0").await;
+    let _ = adb::reverse_remove(serial, crate::net::DEFAULT_PROXY_PORT).await;
 }
 
 fn studio_checks() -> Vec<Check> {

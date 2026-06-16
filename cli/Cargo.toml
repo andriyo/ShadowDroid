@@ -1,6 +1,6 @@
 [package]
 name = "shadowdroid"
-version = "0.1.9"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.82"   # raised: reqwest 0.13 requires 1.81+; modern crates assume 1.80+
 description = "Drive Android apps from the command line — streaming JSON events, structured crashes, declarative popup watchers"
@@ -25,7 +25,7 @@ path = "src/main.rs"
 clap = { version = "4.6", features = ["derive", "env"] }
 
 # ── Async runtime + HTTP client ─────────────────────────────────────────
-tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "fs", "signal", "sync", "time"] }
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "fs", "signal", "sync", "time", "net"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 
 # ── Serialization ───────────────────────────────────────────────────────
@@ -54,6 +54,19 @@ urlencoding = "2.1"   # used for ?package= query strings
 zip = { version = "2.4", default-features = false, features = ["deflate"] }
 # once_cell removed: std::sync::OnceLock (stable since 1.70) covers our use case.
 # Bring it back if we need the &'static initialisation guarantee for ergonomics.
+
+# ── MITM proxy (`net` namespace) ────────────────────────────────────────
+# All already present transitively (verified in Cargo.lock); promoting to
+# direct deps adds no build cost. aws-lc-rs is the active rustls provider.
+hyper = { version = "1.9", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http = "1.4"
+http-body-util = "0.1"
+bytes = "1"
+tokio-rustls = "0.26"
+rustls = "0.23"
+rcgen = { version = "0.14", features = ["x509-parser"] }
+flate2 = "1"             # decompress captured gzip/deflate response bodies (already in lock via zip)
 
 [dev-dependencies]
 tempfile = "3.27"

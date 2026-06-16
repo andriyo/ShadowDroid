@@ -166,6 +166,38 @@ pub async fn forward_remove(serial: impl Into<String>, host_port: u16) -> Result
     .context("forward_remove task panicked")?
 }
 
+/// Set up `adb reverse tcp:<device_port> tcp:<host_port>` — the *device's*
+/// `localhost:<device_port>` tunnels back to the host's `localhost:<host_port>`.
+/// This is the opposite direction of [forward] and is how we point an app's
+/// system `http_proxy` (which it dials on device-localhost) at the host-side
+/// MITM proxy. adb_client's `reverse(remote, local)` maps to the ADB protocol
+/// `reverse:forward:<remote>;<local>` where `remote` is the device socket and
+/// `local` is the host socket.
+pub async fn reverse(serial: impl Into<String>, device_port: u16, host_port: u16) -> Result<()> {
+    let serial = serial.into();
+    spawn_blocking(move || {
+        let mut device = get_device_sync(&serial)?;
+        device
+            .reverse(format!("tcp:{device_port}"), format!("tcp:{host_port}"))
+            .map_err(|e| anyhow!("adb reverse tcp:{device_port} tcp:{host_port}: {e}"))
+    })
+    .await
+    .context("reverse task panicked")?
+}
+
+/// Remove a previously-set reverse rule by the device-side port.
+pub async fn reverse_remove(serial: impl Into<String>, device_port: u16) -> Result<()> {
+    let serial = serial.into();
+    spawn_blocking(move || {
+        let mut device = get_device_sync(&serial)?;
+        device
+            .reverse_remove(format!("tcp:{device_port}"))
+            .map_err(|e| anyhow!("adb reverse --remove tcp:{device_port}: {e}"))
+    })
+    .await
+    .context("reverse_remove task panicked")?
+}
+
 /// Force-stop a package via `am force-stop`. Idempotent — safe to call when
 /// the package isn't running.
 pub async fn am_force_stop(serial: impl Into<String>, package: impl AsRef<str>) -> Result<()> {

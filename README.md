@@ -191,6 +191,7 @@ when `screen_hash` changes.
 | **Permissions**  | `perm grant` / `revoke` / `list` / `reset`, `appops get` / `set`                                   |
 | **Device**       | `device info` / `shell` / `wake` / `sleep` / `unlock` / `orientation` / `clipboard` / `notifications` / `quick-settings` / `open-url` |
 | **Files**        | `files ls` / `push` / `pull`                                                                       |
+| **Network**      | `net check` / `trust` / `start` / `stop` / `status`, `net watch` / `log` / `show` / `export`, `net intercept` / `resume` / `drop` / `respond`, `net rule …` / `replay` |
 | **Display**      | `profile snapshot` / `apply` / `reset` (animations, font, density, size, rotation)                 |
 | **Debug**        | `debug auto` / `snapshot` / `record` / `replay`, `debug attach` / `break` / `stack` / `variables` / `eval` / `inspect`, `debug native` / `tombstones` / `coroutines`, `debug run-until-crash` |
 | **Session**      | `devices`, `connect`, `disconnect`, `doctor`, `collect`, `config`, `update`, `commands`, `skill`, `studio`, `init` |
@@ -198,6 +199,18 @@ when `screen_hash` changes.
 `watch` is the streaming workhorse — it emits debounced, hash-diffed `screen`
 events plus `crash`, `toast`, and `watcher_fired` events as JSON lines, so an
 agent can follow a live app and react to popups and crashes without polling.
+
+`net` is an embedded MITM proxy (built into the single binary — no Python, no
+external mitmproxy). `net start` points the device at it; decrypted HTTP(S)
+transactions then stream as `http` events on the same timeline as `screen`
+(`watch --net` interleaves them). Beyond observing, the agent can **intercept** a
+flow — `net intercept` pauses matching requests/responses and emits them as
+`http_intercept` events; the agent inspects with `net show`, then releases with
+`net resume --set-status/--body/…`, `net drop`, or `net respond` (a canned
+reply). Repeated edits can be promoted to declarative `net rule`s (map-local /
+map-remote / set-status / set-header / replace / block / delay) or served offline
+from a saved session with `net replay`. `net check <app>` reports whether a build
+is interceptable; `net export har|curl` hands a flow to other tools.
 
 Run `shadowdroid commands` for the full command tree, or `shadowdroid --help` on
 any subcommand for its flags.

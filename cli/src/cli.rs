@@ -82,6 +82,9 @@ pub enum Cmd {
     /// Diagnose (and optionally repair) the host↔device pipe: device state,
     /// APK version, port forward, server reachability, UiAutomation owners.
     Doctor {
+        /// Also run the per-app interceptability verdict (`net check <app>`).
+        #[arg(long)]
+        app: Option<String>,
         /// Attempt to repair the issues found.
         #[arg(long)]
         fix: bool,
@@ -138,6 +141,9 @@ pub enum Cmd {
     /// On-device file operations.
     #[command(subcommand)]
     Files(FilesCmd),
+    /// Network MITM proxy: observe, intercept, and modify HTTP(S) traffic.
+    #[command(subcommand)]
+    Net(NetCmd),
     /// Agent-first layout snapshots and diffs.
     Layout(crate::cmd::layout::LayoutArgs),
 
@@ -318,6 +324,9 @@ pub enum Cmd {
         permission_dialogs: PermissionDialogPolicy,
         #[arg(long)]
         watcher_file: Vec<String>,
+        /// Interleave live HTTP events from a running `net` proxy daemon.
+        #[arg(long)]
+        net: bool,
     },
 }
 
@@ -437,6 +446,203 @@ pub enum FilesCmd {
     Pull { remote: String, local: String },
 }
 
+// ── network proxy (`net`) ─────────────────────────────────────
+
+#[derive(Subcommand)]
+pub enum NetCmd {
+    /// Verdict: is this app interceptable (debuggable, NSC trusts user CA, engine proxy-aware)?
+    Check { package: String },
+    /// Install / trust the ShadowDroid CA on the device.
+    Trust {
+        /// Push into the system trust store (emulator/root).
+        #[arg(long)]
+        system: bool,
+        /// Drive the Settings "Install a certificate" UI (real device, non-root).
+        #[arg(long)]
+        ui: bool,
+    },
+    /// Start the MITM proxy: spawn the daemon, `adb reverse`, set `http_proxy`.
+    Start {
+        #[arg(long, default_value_t = crate::net::DEFAULT_PROXY_PORT)]
+        port: u16,
+        /// Limit capture/MITM to these host globs, e.g. '*.livd.app' (repeatable;
+        /// empty = all hosts). NB: matches by host today — per-app uid attribution
+        /// is planned but not yet wired, so this is host-scoping, not app-scoping.
+        #[arg(long)]
+        app: Vec<String>,
+        /// Run the proxy in the foreground instead of detaching a daemon.
+        #[arg(long)]
+        foreground: bool,
+        /// Strip cache-validation request headers (force fresh responses).
+        #[arg(long)]
+        anticache: bool,
+        /// Strip Accept-Encoding (force uncompressed responses).
+        #[arg(long)]
+        anticomp: bool,
+    },
+    /// Stop the proxy and tear down device wiring.
+    Stop {
+        /// Also remove the ShadowDroid CA from the device trust store.
+        #[arg(long)]
+        revoke_ca: bool,
+    },
+    /// Proxy + device-wiring status (running? pointed at us? held flows).
+    Status,
+    /// Stream live HTTP events (same envelope as `watch`).
+    Watch {
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long)]
+        method: Option<String>,
+        #[arg(long)]
+        status: Option<u16>,
+    },
+    /// Recall past flows from the session log.
+    Log {
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long)]
+        method: Option<String>,
+        #[arg(long)]
+        status: Option<u16>,
+        #[arg(short = 'n', long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Full headers + bodies for one flow.
+    Show {
+        id: String,
+        #[arg(long)]
+        body: bool,
+        #[arg(long)]
+        har: bool,
+    },
+    /// Export flows for interop (har | curl).
+    Export {
+        #[arg(value_parser = ["har", "curl"])]
+        format: String,
+        id: Option<String>,
+    },
+    /// Pause matching flows for agent-in-the-loop editing.
+    Intercept {
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long)]
+        method: Option<String>,
+        #[arg(long)]
+        status: Option<u16>,
+        /// Hold at the request phase, response phase, or both.
+        #[arg(long, value_parser = ["request", "response", "both"], default_value = "response")]
+        at: String,
+        /// Auto-act after this long if the agent doesn't (apps time out their own client).
+        #[arg(long, default_value_t = 30000)]
+        hold_ms: u32,
+        /// What to do when the hold deadline passes (fail-open by default).
+        #[arg(long, value_parser = ["resume", "drop"], default_value = "resume")]
+        on_timeout: String,
+    },
+    /// Release a held flow (optionally mutated).
+    Resume {
+        id: String,
+        #[arg(long)]
+        set_status: Option<u16>,
+        #[arg(long, value_name = "NAME=VALUE")]
+        set_header: Vec<String>,
+        #[arg(long, value_name = "NAME")]
+        remove_header: Vec<String>,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long)]
+        body_file: Option<PathBuf>,
+        #[arg(long, num_args = 2, value_names = ["REGEX", "REPL"])]
+        replace: Option<Vec<String>>,
+        #[arg(long)]
+        delay: Option<u32>,
+        #[arg(long)]
+        set_url: Option<String>,
+    },
+    /// Kill a held flow (device sees a connection error, or the given status).
+    Drop {
+        id: String,
+        #[arg(long)]
+        status: Option<u16>,
+    },
+    /// Short-circuit a held request with a canned response (never hits the server).
+    Respond {
+        id: String,
+        #[arg(long, default_value_t = 200)]
+        status: u16,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long)]
+        body_file: Option<PathBuf>,
+        #[arg(long, value_name = "NAME=VALUE")]
+        set_header: Vec<String>,
+    },
+    /// Declarative response/request rules.
+    #[command(subcommand)]
+    Rule(NetRuleCmd),
+    /// Apply a bulk rules file (JSON array of rules).
+    Rules { file: PathBuf },
+    /// Serve saved responses without a backend.
+    Replay {
+        #[arg(long)]
+        from: PathBuf,
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Internal: run the proxy daemon in the foreground (spawned by `net start`).
+    #[command(hide = true)]
+    Daemon(NetDaemonArgs),
+}
+
+#[derive(Subcommand)]
+pub enum NetRuleCmd {
+    /// Add a rule (kind = map-local|map-remote|set-status|set-header|replace|block|delay).
+    Add(NetRuleAddArgs),
+    /// List active rules.
+    List,
+    /// Remove a rule by id.
+    Rm { id: String },
+    /// Remove all rules.
+    Clear,
+}
+
+#[derive(clap::Args)]
+pub struct NetRuleAddArgs {
+    /// map-local | map-remote | set-status | set-header | replace | block | delay
+    pub kind: String,
+    #[arg(long)]
+    pub host: Option<String>,
+    #[arg(long)]
+    pub path: Option<String>,
+    #[arg(long)]
+    pub method: Option<String>,
+    #[arg(long)]
+    pub content_type: Option<String>,
+    /// Kind-specific positional args (e.g. set-status <code>, set-header <name> <value>).
+    pub args: Vec<String>,
+}
+
+#[derive(clap::Args)]
+pub struct NetDaemonArgs {
+    #[arg(long)]
+    pub serial: String,
+    #[arg(long, default_value_t = crate::net::DEFAULT_PROXY_PORT)]
+    pub port: u16,
+    #[arg(long)]
+    pub app: Vec<String>,
+    #[arg(long)]
+    pub anticache: bool,
+    #[arg(long)]
+    pub anticomp: bool,
+}
+
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     let config = ShadowDroidConfig::load()?;
@@ -466,8 +672,20 @@ pub async fn run() -> Result<()> {
             return cmd_connect(device.as_deref(), apk.as_deref(), any_apk_version).await
         }
         Cmd::Disconnect => return cmd_disconnect(device.as_deref()).await,
-        Cmd::Doctor { fix, force, json } => {
-            return crate::cmd::doctor::run(device.as_deref(), *fix, *force, *json).await
+        Cmd::Doctor {
+            app,
+            fix,
+            force,
+            json,
+        } => {
+            return crate::cmd::doctor::run(
+                device.as_deref(),
+                *fix,
+                *force,
+                *json,
+                app.as_deref(),
+            )
+            .await
         }
         Cmd::Collect {
             app,
@@ -498,6 +716,17 @@ pub async fn run() -> Result<()> {
             let serial = resolve_serial(device.as_deref()).await?;
             return crate::cmd::app_install::run(&serial, a, true).await;
         }
+        // `net` is host-only: the proxy is a host-side daemon driven over adb.
+        // (`trust --ui` brings up the UI server on demand internally.)
+        Cmd::Net(c) => {
+            // The detached daemon carries its own `--serial` and must not depend
+            // on a live device being attached; everything else resolves one.
+            if matches!(c, NetCmd::Daemon(_)) {
+                return dispatch_net(c, "").await;
+            }
+            let serial = resolve_serial(device.as_deref()).await?;
+            return dispatch_net(c, &serial).await;
+        }
         _ => {}
     }
 
@@ -520,7 +749,8 @@ pub async fn run() -> Result<()> {
         | Cmd::Studio(_)
         | Cmd::Perm(_)
         | Cmd::Appops(_)
-        | Cmd::Profile(_) => unreachable!("handled before ensure_ready"),
+        | Cmd::Profile(_)
+        | Cmd::Net(_) => unreachable!("handled before ensure_ready"),
 
         // ── namespaces ─────────────────────────────────────────
         Cmd::App(app_cmd) => dispatch_app(app_cmd, &client).await?,
@@ -705,6 +935,7 @@ pub async fn run() -> Result<()> {
             screen_format,
             permission_dialogs,
             watcher_file,
+            net,
         } => {
             let app = resolve_app_package(&config, Some(&serial), app).await?;
             crate::watch::r#loop::run(crate::watch::r#loop::WatchConfig {
@@ -718,6 +949,7 @@ pub async fn run() -> Result<()> {
                 watcher_files: watcher_file,
                 permission_dialog_policy: permission_dialogs,
                 screen_format,
+                net,
             })
             .await?;
         }
@@ -737,6 +969,7 @@ fn apply_config_defaults(cmd: &mut Cmd, config: &ShadowDroidConfig) {
         }
         Cmd::Studio(args) => apply_studio_config(args, config),
         Cmd::Collect { app, .. } => fill_app(app, config),
+        Cmd::Doctor { app, .. } => fill_app(app, config),
         Cmd::Debug(args) => apply_debug_config(args, config),
         Cmd::Layout(args) => apply_layout_config(args, config),
         _ => {}
@@ -977,6 +1210,182 @@ async fn dispatch_profile(c: &ProfileCmd, serial: &str) -> Result<()> {
         ProfileCmd::Snapshot { out } => device_profile::snapshot(serial, out.as_ref()).await,
         ProfileCmd::Apply(args) => device_profile::apply(serial, args).await,
         ProfileCmd::Reset => device_profile::reset(serial).await,
+    }
+}
+
+/// Route a parsed `net` command to its host-side handler. `net` owns its own
+/// daemon + adb wiring, so (unlike server-backed namespaces) this never touches
+/// `ensure_ready`. Clap types stay here; the handlers speak plain structs.
+async fn dispatch_net(c: &NetCmd, serial: &str) -> Result<()> {
+    use crate::net::commands as nc;
+    use crate::net::{DaemonConfig, Matcher, RuleSpec};
+
+    let matcher = |host: &Option<String>,
+                   path: &Option<String>,
+                   method: &Option<String>,
+                   status: &Option<u16>| Matcher {
+        host: host.clone(),
+        path: path.clone(),
+        method: method.clone(),
+        status: *status,
+    };
+
+    match c {
+        NetCmd::Check { package } => nc::check(serial, package).await,
+        NetCmd::Trust { system, ui } => nc::trust(serial, *system, *ui).await,
+        NetCmd::Start {
+            port,
+            app,
+            foreground,
+            anticache,
+            anticomp,
+        } => {
+            nc::start(
+                serial,
+                *port,
+                app.clone(),
+                *foreground,
+                *anticache,
+                *anticomp,
+            )
+            .await
+        }
+        NetCmd::Stop { revoke_ca } => nc::stop(serial, *revoke_ca).await,
+        NetCmd::Status => nc::status(serial).await,
+        NetCmd::Watch {
+            host,
+            path,
+            method,
+            status,
+        } => nc::watch(serial, matcher(host, path, method, status)).await,
+        NetCmd::Log {
+            host,
+            path,
+            method,
+            status,
+            limit,
+        } => nc::log(serial, matcher(host, path, method, status), *limit).await,
+        NetCmd::Show { id, body, har } => nc::show(serial, id, *body, *har).await,
+        NetCmd::Export { format, id } => nc::export(serial, format, id.clone()).await,
+        NetCmd::Intercept {
+            host,
+            path,
+            method,
+            status,
+            at,
+            hold_ms,
+            on_timeout,
+        } => {
+            nc::intercept(
+                serial,
+                matcher(host, path, method, status),
+                at.clone(),
+                *hold_ms,
+                on_timeout.clone(),
+            )
+            .await
+        }
+        NetCmd::Resume {
+            id,
+            set_status,
+            set_header,
+            remove_header,
+            body,
+            body_file,
+            replace,
+            delay,
+            set_url,
+        } => {
+            let replace = match replace {
+                Some(v) if v.len() == 2 => Some((v[0].clone(), v[1].clone())),
+                Some(_) => bail!("--replace expects exactly REGEX and REPL"),
+                None => None,
+            };
+            let mutation = crate::net::Mutation {
+                set_status: *set_status,
+                set_headers: parse_header_pairs(set_header)?,
+                remove_headers: remove_header.clone(),
+                body: read_body_arg(body, body_file)?,
+                replace,
+                delay_ms: *delay,
+                set_url: set_url.clone(),
+            };
+            nc::resume(serial, id, mutation).await
+        }
+        NetCmd::Drop { id, status } => nc::drop_flow(serial, id, *status).await,
+        NetCmd::Respond {
+            id,
+            status,
+            body,
+            body_file,
+            set_header,
+        } => {
+            nc::respond(
+                serial,
+                id,
+                *status,
+                read_body_arg(body, body_file)?,
+                parse_header_pairs(set_header)?,
+            )
+            .await
+        }
+        NetCmd::Rule(rc) => match rc {
+            NetRuleCmd::Add(a) => {
+                let spec = RuleSpec {
+                    kind: a.kind.clone(),
+                    matcher: Matcher {
+                        host: a.host.clone(),
+                        path: a.path.clone(),
+                        method: a.method.clone(),
+                        status: None,
+                    },
+                    content_type: a.content_type.clone(),
+                    args: a.args.clone(),
+                };
+                nc::rule_add(serial, spec).await
+            }
+            NetRuleCmd::List => nc::rule_list(serial).await,
+            NetRuleCmd::Rm { id } => nc::rule_rm(serial, id).await,
+            NetRuleCmd::Clear => nc::rule_clear(serial).await,
+        },
+        NetCmd::Rules { file } => nc::rules_apply(serial, file).await,
+        NetCmd::Replay { from, host } => nc::replay(serial, from, host.clone()).await,
+        NetCmd::Daemon(a) => {
+            crate::net::daemon::run(DaemonConfig {
+                serial: a.serial.clone(),
+                port: a.port,
+                app_filters: a.app.clone(),
+                anticache: a.anticache,
+                anticomp: a.anticomp,
+            })
+            .await
+        }
+    }
+}
+
+/// Parse `--set-header NAME=VALUE` pairs.
+fn parse_header_pairs(pairs: &[String]) -> Result<Vec<(String, String)>> {
+    pairs
+        .iter()
+        .map(|p| {
+            p.split_once('=')
+                .map(|(n, v)| (n.trim().to_string(), v.to_string()))
+                .ok_or_else(|| anyhow!("--set-header expects NAME=VALUE, got {p:?}"))
+        })
+        .collect()
+}
+
+/// Resolve a body from `--body <str>` or `--body-file <path>` (mutually exclusive).
+fn read_body_arg(inline: &Option<String>, file: &Option<PathBuf>) -> Result<Option<Vec<u8>>> {
+    match (inline, file) {
+        (Some(_), Some(_)) => bail!("--body and --body-file are mutually exclusive"),
+        (Some(s), None) => Ok(Some(s.clone().into_bytes())),
+        (None, Some(p)) => {
+            Ok(Some(std::fs::read(p).with_context(|| {
+                format!("reading {}", p.display())
+            })?))
+        }
+        (None, None) => Ok(None),
     }
 }
 
