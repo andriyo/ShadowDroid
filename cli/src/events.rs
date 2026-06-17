@@ -126,7 +126,8 @@ pub struct CompactElement {
     pub rid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub klass: Option<String>,
-    pub tap: [i32; 2],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tap: Option<[i32; 2]>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub clickable: bool,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -282,8 +283,8 @@ mod tests {
             desc: None,
             klass: Some("android.widget.Button".into()),
             rid: None,
-            bounds: [0, 0, 4, 4],
-            tap: [2, 2],
+            bounds: Some([0, 0, 4, 4]),
+            tap: Some([2, 2]),
             clickable: true,
             long_clickable: true,
             scrollable: false,

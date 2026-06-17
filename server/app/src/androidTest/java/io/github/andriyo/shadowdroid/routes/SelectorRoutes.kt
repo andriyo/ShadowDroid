@@ -1,6 +1,7 @@
 package io.github.andriyo.shadowdroid.routes
 
 import android.app.Instrumentation
+import android.view.accessibility.AccessibilityNodeInfo
 import androidx.test.uiautomator.By
 import androidx.test.uiautomator.Direction
 import androidx.test.uiautomator.UiDevice
@@ -23,35 +24,32 @@ object SelectorRoutes {
     ) {
         route.post("/find") {
             val request: SelectorReq = call.receive()
-            val matches = findElements(request, uiDevice, instr)
+            val matches = findElementMatches(request, uiDevice, instr).map { it.element }
             call.respond(FindResp(matched = matches.firstOrNull(), elements = matches))
         }
 
         route.post("/find_tap") {
             val request: SelectorReq = call.receive()
             val match =
-                findElements(request.copy(all = false), uiDevice, instr).firstOrNull()
+                findElementMatches(request.copy(all = false), uiDevice, instr).firstOrNull()
                     ?: throw NotFound("element_not_found", "no element matched selector")
-            val x = match.tap[0]
-            val y = match.tap[1]
-            if (!uiDevice.click(x, y)) throw BadRequest("tap_failed", "UiDevice.click returned false")
-            call.respond(FindTapResp(matched = match, x = x, y = y))
+            val tap = tapMatch(match, uiDevice)
+            call.respond(FindTapResp(matched = match.element, x = tap.x, y = tap.y, action = tap.action))
         }
 
         route.post("/xpath") {
             val request: XpathReq = call.receive()
             val selector = SelectorReq(xpath = request.query, all = !request.tap)
-            val matches = findElements(selector, uiDevice, instr)
+            val matches = findElementMatches(selector, uiDevice, instr)
             if (request.tap) {
                 val match =
                     matches.firstOrNull()
                         ?: throw NotFound("element_not_found", "no element matched xpath")
-                val x = match.tap[0]
-                val y = match.tap[1]
-                if (!uiDevice.click(x, y)) throw BadRequest("tap_failed", "UiDevice.click returned false")
-                call.respond(FindTapResp(matched = match, x = x, y = y))
+                val tap = tapMatch(match, uiDevice)
+                call.respond(FindTapResp(matched = match.element, x = tap.x, y = tap.y, action = tap.action))
             } else {
-                call.respond(FindResp(matched = matches.firstOrNull(), elements = matches))
+                val elements = matches.map { it.element }
+                call.respond(FindResp(matched = elements.firstOrNull(), elements = elements))
             }
         }
 
@@ -109,20 +107,29 @@ private fun bySelector(
     else -> null
 }
 
-private fun findElements(
+internal data class ElementMatch(
+    val element: Element,
+    val node: AccessibilityNodeInfo,
+)
+
+internal fun findElementMatches(
     request: SelectorReq,
     uiDevice: UiDevice,
     instr: Instrumentation,
-): List<Element> {
+): List<ElementMatch> {
     request.validate()
     val root = instr.uiAutomation.rootInActiveWindow
-    val elements = TreeWalker.walk(root, uiDevice.displayWidth, uiDevice.displayHeight)
-    val matches = elements.filter { request.matches(it) }
+    val elements = TreeWalker.walkWithNodes(root, uiDevice.displayWidth, uiDevice.displayHeight)
+    val matches =
+        elements
+            .filter { request.matches(it.element) }
+            .map { ElementMatch(it.element, it.node) }
     return if (request.all) matches else matches.take(1)
 }
 
 @Serializable
 data class SelectorReq(
+    val id: Int? = null,
     val text: String? = null,
     val rid: String? = null,
     val desc: String? = null,
@@ -135,6 +142,7 @@ data class SelectorReq(
 ) {
     fun validate() {
         if (
+            id == null &&
             text == null &&
             rid == null &&
             desc == null &&
@@ -148,6 +156,7 @@ data class SelectorReq(
     }
 
     fun matches(element: Element): Boolean {
+        if (id != null && element.id != id) return false
         if (!matchString(element.text, text, exact)) return false
         if (!matchString(element.rid, rid, exact)) return false
         if (!matchString(element.desc, desc, exact)) return false
@@ -193,9 +202,48 @@ private data class FindResp(
 @Serializable
 private data class FindTapResp(
     val matched: Element,
-    val x: Int,
-    val y: Int,
+    val x: Int? = null,
+    val y: Int? = null,
+    val action: String,
 )
+
+private data class TapResult(
+    val x: Int? = null,
+    val y: Int? = null,
+    val action: String,
+)
+
+private fun tapMatch(
+    match: ElementMatch,
+    uiDevice: UiDevice,
+): TapResult {
+    val tap = match.element.tap
+    if (tap != null && tap.size >= 2) {
+        val x = tap[0]
+        val y = tap[1]
+        if (!uiDevice.click(x, y)) throw BadRequest("tap_failed", "UiDevice.click returned false")
+        return TapResult(x = x, y = y, action = "coordinate")
+    }
+
+    if (performAccessibilityClick(match.node)) {
+        return TapResult(action = "accessibility_click")
+    }
+    throw BadRequest(
+        "tap_failed",
+        "matched element has no usable bounds and ACTION_CLICK failed",
+    )
+}
+
+private fun performAccessibilityClick(node: AccessibilityNodeInfo): Boolean {
+    var current: AccessibilityNodeInfo? = node
+    var depth = 0
+    while (current != null && depth < 5) {
+        if (current.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+        current = current.parent
+        depth++
+    }
+    return false
+}
 
 private fun matchString(
     actual: String?,

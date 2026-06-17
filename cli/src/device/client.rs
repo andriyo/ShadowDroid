@@ -316,12 +316,42 @@ impl ServerClient {
         Ok(r.ok)
     }
     pub async fn text(&self, value: &str, clear: bool) -> Result<()> {
-        let _: OkResponse = self
-            .post(
-                "/text",
-                &serde_json::json!({"value": value, "clear": clear}),
-            )
-            .await?;
+        self.text_with_target(value, clear, None).await
+    }
+
+    pub async fn text_with_target(
+        &self,
+        value: &str,
+        clear: bool,
+        target: Option<&SelectorQuery>,
+    ) -> Result<()> {
+        let mut body = serde_json::Map::new();
+        body.insert("value".into(), value.into());
+        body.insert("clear".into(), clear.into());
+        if let Some(target) = target {
+            if let Some(id) = target.id {
+                body.insert("id".into(), id.into());
+            }
+            if let Some(v) = target.text.as_deref() {
+                body.insert("text".into(), v.into());
+            }
+            if let Some(v) = target.rid.as_deref() {
+                body.insert("rid".into(), v.into());
+            }
+            if let Some(v) = target.desc.as_deref() {
+                body.insert("desc".into(), v.into());
+            }
+            if let Some(v) = target.klass.as_deref() {
+                body.insert("klass".into(), v.into());
+            }
+            if let Some(v) = target.xpath.as_deref() {
+                body.insert("xpath".into(), v.into());
+            }
+            if target.exact {
+                body.insert("exact".into(), true.into());
+            }
+        }
+        let _: OkResponse = self.post("/text", &serde_json::Value::Object(body)).await?;
         Ok(())
     }
 

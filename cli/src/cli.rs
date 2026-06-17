@@ -260,11 +260,29 @@ pub enum Cmd {
     },
 
     // ── input (flat) ──────────────────────────────────────────
-    /// Type into the focused field.
+    /// Type into the focused field, or into an element matched by --id/--text/--rid/--desc/--xpath.
     Text {
         value: String,
         #[arg(long)]
         clear: bool,
+        /// Element id from a fresh `screen` dump to receive text.
+        #[arg(long)]
+        id: Option<u32>,
+        /// Match a text-bearing/editable element to receive text.
+        #[arg(long)]
+        text: Option<String>,
+        /// Match by resource-id substring.
+        #[arg(long)]
+        rid: Option<String>,
+        /// Match by content-description substring.
+        #[arg(long)]
+        desc: Option<String>,
+        /// Match by xpath.
+        #[arg(long)]
+        xpath: Option<String>,
+        /// Use exact selector matching instead of substring matching.
+        #[arg(long)]
+        exact: bool,
     },
     /// Press a named key or keycode.
     Key { name: String },
@@ -889,9 +907,24 @@ pub async fn run() -> Result<()> {
             let injected = client.key(&name).await?;
             emit_action("key", &json!({"name":name,"injected":injected}));
         }
-        Cmd::Text { value, clear } => {
-            client.text(&value, clear).await?;
-            emit_action("text", &json!({"value":value,"clear":clear}));
+        Cmd::Text {
+            value,
+            clear,
+            id,
+            text,
+            rid,
+            desc,
+            xpath,
+            exact,
+        } => {
+            let target = text_target_query(id, text, rid, desc, xpath, exact);
+            client
+                .text_with_target(&value, clear, target.as_ref())
+                .await?;
+            emit_action(
+                "text",
+                &json!({"value":value,"clear":clear,"target":target}),
+            );
         }
 
         // ── sync / stream / capture ────────────────────────────
@@ -1677,7 +1710,7 @@ async fn cmd_tap(
         let r = client.xpath_tap(&query).await?;
         emit_action(
             "tap",
-            &json!({"via":"xpath","xpath":query,"x":r.x,"y":r.y,"matched":r.matched}),
+            &json!({"via":"xpath","xpath":query,"x":r.x,"y":r.y,"action":r.action,"matched":r.matched}),
         );
         return Ok(());
     }
@@ -1692,7 +1725,7 @@ async fn cmd_tap(
             .await?;
         emit_action(
             "tap",
-            &json!({"via":"selector","x":r.x,"y":r.y,"matched":r.matched}),
+            &json!({"via":"selector","x":r.x,"y":r.y,"action":r.action,"matched":r.matched}),
         );
         return Ok(());
     }
@@ -1720,22 +1753,42 @@ async fn cmd_tap(
 }
 
 async fn tap_element_id(client: &ServerClient, id: u32) -> Result<()> {
-    let screen = client.screen().await?;
-    let el = screen
-        .elements
-        .iter()
-        .find(|e| e.id == id)
-        .ok_or_else(|| anyhow!("element id {id} out of range (0..{})", screen.element_count))?;
-    let [x, y] = el.tap;
-    client.tap_xy(x, y).await?;
+    let r = client
+        .find_tap(&SelectorQuery {
+            id: Some(id),
+            ..Default::default()
+        })
+        .await?;
     emit_action(
         "tap",
         &json!({
-            "via":"id","id": id, "x": x, "y": y,
-            "matched": {"text": el.text, "rid": el.rid, "desc": el.desc}
+            "via":"id","id": id, "x": r.x, "y": r.y, "action": r.action,
+            "matched": r.matched
         }),
     );
     Ok(())
+}
+
+fn text_target_query(
+    id: Option<u32>,
+    text: Option<String>,
+    rid: Option<String>,
+    desc: Option<String>,
+    xpath: Option<String>,
+    exact: bool,
+) -> Option<SelectorQuery> {
+    if id.is_none() && text.is_none() && rid.is_none() && desc.is_none() && xpath.is_none() {
+        return None;
+    }
+    Some(SelectorQuery {
+        id,
+        text,
+        rid,
+        desc,
+        xpath,
+        exact,
+        ..Default::default()
+    })
 }
 
 async fn cmd_toast(client: &ServerClient, wait_ms: u32) -> Result<()> {

@@ -53,8 +53,8 @@ data class Element(
     val desc: String? = null,
     val klass: String? = null,
     val rid: String? = null,
-    val bounds: List<Int>, // [x1, y1, x2, y2]
-    val tap: List<Int>, // [cx, cy]
+    val bounds: List<Int>? = null, // [x1, y1, x2, y2] when UIA exposes usable bounds
+    val tap: List<Int>? = null, // [cx, cy] when coordinate tapping is possible
     val clickable: Boolean = false,
     val long_clickable: Boolean = false,
     val scrollable: Boolean = false,

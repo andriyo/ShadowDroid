@@ -56,7 +56,7 @@ class HttpServer(
                         StateRoutes.register(this, uiDevice, instrumentation)
                         ScreenRoutes.register(this, uiDevice, instrumentation)
                         GestureRoutes.register(this, uiDevice)
-                        KeyTextRoutes.register(this, uiDevice)
+                        KeyTextRoutes.register(this, uiDevice, instrumentation)
                         AppRoutes.register(this, uiDevice, instrumentation)
                         SystemRoutes.register(this, uiDevice, instrumentation)
                         // M4:

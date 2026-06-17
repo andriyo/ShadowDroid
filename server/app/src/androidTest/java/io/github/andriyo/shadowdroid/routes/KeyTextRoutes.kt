@@ -1,5 +1,8 @@
 package io.github.andriyo.shadowdroid.routes
 
+import android.app.Instrumentation
+import android.os.Bundle
+import android.view.accessibility.AccessibilityNodeInfo
 import androidx.test.uiautomator.By
 import androidx.test.uiautomator.UiDevice
 import io.github.andriyo.shadowdroid.BadRequest
@@ -16,6 +19,7 @@ object KeyTextRoutes {
     fun register(
         route: Route,
         uiDevice: UiDevice,
+        instr: Instrumentation,
     ) {
         route.post("/key") {
             val r: KeyReq = call.receive()
@@ -37,16 +41,27 @@ object KeyTextRoutes {
         }
         route.post("/text") {
             val r: TextReq = call.receive()
-            // Find the focused field. UI Automator finds the focused-input
-            // node via By.focused(true). If clear=true, clear it first.
-            val focused =
-                uiDevice.findObject(By.focused(true))
-                    ?: throw NotFound(
-                        "no_focused_field",
-                        "no element has input focus. Tap a text field first.",
+            val selector = r.selector()
+            if (selector != null) {
+                val match =
+                    findElementMatches(selector, uiDevice, instr).firstOrNull()
+                        ?: throw NotFound("element_not_found", "no element matched text target selector")
+                if (!setAccessibilityText(match.node, r.value)) {
+                    throw BadRequest(
+                        "text_failed",
+                        "matched element rejected ACTION_SET_TEXT",
                     )
-            if (r.clear) focused.clear()
-            focused.text = r.value
+                }
+            } else if (!setFocusedAccessibilityText(instr, r.value)) {
+                val focused =
+                    uiDevice.findObject(By.focused(true))
+                        ?: throw NotFound(
+                            "no_focused_field",
+                            "no element has input focus. Tap a text field first, or pass --id/--text/--rid/--desc/--xpath.",
+                        )
+                if (r.clear) focused.clear()
+                focused.text = r.value
+            }
             call.respond(OkResponse())
         }
     }
@@ -97,4 +112,49 @@ private data class KeyReq(
 private data class TextReq(
     val value: String,
     val clear: Boolean = false,
-)
+    val id: Int? = null,
+    val text: String? = null,
+    val rid: String? = null,
+    val desc: String? = null,
+    val klass: String? = null,
+    val xpath: String? = null,
+    val exact: Boolean = false,
+) {
+    fun selector(): SelectorReq? {
+        if (id == null && text == null && rid == null && desc == null && klass == null && xpath == null) {
+            return null
+        }
+        return SelectorReq(
+            id = id,
+            text = text,
+            rid = rid,
+            desc = desc,
+            klass = klass,
+            xpath = xpath,
+            exact = exact,
+        )
+    }
+}
+
+private fun setFocusedAccessibilityText(
+    instr: Instrumentation,
+    value: String,
+): Boolean {
+    val root = instr.uiAutomation.rootInActiveWindow ?: return false
+    val focused =
+        root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+            ?: root.findFocus(AccessibilityNodeInfo.FOCUS_ACCESSIBILITY)
+            ?: return false
+    return setAccessibilityText(focused, value)
+}
+
+private fun setAccessibilityText(
+    node: AccessibilityNodeInfo,
+    value: String,
+): Boolean {
+    val args =
+        Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value)
+        }
+    return node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+}

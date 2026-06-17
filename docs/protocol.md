@@ -80,7 +80,7 @@ Query params:
 }
 ```
 
-Element selection rule (server side): include a node if it is `clickable || long-clickable || scrollable || checkable || has non-empty text/contentDescription || is EditText`. Pure layout containers are dropped.
+Element selection rule (server side): include a node if it is `clickable || long-clickable || scrollable || checkable || has non-empty text/contentDescription || is EditText`. Pure layout containers are dropped. If UI Automator exposes an otherwise useful node with zero/invalid bounds, the element is still included but `bounds` and `tap` are omitted/null; selector actions can still use accessibility actions on those nodes. `focused` is true for either input focus or accessibility focus, which helps TV D-pad surfaces.
 
 ### `GET /v1/screenshot.png`
 
@@ -118,7 +118,7 @@ Use `name` for the common cases; `code` for anything else. One or the other.
 {"value": "any unicode text including \n and special chars", "clear": false}
 ```
 
-The text is set via `UiObject2.setText(...)` on the focused element. If `clear: true`, calls `clear()` first.
+By default, text targets the focused input. The same selector fields as `/v1/find` may be included (`id`, `text`, `rid`, `desc`, `klass`, `xpath`, `exact`) to target a specific element; selector-targeted text uses accessibility `ACTION_SET_TEXT`, which bypasses custom on-screen keyboards.
 
 ## 5. Selectors (server-side find + act)
 
@@ -127,13 +127,13 @@ These run a UI Automator `By` query *on the live tree* — cheaper than dumping 
 ### `POST /v1/find`
 
 ```json
-{"text": "...", "rid": "...", "desc": "...", "klass": "...", "xpath": "...", "all": false}
+{"id": 5, "text": "...", "rid": "...", "desc": "...", "klass": "...", "xpath": "...", "all": false}
 ```
 Returns one or many elements in the same shape as `/v1/screen` elements. Substring match on text/rid/desc by default; pass `"exact": true` for exact.
 
 ### `POST /v1/find_tap`
 
-Same body as `/v1/find` but performs a tap on the first match. Returns `{"matched": {...element}, "x": int, "y": int}`.
+Same body as `/v1/find` but performs a tap on the first match. If a match has a usable tap point, the server uses a coordinate tap. If it has no usable bounds, the server falls back to accessibility `ACTION_CLICK` on the matched node or a clickable parent. Returns `{"matched": {...element}, "x": int|null, "y": int|null, "action": "coordinate|accessibility_click"}`.
 
 ### `POST /v1/xpath`
 

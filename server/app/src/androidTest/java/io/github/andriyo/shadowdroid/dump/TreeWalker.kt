@@ -19,12 +19,23 @@ import java.security.MessageDigest
  * dump. After any UI change the agent must re-dump.
  */
 object TreeWalker {
+    data class WalkedElement(
+        val element: Element,
+        val node: AccessibilityNodeInfo,
+    )
+
     fun walk(
         root: AccessibilityNodeInfo?,
         viewportW: Int,
         viewportH: Int,
-    ): List<Element> {
-        val elements = mutableListOf<Element>()
+    ): List<Element> = walkWithNodes(root, viewportW, viewportH).map { it.element }
+
+    fun walkWithNodes(
+        root: AccessibilityNodeInfo?,
+        viewportW: Int,
+        viewportH: Int,
+    ): List<WalkedElement> {
+        val elements = mutableListOf<WalkedElement>()
         if (root == null) return elements
         visit(root, elements, viewportW, viewportH)
         return elements
@@ -32,7 +43,7 @@ object TreeWalker {
 
     private fun visit(
         node: AccessibilityNodeInfo,
-        out: MutableList<Element>,
+        out: MutableList<WalkedElement>,
         vw: Int,
         vh: Int,
     ) {
@@ -61,34 +72,50 @@ object TreeWalker {
             val bounds = Rect().also { node.getBoundsInScreen(it) }
             // Skip elements completely outside the viewport (off-screen pages in
             // a ViewPager etc.) — their tap points would be nonsense.
-            val onScreen =
+            val hasUsableBounds =
+                bounds.width() > 0 &&
+                    bounds.height() > 0 &&
                 bounds.right > 0 &&
-                    bounds.bottom > 0 &&
-                    bounds.left < vw &&
-                    bounds.top < vh &&
-                    bounds.width() > 0 &&
-                    bounds.height() > 0
-            if (onScreen) {
+                bounds.bottom > 0 &&
+                bounds.left < vw &&
+                bounds.top < vh
+            val isPositiveButOffscreen =
+                bounds.width() > 0 &&
+                    bounds.height() > 0 &&
+                    !hasUsableBounds
+            if (!isPositiveButOffscreen) {
+                val boundsList =
+                    if (hasUsableBounds) {
+                        listOf(bounds.left, bounds.top, bounds.right, bounds.bottom)
+                    } else {
+                        null
+                    }
+                val tapList =
+                    boundsList?.let { listOf((it[0] + it[2]) / 2, (it[1] + it[3]) / 2) }
                 out +=
-                    Element(
-                        id = out.size,
-                        text = text.ifEmpty { null },
-                        desc = desc.ifEmpty { null },
-                        klass = cls.substringAfterLast('.').ifEmpty { null },
-                        rid = rid.ifEmpty { null },
-                        bounds = listOf(bounds.left, bounds.top, bounds.right, bounds.bottom),
-                        tap = listOf((bounds.left + bounds.right) / 2, (bounds.top + bounds.bottom) / 2),
-                        clickable = node.isClickable,
-                        long_clickable = node.isLongClickable,
-                        scrollable = node.isScrollable,
-                        checkable = node.isCheckable,
-                        focusable = node.isFocusable,
-                        enabled = node.isEnabled,
-                        selected = node.isSelected,
-                        checked = node.isChecked,
-                        focused = node.isFocused,
-                        password = node.isPassword,
-                        input = isInput,
+                    WalkedElement(
+                        element =
+                            Element(
+                                id = out.size,
+                                text = text.ifEmpty { null },
+                                desc = desc.ifEmpty { null },
+                                klass = cls.substringAfterLast('.').ifEmpty { null },
+                                rid = rid.ifEmpty { null },
+                                bounds = boundsList,
+                                tap = tapList,
+                                clickable = node.isClickable,
+                                long_clickable = node.isLongClickable,
+                                scrollable = node.isScrollable,
+                                checkable = node.isCheckable,
+                                focusable = node.isFocusable,
+                                enabled = node.isEnabled,
+                                selected = node.isSelected,
+                                checked = node.isChecked,
+                                focused = node.isFocused || node.isAccessibilityFocused,
+                                password = node.isPassword,
+                                input = isInput,
+                            ),
+                        node = node,
                     )
             }
         }
@@ -118,7 +145,7 @@ object TreeWalker {
             md.update(e.desc.orEmpty().toByteArray())
             md.update(e.rid.orEmpty().toByteArray())
             md.update(e.klass.orEmpty().toByteArray())
-            md.update(e.bounds.joinToString(",").toByteArray())
+            md.update(e.bounds?.joinToString(",").orEmpty().toByteArray())
             md.update(
                 byteArrayOf(
                     if (e.clickable) 1 else 0,

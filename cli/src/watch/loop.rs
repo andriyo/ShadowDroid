@@ -364,8 +364,8 @@ enum DispatchOutcome {
 #[derive(Debug, Clone)]
 struct TapOutcome {
     id: Option<u32>,
-    x: i32,
-    y: i32,
+    x: Option<i32>,
+    y: Option<i32>,
     source: String,
 }
 
@@ -438,8 +438,13 @@ async fn dispatch_command(
         "text" => {
             let value = req_str(cmd, "value")?;
             let clear = opt_bool(cmd, "clear").unwrap_or(false);
-            cfg.client.text(value, clear).await?;
-            emit_json(json!({"type":"action","cmd":"text","value":value,"clear":clear}));
+            let target = selector_query_from_cmd(cmd)?;
+            cfg.client
+                .text_with_target(value, clear, target.as_ref())
+                .await?;
+            emit_json(
+                json!({"type":"action","cmd":"text","value":value,"clear":clear,"target":target}),
+            );
         }
         "launch" => {
             let package = req_str(cmd, "package")?;
@@ -560,7 +565,7 @@ async fn dispatch_command(
             let start_hash = state.last_hash.clone();
             let r = cfg.client.find_tap(&query).await?;
             emit_json(
-                json!({"type":"action","cmd":base_op,"value":value,"x":r.x,"y":r.y,"matched":r.matched}),
+                json!({"type":"action","cmd":base_op,"value":value,"x":r.x,"y":r.y,"action":r.action,"matched":r.matched}),
             );
             if op.ends_with("_and_wait") {
                 wait_after_action(
@@ -573,7 +578,7 @@ async fn dispatch_command(
                         id: Some(r.matched.id),
                         x: r.x,
                         y: r.y,
-                        source: "server".to_string(),
+                        source: r.action.unwrap_or_else(|| "server".to_string()),
                     }),
                 )
                 .await?;
@@ -591,7 +596,7 @@ async fn dispatch_command(
             let query = req_any_str(cmd, &["query", "value"])?;
             let r = cfg.client.xpath_tap(query).await?;
             emit_json(
-                json!({"type":"action","cmd":"xpath_tap","query":query,"x":r.x,"y":r.y,"matched":r.matched}),
+                json!({"type":"action","cmd":"xpath_tap","query":query,"x":r.x,"y":r.y,"action":r.action,"matched":r.matched}),
             );
         }
         "toast" => {
@@ -689,31 +694,23 @@ async fn dispatch_tap(
                 );
             }
         }
-        let (el, source) = if let Some(el) = cached_element_by_id(state, id) {
-            (el, "cache".to_string())
-        } else {
-            let screen = cfg.client.screen().await?;
-            let el = screen
-                .elements
-                .iter()
-                .find(|el| el.id == id)
-                .cloned()
-                .ok_or_else(|| anyhow!("element id {id} is not present in the latest screen"))?;
-            state.last_hash = Some(screen.screen_hash.clone());
-            state.last_screen = Some(screen);
-            (el, "fresh".to_string())
-        };
-        let [x, y] = el.tap;
-        cfg.client.tap_xy(x, y).await?;
+        let r = cfg
+            .client
+            .find_tap(&SelectorQuery {
+                id: Some(id),
+                ..Default::default()
+            })
+            .await?;
+        let source = r.action.clone().unwrap_or_else(|| "server".to_string());
         emit_json(json!({
-            "type":"action","cmd":action_cmd,"id":id,"x":x,"y":y,
+            "type":"action","cmd":action_cmd,"id":id,"x":r.x,"y":r.y,
             "source":source,
-            "matched":{"text":el.text,"rid":el.rid,"desc":el.desc}
+            "matched":r.matched
         }));
         return Ok(TapOutcome {
             id: Some(id),
-            x,
-            y,
+            x: r.x,
+            y: r.y,
             source,
         });
     }
@@ -724,20 +721,10 @@ async fn dispatch_tap(
     emit_json(json!({"type":"action","cmd":action_cmd,"x":x,"y":y,"source":"coordinates"}));
     Ok(TapOutcome {
         id: None,
-        x,
-        y,
+        x: Some(x),
+        y: Some(y),
         source: "coordinates".to_string(),
     })
-}
-
-fn cached_element_by_id(state: &WatchState, id: u32) -> Option<Element> {
-    state
-        .last_screen
-        .as_ref()?
-        .elements
-        .iter()
-        .find(|el| el.id == id)
-        .cloned()
 }
 
 async fn wait_after_action(
@@ -899,6 +886,34 @@ fn selector_string_matches(actual: Option<&str>, expected: Option<&str>) -> bool
     actual
         .map(|actual| actual.to_lowercase().contains(&expected.to_lowercase()))
         .unwrap_or(false)
+}
+
+fn selector_query_from_cmd(cmd: &Value) -> Result<Option<SelectorQuery>> {
+    let id = opt_u32(cmd, "id")?;
+    let text = cmd.get("text").and_then(Value::as_str).map(String::from);
+    let rid = cmd.get("rid").and_then(Value::as_str).map(String::from);
+    let desc = cmd.get("desc").and_then(Value::as_str).map(String::from);
+    let klass = cmd.get("klass").and_then(Value::as_str).map(String::from);
+    let xpath = cmd.get("xpath").and_then(Value::as_str).map(String::from);
+    if id.is_none()
+        && text.is_none()
+        && rid.is_none()
+        && desc.is_none()
+        && klass.is_none()
+        && xpath.is_none()
+    {
+        return Ok(None);
+    }
+    Ok(Some(SelectorQuery {
+        id,
+        text,
+        rid,
+        desc,
+        klass,
+        xpath,
+        exact: opt_bool(cmd, "exact").unwrap_or(false),
+        ..Default::default()
+    }))
 }
 
 async fn write_screenshot(client: &ServerClient, path: Option<String>) -> Result<(String, u64)> {

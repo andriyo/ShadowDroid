@@ -52,8 +52,10 @@ pub struct Element {
     pub klass: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rid: Option<String>,
-    pub bounds: [i32; 4],
-    pub tap: [i32; 2],
+    #[serde(default)]
+    pub bounds: Option<[i32; 4]>,
+    #[serde(default)]
+    pub tap: Option<[i32; 2]>,
     // Flags are omitted from serialized `screen --full` / `find --full` output
     // when they hold their default, so the agent only pays tokens for what's
     // set. `enabled` defaults to true, so it's the inverse — emitted only when an
@@ -134,6 +136,8 @@ pub struct ShellResp {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SelectorQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rid: Option<String>,
@@ -162,8 +166,12 @@ pub struct FindResp {
 #[derive(Debug, Clone, Deserialize)]
 pub struct FindTapResp {
     pub matched: Element,
-    pub x: i32,
-    pub y: i32,
+    #[serde(default)]
+    pub x: Option<i32>,
+    #[serde(default)]
+    pub y: Option<i32>,
+    #[serde(default)]
+    pub action: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -264,8 +272,8 @@ mod tests {
             desc: None,
             klass: None,
             rid: None,
-            bounds: [0, 0, 10, 10],
-            tap: [5, 5],
+            bounds: Some([0, 0, 10, 10]),
+            tap: Some([5, 5]),
             clickable: true,
             long_clickable: false,
             scrollable: false,

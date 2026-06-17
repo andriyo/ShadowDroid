@@ -754,7 +754,7 @@ Read the screen, act by **selector** (don't hard-code coordinates), confirm.
 ```bash
 shadowdroid screen | jq '.elements[] | {id, text, rid, tap}'
 shadowdroid tap --text "Sign in"        # or --rid / --desc / --xpath, or `tap <id>`
-shadowdroid text "alice@example.com"    # types into the focused field
+shadowdroid text "alice@example.com"    # focused field; add --rid/--text/--id to target one
 shadowdroid key enter
 shadowdroid scroll-to --text "Privacy" --tap   # scroll a list until found, then tap
 shadowdroid wait --text "Welcome" --timeout-ms 8000   # block until it appears

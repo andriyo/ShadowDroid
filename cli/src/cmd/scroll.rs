@@ -14,7 +14,7 @@
 use anyhow::{bail, Result};
 
 use crate::device::client::ServerClient;
-use crate::proto::{Element, ScrollResp};
+use crate::proto::{Element, ScrollResp, SelectorQuery};
 
 #[derive(clap::Args)]
 pub struct ScrollArgs {
@@ -79,6 +79,23 @@ impl Selector {
             Selector::Desc(q) => serde_json::json!({ "desc": q }),
         }
     }
+
+    fn query(&self) -> SelectorQuery {
+        match self {
+            Selector::Text(q) => SelectorQuery {
+                text: Some(q.clone()),
+                ..Default::default()
+            },
+            Selector::Rid(q) => SelectorQuery {
+                rid: Some(q.clone()),
+                ..Default::default()
+            },
+            Selector::Desc(q) => SelectorQuery {
+                desc: Some(q.clone()),
+                ..Default::default()
+            },
+        }
+    }
 }
 
 pub async fn run(client: &ServerClient, args: &ScrollArgs) -> Result<()> {
@@ -110,9 +127,9 @@ pub async fn run(client: &ServerClient, args: &ScrollArgs) -> Result<()> {
     loop {
         let screen = client.screen().await?;
         if let Some(el) = screen.elements.iter().find(|e| selector.matches(e)) {
-            let el = el.clone();
+            let mut el = el.clone();
             if args.tap {
-                client.tap_xy(el.tap[0], el.tap[1]).await?;
+                el = client.find_tap(&selector.query()).await?.matched;
             }
             return emit(&selector, true, swipes, "found", Some(&el), args.tap);
         }
@@ -159,9 +176,8 @@ async fn swipe(
     container: Option<&&Element>,
     duration_ms: u32,
 ) -> Result<()> {
-    match container {
-        Some(el) => {
-            let [x1, y1, x2, y2] = el.bounds;
+    match container.and_then(|el| el.bounds) {
+        Some([x1, y1, x2, y2]) => {
             let (sx, sy, ex, ey) = swipe_within(x1, y1, x2, y2, finger_dir);
             client.swipe(sx, sy, ex, ey, duration_ms).await
         }
