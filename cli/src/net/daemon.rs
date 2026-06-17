@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use tokio::net::UnixListener;
+use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::events::{self, Event};
@@ -81,11 +81,16 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         });
     }
 
-    // Control socket.
-    let sock = paths::sock_path(&cfg.serial)?;
-    let _ = std::fs::remove_file(&sock); // clear any stale socket
-    let listener = UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))?;
-    tracing::info!("net daemon up: proxy :{}, control {}", cfg.port, sock.display());
+    // Control socket — loopback TCP on an ephemeral port (cross-platform; a
+    // Unix domain socket wouldn't build on Windows). The chosen port is written
+    // to a `.ctl` file that clients read to find us.
+    let listener = TcpListener::bind(("127.0.0.1", 0u16))
+        .await
+        .context("bind control socket")?;
+    let ctl_port = listener.local_addr().context("control addr")?.port();
+    let ctl_path = paths::ctl_path(&cfg.serial)?;
+    std::fs::write(&ctl_path, ctl_port.to_string()).context("write control port file")?;
+    tracing::info!("net daemon up: proxy :{}, control 127.0.0.1:{}", cfg.port, ctl_port);
 
     let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
     loop {
@@ -106,7 +111,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
 
     // Teardown.
     let _ = proxy_stop_tx.send(());
-    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_file(&ctl_path);
     let _ = std::fs::remove_file(paths::pid_path(&cfg.serial)?);
     tracing::info!("net daemon stopped");
     Ok(())

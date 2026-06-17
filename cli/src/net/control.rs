@@ -1,5 +1,6 @@
-//! Control plane: line-delimited JSON over the daemon's Unix socket
-//! (`~/.shadowdroid/net/<serial>.sock`).
+//! Control plane: line-delimited JSON over the daemon's loopback-TCP control
+//! socket. The chosen port lives in `~/.shadowdroid/net/<serial>.ctl` (TCP
+//! rather than a Unix domain socket so `net` builds + runs on Windows too).
 //!
 //! Why a socket (not the existing `watch` stdin model): a *held* intercepted
 //! flow must survive across the agent's discrete one-shot `net` commands —
@@ -15,7 +16,8 @@ use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixStream, unix::OwnedWriteHalf};
+use tokio::net::tcp::OwnedWriteHalf;
+use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::events::Event;
@@ -36,7 +38,7 @@ pub struct DaemonState {
 /// Serve one control connection. `shared` lets future ops mutate proxy knobs;
 /// `stop_tx` lets the `stop` op shut the daemon down.
 pub async fn serve_client(
-    stream: UnixStream,
+    stream: TcpStream,
     state: Arc<DaemonState>,
     shared: Arc<SharedState>,
     stop_tx: mpsc::Sender<()>,
@@ -337,10 +339,16 @@ async fn write_json(wr: &mut OwnedWriteHalf, v: &Value) -> Result<()> {
 
 /// Is a daemon for `serial` reachable on its control socket?
 pub async fn is_running(serial: &str) -> bool {
-    match paths::sock_path(serial) {
-        Ok(sock) => UnixStream::connect(&sock).await.is_ok(),
-        Err(_) => false,
+    match read_ctl_port(serial) {
+        Some(port) => TcpStream::connect(("127.0.0.1", port)).await.is_ok(),
+        None => false,
     }
+}
+
+/// The daemon's loopback control port from its `.ctl` file, if present.
+fn read_ctl_port(serial: &str) -> Option<u16> {
+    let path = paths::ctl_path(serial).ok()?;
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 /// The daemon pid from its pidfile, if present + parseable.
@@ -349,13 +357,12 @@ pub fn daemon_pid(serial: &str) -> Option<u32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-async fn connect(serial: &str) -> Result<UnixStream> {
-    let sock = paths::sock_path(serial)?;
-    UnixStream::connect(&sock).await.map_err(|e| {
-        anyhow!(
-            "cannot reach the net proxy daemon ({}): {e}. Is `shadowdroid net start` running?",
-            sock.display()
-        )
+async fn connect(serial: &str) -> Result<TcpStream> {
+    let port = read_ctl_port(serial).ok_or_else(|| {
+        anyhow!("no net proxy daemon for {serial}. Is `shadowdroid net start` running?")
+    })?;
+    TcpStream::connect(("127.0.0.1", port)).await.map_err(|e| {
+        anyhow!("cannot reach the net proxy daemon on 127.0.0.1:{port}: {e}. Is `net start` running?")
     })
 }
 

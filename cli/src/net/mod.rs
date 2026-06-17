@@ -8,8 +8,9 @@
 //! Architecture (see `docs/net-proxy-plan.md`):
 //!   - The proxy runs as a **background daemon** ([daemon]) so a *held*
 //!     intercepted flow survives across the agent's discrete one-shot commands.
-//!   - Control is a Unix socket under `~/.shadowdroid/net/` ([paths]); `net
-//!     resume`/`drop`/`status`/… are short-lived clients of it ([control]).
+//!   - Control is a loopback-TCP socket (port in a `.ctl` file under
+//!     `~/.shadowdroid/net/`, [paths]); `net resume`/`drop`/`status`/… are
+//!     short-lived clients of it ([control]).
 //!   - The device is pointed at the proxy with `adb reverse` + `settings put
 //!     global http_proxy` ([commands::start]); trust via the ShadowDroid CA
 //!     ([ca], installed by [trust]).

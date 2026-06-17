@@ -40,8 +40,10 @@ pub fn ca_key_path() -> Result<PathBuf> {
     Ok(net_dir()?.join("ca.key"))
 }
 
-pub fn sock_path(serial: &str) -> Result<PathBuf> {
-    Ok(net_dir()?.join(format!("{}.sock", sanitize(serial))))
+/// The control endpoint file — stores the daemon's loopback-TCP control port.
+/// (TCP rather than a Unix socket so `net` builds + runs on Windows too.)
+pub fn ctl_path(serial: &str) -> Result<PathBuf> {
+    Ok(net_dir()?.join(format!("{}.ctl", sanitize(serial))))
 }
 
 pub fn session_log_path(serial: &str) -> Result<PathBuf> {
