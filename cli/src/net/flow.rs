@@ -1,7 +1,7 @@
 //! Captured-flow model + conversion to the `http` event / `net show` detail.
 //!
 //! A [FlowRecord] is the full record persisted to the session log (headers +
-//! textual bodies, capped). The live `net watch` stream and `net log` emit the
+//! textual bodies, capped). The live `watch` stream and `net log` emit the
 //! *compact* [crate::events::Event::Http] derived from it; `net show` returns
 //! the full detail. Binary bodies are not stored verbatim (kept lean + readable)
 //! — only textual content (JSON/text/xml/form) is captured, up to [BODY_CAP].

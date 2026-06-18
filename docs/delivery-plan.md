@@ -56,7 +56,7 @@ shadowdroid connect             # → reinstalls, ~3s
 
 **In:**
 - Server: implement `ScreenRoutes`, `GestureRoutes`, `KeyTextRoutes`, `AppRoutes`, `SystemRoutes` (everything except Toast/xpath/find — those are M4).
-- CLI: every protocol-backed one-shot command — `screen`, `tap`, `swipe`, `text`, `app start`, etc.
+- CLI: every protocol-backed one-shot command — `ui dump`, `ui tap`, `ui swipe`, `ui text`, `app start`, etc.
 - Element model: server flattens the UI Automator XML into our element JSON shape *on device* (cheaper than shipping XML over loopback).
 
 **Out:** the watch loop, crash detection, watchers, xpath, find.
@@ -64,9 +64,9 @@ shadowdroid connect             # → reinstalls, ~3s
 **Demo:**
 ```bash
 shadowdroid app start com.livd
-shadowdroid screen | jq '.elements | length'    # → 17
-shadowdroid tap --text Profile                  # (uses /v1/find_tap)
-shadowdroid screenshot /tmp/profile.png
+shadowdroid ui dump | jq '.elements | length'   # → 17
+shadowdroid ui tap --text Profile               # (uses /v1/find_tap)
+shadowdroid ui screenshot /tmp/profile.png
 shadowdroid device shell "getprop ro.product.model"
 ```
 

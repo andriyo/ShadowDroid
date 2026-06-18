@@ -13,19 +13,20 @@ layout inspection — all at roughly **25 ms per UI dump**, fast enough that the
 agent loop never stalls.
 
 There's no test DSL and no extra runtime to babysit — just the CLI and `adb`.
-Every action is one subcommand that prints one line of JSON: `shadowdroid <verb>`
-in, a JSON event out. That makes it trivial to wire into any agent — point it at
-the command catalog and let it drive.
+Every action is one command that prints one line of JSON: `shadowdroid ui …` for
+live UI automation, `shadowdroid app …` for app lifecycle, `shadowdroid net …`
+for HTTP(S) traffic, and so on. That makes it trivial to wire into any agent —
+point it at the command catalog and let it drive.
 
 ```jsonc
-$ shadowdroid screen
+$ shadowdroid ui dump
 {"screen_hash":"a1b2…","viewport":{"w":1080,"h":2424},"current_app":{…},"element_count":42,
  "elements":[{"id":7,"rid":"main_tab_profile","tap":[980,2256],"clickable":true}, …]}
 
-$ shadowdroid tap --rid main_tab_profile
+$ shadowdroid ui tap --rid main_tab_profile
 {"type":"action","cmd":"tap","via":"selector","x":980,"y":2256,"matched":true}
 
-$ shadowdroid wait --text "Welcome back" --timeout-ms 5000
+$ shadowdroid ui wait --text "Welcome back" --timeout-ms 5000
 {"type":"action","cmd":"wait","matched":true,"gone":false,"screen_hash":"c3d4…"}
 ```
 
@@ -176,36 +177,37 @@ shadowdroid config validate --json
 
 ## What you can drive
 
-Every verb prints a single JSON event. Selectors are consistent across commands:
+Every command prints a single JSON event. Selectors are consistent across commands:
 `--text`, `--rid` (resource id), `--desc` (content description), and `--xpath`.
-A typical agent reads `screen` once, acts by `--rid`/`--text`, and re-reads only
+A typical agent reads `ui dump` once, acts by `--rid`/`--text`, and re-reads only
 when `screen_hash` changes.
 
 | Group            | Commands                                                                                          |
 | ---------------- | ------------------------------------------------------------------------------------------------- |
-| **Observe**      | `screen` (flat element list), `screenshot`, `find` (by selector), `layout snapshot` / `layout diff` |
-| **Interact**     | `tap` (by id / coords / selector), `double-tap`, `long-tap`, `swipe`, `drag`, `swipe-ext`, `pinch`, `scroll-to` |
-| **Input**        | `text`, `key`, `back`, `home`                                                                      |
-| **Synchronize**  | `wait` (element / activity / package, or `--gone`), `toast`, `watch` (stream events + declarative watchers) |
+| **UI**           | `ui dump`, `ui screenshot`, `ui find`, `ui tap`, `ui double-tap`, `ui long-tap`, `ui swipe`, `ui drag`, `ui swipe-ext`, `ui pinch`, `ui scroll-to`, `ui text`, `ui key`, `ui back`, `ui home`, `ui wait`, `ui toast` |
+| **Watch**        | `watch` (screen changes, crashes, toasts, watcher actions, and HTTP events when `net start` is running) |
+| **Layout**       | `layout snapshot` / `layout diff` / `layout source` / `layout recompositions`                      |
 | **App**          | `app start` / `stop` / `install` / `reinstall` / `clear` / `info` / `wait` / `current`             |
 | **Permissions**  | `perm grant` / `revoke` / `list` / `reset`, `appops get` / `set`                                   |
 | **Device**       | `device info` / `shell` / `wake` / `sleep` / `unlock` / `orientation` / `clipboard` / `notifications` / `quick-settings` / `open-url` |
 | **Files**        | `files ls` / `push` / `pull`                                                                       |
-| **Network**      | `net check` / `trust` / `start` / `stop` / `status`, `net watch` / `log` / `show` / `export`, `net intercept` / `resume` / `drop` / `respond`, `net rule …` / `replay` |
+| **Network**      | `net check` / `trust` / `start` / `stop` / `status`, `net log` / `show` / `export`, `net intercept` / `resume` / `drop` / `respond`, `net rule …` / `replay` |
 | **Display**      | `profile snapshot` / `apply` / `reset` (animations, font, density, size, rotation)                 |
 | **Debug**        | `debug auto` / `snapshot` / `record` / `replay`, `debug attach` / `break` / `stack` / `variables` / `eval` / `inspect`, `debug native` / `tombstones` / `coroutines`, `debug run-until-crash` |
 | **Session**      | `devices`, `connect`, `disconnect`, `doctor`, `collect`, `config`, `update`, `commands`, `skill`, `studio`, `init` |
 
 `watch` is the streaming workhorse — it emits debounced, hash-diffed `screen`
-events plus `crash`, `toast`, and `watcher_fired` events as JSON lines, so an
-agent can follow a live app and react to popups and crashes without polling.
+events plus `crash`, `toast`, `watcher_fired`, and `http` events when a `net`
+proxy is running. If network capture is not available, `watch` emits a structured
+`warning` event with the suggested recovery command, so an agent can decide
+whether to run `net start` or continue UI/crash-only (`watch --no-net`).
 
 `net` is an embedded MITM proxy (built into the single binary — no Python, no
 external mitmproxy). `net start` points the device at it; decrypted HTTP(S)
 transactions then stream as `http` events on the same timeline as `screen`
-(`watch --net` interleaves them). Beyond observing, the agent can **intercept** a
-flow — `net intercept` pauses matching requests/responses and emits them as
-`http_intercept` events; the agent inspects with `net show`, then releases with
+when `watch` is running. Beyond observing, the agent can **intercept** a flow —
+`net intercept` pauses matching requests/responses and emits them as
+`http_intercept` events on `watch`; the agent inspects with `net show`, then releases with
 `net resume --set-status/--body/…`, `net drop`, or `net respond` (a canned
 reply). Repeated edits can be promoted to declarative `net rule`s (map-local /
 map-remote / set-status / set-header / replace / block / delay) or served offline
@@ -258,9 +260,9 @@ See [docs/agent-debugging.md](docs/agent-debugging.md).
 ## Agent integration
 
 ShadowDroid is self-describing. `shadowdroid commands --json` emits the full
-command catalog (names, nesting, args, help) straight from the CLI definition —
-the machine-readable counterpart to `--help` that an agent reads once to discover
-the whole tool.
+command catalog (names, nesting, args, help, and agent-facing decision hints)
+straight from the CLI definition — the machine-readable counterpart to `--help`
+that an agent reads once to discover the whole tool.
 
 `shadowdroid init` installs/updates global agent skills automatically.
 Project-scoped Codex `AGENTS.md` remains explicit so installers do not write

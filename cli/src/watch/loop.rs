@@ -48,7 +48,7 @@ pub struct WatchConfig {
     pub watcher_files: Vec<String>,
     pub permission_dialog_policy: PermissionDialogPolicy,
     pub screen_format: ScreenFormat,
-    /// Also interleave live `http` events from a running `net` proxy daemon.
+    /// Interleave live `http` events from a running `net` proxy daemon.
     pub net: bool,
 }
 
@@ -66,6 +66,8 @@ struct WatchState {
 pub async fn run(cfg: WatchConfig) -> Result<()> {
     let watchers = WatcherSet::from_files(&cfg.watcher_files)?;
     watchers.set_permission_dialog_policy(cfg.permission_dialog_policy);
+    let (watch_tx, mut watch_rx) = mpsc::channel::<WatchMsg>(128);
+    let (event_tx, mut event_rx) = mpsc::channel::<Event>(64);
     let state = cfg
         .client
         .state()
@@ -80,22 +82,14 @@ pub async fn run(cfg: WatchConfig) -> Result<()> {
         ts: now_ts(),
     });
 
-    // `--net`: tail a running net proxy daemon's live HTTP events onto the same
-    // stdout timeline (best-effort; silently no-ops if no `net start` is up).
+    // Network capture is part of the default watch posture: if a proxy daemon is
+    // running, HTTP lines join the same stdout timeline as screen/crash lines. If
+    // it is not running, emit a structured warning so an agent can decide whether
+    // to run `net start` or continue UI-only.
     // println! locks stdout per line, so http/screen lines interleave cleanly.
     if cfg.net {
-        let serial = cfg.serial.clone();
-        tokio::spawn(async move {
-            let _ = crate::net::control::request_stream(
-                &serial,
-                serde_json::json!({"op": "watch", "matcher": {}}),
-            )
-            .await;
-        });
+        spawn_net_events(cfg.serial.clone(), event_tx.clone());
     }
-
-    let (watch_tx, mut watch_rx) = mpsc::channel::<WatchMsg>(128);
-    let (event_tx, mut event_rx) = mpsc::channel::<Event>(64);
 
     spawn_wake_logcat(cfg.serial.clone(), watch_tx.clone(), event_tx.clone());
     if cfg.detect_crashes {
@@ -142,6 +136,26 @@ pub async fn run(cfg: WatchConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn spawn_net_events(serial: String, event_tx: mpsc::Sender<Event>) {
+    tokio::spawn(async move {
+        let req = serde_json::json!({"op": "watch", "matcher": {}});
+        if let Err(err) = crate::net::control::request_stream(&serial, req).await {
+            let _ = event_tx
+                .send(Event::Warning {
+                    stage: "net_watch".to_string(),
+                    msg: format!("network events unavailable: {err}"),
+                    suggested_command: Some("shadowdroid net start".to_string()),
+                    hint: Some(
+                        "Run `shadowdroid net start` to add HTTP(S) events to this watch timeline, then restart watch; use `watch --no-net` for UI/crash-only streams."
+                            .to_string(),
+                    ),
+                    ts: now_ts(),
+                })
+                .await;
+        }
+    });
 }
 
 fn spawn_crash_detector(serial: String, app_filter: Option<String>, event_tx: mpsc::Sender<Event>) {

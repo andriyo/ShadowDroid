@@ -547,10 +547,12 @@ mod tests {
     fn command_reference_expands_core_and_points_to_catalog_for_tail() {
         let r = command_reference();
         // Core driving verbs are expanded with detail…
-        assert!(r.contains("- **`tap`**"), "{r}");
-        assert!(r.contains("- **`screen`**"), "{r}");
+        assert!(r.contains("- **`ui`**"), "{r}");
+        assert!(r.contains("  - `ui dump`"), "{r}");
+        assert!(r.contains("  - `ui tap`"), "{r}");
         // …and a previously blank gesture now carries help text.
-        assert!(r.contains("- **`swipe`** — Swipe"), "{r}");
+        assert!(r.contains("  - `ui swipe` — Swipe"), "{r}");
+        assert!(r.contains("- **`watch`**"), "{r}");
         // The advanced long tail is not expanded inline (no subcommands)…
         assert!(!r.contains("debug variables"), "{r}");
         // …but stays discoverable via the pointer line.
@@ -629,23 +631,7 @@ fn command_reference() -> String {
         "doctor",
         "collect",
         "config",
-        "screen",
-        "screenshot",
-        "find",
-        "tap",
-        "double-tap",
-        "long-tap",
-        "swipe",
-        "drag",
-        "swipe-ext",
-        "pinch",
-        "scroll-to",
-        "text",
-        "key",
-        "back",
-        "home",
-        "wait",
-        "toast",
+        "ui",
         "watch",
         "app",
         "perm",
@@ -678,9 +664,9 @@ fn command_reference() -> String {
     }
 
     let mut out = String::from(
-        "## Command reference\n\nCore driving verbs below — run \
+        "## Command reference\n\nCore commands below — run \
          `shadowdroid commands --json` for the full catalog (every command, \
-         subcommand, and flag).\n\n",
+         subcommand, flag, and agent decision hint).\n\n",
     );
     out.push_str(&core);
     if !tail.is_empty() {
@@ -712,7 +698,7 @@ shadowdroid devices                 # attached devices/emulators
 shadowdroid connect                 # install + start the on-device service
 shadowdroid commands --json         # the full command catalog, for discovery
 shadowdroid config schema --json    # config format, paths, fields, example
-shadowdroid screen | jq             # current UI as a flat element list
+shadowdroid ui dump | jq            # current UI as a flat element list
 ```
 
 If no device is attached, ask the user to start one — don't boot an emulator
@@ -752,21 +738,26 @@ project config:
 Read the screen, act by **selector** (don't hard-code coordinates), confirm.
 
 ```bash
-shadowdroid screen | jq '.elements[] | {id, text, rid, tap}'
-shadowdroid tap --text "Sign in"        # or --rid / --desc / --xpath, or `tap <id>`
-shadowdroid text "alice@example.com"    # focused field; add --rid/--text/--id to target one
-shadowdroid key enter
-shadowdroid scroll-to --text "Privacy" --tap   # scroll a list until found, then tap
-shadowdroid wait --text "Welcome" --timeout-ms 8000   # block until it appears
-shadowdroid screenshot /tmp/after.png
+shadowdroid ui dump | jq '.elements[] | {id, text, rid, tap}'
+shadowdroid ui tap --text "Sign in"        # or --rid / --desc / --xpath, or `ui tap <id>`
+shadowdroid ui text "alice@example.com"    # focused field; add --rid/--text/--id to target one
+shadowdroid ui key enter
+shadowdroid ui scroll-to --text "Privacy" --tap   # scroll a list until found, then tap
+shadowdroid ui wait --text "Welcome" --timeout-ms 8000   # block until it appears
+shadowdroid ui screenshot /tmp/after.png
 ```
 
 For a long flow, stream every change and watch for crashes:
 
 ```bash
 shadowdroid watch --app com.example.app | jq -c .
-# emits ready → screen_compact → … and a structured `crash` event on a stack trace
+# emits ready → screen_compact → http/http_intercept when `net start` is running
+# emits a structured warning with `suggested_command` when network capture is unavailable
 ```
+
+`watch` is the unified live timeline. It tries to attach HTTP(S) events by
+default, warns when the net proxy is unavailable, and accepts `--no-net` only
+when you intentionally want UI/crash-only events.
 
 ## Debugging for agents
 

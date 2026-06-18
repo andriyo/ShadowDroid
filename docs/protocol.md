@@ -189,7 +189,7 @@ GET  /v1/toast/recent?since_ts=<unix_ms>               # default since_ts=now-5s
    → {"toasts": [{"package": "...", "text": "...", "ts": 1234}, ...]}
 ```
 
-The CLI's `shadowdroid toast --wait 5` does: `start` (once per session, idempotent) → `GET recent` polling loop.
+The CLI's `shadowdroid ui toast --wait-ms 5000` does: `start` (once per session, idempotent) → `GET recent` polling loop.
 
 ## 10. Files
 

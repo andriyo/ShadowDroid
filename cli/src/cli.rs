@@ -1,13 +1,12 @@
 //! Argument parsing + subcommand dispatch.
 //!
 //! Command surface follows a noun-namespace model:
-//!   - **Interaction primitives stay flat** — gestures (`tap`, `swipe`, …),
-//!     input (`text`, `key`, `back`, `home`), reads (`screen`, `screenshot`),
-//!     locate (`find`), `scroll-to`, sync/stream (`wait`, `watch`, `toast`),
-//!     and session/diagnostics (`connect`, `doctor`, `collect`, …).
-//!   - **Resources are nested** under a noun: `app`, `perm`, `appops`,
-//!     `profile`, `device`, `files` (e.g. `app install`, `perm grant`,
-//!     `device shell`, `files pull`).
+//!   - **Live UI automation is nested** under `ui`: reads (`ui dump`),
+//!     locate (`ui find`), gestures (`ui tap`, `ui swipe`, …), input
+//!     (`ui text`, `ui key`), and sync (`ui wait`).
+//!   - **Resources are nested** under a noun: `app`, `perm`, `appops`, `profile`,
+//!     `device`, `files`, `net` (e.g. `app install`, `perm grant`,
+//!     `device shell`, `files pull`, `net intercept`).
 //!
 //! Dispatch is two-phase: host-only commands (no on-device server) run first
 //! and return; everything else shares one `ensure_ready` bring-up, then routes
@@ -121,204 +120,7 @@ pub enum Cmd {
     Studio(crate::cmd::studio::StudioArgs),
     /// Agent-first debug snapshots, timelines, replays, and Studio-backed debugger control.
     Debug(crate::cmd::debug::DebugArgs),
-
-    // ── resource namespaces (nested) ──────────────────────────
-    /// Application lifecycle, info, and install rituals.
-    #[command(subcommand)]
-    App(AppCmd),
-    /// Runtime permission grants.
-    #[command(subcommand)]
-    Perm(PermCmd),
-    /// App-ops (allow|deny|ignore|default|… per operation).
-    #[command(subcommand)]
-    Appops(AppopsCmd),
-    /// Device display profile (animations, font, density, size, rotation).
-    #[command(subcommand)]
-    Profile(ProfileCmd),
-    /// Device & system controls (info, shell, power, orientation, clipboard, …).
-    #[command(subcommand)]
-    Device(DeviceCmd),
-    /// On-device file operations.
-    #[command(subcommand)]
-    Files(FilesCmd),
-    /// Network MITM proxy: observe, intercept, and modify HTTP(S) traffic.
-    #[command(subcommand)]
-    Net(NetCmd),
-    /// Agent-first layout snapshots and diffs.
-    Layout(crate::cmd::layout::LayoutArgs),
-
-    // ── UI read (flat) ────────────────────────────────────────
-    /// Dump the current UI as a flat element list.
-    Screen {
-        /// Emit the full element set (bounds + every UIAutomator flag). Default
-        /// is the compact agent shape: selector fields + tap, false flags omitted.
-        #[arg(long)]
-        full: bool,
-    },
-    /// Capture a screenshot to a file.
-    Screenshot {
-        path: Option<String>,
-        /// Image format: png (default) or jpeg.
-        #[arg(long)]
-        format: Option<String>,
-        /// Server-side downscale factor, e.g. 0.5.
-        #[arg(long)]
-        scale: Option<f32>,
-        /// JPEG quality 1..100 (format=jpeg only).
-        #[arg(long)]
-        quality: Option<u32>,
-    },
-
-    // ── gestures (flat) ───────────────────────────────────────
-    /// Tap by element id, coordinates, or a selector (--text/--rid/--desc/--xpath).
-    Tap {
-        /// Element id from a fresh `screen` dump. Equivalent to positional `tap <id>`.
-        #[arg(long)]
-        id: Option<u32>,
-        /// Element id (from `screen`) or X coordinate.
-        a: Option<i32>,
-        /// Y coordinate (with X for a coordinate tap).
-        b: Option<i32>,
-        #[arg(long)]
-        text: Option<String>,
-        #[arg(long)]
-        rid: Option<String>,
-        #[arg(long)]
-        desc: Option<String>,
-        #[arg(long)]
-        xpath: Option<String>,
-    },
-    /// Double-tap at <x> <y> coordinates.
-    DoubleTap { x: i32, y: i32 },
-    /// Long-press at <x> <y> coordinates (hold for --duration-ms).
-    LongTap {
-        x: i32,
-        y: i32,
-        #[arg(long, default_value_t = 600)]
-        duration_ms: u32,
-    },
-    /// Swipe from (x1,y1) to (x2,y2).
-    Swipe {
-        x1: i32,
-        y1: i32,
-        x2: i32,
-        y2: i32,
-        #[arg(long, default_value_t = 200)]
-        duration_ms: u32,
-    },
-    /// Drag from (x1,y1) to (x2,y2) — slower than swipe, for drag-and-drop / reorder.
-    Drag {
-        x1: i32,
-        y1: i32,
-        x2: i32,
-        y2: i32,
-        #[arg(long, default_value_t = 500)]
-        duration_ms: u32,
-    },
-    /// Swipe a fraction (--scale) of the screen in a direction (up/down/left/right).
-    SwipeExt {
-        #[arg(value_parser = ["up", "down", "left", "right"])]
-        direction: String,
-        #[arg(long, default_value_t = 0.9)]
-        scale: f32,
-        #[arg(long, default_value_t = 200)]
-        duration_ms: u32,
-    },
-    /// Pinch in (zoom out) or out (zoom in) on the element matched by a selector.
-    Pinch {
-        #[arg(value_parser = ["in", "out"])]
-        direction: String,
-        #[arg(long)]
-        rid: Option<String>,
-        #[arg(long)]
-        text: Option<String>,
-        #[arg(long)]
-        desc: Option<String>,
-        #[arg(long, default_value_t = 50)]
-        percent: u32,
-    },
-    /// Scroll a list until a selector is visible, then optionally tap it.
-    ScrollTo(ScrollArgs),
-
-    // ── locate (flat) ─────────────────────────────────────────
-    /// Find elements by selector (--text/--rid/--desc/--xpath); does not tap.
-    Find {
-        #[arg(long)]
-        text: Option<String>,
-        #[arg(long)]
-        rid: Option<String>,
-        #[arg(long)]
-        desc: Option<String>,
-        #[arg(long)]
-        xpath: Option<String>,
-        /// Return all matches instead of the first.
-        #[arg(long)]
-        all: bool,
-        /// Emit the full element set instead of the compact agent shape.
-        #[arg(long)]
-        full: bool,
-    },
-
-    // ── input (flat) ──────────────────────────────────────────
-    /// Type into the focused field, or into an element matched by --id/--text/--rid/--desc/--xpath.
-    Text {
-        value: String,
-        #[arg(long)]
-        clear: bool,
-        /// Element id from a fresh `screen` dump to receive text.
-        #[arg(long)]
-        id: Option<u32>,
-        /// Match a text-bearing/editable element to receive text.
-        #[arg(long)]
-        text: Option<String>,
-        /// Match by resource-id substring.
-        #[arg(long)]
-        rid: Option<String>,
-        /// Match by content-description substring.
-        #[arg(long)]
-        desc: Option<String>,
-        /// Match by xpath.
-        #[arg(long)]
-        xpath: Option<String>,
-        /// Use exact selector matching instead of substring matching.
-        #[arg(long)]
-        exact: bool,
-    },
-    /// Press a named key or keycode.
-    Key { name: String },
-    /// Press the Back button.
-    Back,
-    /// Press the Home button.
-    Home,
-
-    // ── sync / stream / capture (flat) ────────────────────────
-    /// Wait for an element / activity / package to appear (or be --gone).
-    Wait {
-        #[arg(long)]
-        text: Option<String>,
-        #[arg(long)]
-        rid: Option<String>,
-        #[arg(long)]
-        desc: Option<String>,
-        #[arg(long)]
-        klass: Option<String>,
-        #[arg(long)]
-        activity: Option<String>,
-        #[arg(long)]
-        package: Option<String>,
-        #[arg(long)]
-        gone: bool,
-        #[arg(long, default_value_t = 10000)]
-        timeout_ms: u32,
-        #[arg(long, default_value_t = 200)]
-        poll_ms: u32,
-    },
-    /// Capture recent toast messages.
-    Toast {
-        #[arg(long, default_value_t = 5000)]
-        wait_ms: u32,
-    },
-    /// Stream UI/crash/toast events as JSON lines.
+    /// Watch the app timeline: UI changes, crashes, toasts, watchers, and network events when available.
     Watch {
         /// Only emit app-scoped events for this package. Permission dialogs are still allowed.
         #[arg(long)]
@@ -342,10 +144,38 @@ pub enum Cmd {
         permission_dialogs: PermissionDialogPolicy,
         #[arg(long)]
         watcher_file: Vec<String>,
-        /// Interleave live HTTP events from a running `net` proxy daemon.
+        /// Do not try to attach live HTTP events from a running `net` proxy daemon.
         #[arg(long)]
-        net: bool,
+        no_net: bool,
     },
+
+    // ── resource namespaces (nested) ──────────────────────────
+    /// Application lifecycle, info, and install rituals.
+    #[command(subcommand)]
+    App(AppCmd),
+    /// Runtime permission grants.
+    #[command(subcommand)]
+    Perm(PermCmd),
+    /// App-ops (allow|deny|ignore|default|… per operation).
+    #[command(subcommand)]
+    Appops(AppopsCmd),
+    /// Device display profile (animations, font, density, size, rotation).
+    #[command(subcommand)]
+    Profile(ProfileCmd),
+    /// Device & system controls (info, shell, power, orientation, clipboard, …).
+    #[command(subcommand)]
+    Device(DeviceCmd),
+    /// On-device file operations.
+    #[command(subcommand)]
+    Files(FilesCmd),
+    /// Network MITM proxy: enable, inspect, intercept, and modify HTTP(S) traffic.
+    #[command(subcommand)]
+    Net(NetCmd),
+    /// Live UI automation: dump, find, tap, type, and wait for screen state.
+    #[command(subcommand)]
+    Ui(UiCmd),
+    /// Agent-first layout snapshots and diffs.
+    Layout(crate::cmd::layout::LayoutArgs),
 }
 
 // ── nested namespaces ─────────────────────────────────────────
@@ -464,6 +294,174 @@ pub enum FilesCmd {
     Pull { remote: String, local: String },
 }
 
+// ── live UI automation (`ui`) ─────────────────────────────────
+
+#[derive(Subcommand)]
+pub enum UiCmd {
+    /// Dump the current UI as a flat element list.
+    Dump {
+        /// Emit the full element set (bounds + every UIAutomator flag). Default
+        /// is the compact agent shape: selector fields + tap, false flags omitted.
+        #[arg(long)]
+        full: bool,
+    },
+    /// Capture a screenshot to a file.
+    Screenshot {
+        path: Option<String>,
+        /// Image format: png (default) or jpeg.
+        #[arg(long)]
+        format: Option<String>,
+        /// Server-side downscale factor, e.g. 0.5.
+        #[arg(long)]
+        scale: Option<f32>,
+        /// JPEG quality 1..100 (format=jpeg only).
+        #[arg(long)]
+        quality: Option<u32>,
+    },
+    /// Find elements by selector (--text/--rid/--desc/--xpath); does not tap.
+    Find {
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long)]
+        rid: Option<String>,
+        #[arg(long)]
+        desc: Option<String>,
+        #[arg(long)]
+        xpath: Option<String>,
+        /// Return all matches instead of the first.
+        #[arg(long)]
+        all: bool,
+        /// Emit the full element set instead of the compact agent shape.
+        #[arg(long)]
+        full: bool,
+    },
+    /// Tap by element id, coordinates, or a selector (--text/--rid/--desc/--xpath).
+    Tap {
+        /// Element id from a fresh `ui dump`. Equivalent to positional `ui tap <id>`.
+        #[arg(long)]
+        id: Option<u32>,
+        /// Element id (from `ui dump`) or X coordinate.
+        a: Option<i32>,
+        /// Y coordinate (with X for a coordinate tap).
+        b: Option<i32>,
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long)]
+        rid: Option<String>,
+        #[arg(long)]
+        desc: Option<String>,
+        #[arg(long)]
+        xpath: Option<String>,
+    },
+    /// Double-tap at <x> <y> coordinates.
+    DoubleTap { x: i32, y: i32 },
+    /// Long-press at <x> <y> coordinates (hold for --duration-ms).
+    LongTap {
+        x: i32,
+        y: i32,
+        #[arg(long, default_value_t = 600)]
+        duration_ms: u32,
+    },
+    /// Swipe from (x1,y1) to (x2,y2).
+    Swipe {
+        x1: i32,
+        y1: i32,
+        x2: i32,
+        y2: i32,
+        #[arg(long, default_value_t = 200)]
+        duration_ms: u32,
+    },
+    /// Drag from (x1,y1) to (x2,y2) — slower than swipe, for drag-and-drop / reorder.
+    Drag {
+        x1: i32,
+        y1: i32,
+        x2: i32,
+        y2: i32,
+        #[arg(long, default_value_t = 500)]
+        duration_ms: u32,
+    },
+    /// Swipe a fraction (--scale) of the screen in a direction (up/down/left/right).
+    SwipeExt {
+        #[arg(value_parser = ["up", "down", "left", "right"])]
+        direction: String,
+        #[arg(long, default_value_t = 0.9)]
+        scale: f32,
+        #[arg(long, default_value_t = 200)]
+        duration_ms: u32,
+    },
+    /// Pinch in (zoom out) or out (zoom in) on the element matched by a selector.
+    Pinch {
+        #[arg(value_parser = ["in", "out"])]
+        direction: String,
+        #[arg(long)]
+        rid: Option<String>,
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long)]
+        desc: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        percent: u32,
+    },
+    /// Scroll a list until a selector is visible, then optionally tap it.
+    ScrollTo(ScrollArgs),
+    /// Type into the focused field, or into an element matched by --id/--text/--rid/--desc/--xpath.
+    Text {
+        value: String,
+        #[arg(long)]
+        clear: bool,
+        /// Element id from a fresh `ui dump` to receive text.
+        #[arg(long)]
+        id: Option<u32>,
+        /// Match a text-bearing/editable element to receive text.
+        #[arg(long)]
+        text: Option<String>,
+        /// Match by resource-id substring.
+        #[arg(long)]
+        rid: Option<String>,
+        /// Match by content-description substring.
+        #[arg(long)]
+        desc: Option<String>,
+        /// Match by xpath.
+        #[arg(long)]
+        xpath: Option<String>,
+        /// Use exact selector matching instead of substring matching.
+        #[arg(long)]
+        exact: bool,
+    },
+    /// Press a named key or keycode.
+    Key { name: String },
+    /// Press the Back button.
+    Back,
+    /// Press the Home button.
+    Home,
+    /// Wait for an element / activity / package to appear (or be --gone).
+    Wait {
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long)]
+        rid: Option<String>,
+        #[arg(long)]
+        desc: Option<String>,
+        #[arg(long)]
+        klass: Option<String>,
+        #[arg(long)]
+        activity: Option<String>,
+        #[arg(long)]
+        package: Option<String>,
+        #[arg(long)]
+        gone: bool,
+        #[arg(long, default_value_t = 10000)]
+        timeout_ms: u32,
+        #[arg(long, default_value_t = 200)]
+        poll_ms: u32,
+    },
+    /// Capture recent toast messages.
+    Toast {
+        #[arg(long, default_value_t = 5000)]
+        wait_ms: u32,
+    },
+}
+
 // ── network proxy (`net`) ─────────────────────────────────────
 
 #[derive(Subcommand)]
@@ -506,17 +504,6 @@ pub enum NetCmd {
     },
     /// Proxy + device-wiring status (running? pointed at us? held flows).
     Status,
-    /// Stream live HTTP events (same envelope as `watch`).
-    Watch {
-        #[arg(long)]
-        host: Option<String>,
-        #[arg(long)]
-        path: Option<String>,
-        #[arg(long)]
-        method: Option<String>,
-        #[arg(long)]
-        status: Option<u16>,
-    },
     /// Recall past flows from the session log.
     Log {
         #[arg(long)]
@@ -696,14 +683,8 @@ pub async fn run() -> Result<()> {
             force,
             json,
         } => {
-            return crate::cmd::doctor::run(
-                device.as_deref(),
-                *fix,
-                *force,
-                *json,
-                app.as_deref(),
-            )
-            .await
+            return crate::cmd::doctor::run(device.as_deref(), *fix, *force, *json, app.as_deref())
+                .await
         }
         Cmd::Collect {
             app,
@@ -776,98 +757,56 @@ pub async fn run() -> Result<()> {
         Cmd::Files(files_cmd) => dispatch_files(files_cmd, &client, &serial).await?,
         Cmd::Debug(args) => crate::cmd::debug::run(&serial, &client, args).await?,
         Cmd::Layout(args) => crate::cmd::layout::run(&serial, &client, args).await?,
-
-        // ── UI read ────────────────────────────────────────────
-        Cmd::Screen { full } => {
-            cmd_screen(&serial, apk.as_deref(), any_apk_version, &client, full).await?
+        Cmd::Ui(ui_cmd) => {
+            dispatch_ui(ui_cmd, &client, &serial, apk.as_deref(), any_apk_version).await?
         }
-        Cmd::Screenshot {
+        Cmd::Watch {
+            app,
+            poll_ms,
+            debounce_ms,
+            no_stdin,
+            no_crash_detect,
+            screen_format,
+            permission_dialogs,
+            watcher_file,
+            no_net,
+        } => {
+            let app = resolve_app_package(&config, Some(&serial), app).await?;
+            crate::watch::r#loop::run(crate::watch::r#loop::WatchConfig {
+                serial,
+                client,
+                app_filter: app,
+                poll_ms: poll_ms.max(1),
+                debounce_ms,
+                accept_stdin: !no_stdin,
+                detect_crashes: !no_crash_detect,
+                watcher_files: watcher_file,
+                permission_dialog_policy: permission_dialogs,
+                screen_format,
+                net: !no_net,
+            })
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn dispatch_ui(
+    c: UiCmd,
+    client: &ServerClient,
+    serial: &str,
+    apk: Option<&std::path::Path>,
+    any_apk_version: bool,
+) -> Result<()> {
+    match c {
+        UiCmd::Dump { full } => cmd_screen(serial, apk, any_apk_version, client, full).await?,
+        UiCmd::Screenshot {
             path,
             format,
             scale,
             quality,
-        } => cmd_screenshot(&client, path, format, scale, quality).await?,
-
-        // ── gestures ───────────────────────────────────────────
-        Cmd::Tap {
-            id,
-            a,
-            b,
-            text,
-            rid,
-            desc,
-            xpath,
-        } => cmd_tap(&client, id, a, b, text, rid, desc, xpath).await?,
-        Cmd::DoubleTap { x, y } => {
-            client.double_tap(x, y).await?;
-            emit_action("double_tap", &json!({"x":x,"y":y}));
-        }
-        Cmd::LongTap { x, y, duration_ms } => {
-            client.long_tap(x, y, duration_ms).await?;
-            emit_action("long_tap", &json!({"x":x,"y":y,"duration_ms":duration_ms}));
-        }
-        Cmd::Swipe {
-            x1,
-            y1,
-            x2,
-            y2,
-            duration_ms,
-        } => {
-            client.swipe(x1, y1, x2, y2, duration_ms).await?;
-            emit_action(
-                "swipe",
-                &json!({"from":[x1,y1],"to":[x2,y2],"duration_ms":duration_ms}),
-            );
-        }
-        Cmd::Drag {
-            x1,
-            y1,
-            x2,
-            y2,
-            duration_ms,
-        } => {
-            client.drag(x1, y1, x2, y2, duration_ms).await?;
-            emit_action(
-                "drag",
-                &json!({"from":[x1,y1],"to":[x2,y2],"duration_ms":duration_ms}),
-            );
-        }
-        Cmd::SwipeExt {
-            direction,
-            scale,
-            duration_ms,
-        } => {
-            client.swipe_ext(&direction, scale, duration_ms).await?;
-            emit_action(
-                "swipe_ext",
-                &json!({"direction":direction,"scale":scale,"duration_ms":duration_ms}),
-            );
-        }
-        Cmd::Pinch {
-            direction,
-            rid,
-            text,
-            desc,
-            percent,
-        } => {
-            client
-                .pinch(
-                    rid.as_deref(),
-                    text.as_deref(),
-                    desc.as_deref(),
-                    &direction,
-                    percent,
-                )
-                .await?;
-            emit_action(
-                "pinch",
-                &json!({"direction":direction,"rid":rid,"text":text,"desc":desc,"percent":percent}),
-            );
-        }
-        Cmd::ScrollTo(args) => crate::cmd::scroll::run(&client, &args).await?,
-
-        // ── locate ─────────────────────────────────────────────
-        Cmd::Find {
+        } => cmd_screenshot(client, path, format, scale, quality).await?,
+        UiCmd::Find {
             text,
             rid,
             desc,
@@ -893,21 +832,83 @@ pub async fn run() -> Result<()> {
                 emit_action("find", &json!({"matched":matched,"elements":elements}));
             }
         }
-
-        // ── input ──────────────────────────────────────────────
-        Cmd::Back => {
-            let injected = client.key("back").await?;
-            emit_action("key", &json!({"name":"back","injected":injected}));
+        UiCmd::Tap {
+            id,
+            a,
+            b,
+            text,
+            rid,
+            desc,
+            xpath,
+        } => cmd_tap(client, id, a, b, text, rid, desc, xpath).await?,
+        UiCmd::DoubleTap { x, y } => {
+            client.double_tap(x, y).await?;
+            emit_action("double_tap", &json!({"x":x,"y":y}));
         }
-        Cmd::Home => {
-            let injected = client.key("home").await?;
-            emit_action("key", &json!({"name":"home","injected":injected}));
+        UiCmd::LongTap { x, y, duration_ms } => {
+            client.long_tap(x, y, duration_ms).await?;
+            emit_action("long_tap", &json!({"x":x,"y":y,"duration_ms":duration_ms}));
         }
-        Cmd::Key { name } => {
-            let injected = client.key(&name).await?;
-            emit_action("key", &json!({"name":name,"injected":injected}));
+        UiCmd::Swipe {
+            x1,
+            y1,
+            x2,
+            y2,
+            duration_ms,
+        } => {
+            client.swipe(x1, y1, x2, y2, duration_ms).await?;
+            emit_action(
+                "swipe",
+                &json!({"from":[x1,y1],"to":[x2,y2],"duration_ms":duration_ms}),
+            );
         }
-        Cmd::Text {
+        UiCmd::Drag {
+            x1,
+            y1,
+            x2,
+            y2,
+            duration_ms,
+        } => {
+            client.drag(x1, y1, x2, y2, duration_ms).await?;
+            emit_action(
+                "drag",
+                &json!({"from":[x1,y1],"to":[x2,y2],"duration_ms":duration_ms}),
+            );
+        }
+        UiCmd::SwipeExt {
+            direction,
+            scale,
+            duration_ms,
+        } => {
+            client.swipe_ext(&direction, scale, duration_ms).await?;
+            emit_action(
+                "swipe_ext",
+                &json!({"direction":direction,"scale":scale,"duration_ms":duration_ms}),
+            );
+        }
+        UiCmd::Pinch {
+            direction,
+            rid,
+            text,
+            desc,
+            percent,
+        } => {
+            client
+                .pinch(
+                    rid.as_deref(),
+                    text.as_deref(),
+                    desc.as_deref(),
+                    &direction,
+                    percent,
+                )
+                .await?;
+            emit_action(
+                "pinch",
+                &json!({"direction":direction,"rid":rid,"text":text,"desc":desc,"percent":percent}),
+            );
+        }
+        UiCmd::ScrollTo(args) => crate::cmd::scroll::run(client, &args).await?,
+        UiCmd::Text {
             value,
             clear,
             id,
@@ -926,9 +927,19 @@ pub async fn run() -> Result<()> {
                 &json!({"value":value,"clear":clear,"target":target}),
             );
         }
-
-        // ── sync / stream / capture ────────────────────────────
-        Cmd::Wait {
+        UiCmd::Key { name } => {
+            let injected = client.key(&name).await?;
+            emit_action("key", &json!({"name":name,"injected":injected}));
+        }
+        UiCmd::Back => {
+            let injected = client.key("back").await?;
+            emit_action("key", &json!({"name":"back","injected":injected}));
+        }
+        UiCmd::Home => {
+            let injected = client.key("home").await?;
+            emit_action("key", &json!({"name":"home","injected":injected}));
+        }
+        UiCmd::Wait {
             text,
             rid,
             desc,
@@ -940,7 +951,7 @@ pub async fn run() -> Result<()> {
             poll_ms,
         } => {
             cmd_wait(
-                &client,
+                client,
                 WaitQuery {
                     text,
                     rid,
@@ -952,40 +963,13 @@ pub async fn run() -> Result<()> {
                 gone,
                 timeout_ms,
                 poll_ms,
-                &serial,
-                apk.as_deref(),
+                serial,
+                apk,
                 any_apk_version,
             )
             .await?;
         }
-        Cmd::Toast { wait_ms } => cmd_toast(&client, wait_ms).await?,
-        Cmd::Watch {
-            app,
-            poll_ms,
-            debounce_ms,
-            no_stdin,
-            no_crash_detect,
-            screen_format,
-            permission_dialogs,
-            watcher_file,
-            net,
-        } => {
-            let app = resolve_app_package(&config, Some(&serial), app).await?;
-            crate::watch::r#loop::run(crate::watch::r#loop::WatchConfig {
-                serial,
-                client,
-                app_filter: app,
-                poll_ms: poll_ms.max(1),
-                debounce_ms,
-                accept_stdin: !no_stdin,
-                detect_crashes: !no_crash_detect,
-                watcher_files: watcher_file,
-                permission_dialog_policy: permission_dialogs,
-                screen_format,
-                net,
-            })
-            .await?;
-        }
+        UiCmd::Toast { wait_ms } => cmd_toast(client, wait_ms).await?,
     }
     Ok(())
 }
@@ -1285,12 +1269,6 @@ async fn dispatch_net(c: &NetCmd, serial: &str) -> Result<()> {
         }
         NetCmd::Stop { revoke_ca } => nc::stop(serial, *revoke_ca).await,
         NetCmd::Status => nc::status(serial).await,
-        NetCmd::Watch {
-            host,
-            path,
-            method,
-            status,
-        } => nc::watch(serial, matcher(host, path, method, status)).await,
         NetCmd::Log {
             host,
             path,
@@ -1413,11 +1391,9 @@ fn read_body_arg(inline: &Option<String>, file: &Option<PathBuf>) -> Result<Opti
     match (inline, file) {
         (Some(_), Some(_)) => bail!("--body and --body-file are mutually exclusive"),
         (Some(s), None) => Ok(Some(s.clone().into_bytes())),
-        (None, Some(p)) => {
-            Ok(Some(std::fs::read(p).with_context(|| {
-                format!("reading {}", p.display())
-            })?))
-        }
+        (None, Some(p)) => Ok(Some(
+            std::fs::read(p).with_context(|| format!("reading {}", p.display()))?,
+        )),
         (None, None) => Ok(None),
     }
 }
@@ -1546,7 +1522,10 @@ async fn dispatch_files(c: FilesCmd, client: &ServerClient, serial: &str) -> Res
                 ),
                 Err(_) => {
                     let entries = adb::list_dir(serial, &remote).await?;
-                    emit_action("ls", &json!({"remote":remote,"entries":entries,"via":"adb"}));
+                    emit_action(
+                        "ls",
+                        &json!({"remote":remote,"entries":entries,"via":"adb"}),
+                    );
                 }
             }
         }
@@ -1633,7 +1612,7 @@ async fn cmd_device_info(client: &ServerClient, serial: &str) -> Result<()> {
     Ok(())
 }
 
-/// `screen` defaults to the compact agent shape (no bounds, false flags
+/// `ui dump` defaults to the compact agent shape (no bounds, false flags
 /// omitted) — the loop reads this every iteration, so it pays for itself in
 /// tokens. `--full` restores the complete UIAutomator element set.
 async fn cmd_screen(
@@ -1692,8 +1671,8 @@ async fn cmd_screenshot(
     Ok(())
 }
 
-/// `tap` covers four targeting modes: a selector (`--text/--rid/--desc/--xpath`),
-/// an element id from a fresh `screen` dump, or `<x> <y>` coordinates.
+/// `ui tap` covers four targeting modes: a selector (`--text/--rid/--desc/--xpath`),
+/// an element id from a fresh `ui dump`, or `<x> <y>` coordinates.
 #[allow(clippy::too_many_arguments)]
 async fn cmd_tap(
     client: &ServerClient,

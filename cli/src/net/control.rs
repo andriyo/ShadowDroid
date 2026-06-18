@@ -279,7 +279,7 @@ fn event_matches(ev: &Event, m: &Matcher) -> bool {
                 && sub(method, &m.method)
                 && m.status.map(|s| *status == Some(s)).unwrap_or(true)
         }
-        // Only HTTP events flow over `net watch`.
+        // Only HTTP events flow over network stream clients.
         _ => false,
     }
 }

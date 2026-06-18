@@ -59,6 +59,15 @@ pub enum Event {
         input: Option<String>,
         ts: f64,
     },
+    Warning {
+        stage: String,
+        msg: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        suggested_command: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hint: Option<String>,
+        ts: f64,
+    },
     /// A completed HTTP(S) transaction through the `net` proxy. Compact by
     /// design — full headers/bodies are fetched on demand via `net show <id>`.
     /// Field shape mirrors the `net` capture wire format so the timeline can

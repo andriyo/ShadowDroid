@@ -7,11 +7,11 @@ inside the single Rust binary.
 
 > Status: **IMPLEMENTED** (P1–P4). The `net` namespace ships in the CLI
 > (`cli/src/net/`): hand-rolled MITM proxy + daemon + control socket, observe
-> (`check`/`trust`/`start`/`stop`/`status`/`watch`/`log`/`show`), agent-in-the-loop
+> (`check`/`trust`/`start`/`stop`/`status`/`log`/`show`), agent-in-the-loop
 > intercept (`intercept`/`resume`/`drop`/`respond`), declarative rules + replay,
 > doctor integration, and HAR/curl export. The proxy core, intercept, and rule
 > engine are validated end-to-end (host-curl through the live daemon). The CA
-> system-store install and `watch --net` interleave are device-gated (logic is in
+> system-store install and `watch` HTTP interleave are device-gated (logic is in
 > place, full validation needs an attached device/emulator). Supersedes the earlier
 > read-only "net capture" direction (Route C / `SHADOWDROID_NET` logcat tailing).
 > See [Relationship to the capture plan](#relationship-to-the-read-only-capture-plan).
@@ -116,11 +116,11 @@ daemon**:
 - event log at `~/.shadowdroid/net/<serial>.jsonl` (backs `net log`),
 - an in-memory map of currently-held flows keyed by flow id.
 
-`net start` spawns it (or runs `--foreground`); `net watch` / `resume` / `drop` /
-`respond` / `status` / `rule` / `stop` are short-lived **clients** of that socket. The
+`net start` spawns it (or runs `--foreground`); `watch`, `resume`, `drop`,
+`respond`, `status`, `rule`, and `stop` are short-lived **clients** of that socket. The
 existing `watch/stdin.rs` text-command model ([cli/src/watch/stdin.rs:15](../cli/src/watch/stdin.rs))
 stays for humans, but the agent path is socket-backed one-shots — matching how the
-agent already drives `tap`/`screen` as discrete calls.
+agent already drives `ui tap`/`ui dump` as discrete calls.
 
 `~/.shadowdroid/` is the established store root
 ([config.rs:15](../cli/src/config.rs) `USER_CONFIG_REL`, plugins under
@@ -152,8 +152,8 @@ revived, both producers emit the *same* `http` event.
 {"type":"screen","ts":1718539200.30,"screen_hash":"c4d5"}   // ← the error screen the 401 produced
 ```
 
-- `shadowdroid watch --net com.livd` interleaves screen + http + crash on one timeline.
-- `net watch [matchers]` is `watch` pre-filtered to `http` events.
+- `shadowdroid watch --app com.livd` interleaves screen + http + crash on one timeline when `net start` is running.
+- `watch --no-net` intentionally suppresses the HTTP attach attempt for UI/crash-only streams.
 - `net log [matchers] [-n 50]` recalls past flows from the session JSONL.
 - `net show <id> [--body|--har]` returns full headers + bodies for one flow.
 
@@ -229,7 +229,7 @@ net intercept --host api.livd.app --path /v1/login   # arm the pause
 #   {"type":"http_intercept","id":"f9","phase":"response","status":200, …}
 net resume f9 --set-status 401 --body '{"error":"invalid_credentials"}'
 
-# agent calls `screen` and confirms the app rendered the error state correctly
+# agent calls `ui dump` and confirms the app rendered the error state correctly
 net stop --revoke-ca
 ```
 
@@ -284,7 +284,7 @@ net stop   [--revoke-ca]         tear down proxy + http_proxy + reverse
 net status                       running? device pointed at it? held flows, counts
 
 # Observe
-net watch  [matchers]            live http events (same envelope as `watch`)
+watch                           live screen + crash + http events (http when `net start` is running)
 net log    [matchers] [-n 50]    recall past flows from session JSONL
 net show   <id> [--body|--har]   full headers + bodies for one flow
 net export <har|curl> [id]       interop hand-off
@@ -380,7 +380,7 @@ Glob hosts (`*.livd.app`) in the flag form; full regex in `--filter`.
 | --- | --- | --- |
 | Command tree | [cli/src/cli.rs](../cli/src/cli.rs) `Cmd` enum (~:125–141) | add `#[command(subcommand)] Net(NetCmd)` |
 | Host-only dispatch | cli.rs phase-1 block | `net check`, `net trust --system`, `net start/stop/status/watch/log/show/resume/drop` are host+adb+daemon — no on-device server |
-| Server-backed dispatch | cli.rs phase-2 | only `net trust --ui` needs `ensure_ready` (uses `tap`/`find`/`screen`) |
+| Server-backed dispatch | cli.rs phase-2 | only `net trust --ui` needs `ensure_ready` (uses `ui tap`/`ui find`/`ui dump`) |
 | Event types | [cli/src/events.rs:18](../cli/src/events.rs) | add `Http { … }` and `HttpIntercept { … }` variants |
 | CLI verbs | new `cli/src/cmd/net/` (mod, check, trust, proxy, intercept, rule, control) | mirror `cmd/permissions.rs` shape |
 | Proxy engine | new `cli/src/net/` (server task, CA, flow model, control socket) | feeds the same event channel the crash detector uses |
@@ -395,9 +395,9 @@ Lifecycle hooks into existing commands:
   proxy-aware OkHttp/Ktor-OkHttp vs Cronet/QUIC?). Release builds are hard-blocked.
 - **`net trust`** reuses ShadowDroid's *own* UI automation: emulator/root → system
   store; real device → push `.crt`, then drive the Settings cert-install flow with
-  `tap`/`find`/`screen`. The proxy installs its trust *by using the rest of the
+  `ui tap`/`ui find`/`ui dump`. The proxy installs its trust *by using the rest of the
   product* — the tightest possible integration.
-- **`watch --net`** unified stream; **`doctor`** gains a net section (see
+- **`watch`** unified stream; **`doctor`** gains a net section (see
   [§11.1](#111-net-check-inside-doctor)); **`collect`** bundles recent flows (and, with
   `--app`, the `net check` verdict); **`disconnect`** / `net stop` tears down proxy +
   `http_proxy` + `reverse` so no orphaned global proxy bricks device networking.
@@ -442,7 +442,7 @@ who only occasionally touch `net`.
 
 | Phase | Goal | Done when… |
 | --- | --- | --- |
-| **P1** | Observe via inline proxy | `net check` / `trust` / `start` / `stop` / `status`; `net watch`/`log`/`show`; `http` event in `watch --net`; **`doctor` net section** (dangling-proxy detect + `--fix`) and **`doctor --app <pkg>`** verdict, sharing the `net::check` module. Hand-rolled proxy + daemon + control socket + CA pipeline proven on emulator vs `com.livd`. |
+| **P1** | Observe via inline proxy | `net check` / `trust` / `start` / `stop` / `status`; `net log`/`show`; `http` events in `watch`; **`doctor` net section** (dangling-proxy detect + `--fix`) and **`doctor --app <pkg>`** verdict, sharing the `net::check` module. Hand-rolled proxy + daemon + control socket + CA pipeline proven on emulator vs `com.livd`. |
 | **P2** | Agent-in-the-loop intercept (**headline**) | `net intercept`/`resume`/`drop`/`respond` with fail-open hold-timeout; agent forces a 401 on `/v1/login` and confirms the error screen. |
 | **P3** | Static rules | `net rule add …` (map-local/remote, set-status/header, replace, block, delay) + `net rules apply` + `net replay`. |
 | **P4** | Interop & polish | HAR/curl export, anticache/anticomp, `uid` attribution, QUIC/pinning warnings in `net check`. |

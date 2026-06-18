@@ -18,7 +18,7 @@ ShadowDroid is designed so this loop is **three commands**:
 shadowdroid connect
 
 # 3. Run your CLI verb
-shadowdroid screen | jq
+shadowdroid ui dump | jq
 ```
 
 Step 2 picks up the freshly-built APK automatically (see "How `shadowdroid` finds the APK" below). You don't have to copy files anywhere or update any paths.
@@ -56,7 +56,7 @@ cd ShadowDroid
 
 # Repo auto-discovery picks up the build output:
 cargo run -p shadowdroid -- connect
-cargo run -p shadowdroid -- screen | jq
+cargo run -p shadowdroid -- ui dump | jq
 ```
 
 No flags, no env vars. The CLI walks up from `$CWD` looking for

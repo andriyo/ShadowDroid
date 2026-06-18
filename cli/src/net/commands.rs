@@ -73,7 +73,7 @@ pub async fn start(
             "anticache": anticache,
             "anticomp": anticomp,
             "ca": paths::ca_cert_path()?.display().to_string(),
-            "hint": "next: `net check <pkg>` to confirm trust, `net watch` to stream traffic",
+            "hint": "next: `net check <pkg>` to confirm trust; `watch` streams HTTP events alongside screen/crash events",
         }),
     );
     Ok(())
@@ -176,11 +176,6 @@ async fn teardown_wiring(serial: &str, port: u16) -> Result<()> {
 }
 
 // ── observe (task 8) ──────────────────────────────────────────
-
-pub async fn watch(serial: &str, matcher: Matcher) -> Result<()> {
-    let req = json!({"op": "watch", "matcher": matcher});
-    control::request_stream(serial, req).await
-}
 
 pub async fn log(serial: &str, matcher: Matcher, limit: usize) -> Result<()> {
     let flows = store::read_filtered(serial, &matcher, limit)?;
