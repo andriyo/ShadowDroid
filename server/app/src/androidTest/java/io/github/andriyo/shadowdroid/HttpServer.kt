@@ -29,10 +29,9 @@ import kotlinx.serialization.json.Json
 import org.slf4j.event.Level
 
 /**
- * Ktor 3 / CIO-backed v1 HTTP API for ShadowDroid. Implements the protocol
- * documented in `docs/protocol.md`.
+ * Ktor 3 / CIO-backed v1 HTTP API for ShadowDroid.
  *
- * Design choices (see architecture.md §9):
+ * Design choices:
  *   • Ktor 3 (CIO engine) for active maintenance + the type-safe routing DSL.
  *   • No gzip, no WebSocket — single-request/single-response keeps the wire
  *     `curl`-able and the CLI in charge of the watch loop's cadence.
@@ -92,8 +91,8 @@ private fun Application.installPlugins() {
         level = Level.DEBUG // captured in `adb logcat` under the test process tag
     }
     install(StatusPages) {
-        // Map our domain exceptions to the wire-error envelope documented in
-        // protocol.md §11. Anything we don't recognise turns into a 500 with
+        // Map our domain exceptions to the wire-error envelope. Anything we
+        // don't recognise turns into a 500 with
         // the exception type name in `detail.type`.
         exception<BadRequest> { call, e ->
             call.respond(HttpStatusCode.BadRequest, ErrorEnvelope(ErrorBody(e.code, e.message ?: "bad request", e.detail)))

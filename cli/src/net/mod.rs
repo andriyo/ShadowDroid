@@ -5,7 +5,7 @@
 //! reasoning loop, and apply declarative **rules** — modelled on mitmproxy but
 //! hand-rolled on `hyper`+`tokio-rustls`+`rcgen` to keep the single binary.
 //!
-//! Architecture (see `docs/net-proxy-plan.md`):
+//! Runtime shape:
 //!   - The proxy runs as a **background daemon** ([daemon]) so a *held*
 //!     intercepted flow survives across the agent's discrete one-shot commands.
 //!   - Control is a loopback-TCP socket (port in a `.ctl` file under

@@ -78,8 +78,8 @@ On the first `connect`, the CLI auto-installs a **version-matched APK pair**
 calls just probe `GET /v1/state` and reuse the live server, so steady-state
 latency stays low.
 
-See [docs/architecture.md](docs/architecture.md) for the full design and
-[docs/protocol.md](docs/protocol.md) for the HTTP wire format.
+At the wire level the server is a loopback HTTP/JSON API, but the supported
+public interface for agents is the CLI surface and `shadowdroid commands --json`.
 
 ## Install
 
@@ -114,8 +114,7 @@ installers print a hint if it's missing. On macOS:
 The direct shell/PowerShell installers also seed global agent skills; for
 package-manager installs, run `shadowdroid init` once.
 
-See [docs/getting-started.md](docs/getting-started.md) for pinned versions,
-custom install dirs, manual downloads, and uninstall.
+For manual installs, use the assets attached to the latest GitHub Release.
 
 ## Connect
 
@@ -128,9 +127,9 @@ shadowdroid connect        # install the on-device server, forward, and verify
 
 On first `connect`, the CLI downloads the matching instrumentation APKs from the
 GitHub Release, verifies them with SHA-256, caches them under
-`~/.shadowdroid/apks/<version>/`, and installs them on the device. (When working
-inside this repo it auto-discovers your local build instead — see
-[docs/development.md](docs/development.md).)
+`~/.shadowdroid/apks/<version>/`, and installs them on the device. When working
+inside this repo it auto-discovers local Gradle build outputs before falling
+back to cached or release APKs.
 
 Keep the CLI current and diagnose a flaky pipe:
 
@@ -254,8 +253,8 @@ Backed by an optional Android Studio plugin:
 
 Everything degrades gracefully: with no Studio plugin running, the device and UI
 commands still work and the debugger section just reports `available:false`.
-
-See [docs/agent-debugging.md](docs/agent-debugging.md).
+Run `shadowdroid debug --help` and `shadowdroid layout --help` for the live
+command surface.
 
 ## Agent integration
 

@@ -78,7 +78,7 @@ dependencies {
     androidTestImplementation("androidx.test:rules:1.7.0")
 
     // ── HTTP server: Ktor 3 (JetBrains-maintained, coroutines-native). ─
-    // Engine: CIO (pure-Kotlin, no Netty). See architecture.md §9.1.
+    // Engine: CIO (pure-Kotlin, no Netty).
     val ktor = "3.2.0"
     androidTestImplementation("io.ktor:ktor-server-core:$ktor")
     androidTestImplementation("io.ktor:ktor-server-cio:$ktor")

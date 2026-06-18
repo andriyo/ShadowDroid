@@ -14,7 +14,7 @@
 //!   each decrypted (or plaintext) request ──▶ [proxy_request]: buffer body,
 //!     forward upstream via reqwest, capture a [FlowRecord], return the response.
 //!
-//! Footguns (docs/net-proxy-plan.md §3): peek+rewind is mandatory (rustls must
+//! Footguns: peek+rewind is mandatory (rustls must
 //! read the ClientHello from byte 0); `serve_connection().with_upgrades()` is
 //! required or CONNECT hangs; the 200 is returned synchronously and the MITM
 //! work happens on a detached task.

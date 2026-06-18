@@ -3,7 +3,7 @@ package io.github.andriyo.shadowdroid.proto
 import kotlinx.serialization.Serializable
 
 /*
- * Wire types for the v1 HTTP API. Mirrors docs/protocol.md exactly.
+ * Wire types for the v1 HTTP API.
  *
  * Kept in their own package + file so the wire schema is greppable as one unit
  * and so adding/changing a field has a single point of audit.

@@ -42,8 +42,7 @@ pub struct Cli {
     #[arg(short, long, global = true, env = "SHADOWDROID_DEVICE")]
     pub device: Option<String>,
 
-    /// Local APK to install instead of fetching from GitHub releases. See
-    /// docs/development.md for the precedence chain. Can be either:
+    /// Local APK to install instead of normal APK resolution. Can be either:
     ///   • a path to the test APK (e.g., app-debug-androidTest.apk); the
     ///     sibling main APK is auto-discovered in the same directory tree
     ///   • a directory containing both app-debug.apk and app-debug-androidTest.apk

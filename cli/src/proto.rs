@@ -1,4 +1,4 @@
-//! Wire types for the on-device HTTP API. Mirrors docs/protocol.md.
+//! Wire types for the on-device HTTP API.
 //!
 //! Kept deliberately small — only what we actually serialise on the wire.
 

@@ -1,6 +1,6 @@
 //! APK lifecycle manager — resolve, install, and verify the on-device server.
 //!
-//! Source-precedence chain (first hit wins; see architecture.md §4):
+//! Source-precedence chain (first hit wins):
 //!
 //!   1. `--apk PATH` flag                  (explicit, highest priority)
 //!   2. `SHADOWDROID_APK` env var          (same semantics as --apk)

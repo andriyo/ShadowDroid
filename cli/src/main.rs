@@ -6,11 +6,11 @@
 //!   device      — talking to the on-device server (HTTP) + adb (ADB protocol)
 //!   watch       — event loop, debounce, crash watcher, watcher rule engine
 //!   dump        — XML / element JSON model
-//!   proto       — wire types (mirrors docs/protocol.md)
+//!   proto       — wire types for the on-device HTTP API
 //!   events      — JSON event emission (stdout) + types
 //!
-//! Each module is documented in the file header. See README.md for repo layout
-//! and docs/architecture.md for the big picture.
+//! Each module is documented in the file header. See README.md for the public
+//! command surface.
 
 mod cli;
 mod cmd;

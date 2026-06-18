@@ -10,7 +10,7 @@
 //!   - The fully-built `ServerConfig` is cached per host so repeat connections to
 //!     the same origin don't re-mint.
 //!
-//! Footguns handled (see docs/net-proxy-plan.md §3): explicit `aws_lc_rs`
+//! Footguns handled: explicit `aws_lc_rs`
 //! `CryptoProvider` (no global install race); **http/1.1-only ALPN** so the
 //! inner leg never negotiates h2 (we serve http1); `DnsName` SAN (CN alone is
 //! rejected by modern clients) + `serverAuth` EKU.
