@@ -8,6 +8,7 @@
 //! `doctor` diagnoses the very server `ensure_ready` would start, and `collect`
 //! must still produce a bundle when the server can't come up.
 
+pub mod aar;
 pub mod app_install;
 pub mod collect;
 pub mod config;

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The agent self-installs: AGP merges this <provider> into the host app's
+  manifest, so the framework instantiates ShadowDroidAgentProvider and calls
+  onCreate() before Application.onCreate() — zero app code. Only present in
+  builds that pull the AAR in via debugImplementation.
+
+  ${applicationId} is substituted with the consuming app's id at merge time, so
+  the authority is unique per app.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Loopback control channel binds a ServerSocket; networked apps already
+         hold this, harmless otherwise. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application>
+        <provider
+            android:name="io.github.andriyo.shadowdroid.agent.ShadowDroidAgentProvider"
+            android:authorities="${applicationId}.shadowdroid.agent"
+            android:enabled="true"
+            android:exported="false"
+            android:initOrder="100" />
+    </application>
+</manifest>

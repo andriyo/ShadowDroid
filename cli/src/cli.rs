@@ -175,6 +175,11 @@ pub enum Cmd {
     Ui(UiCmd),
     /// Agent-first layout snapshots and diffs.
     Layout(crate::cmd::layout::LayoutArgs),
+    /// Install/manage the in-app debug AAR (the ShadowDroid agent) in an app you
+    /// can build: wires one debug-only dependency; the agent auto-installs via a
+    /// merged ContentProvider. Host-only (no device needed).
+    #[command(subcommand)]
+    Aar(crate::cmd::aar::AarCmd),
 }
 
 // ── nested namespaces ─────────────────────────────────────────
@@ -669,6 +674,9 @@ pub async fn run() -> Result<()> {
         Cmd::Config(args) => return crate::cmd::config::run(args),
         Cmd::Skill(args) => return crate::cmd::skill::run(args),
         Cmd::Studio(args) => return crate::cmd::studio::run(args).await,
+        // `aar` is host-only: it edits a local app's Gradle build + copies the
+        // AAR. No device, no on-device server.
+        Cmd::Aar(c) => return crate::cmd::aar::run(c).await,
         Cmd::Debug(args) if args.is_host_only() => {
             return crate::cmd::debug::run_host_only(args).await
         }
@@ -748,7 +756,8 @@ pub async fn run() -> Result<()> {
         | Cmd::Perm(_)
         | Cmd::Appops(_)
         | Cmd::Profile(_)
-        | Cmd::Net(_) => unreachable!("handled before ensure_ready"),
+        | Cmd::Net(_)
+        | Cmd::Aar(_) => unreachable!("handled before ensure_ready"),
 
         // ── namespaces ─────────────────────────────────────────
         Cmd::App(app_cmd) => dispatch_app(app_cmd, &client).await?,
