@@ -67,6 +67,13 @@ pub struct Cli {
     #[arg(long, global = true, env = "SHADOWDROID_PROJECT", value_name = "PATH")]
     pub project: Option<PathBuf>,
 
+    /// Silence ShadowDroid's own operational logs (the `tracing` lines written to
+    /// stderr) so command output on stdout stays clean — handy when piping with
+    /// `2>&1` or for the tidiest agent output. Real errors are still reported, and
+    /// an explicit `RUST_LOG` still takes precedence.
+    #[arg(short = 'q', long, global = true, env = "SHADOWDROID_QUIET")]
+    pub quiet: bool,
+
     #[command(subcommand)]
     pub cmd: Cmd,
 }
@@ -1942,6 +1949,22 @@ async fn cmd_devices() -> Result<()> {
     Ok(())
 }
 
+/// Advisory surfaced on `connect`. ShadowDroid hosts its on-device server as an
+/// `AndroidJUnitRunner` instrumentation, which occupies the device's single
+/// `UiAutomation` slot. While ShadowDroid is connected, a user's own Espresso /
+/// UI Automator instrumentation tests cannot acquire that slot and fail at
+/// startup with "UiAutomationService ... already registered!". Disconnecting
+/// releases it. This is reported (not silently assumed) so agents and humans
+/// can plan around it instead of debugging a cryptic instrumentation failure.
+fn ui_automation_advisory() -> serde_json::Value {
+    json!({
+        "owner": "shadowdroid",
+        "blocks_instrumentation_tests": true,
+        "advisory": "ShadowDroid holds the device's single UiAutomation slot, so Espresso / UI Automator instrumentation tests (AndroidJUnitRunner) fail to start with \"UiAutomationService ... already registered!\" while it is connected.",
+        "resolution": "run `shadowdroid disconnect` before launching instrumentation tests, then `shadowdroid connect` again to resume driving",
+    })
+}
+
 async fn cmd_connect(
     device: Option<&str>,
     apk: Option<&std::path::Path>,
@@ -1966,7 +1989,13 @@ async fn cmd_connect(
         "viewport": {"w": state.viewport.w, "h": state.viewport.h},
         "current_app": state.current_app,
         "device_prep": {"stylus_tutorial_disabled": stylus_tutorial_disabled},
+        "ui_automation": ui_automation_advisory(),
     });
+    // Surface the UiAutomation-slot implication once, up front, so a later
+    // instrumentation-test failure isn't a mystery. Muted by `--quiet`.
+    tracing::info!(
+        "ShadowDroid now holds the device's single UiAutomation slot — run `shadowdroid disconnect` before launching Espresso / UI Automator instrumentation tests"
+    );
     // After a CLI upgrade, bring installed skills up to date — pristine ones are
     // rewritten silently; anything hand-edited is flagged for `skill sync`.
     if let Some(skills) = crate::cmd::skill::refresh_for_connect() {
@@ -2001,5 +2030,45 @@ async fn resolve_serial(explicit: Option<&str>) -> Result<String> {
             devices.len(),
             devices.join(", ")
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_defines_global_quiet_flag() {
+        // Guards the `--quiet`/`-q` contract that `main` pre-scans before clap runs.
+        Cli::command().debug_assert();
+        let cmd = Cli::command();
+        let quiet = cmd
+            .get_arguments()
+            .find(|a| a.get_id().as_str() == "quiet")
+            .expect("global --quiet flag should be defined");
+        assert_eq!(quiet.get_short(), Some('q'));
+        assert!(quiet.is_global_set(), "--quiet must be global");
+    }
+
+    #[test]
+    fn ui_automation_advisory_flags_instrumentation_conflict() {
+        let v = ui_automation_advisory();
+        assert_eq!(v["owner"], "shadowdroid");
+        assert_eq!(v["blocks_instrumentation_tests"], true);
+        assert!(
+            v["advisory"]
+                .as_str()
+                .unwrap()
+                .contains("already registered"),
+            "advisory should name the instrumentation failure symptom",
+        );
+        assert!(
+            v["resolution"]
+                .as_str()
+                .unwrap()
+                .contains("shadowdroid disconnect"),
+            "resolution should point at disconnect",
+        );
     }
 }

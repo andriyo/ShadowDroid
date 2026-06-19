@@ -27,10 +27,20 @@ use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `--quiet`/`-q` (or SHADOWDROID_QUIET) suppresses our own operational logs so
+    // stdout stays clean JSON even under `2>&1`. It's read here, ahead of clap,
+    // because tracing is initialized before argument dispatch. An explicit
+    // `RUST_LOG` (via the default env filter) still takes precedence.
+    let quiet = std::env::args()
+        .skip(1)
+        .any(|a| a == "-q" || a == "--quiet")
+        || std::env::var_os("SHADOWDROID_QUIET")
+            .is_some_and(|v| !matches!(v.to_str(), Some("") | Some("0") | Some("false")));
+    let default_filter = if quiet { "off" } else { "shadowdroid=info" };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("shadowdroid=info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter)),
         )
         .with_writer(std::io::stderr)
         .init();

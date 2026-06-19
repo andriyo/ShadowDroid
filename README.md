@@ -140,6 +140,13 @@ shadowdroid doctor --fix    # attempt repairs (reinstall, re-forward, restart)
 shadowdroid collect         # bundle a self-contained diagnostic snapshot
 ```
 
+> **Running instrumentation tests?** While connected, ShadowDroid holds the
+> device's single `UiAutomation` slot, so Espresso / UI Automator tests
+> (`AndroidJUnitRunner`) fail with `UiAutomationService ... already registered!`.
+> Run `shadowdroid disconnect` before the test run, then `shadowdroid connect`
+> again. `connect` reports this in its `ui_automation` field and `doctor` shows
+> the current slot owner.
+
 Initialize host integrations (Android Studio plugin for debugger + layout,
 plus agent skills):
 
@@ -180,6 +187,10 @@ Every command prints a single JSON event. Selectors are consistent across comman
 `--text`, `--rid` (resource id), `--desc` (content description), and `--xpath`.
 A typical agent reads `ui dump` once, acts by `--rid`/`--text`, and re-reads only
 when `screen_hash` changes.
+
+Results go to **stdout**; ShadowDroid's own logs go to **stderr**, so `… | jq`
+already sees clean JSON. Add `--quiet`/`-q` (or `SHADOWDROID_QUIET=1`) to silence
+those logs entirely — handy when you pipe with `2>&1`.
 
 | Group            | Commands                                                                                          |
 | ---------------- | ------------------------------------------------------------------------------------------------- |
