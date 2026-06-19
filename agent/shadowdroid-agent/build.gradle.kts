@@ -18,7 +18,10 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        minSdk = 24 // <= any reasonable app's minSdk; matches the server APK
+        // Low floor so the AAR drops into essentially any app (framework-only
+        // APIs; 21 is also the OkHttp companion's floor). Must be <= the host
+        // app's minSdk or the manifest merger rejects it.
+        minSdk = 21
     }
 
     buildTypes {

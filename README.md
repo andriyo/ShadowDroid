@@ -195,7 +195,7 @@ those logs entirely — handy when you pipe with `2>&1`.
 | Group            | Commands                                                                                          |
 | ---------------- | ------------------------------------------------------------------------------------------------- |
 | **UI**           | `ui dump`, `ui screenshot`, `ui find`, `ui tap`, `ui double-tap`, `ui long-tap`, `ui swipe`, `ui drag`, `ui swipe-ext`, `ui pinch`, `ui scroll-to`, `ui text`, `ui key`, `ui back`, `ui home`, `ui wait`, `ui toast` |
-| **Authoring**    | `ui audit` (flag elements with no stable selector), `ui gen` (scaffold a Screen Object), `net export fixtures` (replayable mocks), `test` (run an instrumentation test with the slot freed), `debug replay --repeat --diff` (flake hunt) |
+| **Authoring**    | `ui audit` (flag elements with no stable selector), `ui gen` (scaffold a Screen Object), `net export fixtures` (replayable response set + `manifest.json`, GraphQL keyed by operationName), `test` (run an instrumentation test with the slot freed), `debug replay --repeat --diff` (flake hunt) |
 | **Watch**        | `watch` (screen changes, crashes, toasts, watcher actions, and HTTP events when `net start` is running) |
 | **Layout**       | `layout snapshot` / `layout diff` / `layout source` / `layout recompositions`                      |
 | **App**          | `app start` / `stop` / `install` / `reinstall` / `clear` / `info` / `wait` / `current`             |
@@ -203,6 +203,7 @@ those logs entirely — handy when you pipe with `2>&1`.
 | **Device**       | `device info` / `shell` / `wake` / `sleep` / `unlock` / `orientation` / `clipboard` / `notifications` / `quick-settings` / `open-url` |
 | **Files**        | `files ls` / `push` / `pull`                                                                       |
 | **Network**      | `net check` / `trust` / `start` / `stop` / `status`, `net log` / `show` / `export`, `net intercept` / `resume` / `drop` / `respond`, `net rule …` / `replay` |
+| **Agent (AAR)**  | `aar install` / `status` / `remove` (wire the in-app debug agent), `aar capture` (in-app, **above-TLS** flows → `net export fixtures`), `aar intercept` / `resume` / `drop` / `agent` (in-app agent-in-the-loop modify — works on **pinned / Cronet / QUIC**, no CA) |
 | **Display**      | `profile snapshot` / `apply` / `reset` (animations, font, density, size, rotation)                 |
 | **Debug**        | `debug auto` / `snapshot` / `record` / `replay`, `debug attach` / `break` / `stack` / `variables` / `eval` / `inspect`, `debug native` / `tombstones` / `coroutines`, `debug run-until-crash` |
 | **Session**      | `devices`, `connect`, `disconnect`, `test`, `doctor`, `collect`, `config`, `update`, `commands`, `skill`, `studio`, `init` |

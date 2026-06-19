@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Build
 import android.os.Process
 import android.util.Log
+import org.json.JSONObject
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -12,8 +13,10 @@ import java.util.concurrent.atomic.AtomicBoolean
  * (`adb forward`).
  *
  * It is intentionally a small, extensible host: capabilities register a command
- * verb in [handle]. Today it answers `info`/`ping`; network capture, state
- * inspection, and the net-mock fixture broker plug in here later.
+ * verb in [handle]. It answers `info`/`ping`, and — when the OkHttp companion
+ * interceptor is wired into the host app — the network verbs `capture`,
+ * `intercept`, `resume`, `drop`, and `status` (above-TLS, in-process capture +
+ * agent-in-the-loop interception; see [Capture] / [Intercept]).
  */
 object ShadowDroidAgent {
     const val TAG = "ShadowDroidAgent"
@@ -48,14 +51,79 @@ object ShadowDroidAgent {
         )
     }
 
-    /** Dispatch one control-channel command line to a single JSON response. */
+    /**
+     * Dispatch one control-channel command line to a single JSON response.
+     *
+     * Grammar (newline-framed, one line in → one JSON line out):
+     * - `info` / `ping`
+     * - `capture [--clear]`            → buffered flows (FlowRecord shape)
+     * - `capture-clear`                → drop the capture buffer
+     * - `intercept {json-matcher}`     → arm interception
+     * - `intercept-clear`              → disarm
+     * - `status`                       → armed matcher + held flows + counts
+     * - `resume <id> [{status,body,contentType}]`
+     * - `drop <id>`
+     */
     private fun handle(line: String): String {
-        val cmd = line.trim().substringBefore(' ').ifEmpty { "info" }
-        return when (cmd) {
-            "info", "ping" -> info()
-            else -> jsonError("unknown command: $cmd")
+        val trimmed = line.trim()
+        val cmd = trimmed.substringBefore(' ').ifEmpty { "info" }
+        val rest = trimmed.substringAfter(' ', "").trim()
+        return try {
+            when (cmd) {
+                "info", "ping" -> info()
+                "capture" -> capture(clear = rest.contains("--clear"))
+                "capture-clear" -> { Capture.clear(); ok() }
+                "intercept" -> intercept(rest)
+                "intercept-clear", "disarm" -> { Intercept.disarm(); statusJson() }
+                "status" -> statusJson()
+                "resume" -> resolve(rest, drop = false)
+                "drop" -> resolve(rest, drop = true)
+                else -> jsonError("unknown command: $cmd")
+            }
+        } catch (t: Throwable) {
+            jsonError("command '$cmd' failed: ${t.message}")
         }
     }
+
+    private fun capture(clear: Boolean): String =
+        JSONObject().apply {
+            put("ok", true)
+            val flows = Capture.drain(clear)
+            put("flows", flows)
+            put("count", flows.length())
+        }.toString()
+
+    private fun intercept(rest: String): String {
+        val spec = if (rest.isEmpty()) JSONObject() else JSONObject(rest)
+        Intercept.arm(spec)
+        return statusJson()
+    }
+
+    private fun statusJson(): String =
+        JSONObject().apply {
+            put("ok", true)
+            put("package", packageName)
+            put("captured", Capture.size())
+            put("intercept", Intercept.status())
+        }.toString()
+
+    private fun resolve(rest: String, drop: Boolean): String {
+        val id = rest.substringBefore(' ').ifEmpty { return jsonError("missing flow id") }
+        val payload = rest.substringAfter(' ', "").trim()
+        val action = when {
+            drop -> JSONObject().put("drop", true)
+            payload.isEmpty() -> JSONObject()
+            else -> JSONObject(payload)
+        }
+        val resolved = Intercept.resolve(id, action)
+        return JSONObject().apply {
+            put("ok", resolved)
+            put("id", id)
+            if (!resolved) put("error", "no held flow with id '$id'")
+        }.toString()
+    }
+
+    private fun ok(): String = """{"ok":true}"""
 
     fun info(): String =
         """{"ok":true,"agent":"shadowdroid","version":"${BuildInfo.VERSION}",""" +

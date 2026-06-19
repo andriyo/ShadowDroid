@@ -40,6 +40,99 @@ pub enum AarCmd {
     Status(TargetArgs),
     /// Remove the managed dependency line and the copied AAR file.
     Remove(TargetArgs),
+
+    // ── device verbs (talk to the running in-app agent) ──────────────────
+    /// Drain in-app captured HTTP(S) flows; optionally export or persist them.
+    Capture(CaptureArgs),
+    /// Arm (or clear) in-app, above-TLS interception of matching flows.
+    Intercept(InterceptArgs),
+    /// Release a held flow, optionally mutating its response.
+    Resume(ResumeArgs),
+    /// Fail a held flow (the app sees a connection error).
+    Drop(IdArgs),
+    /// Show the running agent: info, armed matcher, held flows, capture count.
+    Agent(JsonArg),
+}
+
+#[derive(Args)]
+pub struct CaptureArgs {
+    /// Drain (clear) the agent buffer after reading.
+    #[arg(long)]
+    pub clear: bool,
+    /// Write the flows as FlowRecord JSONL to this file.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+    /// Generate a fixtures manifest + response files into this directory.
+    #[arg(long)]
+    pub fixtures: Option<PathBuf>,
+    /// Append the flows to the `net` session store (so `net log`/`export` see them).
+    #[arg(long)]
+    pub store: bool,
+    /// Emit a single JSON object instead of human-readable text.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct InterceptArgs {
+    /// Host substring to match.
+    #[arg(long)]
+    pub host: Option<String>,
+    /// Path substring to match.
+    #[arg(long)]
+    pub path: Option<String>,
+    /// HTTP method to match (exact, case-insensitive).
+    #[arg(long)]
+    pub method: Option<String>,
+    /// GraphQL operationName to match (exact).
+    #[arg(long)]
+    pub operation: Option<String>,
+    /// Per-flow hold budget in ms (fail-open on expiry).
+    #[arg(long)]
+    pub hold_ms: Option<u64>,
+    /// Disarm interception instead of arming.
+    #[arg(long)]
+    pub clear: bool,
+    /// Emit a single JSON object instead of human-readable text.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct ResumeArgs {
+    /// Held flow id (from `aar status`).
+    pub id: String,
+    /// Override the response status code.
+    #[arg(long)]
+    pub set_status: Option<u16>,
+    /// Replace the response body with this string.
+    #[arg(long)]
+    pub body: Option<String>,
+    /// Replace the response body with this file's contents.
+    #[arg(long)]
+    pub body_file: Option<PathBuf>,
+    /// Content-Type for the replaced body.
+    #[arg(long)]
+    pub content_type: Option<String>,
+    /// Emit a single JSON object instead of human-readable text.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct IdArgs {
+    /// Held flow id (from `aar status`).
+    pub id: String,
+    /// Emit a single JSON object instead of human-readable text.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct JsonArg {
+    /// Emit a single JSON object instead of human-readable text.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]
@@ -68,14 +161,70 @@ pub struct TargetArgs {
     pub json: bool,
 }
 
-pub async fn run(cmd: &AarCmd, project: Option<&Path>) -> Result<()> {
-    // The app source root comes from the global `--project` (or config),
-    // falling back to the current directory.
+pub async fn run(cmd: &AarCmd, project: Option<&Path>, device: Option<&str>) -> Result<()> {
+    use crate::cmd::agent;
+
+    // Device verbs talk to the running in-app agent; resolve a serial first.
+    match cmd {
+        AarCmd::Capture(a) => {
+            let serial = crate::cli::resolve_serial(device).await?;
+            return agent::capture(
+                &serial,
+                a.clear,
+                a.out.as_ref(),
+                a.fixtures.as_ref(),
+                a.store,
+                a.json,
+            )
+            .await;
+        }
+        AarCmd::Intercept(a) => {
+            let serial = crate::cli::resolve_serial(device).await?;
+            return if a.clear {
+                agent::intercept_clear(&serial, a.json).await
+            } else {
+                agent::intercept(
+                    &serial,
+                    a.host.as_deref(),
+                    a.path.as_deref(),
+                    a.method.as_deref(),
+                    a.operation.as_deref(),
+                    a.hold_ms,
+                    a.json,
+                )
+                .await
+            };
+        }
+        AarCmd::Resume(a) => {
+            let serial = crate::cli::resolve_serial(device).await?;
+            let body = match (&a.body, &a.body_file) {
+                (Some(b), _) => Some(b.clone()),
+                (None, Some(f)) => Some(
+                    fs::read_to_string(f).with_context(|| format!("read --body-file {}", f.display()))?,
+                ),
+                (None, None) => None,
+            };
+            return agent::resume(&serial, &a.id, a.set_status, body, a.content_type.as_deref(), a.json)
+                .await;
+        }
+        AarCmd::Drop(a) => {
+            let serial = crate::cli::resolve_serial(device).await?;
+            return agent::drop_flow(&serial, &a.id, a.json).await;
+        }
+        AarCmd::Agent(a) => {
+            let serial = crate::cli::resolve_serial(device).await?;
+            return agent::status(&serial, a.json).await;
+        }
+        _ => {}
+    }
+
+    // Host-only verbs: pure filesystem + Gradle on the host, no device.
     let root = canonical_root(project.unwrap_or_else(|| Path::new(".")))?;
     match cmd {
         AarCmd::Install(a) => install(a, &root).await,
         AarCmd::Status(a) => status(a, &root),
         AarCmd::Remove(a) => remove(a, &root),
+        _ => unreachable!("device verbs handled above"),
     }
 }
 

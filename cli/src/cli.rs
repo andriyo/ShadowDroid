@@ -578,8 +578,9 @@ pub enum NetCmd {
         har: bool,
     },
     /// Export flows for interop: `har`, `curl`, or `fixtures` (a replayable
-    /// response set + manifest for deterministic instrumentation tests; GraphQL
-    /// POSTs are keyed by operationName).
+    /// response set + `manifest.json` for deterministic instrumentation tests;
+    /// GraphQL POSTs are keyed by operationName). Framework-specific setups are
+    /// generated from the neutral fixtures manifest by your own tooling.
     Export {
         #[arg(value_parser = ["har", "curl", "fixtures"])]
         format: String,
@@ -730,9 +731,10 @@ pub async fn run() -> Result<()> {
         Cmd::Config(args) => return crate::cmd::config::run(args),
         Cmd::Skill(args) => return crate::cmd::skill::run(args),
         Cmd::Studio(args) => return crate::cmd::studio::run(args).await,
-        // `aar` is host-only: it edits a local app's Gradle build + copies the
-        // AAR. No device, no on-device server.
-        Cmd::Aar(c) => return crate::cmd::aar::run(c, project.as_deref()).await,
+        // `aar` install/status/remove are host-only (Gradle + filesystem); the
+        // capture/intercept/resume/drop/agent verbs talk to the running in-app
+        // agent and resolve a device serial internally.
+        Cmd::Aar(c) => return crate::cmd::aar::run(c, project.as_deref(), device.as_deref()).await,
         Cmd::Debug(args) if args.is_host_only() => {
             return crate::cmd::debug::run_host_only(args).await
         }
@@ -2150,7 +2152,7 @@ async fn cmd_test(
     }
 }
 
-async fn resolve_serial(explicit: Option<&str>) -> Result<String> {
+pub(crate) async fn resolve_serial(explicit: Option<&str>) -> Result<String> {
     if let Some(s) = explicit {
         return Ok(s.to_string());
     }

@@ -16,3 +16,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "shadowdroid-agent-build"
 include(":shadowdroid-agent")
+include(":shadowdroid-agent-okhttp")

@@ -9,6 +9,7 @@
 //! must still produce a bundle when the server can't come up.
 
 pub mod aar;
+pub mod agent;
 pub mod app_install;
 pub mod authoring;
 pub mod collect;
