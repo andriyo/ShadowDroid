@@ -1,6 +1,6 @@
 [package]
 name = "shadowdroid"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.82"   # raised: reqwest 0.13 requires 1.81+; modern crates assume 1.80+
 description = "Drive Android apps from the command line — streaming JSON events, structured crashes, declarative popup watchers"
