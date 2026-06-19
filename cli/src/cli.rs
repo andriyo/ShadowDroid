@@ -87,6 +87,24 @@ pub enum Cmd {
     Connect,
     /// Stop the server and remove the port forward.
     Disconnect,
+    /// Run an instrumentation-test command with the device's UiAutomation slot
+    /// freed: disconnects ShadowDroid, runs the given command (stdio inherited),
+    /// then reconnects (unless `--no-reconnect`). Exits with the command's status.
+    ///
+    /// Example: `shadowdroid test -- ./gradlew :app:connectedDebugAndroidTest`
+    Test {
+        /// Leave ShadowDroid disconnected after the command finishes.
+        #[arg(long)]
+        no_reconnect: bool,
+        /// The command to run, after `--`.
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            required = true,
+            value_name = "COMMAND"
+        )]
+        command: Vec<String>,
+    },
     /// Check whether this CLI is older than the latest GitHub Release.
     Update {
         #[arg(long)]
@@ -328,6 +346,17 @@ pub enum UiCmd {
         #[arg(long)]
         full: bool,
     },
+    /// Audit the current screen for interactive elements lacking a stable
+    /// selector (resource-id / Compose testTag) — the ones that force a test to
+    /// match on localized text or element index. Helps before writing a test.
+    Audit,
+    /// Generate a starting-point Kotlin Screen Object from the current screen,
+    /// with stable selectors filled in and un-tagged elements listed as TODOs.
+    Gen {
+        /// Class-name prefix; the generated class is `<name>Screen`.
+        #[arg(long, default_value = "Generated")]
+        name: String,
+    },
     /// Capture a screenshot to a file.
     Screenshot {
         path: Option<String>,
@@ -548,11 +577,16 @@ pub enum NetCmd {
         #[arg(long)]
         har: bool,
     },
-    /// Export flows for interop (har | curl).
+    /// Export flows for interop: `har`, `curl`, or `fixtures` (a replayable
+    /// response set + manifest for deterministic instrumentation tests; GraphQL
+    /// POSTs are keyed by operationName).
     Export {
-        #[arg(value_parser = ["har", "curl"])]
+        #[arg(value_parser = ["har", "curl", "fixtures"])]
         format: String,
         id: Option<String>,
+        /// Output directory for `fixtures` (default: ./shadowdroid-fixtures).
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// Pause matching flows for agent-in-the-loop editing.
     Intercept {
@@ -706,6 +740,19 @@ pub async fn run() -> Result<()> {
             return cmd_connect(device.as_deref(), apk.as_deref(), any_apk_version).await
         }
         Cmd::Disconnect => return cmd_disconnect(device.as_deref()).await,
+        Cmd::Test {
+            no_reconnect,
+            command,
+        } => {
+            return cmd_test(
+                device.as_deref(),
+                apk.as_deref(),
+                any_apk_version,
+                !*no_reconnect,
+                command.clone(),
+            )
+            .await
+        }
         Cmd::Doctor {
             app,
             fix,
@@ -767,6 +814,7 @@ pub async fn run() -> Result<()> {
         Cmd::Devices
         | Cmd::Connect
         | Cmd::Disconnect
+        | Cmd::Test { .. }
         | Cmd::Update { .. }
         | Cmd::Init(_)
         | Cmd::Doctor { .. }
@@ -830,6 +878,21 @@ async fn dispatch_ui(
 ) -> Result<()> {
     match c {
         UiCmd::Dump { full } => cmd_screen(serial, apk, any_apk_version, client, full).await?,
+        UiCmd::Audit => {
+            let screen = read_screen_with_reconnect(serial, apk, any_apk_version, client).await?;
+            let mut body = crate::cmd::authoring::audit_elements(&screen.elements);
+            if let serde_json::Value::Object(m) = &mut body {
+                m.insert("screen_hash".into(), json!(screen.screen_hash));
+            }
+            emit_action("ui_audit", &body);
+        }
+        UiCmd::Gen { name } => {
+            let screen = read_screen_with_reconnect(serial, apk, any_apk_version, client).await?;
+            print!(
+                "{}",
+                crate::cmd::authoring::generate_screen_object(&name, &screen.elements)
+            );
+        }
         UiCmd::Screenshot {
             path,
             format,
@@ -1307,7 +1370,9 @@ async fn dispatch_net(c: &NetCmd, serial: &str) -> Result<()> {
             limit,
         } => nc::log(serial, matcher(host, path, method, status), *limit).await,
         NetCmd::Show { id, body, har } => nc::show(serial, id, *body, *har).await,
-        NetCmd::Export { format, id } => nc::export(serial, format, id.clone()).await,
+        NetCmd::Export { format, id, out } => {
+            nc::export(serial, format, id.clone(), out.clone()).await
+        }
         NetCmd::Intercept {
             host,
             path,
@@ -1856,9 +1921,14 @@ async fn cmd_wait(
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
+            let hint = if gone {
+                "still present after timeout — the selector may be too broad, or the element is re-created each frame"
+            } else {
+                "never matched — verify the selector against the live screen (`shadowdroid ui find …` or `ui audit`), or the target screen may not have finished loading"
+            };
             emit_action(
                 "wait",
-                &json!({"matched":matched,"gone":gone,"screen_hash":screen_hash,"timeout":true}),
+                &json!({"matched":matched,"gone":gone,"screen_hash":screen_hash,"timeout":true,"hint":hint}),
             );
             return Ok(());
         }
@@ -2007,14 +2077,77 @@ async fn cmd_connect(
 
 async fn cmd_disconnect(device: Option<&str>) -> Result<()> {
     let serial = resolve_serial(device).await?;
-    adb::am_force_stop(&serial, installer::TEST_PACKAGE).await?;
-    adb::am_force_stop(&serial, installer::APP_PACKAGE).await?;
-    adb::kill_instrument_zombies(&serial).await?;
-    // Best-effort remove forward; ignore error if it wasn't set.
-    let _ = adb::forward_remove(&serial, installer::DEFAULT_PORT).await;
+    free_ui_automation_slot(&serial).await?;
     let out = json!({"type": "disconnected", "device": serial});
     println!("{}", serde_json::to_string(&out).unwrap());
     Ok(())
+}
+
+/// Release the device's single UiAutomation slot held by ShadowDroid's
+/// instrumentation: force-stop our packages, kill instrument zombies, drop the
+/// port forward. Shared by `disconnect` and `test`.
+async fn free_ui_automation_slot(serial: &str) -> Result<()> {
+    adb::am_force_stop(serial, installer::TEST_PACKAGE).await?;
+    adb::am_force_stop(serial, installer::APP_PACKAGE).await?;
+    adb::kill_instrument_zombies(serial).await?;
+    // Best-effort remove forward; ignore error if it wasn't set.
+    let _ = adb::forward_remove(serial, installer::DEFAULT_PORT).await;
+    Ok(())
+}
+
+/// `shadowdroid test -- <cmd>`: free the UiAutomation slot, run the user's
+/// instrumentation-test command with stdio inherited, then reconnect (unless
+/// `reconnect` is false). Exits with the command's own status code so CI / agents
+/// see pass/fail.
+async fn cmd_test(
+    device: Option<&str>,
+    apk: Option<&std::path::Path>,
+    any_apk_version: bool,
+    reconnect: bool,
+    command: Vec<String>,
+) -> Result<()> {
+    use std::io::Write;
+
+    let serial = resolve_serial(device).await?;
+    free_ui_automation_slot(&serial)
+        .await
+        .context("freeing the UiAutomation slot before the test run")?;
+
+    // Inherit stdio so the test runner's output streams live to the user.
+    let program = command
+        .first()
+        .ok_or_else(|| anyhow!("no command given; use `shadowdroid test -- <command>`"))?;
+    let status = std::process::Command::new(program)
+        .args(&command[1..])
+        .status()
+        .with_context(|| format!("failed to launch `{}`", command.join(" ")))?;
+    let exit_code = status.code();
+
+    let reconnected = if reconnect {
+        installer::ensure_ready(&serial, apk, any_apk_version)
+            .await
+            .is_ok()
+    } else {
+        false
+    };
+
+    let out = json!({
+        "type": "action",
+        "cmd": "test",
+        "device": serial,
+        "command": command,
+        "exit_code": exit_code,
+        "reconnected": reconnected,
+    });
+    println!("{}", serde_json::to_string(&out).unwrap());
+    let _ = std::io::stdout().flush();
+
+    if status.success() {
+        Ok(())
+    } else {
+        // Propagate the test runner's status so callers (CI/agents) see failure.
+        std::process::exit(exit_code.unwrap_or(1));
+    }
 }
 
 async fn resolve_serial(explicit: Option<&str>) -> Result<String> {

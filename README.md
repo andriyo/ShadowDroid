@@ -195,6 +195,7 @@ those logs entirely — handy when you pipe with `2>&1`.
 | Group            | Commands                                                                                          |
 | ---------------- | ------------------------------------------------------------------------------------------------- |
 | **UI**           | `ui dump`, `ui screenshot`, `ui find`, `ui tap`, `ui double-tap`, `ui long-tap`, `ui swipe`, `ui drag`, `ui swipe-ext`, `ui pinch`, `ui scroll-to`, `ui text`, `ui key`, `ui back`, `ui home`, `ui wait`, `ui toast` |
+| **Authoring**    | `ui audit` (flag elements with no stable selector), `ui gen` (scaffold a Screen Object), `net export fixtures` (replayable mocks), `test` (run an instrumentation test with the slot freed), `debug replay --repeat --diff` (flake hunt) |
 | **Watch**        | `watch` (screen changes, crashes, toasts, watcher actions, and HTTP events when `net start` is running) |
 | **Layout**       | `layout snapshot` / `layout diff` / `layout source` / `layout recompositions`                      |
 | **App**          | `app start` / `stop` / `install` / `reinstall` / `clear` / `info` / `wait` / `current`             |
@@ -204,7 +205,7 @@ those logs entirely — handy when you pipe with `2>&1`.
 | **Network**      | `net check` / `trust` / `start` / `stop` / `status`, `net log` / `show` / `export`, `net intercept` / `resume` / `drop` / `respond`, `net rule …` / `replay` |
 | **Display**      | `profile snapshot` / `apply` / `reset` (animations, font, density, size, rotation)                 |
 | **Debug**        | `debug auto` / `snapshot` / `record` / `replay`, `debug attach` / `break` / `stack` / `variables` / `eval` / `inspect`, `debug native` / `tombstones` / `coroutines`, `debug run-until-crash` |
-| **Session**      | `devices`, `connect`, `disconnect`, `doctor`, `collect`, `config`, `update`, `commands`, `skill`, `studio`, `init` |
+| **Session**      | `devices`, `connect`, `disconnect`, `test`, `doctor`, `collect`, `config`, `update`, `commands`, `skill`, `studio`, `init` |
 
 `watch` is the streaming workhorse — it emits debounced, hash-diffed `screen`
 events plus `crash`, `toast`, `watcher_fired`, and `http` events when a `net`

@@ -174,6 +174,17 @@ pub struct ReplayArgs {
     /// Stop at the first unsupported or failed action.
     #[arg(long)]
     pub stop_on_error: bool,
+    /// Replay the whole timeline this many times back-to-back — a flake hunter.
+    #[arg(long, default_value_t = 1)]
+    pub repeat: u32,
+    /// After each action capture the post-action screen_hash and report
+    /// run-to-run divergence — surfaces non-determinism in the underlying flow
+    /// before it becomes a flaky test.
+    #[arg(long)]
+    pub diff: bool,
+    /// Settle delay before capturing screen_hash when --diff is set.
+    #[arg(long, default_value_t = 0)]
+    pub settle_ms: u64,
 }
 
 #[derive(Args, Clone)]
@@ -942,8 +953,10 @@ async fn replay_cmd(client: &ServerClient, args: ReplayArgs) -> Result<()> {
     let file =
         File::open(&args.file).with_context(|| format!("opening {}", args.file.display()))?;
     let reader = StdBufReader::new(file);
+
+    // Collect the replayable actions up front so we can re-run them N times.
     let mut seen = 0u64;
-    let mut replayed = 0u64;
+    let mut actions: Vec<Value> = Vec::new();
     for line in reader.lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -952,43 +965,137 @@ async fn replay_cmd(client: &ServerClient, args: ReplayArgs) -> Result<()> {
         seen += 1;
         let value: Value = serde_json::from_str(&line)
             .with_context(|| format!("parsing {} line {seen}", args.file.display()))?;
-        if !is_replayable_action(&value) {
-            continue;
+        if is_replayable_action(&value) {
+            actions.push(value);
         }
-        replayed += 1;
-        if args.dry_run {
+    }
+
+    if args.dry_run {
+        for (i, value) in actions.iter().enumerate() {
             println!(
                 "{}",
-                serde_json::to_string(&json!({"type":"replay_plan","index":seen,"event":value}))?
+                serde_json::to_string(&json!({"type":"replay_plan","index":i,"event":value}))?
             );
-        } else {
-            match perform_action(client, &value).await {
-                Ok(()) => println!(
+        }
+        println!(
+            "{}",
+            serde_json::to_string(
+                &json!({"type":"replay_done","seen":seen,"replayable":actions.len()})
+            )?
+        );
+        return Ok(());
+    }
+
+    let repeat = args.repeat.max(1);
+    // Per-run post-action screen hashes (only populated with --diff).
+    let mut runs: Vec<Vec<String>> = Vec::new();
+
+    for run in 1..=repeat {
+        let mut hashes: Vec<String> = Vec::new();
+        for (i, value) in actions.iter().enumerate() {
+            let result = perform_action(client, value).await;
+            let ok = result.is_ok();
+            if let Err(err) = &result {
+                println!(
                     "{}",
-                    serde_json::to_string(&json!({"type":"replay_action","index":seen,"ok":true}))?
-                ),
-                Err(err) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string(
-                            &json!({"type":"replay_action","index":seen,"ok":false,"error":err.to_string()})
-                        )?
-                    );
-                    if args.stop_on_error {
-                        return Err(err);
-                    }
+                    serde_json::to_string(
+                        &json!({"type":"replay_action","run":run,"index":i,"ok":false,"error":err.to_string()})
+                    )?
+                );
+                if args.stop_on_error {
+                    return Err(anyhow::anyhow!(
+                        "replay action {i} failed on run {run}: {err}"
+                    ));
                 }
             }
             if args.delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(args.delay_ms)).await;
             }
+            if args.diff {
+                if args.settle_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(args.settle_ms)).await;
+                }
+                let hash = client
+                    .screen()
+                    .await
+                    .map(|s| s.screen_hash)
+                    .unwrap_or_default();
+                println!(
+                    "{}",
+                    serde_json::to_string(
+                        &json!({"type":"replay_action","run":run,"index":i,"ok":ok,"screen_hash":hash})
+                    )?
+                );
+                hashes.push(hash);
+            } else if ok {
+                println!(
+                    "{}",
+                    serde_json::to_string(
+                        &json!({"type":"replay_action","run":run,"index":i,"ok":true})
+                    )?
+                );
+            }
+        }
+        runs.push(hashes);
+    }
+
+    if args.diff {
+        let divergences = find_divergences(&runs);
+        for d in &divergences {
+            println!("{}", serde_json::to_string(d)?);
+        }
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "type":"replay_repeat_summary",
+                "repeat": repeat,
+                "actions": actions.len(),
+                "divergent_steps": divergences.len(),
+                "stable": divergences.is_empty(),
+            }))?
+        );
+    } else {
+        println!(
+            "{}",
+            serde_json::to_string(
+                &json!({"type":"replay_done","seen":seen,"replayable":actions.len(),"repeat":repeat})
+            )?
+        );
+    }
+    Ok(())
+}
+
+/// Compare per-run post-action screen hashes and report each step index whose
+/// hash was not identical across all runs — i.e. the flow behaved
+/// non-deterministically there. Returns one `replay_divergence` value per
+/// divergent step.
+fn find_divergences(runs: &[Vec<String>]) -> Vec<Value> {
+    let mut out = Vec::new();
+    if runs.len() < 2 {
+        return out;
+    }
+    let steps = runs.iter().map(Vec::len).max().unwrap_or(0);
+    for step in 0..steps {
+        let distinct: std::collections::BTreeSet<&str> = runs
+            .iter()
+            .filter_map(|r| r.get(step))
+            .map(String::as_str)
+            .collect();
+        if distinct.len() > 1 {
+            let per_run: Vec<Value> = runs
+                .iter()
+                .enumerate()
+                .map(|(ri, r)| json!({"run": ri + 1, "screen_hash": r.get(step)}))
+                .collect();
+            out.push(json!({
+                "type": "replay_divergence",
+                "step": step,
+                "distinct_hashes": distinct.len(),
+                "runs": per_run,
+            }));
         }
     }
-    println!(
-        "{}",
-        serde_json::to_string(&json!({"type":"replay_done","seen":seen,"replayable":replayed}))?
-    );
-    Ok(())
+    out
 }
 
 async fn step_until_screen_change(
@@ -1823,6 +1930,30 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_divergences_flags_steps_that_differ_across_runs() {
+        // step 0 stable across runs, step 1 diverges on run 2.
+        let runs = vec![
+            vec!["aaaa".to_string(), "bbbb".to_string()],
+            vec!["aaaa".to_string(), "cccc".to_string()],
+        ];
+        let d = find_divergences(&runs);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0]["step"], 1);
+        assert_eq!(d[0]["distinct_hashes"], 2);
+    }
+
+    #[test]
+    fn find_divergences_stable_runs_have_none() {
+        let runs = vec![
+            vec!["aaaa".to_string(), "bbbb".to_string()],
+            vec!["aaaa".to_string(), "bbbb".to_string()],
+        ];
+        assert!(find_divergences(&runs).is_empty());
+        // A single run can't diverge.
+        assert!(find_divergences(&[vec!["aaaa".to_string()]]).is_empty());
+    }
 
     #[test]
     fn diffs_variables_by_name() {

@@ -10,6 +10,7 @@
 
 pub mod aar;
 pub mod app_install;
+pub mod authoring;
 pub mod collect;
 pub mod config;
 pub mod debug;

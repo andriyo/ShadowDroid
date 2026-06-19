@@ -1,7 +1,13 @@
-//! Interop export for captured flows: `curl` commands (hand a repro to a human)
-//! and HAR 1.2 (load into browser devtools / Charles / Proxyman).
+//! Interop export for captured flows: `curl` commands (hand a repro to a human),
+//! HAR 1.2 (load into browser devtools / Charles / Proxyman), and `fixtures` — a
+//! replayable response set + manifest for deterministic instrumentation tests
+//! (the toil this removes: hand-authoring record/replay mocks like OkReplay /
+//! MockWebServer / WireMock from scratch). GraphQL POSTs are keyed by
+//! `operationName` so same-endpoint operations don't collide.
 
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
+use std::path::Path;
 
 use crate::net::flow::FlowRecord;
 
@@ -76,7 +82,131 @@ fn har_entry(f: &FlowRecord) -> Value {
 }
 
 fn har_headers(h: &[(String, String)]) -> Value {
-    Value::Array(h.iter().map(|(k, v)| json!({"name": k, "value": v})).collect())
+    Value::Array(
+        h.iter()
+            .map(|(k, v)| json!({"name": k, "value": v}))
+            .collect(),
+    )
+}
+
+// ── fixtures (record/replay for tests) ────────────────────────────────────
+
+/// Extract a GraphQL `operationName` from a request body, if it parses as a JSON
+/// object carrying one. This is the key that lets fixtures distinguish multiple
+/// operations POSTed to the same endpoint (the exact thing record/replay mocks
+/// match on). Returns `None` for non-JSON bodies or absent/blank names.
+pub fn graphql_operation_name(req_body: &Option<String>) -> Option<String> {
+    let body = req_body.as_deref()?;
+    let v: Value = serde_json::from_str(body).ok()?;
+    let name = v.get("operationName")?.as_str()?.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Sanitize a string into a filesystem- and identifier-safe token.
+fn sanitize_token(s: &str) -> String {
+    let mut out = String::new();
+    let mut prev_us = false;
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            prev_us = false;
+        } else if !prev_us {
+            out.push('_');
+            prev_us = true;
+        }
+    }
+    out.trim_matches('_').to_string()
+}
+
+fn body_extension(content_type: &Option<String>) -> &'static str {
+    match content_type {
+        Some(ct) if ct.contains("json") || ct.contains("graphql") => "json",
+        _ => "txt",
+    }
+}
+
+/// Build the fixtures manifest plus the list of response files to write
+/// (`(relative_path, body)`). Pure so it can be unit-tested without disk I/O.
+///
+/// Each entry records how a test/replay layer should match the request
+/// (`method` + `path` + optional `operation_name`) and which file holds the
+/// canned response body.
+pub fn build_fixtures(flows: &[FlowRecord]) -> (Value, Vec<(String, String)>) {
+    let mut entries: Vec<Value> = Vec::new();
+    let mut files: Vec<(String, String)> = Vec::new();
+
+    for (i, f) in flows.iter().enumerate() {
+        let op = graphql_operation_name(&f.req_body);
+        let response_file = f.resp_body.as_ref().map(|body| {
+            let path_tok = sanitize_token(&f.path);
+            let op_tok = op
+                .as_deref()
+                .map(|o| format!("_{}", sanitize_token(o)))
+                .unwrap_or_default();
+            let ext = body_extension(&f.resp_type);
+            let name = format!(
+                "responses/{i:03}_{}_{}{}.{}",
+                f.method, path_tok, op_tok, ext
+            );
+            files.push((name.clone(), body.clone()));
+            name
+        });
+
+        entries.push(json!({
+            "method": f.method,
+            "scheme": f.scheme,
+            "host": f.host,
+            "path": f.path,
+            "operation_name": op,
+            "status": f.status,
+            "request_content_type": f.req_type,
+            "response_content_type": f.resp_type,
+            "response_file": response_file,
+            "response_truncated": f.resp_truncated,
+            // The minimal key a replay/mock layer should match on.
+            "match": {
+                "method": f.method,
+                "path": f.path,
+                "operation_name": op,
+            },
+        }));
+    }
+
+    let manifest = json!({
+        "version": 1,
+        "generated_by": format!("shadowdroid net export fixtures ({})", env!("CARGO_PKG_VERSION")),
+        "count": entries.len(),
+        "fixtures": entries,
+    });
+    (manifest, files)
+}
+
+/// Write a fixtures bundle to `out`: `manifest.json` plus a `responses/` file per
+/// captured response body. Returns an action summary for stdout.
+pub fn write_fixtures(flows: &[FlowRecord], out: &Path) -> Result<Value> {
+    let (manifest, files) = build_fixtures(flows);
+    std::fs::create_dir_all(out.join("responses"))
+        .with_context(|| format!("creating fixtures dir {}", out.display()))?;
+    for (rel, body) in &files {
+        let path = out.join(rel);
+        std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
+    }
+    let manifest_path = out.join("manifest.json");
+    std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)
+        .with_context(|| format!("writing {}", manifest_path.display()))?;
+    Ok(json!({
+        "type": "action",
+        "cmd": "export",
+        "format": "fixtures",
+        "out": out.display().to_string(),
+        "manifest": manifest_path.display().to_string(),
+        "count": flows.len(),
+        "response_files": files.len(),
+    }))
 }
 
 /// Single-quote-escape for a POSIX shell.
@@ -132,6 +262,50 @@ mod tests {
         let har = to_har(&[sample()]);
         assert_eq!(har["log"]["version"], "1.2");
         assert_eq!(har["log"]["entries"][0]["response"]["status"], 200);
+    }
+
+    #[test]
+    fn extracts_graphql_operation_name() {
+        let body = Some(
+            r#"{"operationName":"GetMe","query":"query GetMe {me{id}}","variables":{}}"#.into(),
+        );
+        assert_eq!(graphql_operation_name(&body).as_deref(), Some("GetMe"));
+        assert_eq!(graphql_operation_name(&Some("not json".into())), None);
+        assert_eq!(
+            graphql_operation_name(&Some(r#"{"query":"{me}"}"#.into())),
+            None
+        );
+        assert_eq!(graphql_operation_name(&None), None);
+    }
+
+    #[test]
+    fn build_fixtures_keys_graphql_by_operation_name() {
+        let mut gql = sample();
+        gql.method = "POST".into();
+        gql.path = "/v1/public/graphql".into();
+        gql.req_type = Some("application/json".into());
+        gql.req_body = Some(r#"{"operationName":"GetMe","variables":{}}"#.into());
+        gql.resp_body = Some(r#"{"data":{"me":{"id":"1"}}}"#.into());
+
+        let (manifest, files) = build_fixtures(&[gql]);
+        assert_eq!(manifest["count"], 1);
+        let entry = &manifest["fixtures"][0];
+        assert_eq!(entry["operation_name"], "GetMe");
+        assert_eq!(entry["match"]["operation_name"], "GetMe");
+        // Response body is written to a file keyed by path + operation.
+        assert_eq!(files.len(), 1);
+        assert!(files[0].0.contains("GetMe"), "{}", files[0].0);
+        assert!(files[0].1.contains("\"me\""));
+        assert_eq!(entry["response_file"], files[0].0);
+    }
+
+    #[test]
+    fn build_fixtures_omits_file_when_no_response_body() {
+        let mut f = sample();
+        f.resp_body = None;
+        let (manifest, files) = build_fixtures(&[f]);
+        assert!(files.is_empty());
+        assert_eq!(manifest["fixtures"][0]["response_file"], Value::Null);
     }
 
     fn sample() -> FlowRecord {
