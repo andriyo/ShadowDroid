@@ -44,9 +44,6 @@ pub enum AarCmd {
 
 #[derive(Args)]
 pub struct InstallArgs {
-    /// Path to the app's Gradle project root (the dir with settings.gradle[.kts]).
-    #[arg(long, default_value = ".")]
-    pub app: PathBuf,
     /// Gradle module to wire (e.g. `androidApp`). Auto-detected if omitted.
     #[arg(long)]
     pub module: Option<String>,
@@ -63,9 +60,6 @@ pub struct InstallArgs {
 
 #[derive(Args)]
 pub struct TargetArgs {
-    /// Path to the app's Gradle project root.
-    #[arg(long, default_value = ".")]
-    pub app: PathBuf,
     /// Gradle module (auto-detected if omitted).
     #[arg(long)]
     pub module: Option<String>,
@@ -74,11 +68,14 @@ pub struct TargetArgs {
     pub json: bool,
 }
 
-pub async fn run(cmd: &AarCmd) -> Result<()> {
+pub async fn run(cmd: &AarCmd, project: Option<&Path>) -> Result<()> {
+    // The app source root comes from the global `--project` (or config),
+    // falling back to the current directory.
+    let root = canonical_root(project.unwrap_or_else(|| Path::new(".")))?;
     match cmd {
-        AarCmd::Install(a) => install(a).await,
-        AarCmd::Status(a) => status(a),
-        AarCmd::Remove(a) => remove(a),
+        AarCmd::Install(a) => install(a, &root).await,
+        AarCmd::Status(a) => status(a, &root),
+        AarCmd::Remove(a) => remove(a, &root),
     }
 }
 
@@ -96,13 +93,12 @@ struct InstallReport {
     build: &'static str,
 }
 
-async fn install(args: &InstallArgs) -> Result<()> {
-    let root = canonical_root(&args.app)?;
+async fn install(args: &InstallArgs, root: &Path) -> Result<()> {
     let module = match &args.module {
         Some(m) => m.clone(),
-        None => detect_app_module(&root)?,
+        None => detect_app_module(root)?,
     };
-    let module_gradle = module_build_gradle(&root, &module)?;
+    let module_gradle = module_build_gradle(root, &module)?;
 
     // Resolve the AAR (dev → cache → release) and place it in the app.
     let resolved = resolve_aar(args.from.as_deref()).await?;
@@ -117,7 +113,7 @@ async fn install(args: &InstallArgs) -> Result<()> {
 
     let mut build_result = "skipped";
     if args.build {
-        build_result = if gradle_assemble_debug(&root, &module)? {
+        build_result = if gradle_assemble_debug(root, &module)? {
             "ok"
         } else {
             "failed"
@@ -172,37 +168,39 @@ async fn install(args: &InstallArgs) -> Result<()> {
 // ── status ──────────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
-struct StatusReport {
-    app: String,
-    module: String,
-    dependency_present: bool,
-    aar_present: bool,
-    aar_path: String,
-    installed: bool,
+pub struct StatusReport {
+    pub app: String,
+    pub module: String,
+    pub dependency_present: bool,
+    pub aar_present: bool,
+    pub aar_path: String,
+    pub installed: bool,
 }
 
-fn status(args: &TargetArgs) -> Result<()> {
-    let root = canonical_root(&args.app)?;
-    let module = match &args.module {
-        Some(m) => m.clone(),
-        None => detect_app_module(&root)?,
+/// Inspect an app's Gradle root for the agent wiring. Reused by `aar status`
+/// and surfaced in `doctor`.
+pub fn inspect(root: &Path, module: Option<&str>) -> Result<StatusReport> {
+    let module = match module {
+        Some(m) => m.to_string(),
+        None => detect_app_module(root)?,
     };
-    let module_gradle = module_build_gradle(&root, &module)?;
-    let dep_present = fs::read_to_string(&module_gradle)
+    let module_gradle = module_build_gradle(root, &module)?;
+    let dependency_present = fs::read_to_string(&module_gradle)
         .map(|c| c.contains(DEP_MARKER))
         .unwrap_or(false);
-    let aar_path = root.join(APP_AAR_RELPATH);
-    let aar_present = aar_path.is_file();
-
-    let report = StatusReport {
+    let aar_present = root.join(APP_AAR_RELPATH).is_file();
+    Ok(StatusReport {
         app: root.display().to_string(),
         module,
-        dependency_present: dep_present,
+        dependency_present,
         aar_present,
         aar_path: APP_AAR_RELPATH.to_string(),
-        installed: dep_present && aar_present,
-    };
+        installed: dependency_present && aar_present,
+    })
+}
 
+fn status(args: &TargetArgs, root: &Path) -> Result<()> {
+    let report = inspect(root, args.module.as_deref())?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else if report.installed {
@@ -211,20 +209,19 @@ fn status(args: &TargetArgs) -> Result<()> {
         println!("✗ agent AAR not fully installed in `{}` (module :{})", report.app, report.module);
         println!("  dependency line: {}", yes_no(report.dependency_present));
         println!("  aar file:        {}", yes_no(report.aar_present));
-        println!("  install with: shadowdroid aar install --app {}", report.app);
+        println!("  install with: shadowdroid aar install --project {}", report.app);
     }
     Ok(())
 }
 
 // ── remove ───────────────────────────────────────────────────────────────────
 
-fn remove(args: &TargetArgs) -> Result<()> {
-    let root = canonical_root(&args.app)?;
+fn remove(args: &TargetArgs, root: &Path) -> Result<()> {
     let module = match &args.module {
         Some(m) => m.clone(),
-        None => detect_app_module(&root)?,
+        None => detect_app_module(root)?,
     };
-    let module_gradle = module_build_gradle(&root, &module)?;
+    let module_gradle = module_build_gradle(root, &module)?;
     let removed_dep = unwire_dependency(&module_gradle)?;
 
     let aar_path = root.join(APP_AAR_RELPATH);

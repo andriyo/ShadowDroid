@@ -35,7 +35,13 @@ use crate::watch::watcher::PermissionDialogPolicy;
 #[command(
     name = "shadowdroid",
     version,
-    about = "Drive Android apps — streaming JSON events, structured crashes, declarative popup watchers"
+    about = "Drive and debug Android apps from the command line: agent-first UI automation, a streaming JSON event timeline (UI, crashes, network), HTTP(S) interception, and an embeddable in-app debug agent.",
+    long_about = "ShadowDroid drives and debugs Android apps over adb — for AI agents and humans.\n\n\
+Observe & automate: dump the screen as structured JSON elements; tap, type, swipe, scroll, and wait by selector.\n\
+Watch: a live event stream of UI changes, crashes/ANRs, toasts, and network calls.\n\
+Network: an on-device MITM proxy to inspect, intercept, modify, and replay HTTP(S) traffic.\n\
+In-app agent: embed a debug-only AAR for in-process debugging of apps you build (`aar`).\n\
+Plus app & device control, permissions, display profiles, diagnostics (`doctor`), and Android Studio / debugger integration."
 )]
 pub struct Cli {
     /// ADB serial. Defaults to $SHADOWDROID_DEVICE / $ANDROID_SERIAL / sole attached device.
@@ -54,6 +60,12 @@ pub struct Cli {
     /// the cached download flow during local development without --apk.
     #[arg(long, global = true, env = "SHADOWDROID_ANY_APK_VERSION")]
     pub any_apk_version: bool,
+
+    /// Path to an app's source project (Gradle root). Used by `aar` to install
+    /// the in-app debug agent and surfaced by `doctor`. Defaults to the
+    /// `project` field in config.
+    #[arg(long, global = true, env = "SHADOWDROID_PROJECT", value_name = "PATH")]
+    pub project: Option<PathBuf>,
 
     #[command(subcommand)]
     pub cmd: Cmd,
@@ -657,6 +669,9 @@ pub async fn run() -> Result<()> {
     let config = ShadowDroidConfig::load()?;
     let device = cli.device.or_else(|| config.device.clone());
     let apk = cli.apk;
+    let project = cli
+        .project
+        .or_else(|| config.project.as_deref().map(PathBuf::from));
     let any_apk_version = cli.any_apk_version;
     let mut cmd = cli.cmd;
     apply_config_defaults(&mut cmd, &config);
@@ -676,7 +691,7 @@ pub async fn run() -> Result<()> {
         Cmd::Studio(args) => return crate::cmd::studio::run(args).await,
         // `aar` is host-only: it edits a local app's Gradle build + copies the
         // AAR. No device, no on-device server.
-        Cmd::Aar(c) => return crate::cmd::aar::run(c).await,
+        Cmd::Aar(c) => return crate::cmd::aar::run(c, project.as_deref()).await,
         Cmd::Debug(args) if args.is_host_only() => {
             return crate::cmd::debug::run_host_only(args).await
         }
@@ -690,7 +705,7 @@ pub async fn run() -> Result<()> {
             force,
             json,
         } => {
-            return crate::cmd::doctor::run(device.as_deref(), *fix, *force, *json, app.as_deref())
+            return crate::cmd::doctor::run(device.as_deref(), *fix, *force, *json, app.as_deref(), project.as_deref())
                 .await
         }
         Cmd::Collect {

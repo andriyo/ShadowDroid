@@ -411,6 +411,7 @@ pub async fn run(
     force: bool,
     json: bool,
     app: Option<&str>,
+    project: Option<&std::path::Path>,
 ) -> Result<()> {
     let mut report = gather(device).await;
 
@@ -441,6 +442,40 @@ pub async fn run(
                 code: "net_app",
                 status: Status::Warn,
                 detail: format!("net check {app}: {e}"),
+                remedy: None,
+            },
+        };
+        report.checks.push(check);
+        report.healthy = report.checks.iter().all(|c| c.status == Status::Ok);
+    }
+
+    // `--project <path>` (or config `project`): append the in-app debug-agent
+    // wiring status (the same thing `aar status` reports). Source-side and
+    // read-only — independent of the device, sits outside the fix flow.
+    if let Some(project) = project {
+        let check = match crate::cmd::aar::inspect(project, None) {
+            Ok(s) if s.installed => Check {
+                code: "agent",
+                status: Status::Ok,
+                detail: format!("in-app debug agent wired into :{} ({})", s.module, s.app),
+                remedy: None,
+            },
+            Ok(s) => Check {
+                code: "agent",
+                status: Status::Warn,
+                detail: format!(
+                    "in-app debug agent not installed in {} (module :{}): dependency {}, aar {}",
+                    s.app,
+                    s.module,
+                    if s.dependency_present { "present" } else { "missing" },
+                    if s.aar_present { "present" } else { "missing" },
+                ),
+                remedy: Some("shadowdroid aar install".to_string()),
+            },
+            Err(e) => Check {
+                code: "agent",
+                status: Status::Warn,
+                detail: format!("agent status for {}: {e}", project.display()),
                 remedy: None,
             },
         };
