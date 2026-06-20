@@ -349,7 +349,10 @@ fn versioned_cache_dir() -> Result<PathBuf> {
     Ok(shadowdroid_home()?.join("apks").join(EXPECTED_APK_VERSION))
 }
 
-fn env_truthy(name: &str) -> bool {
+/// Truthy-env check shared across the CLI. Accepts `1`/`true`/`yes`/`on`
+/// (case-insensitive, trimmed); unset or anything else (including `0`/`no`/`off`)
+/// is false. Used for `SHADOWDROID_ANY_APK_VERSION` and the dev-source toggle.
+pub fn env_truthy(name: &str) -> bool {
     std::env::var(name)
         .map(|v| {
             matches!(
@@ -521,7 +524,8 @@ async fn install_if_needed(serial: &str, pair: &ApkPair, any_apk_version: bool) 
     let installed_test = adb::pm_path(serial, TEST_PACKAGE).await?.is_some();
     if !installed_main || !installed_test {
         info!("installing main + test APKs (cold install)");
-        return install_pair(serial, pair).await;
+        install_pair(serial, pair).await?;
+        return verify_installed_version(serial, pair.source, any_apk_version).await;
     }
     if pair.source.is_dev() {
         // Explicit --apk: the user pointed us at specific bytes, always reinstall.
@@ -559,9 +563,51 @@ async fn install_if_needed(serial: &str, pair: &ApkPair, any_apk_version: bool) 
             "reinstalling APKs (expected version {EXPECTED_APK_VERSION}, found main={:?})",
             main_version
         );
-        return install_pair(serial, pair).await;
+        install_pair(serial, pair).await?;
+        return verify_installed_version(serial, pair.source, any_apk_version).await;
     }
     Ok(())
+}
+
+/// After installing a *user* APK (versioned cache / GitHub release), confirm it
+/// actually self-reports the version this CLI expects. Dev sources are matched by
+/// bytes (not versionName) and `--any-apk-version` opts out of the gate, so both
+/// short-circuit. A mismatch here means a *mislabeled* artifact — e.g. a release
+/// APK packaged with a stale `versionName` — which reinstalling can never fix.
+/// Failing fast with actionable guidance beats letting the version gate retry the
+/// installer and stall on every subsequent command.
+async fn verify_installed_version(
+    serial: &str,
+    source: ApkSource,
+    any_apk_version: bool,
+) -> Result<()> {
+    if source.is_dev() || any_apk_version {
+        return Ok(());
+    }
+    let found = adb::pm_version(serial, APP_PACKAGE).await?;
+    if found.as_deref() != Some(EXPECTED_APK_VERSION) {
+        return Err(mislabeled_apk_error(source, found.as_deref()));
+    }
+    Ok(())
+}
+
+/// Actionable error for a freshly-installed user APK whose `versionName` doesn't
+/// match this CLI. Names both the bypass flag and the env var, and suggests a
+/// known-good local build — the recovery paths that actually work for a mislabeled
+/// cached/release artifact (plain `disconnect` + `connect` does not).
+fn mislabeled_apk_error(source: ApkSource, found: Option<&str>) -> anyhow::Error {
+    let found = found.unwrap_or("(none)");
+    anyhow!(
+        "installed {APP_PACKAGE} reports versionName {found}, but this shadowdroid \
+         (v{EXPECTED_APK_VERSION}) expects a server APK labeled {EXPECTED_APK_VERSION}.\n\
+         The {source} APK looks mislabeled — its versionName is wrong, so reinstalling \
+         it can't resolve the mismatch.\n\n\
+         To use it anyway, bypass the version check (set once so every command honors it):\n\
+         \x20\x20export SHADOWDROID_ANY_APK_VERSION=1     # or pass --any-apk-version per command\n\n\
+         Or install a known-good local build instead:\n\
+         \x20\x20shadowdroid connect --apk <path-to-test-apk>",
+        source = source.label(),
+    )
 }
 
 /// Install the main + test APKs, recovering from a signature mismatch. When the
@@ -670,9 +716,14 @@ async fn wait_for_server(serial: &str, client: &ServerClient, any_apk_version: b
     }
     if let Some(found) = last_mismatch {
         bail!(
-            "server stayed on stale version {found}; expected {EXPECTED_APK_VERSION}. \
-             ShadowDroid stopped the stale process and retried, but the old server is still \
-             reachable. Try `shadowdroid disconnect`, then `shadowdroid connect --apk <local-test-apk>`."
+            "server stayed on version {found}; this shadowdroid (v{EXPECTED_APK_VERSION}) expects \
+             {EXPECTED_APK_VERSION}. ShadowDroid stopped the stale process and retried, but the \
+             reachable server still reports {found} — usually an installed server APK labeled with \
+             the wrong version.\n\n\
+             Bypass the version check (set once so every command honors it):\n\
+             \x20\x20export SHADOWDROID_ANY_APK_VERSION=1     # or pass --any-apk-version per command\n\n\
+             Or install a known-good local build instead:\n\
+             \x20\x20shadowdroid disconnect && shadowdroid connect --apk <path-to-test-apk>"
         );
     }
     if let Some(hint) = ui_automation_failure_hint(serial).await {
@@ -745,5 +796,33 @@ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa *shadowdroid-se
             "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
         )
         .is_err());
+    }
+
+    #[test]
+    fn env_truthy_accepts_common_spellings() {
+        // Unique var name keeps this independent of other (parallel) tests.
+        let key = "SHADOWDROID_TEST_ENV_TRUTHY";
+        for v in ["1", "true", "TRUE", "yes", " on ", "On"] {
+            std::env::set_var(key, v);
+            assert!(env_truthy(key), "{v:?} should be truthy");
+        }
+        for v in ["0", "false", "no", "off", "", "banana"] {
+            std::env::set_var(key, v);
+            assert!(!env_truthy(key), "{v:?} should be falsy");
+        }
+        std::env::remove_var(key);
+        assert!(!env_truthy(key), "unset should be falsy");
+    }
+
+    #[test]
+    fn mislabeled_apk_error_names_the_bypass() {
+        let msg = mislabeled_apk_error(ApkSource::GithubRelease, Some("0.3.1")).to_string();
+        // The actionable bits the issue asked for: the offending version, the env
+        // var, the flag, and the --apk escape hatch.
+        assert!(msg.contains("0.3.1"), "{msg}");
+        assert!(msg.contains(EXPECTED_APK_VERSION), "{msg}");
+        assert!(msg.contains("SHADOWDROID_ANY_APK_VERSION"), "{msg}");
+        assert!(msg.contains("--any-apk-version"), "{msg}");
+        assert!(msg.contains("--apk"), "{msg}");
     }
 }

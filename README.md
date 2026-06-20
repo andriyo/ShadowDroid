@@ -188,6 +188,14 @@ Every command prints a single JSON event. Selectors are consistent across comman
 A typical agent reads `ui dump` once, acts by `--rid`/`--text`, and re-reads only
 when `screen_hash` changes.
 
+Text/desc selectors match as a case-insensitive **substring** by default. On
+`ui find`/`ui tap`, add `--exact` to require a full match (so `--text Allow` won't
+hit a label reading "Allow Disney+…") and `--clickable` to skip non-clickable
+labels in favor of the actual button. `--rid` is the most reliable target when a
+stable resource id exists. Curly and straight quotes/apostrophes are matched
+interchangeably, so `--text "Don't allow"` matches UI text rendered with a
+typographic apostrophe.
+
 Results go to **stdout**; ShadowDroid's own logs go to **stderr**, so `… | jq`
 already sees clean JSON. Add `--quiet`/`-q` (or `SHADOWDROID_QUIET=1`) to silence
 those logs entirely — handy when you pipe with `2>&1`.

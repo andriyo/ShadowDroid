@@ -19,6 +19,14 @@ object StateRoutes {
         uiDevice: UiDevice,
         instr: Instrumentation,
     ) {
+        // `server_version` is read once from the installed main-app APK's
+        // versionName (set from -Pversion at release time in build.gradle.kts).
+        // This is the *same* value the CLI's install-time gate checks via
+        // `dumpsys package … versionName`, so the version the server reports and
+        // the version on the APK can never disagree. The compiled-in constant is
+        // only a fallback for the unlikely case PackageManager can't see us.
+        val serverVersion = resolveServerVersion(instr)
+
         route.get("/device") {
             val cfg = instr.targetContext.resources.configuration
             val metrics = instr.targetContext.resources.displayMetrics
@@ -47,7 +55,7 @@ object StateRoutes {
 
             val state =
                 ServerState(
-                    server_version = BuildInfo.SERVER_VERSION,
+                    server_version = serverVersion,
                     api_version = BuildInfo.API_VERSION,
                     ui_automator_version = BuildInfo.UI_AUTOMATOR_VERSION,
                     android_sdk = Build.VERSION.SDK_INT,
@@ -59,6 +67,19 @@ object StateRoutes {
         }
     }
 }
+
+/**
+ * The on-device server's version: the installed main-app APK's versionName,
+ * which build.gradle.kts sets from `-Pversion` at release time. Read from
+ * PackageManager (via the instrumentation target context) so it always equals
+ * the version stamped on the APK. Falls back to the compiled-in constant only if
+ * the package somehow isn't visible.
+ */
+private fun resolveServerVersion(instr: Instrumentation): String =
+    runCatching {
+        val ctx = instr.targetContext
+        ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName
+    }.getOrNull()?.takeIf { it.isNotBlank() } ?: BuildInfo.SERVER_VERSION
 
 @Serializable
 private data class DeviceInfo(

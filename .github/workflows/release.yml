@@ -34,7 +34,11 @@ jobs:
 
       - name: Build APK pair
         working-directory: server
-        run: ./gradlew --no-daemon :app:assembleDebug :app:assembleDebugAndroidTest
+        # -Pversion stamps the APK's versionName from the tag (build.gradle.kts
+        # reads it; the running server reports the same value as server_version).
+        # Without this the APK ships build.gradle.kts's fallback versionName, which
+        # is how v0.4.0 APKs went out labeled 0.3.1 and looped the CLI version gate.
+        run: ./gradlew --no-daemon -Pversion="${GITHUB_REF_NAME#v}" :app:assembleDebug :app:assembleDebugAndroidTest
 
       - name: Stage APK assets
         id: checksums

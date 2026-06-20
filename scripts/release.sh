@@ -79,7 +79,8 @@ if [ "$dry_run" = 1 ]; then
 [dry-run] would:
   1. set version in $cargo_toml -> $version
   2. cargo update -p $crate --precise $version --offline   (refresh Cargo.lock)
-  3. git commit cli/Cargo.toml cli/Cargo.lock -m "Release $tag"
+  2b. sync server fallback version literals (build.gradle.kts, BuildInfo.kt) -> $version
+  3. git commit Cargo.toml + Cargo.lock + the two server files -m "Release $tag"
   4. git tag -a $tag -m "ShadowDroid $tag"
   5. git push origin $branch $tag
 EOF
@@ -93,8 +94,31 @@ awk -v new="$version" '!done && /^version = "/ { sub(/"[^"]*"/, "\"" new "\""); 
 # --- 2. refresh Cargo.lock (offline; touches only the local crate entry) -
 ( cd cli && cargo update -p "$crate" --precise "$version" --offline )
 
+# --- 2b. keep the on-device server's fallback version literals in lockstep -
+# The release workflow stamps the APK versionName from the tag via -Pversion, so
+# these literals are only the fallback for local/dev builds. But a stale fallback
+# is exactly the drift that shipped mislabeled APKs, so bump it here too. Each is
+# a precise, anchored substitution; a miss warns rather than blocks the release.
+sync_version_literal() {  # <file> <anchored-ERE-with-group-1-prefix>
+  local file="$1" pattern="$2"
+  if [ ! -f "$file" ]; then echo "warning: $file missing; version sync skipped" >&2; return; fi
+  if grep -Eq "$pattern" "$file"; then
+    sed -E -i.bak "s/$pattern/\\1\"$version\"/" "$file" && rm -f "$file.bak"
+  else
+    echo "warning: no version literal matched in $file; left unchanged" >&2
+  fi
+}
+# build.gradle.kts elvis fallback:  ?: "X.Y.Z"
+sync_version_literal "server/app/build.gradle.kts" '(\?: )"[0-9][^"]*"'
+# BuildInfo.kt fallback constant:  const val SERVER_VERSION: String = "X.Y.Z"
+sync_version_literal \
+  "server/app/src/androidTest/java/io/github/andriyo/shadowdroid/BuildInfo.kt" \
+  '(const val SERVER_VERSION: String = )"[^"]*"'
+
 # --- 3. commit ----------------------------------------------------------
-git add cli/Cargo.toml cli/Cargo.lock
+git add cli/Cargo.toml cli/Cargo.lock \
+  server/app/build.gradle.kts \
+  server/app/src/androidTest/java/io/github/andriyo/shadowdroid/BuildInfo.kt
 git commit -m "Release $tag"
 
 # --- 4. tag -------------------------------------------------------------

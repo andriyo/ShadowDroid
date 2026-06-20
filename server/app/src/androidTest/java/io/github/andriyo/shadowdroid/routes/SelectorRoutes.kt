@@ -251,12 +251,33 @@ private fun matchString(
     exact: Boolean,
 ): Boolean {
     if (expected == null) return true
-    val value = actual ?: return false
+    val value = normalizeForMatch(actual ?: return false)
+    val want = normalizeForMatch(expected)
     return if (exact) {
-        value.equals(expected, ignoreCase = true)
+        value.equals(want, ignoreCase = true)
     } else {
-        value.contains(expected, ignoreCase = true)
+        value.contains(want, ignoreCase = true)
     }
+}
+
+/**
+ * Fold common typographic punctuation to ASCII before comparing, so a selector
+ * typed with a straight apostrophe (`Don't allow`) matches UI text rendered with
+ * a curly one (`Don't allow`) and vice-versa — even under `exact`. Covers the
+ * single/double curly quote families; other characters pass through unchanged.
+ */
+internal fun normalizeForMatch(s: String): String {
+    val out = StringBuilder(s.length)
+    for (c in s) {
+        out.append(
+            when (c) {
+                '‘', '’', 'ʼ', '′', '‛' -> '\'' // ‘ ’ ʼ ′ ‛
+                '“', '”', '″', '‟' -> '"' // “ ” ″ ‟
+                else -> c
+            },
+        )
+    }
+    return out.toString()
 }
 
 private data class XpathMatcher(
@@ -281,10 +302,12 @@ private data class XpathClause(
                 "enabled" -> element.enabled.toString()
                 else -> throw BadRequest("xpath_invalid", "unsupported xpath attribute '@$attr'")
             } ?: return false
+        val haystack = normalizeForMatch(actual)
+        val needle = normalizeForMatch(value)
         return if (contains) {
-            actual.contains(value, ignoreCase = true)
+            haystack.contains(needle, ignoreCase = true)
         } else {
-            actual.equals(value, ignoreCase = true)
+            haystack.equals(needle, ignoreCase = true)
         }
     }
 }

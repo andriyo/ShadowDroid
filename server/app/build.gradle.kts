@@ -11,6 +11,21 @@ plugins {
     id("org.jetbrains.kotlin.plugin.serialization")
 }
 
+// Single source of truth for the on-device server's versionName. Injected at
+// release time via `-Pversion=<tag>` (see .github/workflows/release.yml, which
+// already does this for the Studio plugin); local/dev builds fall back to the
+// literal below. Dev APKs are matched by bytes (SHA-256), not versionName, so the
+// fallback only needs to be a plausible default — but keep it in lockstep with
+// cli/Cargo.toml so a locally-built APK reports the version the CLI expects.
+// The running server reports this same value as `server_version` (read at runtime
+// from the installed APK in StateRoutes), so the two can never drift again — the
+// drift between this and a hand-rolled constant is what shipped v0.4.0 APKs
+// labeled 0.3.1 and sent `connect` into an endless version-gate loop.
+val serverVersionName: String =
+    (project.findProperty("version") as? String)
+        ?.takeIf { it.isNotBlank() && it != "unspecified" }
+        ?: "0.4.0"
+
 android {
     namespace = "io.github.andriyo.shadowdroid"
     // compileSdk tracks the latest GA SDK available on GitHub-hosted runners.
@@ -21,7 +36,7 @@ android {
         minSdk = 24 // covers ~98% of in-use devices; UA 2.3 requires 24+
         targetSdk = 36
         versionCode = 13
-        versionName = "0.3.1"
+        versionName = serverVersionName
 
         // Use the standard AndroidJUnitRunner. We start the HTTP server from a
         // normal @Test method (see ShadowDroidServerTest.kt) rather than from a

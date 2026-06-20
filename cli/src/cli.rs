@@ -58,7 +58,12 @@ pub struct Cli {
     /// Skip the version check when installing — assume any provided/discovered APK
     /// is the right one. Implied by --apk; you only need this explicitly to override
     /// the cached download flow during local development without --apk.
-    #[arg(long, global = true, env = "SHADOWDROID_ANY_APK_VERSION")]
+    ///
+    /// Also settable via the SHADOWDROID_ANY_APK_VERSION env var, which accepts the
+    /// usual truthy spellings (1/0, true/false, yes/no, on/off); unset or any other
+    /// value means false. The env is resolved in `run()` rather than by clap so it
+    /// never dead-ends on a `[possible values: true, false]` parse error.
+    #[arg(long, global = true)]
     pub any_apk_version: bool,
 
     /// Path to an app's source project (Gradle root). Used by `aar` to install
@@ -244,7 +249,11 @@ pub enum AppCmd {
         front: bool,
     },
     /// Print the current foreground app (package / activity / pid).
-    Current,
+    Current {
+        /// Accepted for consistency with other subcommands; output is always JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -383,6 +392,12 @@ pub enum UiCmd {
         /// Return all matches instead of the first.
         #[arg(long)]
         all: bool,
+        /// Match selector values exactly instead of as a substring.
+        #[arg(long)]
+        exact: bool,
+        /// Only match clickable elements (skips labels/containers with the same text).
+        #[arg(long)]
+        clickable: bool,
         /// Emit the full element set instead of the compact agent shape.
         #[arg(long)]
         full: bool,
@@ -404,6 +419,14 @@ pub enum UiCmd {
         desc: Option<String>,
         #[arg(long)]
         xpath: Option<String>,
+        /// Match selector values exactly instead of as a substring. Avoids tapping a
+        /// label whose text merely contains the target (e.g. "Allow Disney+…" vs "Allow").
+        #[arg(long)]
+        exact: bool,
+        /// Only tap a clickable element. Skips a non-clickable label/TextView that
+        /// shares the target's text in favor of the actual button.
+        #[arg(long)]
+        clickable: bool,
     },
     /// Double-tap at <x> <y> coordinates.
     DoubleTap { x: i32, y: i32 },
@@ -714,7 +737,10 @@ pub async fn run() -> Result<()> {
     let project = cli
         .project
         .or_else(|| config.project.as_deref().map(PathBuf::from));
-    let any_apk_version = cli.any_apk_version;
+    // Resolve `--any-apk-version` ourselves from the env (clap's strict bool env
+    // parsing rejects `1`/`yes` and errors with `[possible values: true, false]`).
+    // `env_truthy` accepts 1/true/yes/on; anything else (including 0/no/off) is false.
+    let any_apk_version = cli.any_apk_version || installer::env_truthy("SHADOWDROID_ANY_APK_VERSION");
     let mut cmd = cli.cmd;
     apply_config_defaults(&mut cmd, &config);
 
@@ -907,6 +933,8 @@ async fn dispatch_ui(
             desc,
             xpath,
             all,
+            exact,
+            clickable,
             full,
         } => {
             let query = SelectorQuery {
@@ -915,6 +943,8 @@ async fn dispatch_ui(
                 desc,
                 xpath,
                 all,
+                exact,
+                clickable: clickable.then_some(true),
                 ..Default::default()
             };
             let r = client.find(&query).await?;
@@ -935,7 +965,9 @@ async fn dispatch_ui(
             rid,
             desc,
             xpath,
-        } => cmd_tap(client, id, a, b, text, rid, desc, xpath).await?,
+            exact,
+            clickable,
+        } => cmd_tap(client, id, a, b, text, rid, desc, xpath, exact, clickable).await?,
         UiCmd::DoubleTap { x, y } => {
             client.double_tap(x, y).await?;
             emit_action("double_tap", &json!({"x":x,"y":y}));
@@ -1537,7 +1569,7 @@ async fn dispatch_app(c: AppCmd, client: &ServerClient) -> Result<()> {
                 &json!({"package":package,"matched":r.matched,"current":r.current}),
             );
         }
-        AppCmd::Current => {
+        AppCmd::Current { json: _ } => {
             let cur = client.app_current().await?;
             emit_action(
                 "app_current",
@@ -1780,6 +1812,8 @@ async fn cmd_tap(
     rid: Option<String>,
     desc: Option<String>,
     xpath: Option<String>,
+    exact: bool,
+    clickable: bool,
 ) -> Result<()> {
     // Selector modes take priority.
     if let Some(query) = xpath {
@@ -1796,6 +1830,8 @@ async fn cmd_tap(
                 text,
                 rid,
                 desc,
+                exact,
+                clickable: clickable.then_some(true),
                 ..Default::default()
             })
             .await?;
@@ -2184,6 +2220,73 @@ mod tests {
             .expect("global --quiet flag should be defined");
         assert_eq!(quiet.get_short(), Some('q'));
         assert!(quiet.is_global_set(), "--quiet must be global");
+    }
+
+    #[test]
+    fn app_current_accepts_json_flag() {
+        // `app current` already emits JSON; the flag is accepted for consistency
+        // with doctor/update/commands instead of erroring out as an unknown arg.
+        let cli = Cli::try_parse_from(["shadowdroid", "app", "current", "--json"])
+            .expect("`app current --json` should parse");
+        assert!(matches!(cli.cmd, Cmd::App(AppCmd::Current { json: true })));
+        // And it still parses without the flag.
+        let bare = Cli::try_parse_from(["shadowdroid", "app", "current"]).unwrap();
+        assert!(matches!(bare.cmd, Cmd::App(AppCmd::Current { json: false })));
+    }
+
+    #[test]
+    fn ui_tap_accepts_exact_and_clickable() {
+        let cli = Cli::try_parse_from([
+            "shadowdroid", "ui", "tap", "--text", "Allow", "--exact", "--clickable",
+        ])
+        .expect("`ui tap --exact --clickable` should parse");
+        match cli.cmd {
+            Cmd::Ui(UiCmd::Tap {
+                exact,
+                clickable,
+                text,
+                ..
+            }) => {
+                assert!(exact, "--exact should be set");
+                assert!(clickable, "--clickable should be set");
+                assert_eq!(text.as_deref(), Some("Allow"));
+            }
+            _ => panic!("expected `ui tap`"),
+        }
+    }
+
+    #[test]
+    fn ui_find_accepts_exact_and_clickable() {
+        let cli =
+            Cli::try_parse_from(["shadowdroid", "ui", "find", "--rid", "btn", "--exact"]).unwrap();
+        match cli.cmd {
+            Cmd::Ui(UiCmd::Find {
+                exact, clickable, ..
+            }) => {
+                assert!(exact);
+                assert!(!clickable);
+            }
+            _ => panic!("expected `ui find`"),
+        }
+    }
+
+    #[test]
+    fn any_apk_version_is_a_plain_global_flag() {
+        // The env var is resolved in `run()` (not by clap) so that `1`/`yes`/etc.
+        // don't dead-end on clap's strict bool parser. The CLI flag still works.
+        let cli =
+            Cli::try_parse_from(["shadowdroid", "ui", "dump", "--any-apk-version"]).unwrap();
+        assert!(cli.any_apk_version);
+        let arg = Cli::command()
+            .get_arguments()
+            .find(|a| a.get_id().as_str() == "any_apk_version")
+            .expect("--any-apk-version should be defined")
+            .clone();
+        assert!(arg.is_global_set(), "--any-apk-version must stay global");
+        assert!(
+            arg.get_env().is_none(),
+            "env must be resolved manually, not wired through clap",
+        );
     }
 
     #[test]
