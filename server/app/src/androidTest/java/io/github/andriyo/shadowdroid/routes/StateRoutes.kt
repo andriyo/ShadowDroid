@@ -1,6 +1,8 @@
 package io.github.andriyo.shadowdroid.routes
 
 import android.app.Instrumentation
+import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.os.Build
 import androidx.test.uiautomator.UiDevice
 import io.github.andriyo.shadowdroid.BuildInfo
@@ -62,6 +64,7 @@ object StateRoutes {
                     android_release = Build.VERSION.RELEASE ?: "",
                     viewport = Viewport(uiDevice.displayWidth, uiDevice.displayHeight),
                     current_app = AppRef(`package` = pkg, activity = activity, pid = pid),
+                    is_television = isTelevision(instr),
                 )
             call.respond(state)
         }
@@ -80,6 +83,19 @@ private fun resolveServerVersion(instr: Instrumentation): String =
         val ctx = instr.targetContext
         ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName
     }.getOrNull()?.takeIf { it.isNotBlank() } ?: BuildInfo.SERVER_VERSION
+
+/**
+ * True on Android TV / leanback devices, where the UI is focus + D-pad driven
+ * rather than touch driven. Checks the uiMode television bit first, then falls
+ * back to the leanback system feature (covers devices reporting the feature
+ * without the uiMode flag).
+ */
+private fun isTelevision(instr: Instrumentation): Boolean {
+    val ctx = instr.targetContext
+    val uiModeType = ctx.resources.configuration.uiMode and Configuration.UI_MODE_TYPE_MASK
+    if (uiModeType == Configuration.UI_MODE_TYPE_TELEVISION) return true
+    return ctx.packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK)
+}
 
 @Serializable
 private data class DeviceInfo(

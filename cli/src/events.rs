@@ -143,6 +143,11 @@ pub struct CompactElement {
     pub scrollable: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub input: bool,
+    // Surfaced in the compact dump so agents can see the current D-pad focus on
+    // TV/leanback without `--full`. Only emitted when true, so phones (where the
+    // shown elements are rarely focused) pay nothing.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub focused: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub selected: bool,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -161,6 +166,7 @@ impl From<Element> for CompactElement {
             clickable: el.clickable,
             scrollable: el.scrollable,
             input: el.input,
+            focused: el.focused,
             selected: el.selected,
             checked: el.checked,
         }

@@ -200,9 +200,15 @@ Results go to **stdout**; ShadowDroid's own logs go to **stderr**, so `… | jq`
 already sees clean JSON. Add `--quiet`/`-q` (or `SHADOWDROID_QUIET=1`) to silence
 those logs entirely — handy when you pipe with `2>&1`.
 
+**Android TV / leanback** is focus + D-pad driven, not touch driven: `/v1/state`
+reports `is_television: true`, each element carries a `focused` flag, and
+`ui focus --text/--rid/--desc [--center]` walks the D-pad to a selector (then
+optionally activates it) — the TV analog of `ui tap` / `ui scroll-to`. Prefer it
+(and `ui key dpad_*`) over coordinate taps there.
+
 | Group            | Commands                                                                                          |
 | ---------------- | ------------------------------------------------------------------------------------------------- |
-| **UI**           | `ui dump`, `ui screenshot`, `ui find`, `ui tap`, `ui double-tap`, `ui long-tap`, `ui swipe`, `ui drag`, `ui swipe-ext`, `ui pinch`, `ui scroll-to`, `ui text`, `ui key`, `ui back`, `ui home`, `ui wait`, `ui toast` |
+| **UI**           | `ui dump`, `ui screenshot`, `ui find`, `ui tap`, `ui double-tap`, `ui long-tap`, `ui swipe`, `ui drag`, `ui swipe-ext`, `ui pinch`, `ui scroll-to`, `ui focus`, `ui text`, `ui key`, `ui back`, `ui home`, `ui wait`, `ui toast` |
 | **Authoring**    | `ui audit` (flag elements with no stable selector), `ui gen` (scaffold a Screen Object), `net export fixtures` (replayable response set + `manifest.json`, GraphQL keyed by operationName), `test` (run an instrumentation test with the slot freed), `debug replay --repeat --diff` (flake hunt) |
 | **Watch**        | `watch` (screen changes, crashes, toasts, watcher actions, and HTTP events when `net start` is running) |
 | **Layout**       | `layout snapshot` / `layout diff` / `layout source` / `layout recompositions`                      |

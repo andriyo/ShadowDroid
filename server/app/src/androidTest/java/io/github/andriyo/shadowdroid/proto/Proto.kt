@@ -20,6 +20,10 @@ data class ServerState(
     val android_release: String,
     val viewport: Viewport,
     val current_app: AppRef,
+    // True on leanback / Android TV devices, where the UI is focus + D-pad driven
+    // rather than touch driven. Agents should navigate with `ui focus` / `ui key
+    // dpad_*` instead of coordinate/selector taps. Defaults false for phones/tablets.
+    val is_television: Boolean = false,
 )
 
 @Serializable

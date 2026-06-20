@@ -15,6 +15,12 @@ pub struct ServerState {
     pub android_release: String,
     pub viewport: Viewport,
     pub current_app: AppRef,
+    /// True on leanback / Android TV devices, where the UI is focus + D-pad
+    /// driven. Agents should use `ui focus` / `ui key dpad_*` instead of
+    /// coordinate/selector taps. `default` keeps back-compat with older servers
+    /// that predate this field.
+    #[serde(default)]
+    pub is_television: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

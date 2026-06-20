@@ -22,6 +22,7 @@ use crate::cmd::debug::{DebugArgs, DebugCmd};
 use crate::cmd::debugger::{DebugMode, DebuggerCmd};
 use crate::cmd::device_profile::ProfileApplyArgs;
 use crate::cmd::layout::{LayoutArgs, LayoutCmd};
+use crate::cmd::focus::FocusArgs;
 use crate::cmd::scroll::ScrollArgs;
 use crate::cmd::studio::{StudioArgs, StudioCmd};
 use crate::config::{expand_config_path, ShadowDroidConfig};
@@ -479,6 +480,8 @@ pub enum UiCmd {
     },
     /// Scroll a list until a selector is visible, then optionally tap it.
     ScrollTo(ScrollArgs),
+    /// Move D-pad focus to a selector (TV/leanback), then optionally activate it (--center).
+    Focus(FocusArgs),
     /// Type into the focused field, or into an element matched by --id/--text/--rid/--desc/--xpath.
     Text {
         value: String,
@@ -1035,6 +1038,7 @@ async fn dispatch_ui(
             );
         }
         UiCmd::ScrollTo(args) => crate::cmd::scroll::run(client, &args).await?,
+        UiCmd::Focus(args) => crate::cmd::focus::run(client, &args).await?,
         UiCmd::Text {
             value,
             clear,

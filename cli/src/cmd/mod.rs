@@ -18,6 +18,7 @@ pub mod debug;
 pub mod debugger;
 pub mod device_profile;
 pub mod doctor;
+pub mod focus;
 pub mod introspect;
 pub mod layout;
 pub mod permissions;
