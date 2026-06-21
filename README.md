@@ -3,6 +3,16 @@
 **A fast Android IDE for your AI agents** — because your coding agent deserves the
 best, fastest, most reliable tools to drive and debug Android apps.
 
+[![Latest release](https://img.shields.io/github/v/release/andriyo/ShadowDroid?sort=semver&display_name=tag&label=release&color=blue)](https://github.com/andriyo/ShadowDroid/releases/latest)
+[![License: Apache-2.0](https://img.shields.io/github/license/andriyo/ShadowDroid?color=blue)](LICENSE)
+[![Platform: Android](https://img.shields.io/badge/platform-Android-3DDC84?logo=android&logoColor=white)](#install)
+[![Built with Rust](https://img.shields.io/badge/built%20with-Rust-CE422B?logo=rust&logoColor=white)](#how-it-works)
+
+ShadowDroid is an open-source **Android UI automation tool for AI agents**: it lets
+coding agents such as Claude Code, Cursor, Codex, Gemini, and Antigravity drive,
+inspect, and debug real Android apps and emulators through a fast, JSON-first
+command line — no test DSL, no client library, no Appium server.
+
 ShadowDroid turns a real Android device or emulator into a structured surface an
 AI agent can read and act on. It pairs a single static binary on your laptop
 with a tiny Kotlin instrumentation service on the device, and exposes the whole
@@ -32,6 +42,45 @@ $ shadowdroid ui wait --text "Welcome back" --timeout-ms 5000
 
 > Android-only by design, and not a test framework — ShadowDroid is the fast,
 > observable layer an agent drives directly.
+
+## Key benefits
+
+- **The agent loop never stalls** — a persistent on-device service answers each UI
+  read in ~25 ms, versus ~500 ms–1 s for `adb shell uiautomator dump`.
+- **No test DSL, no SDK, no Appium server** — one command prints one line of JSON.
+  If your agent can run a shell command and parse JSON, it can drive Android.
+- **Robust, selector-based actions** — tap / type / swipe / scroll by `--rid`,
+  `--text`, `--desc`, or `--xpath`, so flows survive layout changes instead of
+  breaking on hard-coded coordinates.
+- **First-class Jetpack Compose support** — a semantics-aware element tree
+  (AndroidX UI Automator 2.3.0+), enriched with Compose source locations and
+  recomposition counts when Android Studio's Layout Inspector is live.
+- **Sees _why_, not just _what_** — a read-only Android Studio debugger exposed as
+  JSON (breakpoints, call stack, variables, expression eval). Nothing else hands an
+  agent this.
+- **One live event stream** — `watch` emits screen diffs, crashes, toasts,
+  popup-watcher actions, and decrypted HTTP(S) on a single timeline.
+- **Built-in HTTP(S) interception** — an embedded MITM proxy (no Python, no
+  external mitmproxy); an optional in-app AAR agent reaches even pinned / Cronet /
+  QUIC traffic with no CA.
+- **Self-describing and agent-ready** — `shadowdroid commands --json` emits the
+  whole catalog, and one command installs skills for Claude Code, Cursor, Codex,
+  Gemini, and Antigravity.
+- **Trivial to install, safe to run** — a single static binary plus a tiny,
+  SHA-256-verified APK; macOS / Linux / Windows hosts; real devices, emulators, and
+  Android TV / leanback.
+
+## Contents
+
+- [Why it exists](#why-it-exists)
+- [How it works](#how-it-works)
+- [Install](#install)
+- [Connect](#connect)
+- [What you can drive](#what-you-can-drive)
+- [Agent debugging](#agent-debugging)
+- [Agent integration](#agent-integration)
+- [FAQ](#faq)
+- [License](#license)
 
 ## Why it exists
 
@@ -319,6 +368,67 @@ shadowdroid skill --sync   # refresh every installed skill to this version
 
 `connect` runs this refresh automatically (pristine skills only), so an upgraded
 CLI keeps its installed skills current with no extra step.
+
+
+## FAQ
+
+**What is ShadowDroid?**
+An open-source command-line tool that turns a real Android device or emulator into
+a structured JSON surface an AI agent can read, drive, and debug. One command prints
+one line of JSON — there's no test DSL or client library to maintain.
+
+**Who is it for?**
+Anyone pointing an AI or coding agent at a *running* Android app: building agentic
+QA, reproducing bugs, automating end-to-end flows, or letting an agent self-verify a
+UI change. It's equally handy by hand for quick scripted automation.
+
+**Is ShadowDroid a test framework?**
+No. There's no assertion DSL or test runner to babysit — it's a fast, observable
+control surface an agent drives live. It *can* launch your existing instrumentation
+tests (`shadowdroid test`, which frees the `UiAutomation` slot first), but it isn't a
+replacement for Espresso or JUnit.
+
+**How is it different from Appium, Maestro, or Espresso?**
+Those are built for authored test suites — WebDriver scripts, YAML flows, compiled
+JUnit — running in CI. ShadowDroid is built for a *live agent loop*: a persistent
+on-device service answers each command in ~25 ms as one line of JSON, with crash /
+toast / HTTP event streaming and an agent-facing debugger. Use those frameworks for
+regression suites; use ShadowDroid when an agent needs to drive and reason about a
+running app right now.
+
+**How is it different from `adb` and the `android` CLI?**
+It complements them. Keep `adb` and the `android` CLI for scaffold, build, deploy,
+and SDK management, then hand the *running* app to ShadowDroid. Raw
+`adb shell uiautomator dump` is ~500 ms–1 s and stateless; ShadowDroid keeps a warm
+service at ~25 ms, acts by selector, and streams events. See
+[Why it exists](#why-it-exists).
+
+**Does it support Jetpack Compose?**
+Yes — first-class, via AndroidX UI Automator 2.3.0+. Compose nodes appear in the same
+element tree, and `layout` adds Compose source locations and recomposition counters
+when Android Studio's Layout Inspector is running.
+
+**Do I need Android Studio?**
+Not for the core. The CLI plus `adb` cover UI automation, app lifecycle, network
+capture, and event streaming. Android Studio (via the optional plugin) only adds the
+live debugger and Layout Inspector enrichment; without it those sections report
+`available:false` and everything else keeps working.
+
+**Which devices work? Emulators? Android TV?**
+Real devices and emulators with USB debugging, plus Android TV / leanback, which is
+focus + D-pad driven via `ui focus` and `ui key dpad_*`.
+
+**Which agents can use it?**
+Any agent that can run a shell command and read JSON. One-command skill install ships
+for Claude Code, Cursor, Codex, Gemini, and Antigravity, and
+`shadowdroid commands --json` emits the whole catalog for anything else.
+
+**What host platforms are supported?**
+macOS, Linux, and Windows hosts (Homebrew, Scoop, or a one-line installer). The
+target is always Android.
+
+**Is it open source?**
+Yes — licensed under Apache-2.0.
 
 
 ## License
