@@ -11,7 +11,7 @@
 #![allow(dead_code)]
 
 use crate::proto::*;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use reqwest::{Client, Response};
 use serde::Serialize;
 use std::time::Duration;
@@ -527,6 +527,34 @@ pub(crate) fn is_transient_transport_error(err: &anyhow::Error) -> bool {
         || message.contains("operation timed out")
 }
 
+/// A structured non-2xx response from the on-device server, carrying the wire
+/// envelope's machine `code` (e.g. `element_not_found`) alongside the HTTP
+/// status. It is surfaced as an `anyhow` error whose chain the CLI walks
+/// (`cli::report_error`) to render a `{"type":"error","code":…}` object on
+/// stdout instead of an opaque string. The `Display` form is kept identical to
+/// the prior `bail!` message so log/string consumers see no change.
+#[derive(Debug)]
+pub struct ServerError {
+    pub status: reqwest::StatusCode,
+    pub code: String,
+    pub message: String,
+    /// The envelope's optional `detail` object (e.g. `ambiguous_match`'s
+    /// candidate list), surfaced verbatim in the CLI's error JSON.
+    pub detail: Option<serde_json::Value>,
+}
+
+impl std::fmt::Display for ServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "server error {}: {} ({})",
+            self.status, self.message, self.code
+        )
+    }
+}
+
+impl std::error::Error for ServerError {}
+
 /// Check response status; on non-2xx, try to parse our wire-error envelope
 /// for a useful Rust error instead of just `error decoding response body`.
 async fn check_then_json<T: serde::de::DeserializeOwned>(resp: Response) -> Result<T> {
@@ -537,12 +565,13 @@ async fn check_then_json<T: serde::de::DeserializeOwned>(resp: Response) -> Resu
     // Try to decode the structured error
     let text = resp.text().await?;
     if let Ok(env) = serde_json::from_str::<ErrorEnvelope>(&text) {
-        bail!(
-            "server error {}: {} ({})",
+        return Err(ServerError {
             status,
-            env.error.message,
-            env.error.code
-        );
+            code: env.error.code,
+            message: env.error.message,
+            detail: env.error.detail,
+        }
+        .into());
     }
     Err(anyhow!("server returned {}: {}", status, text))
 }
@@ -554,12 +583,13 @@ async fn check_then_bytes(resp: Response) -> Result<Vec<u8>> {
     }
     let text = resp.text().await?;
     if let Ok(env) = serde_json::from_str::<ErrorEnvelope>(&text) {
-        bail!(
-            "server error {}: {} ({})",
+        return Err(ServerError {
             status,
-            env.error.message,
-            env.error.code
-        );
+            code: env.error.code,
+            message: env.error.message,
+            detail: env.error.detail,
+        }
+        .into());
     }
     Err(anyhow!("server returned {}: {}", status, text))
 }

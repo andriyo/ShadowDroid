@@ -237,13 +237,27 @@ Every command prints a single JSON event. Selectors are consistent across comman
 A typical agent reads `ui dump` once, acts by `--rid`/`--text`, and re-reads only
 when `screen_hash` changes.
 
-Text/desc selectors match as a case-insensitive **substring** by default. On
-`ui find`/`ui tap`, add `--exact` to require a full match (so `--text Allow` won't
-hit a label reading "Allow Disney+…") and `--clickable` to skip non-clickable
-labels in favor of the actual button. `--rid` is the most reliable target when a
-stable resource id exists. Curly and straight quotes/apostrophes are matched
-interchangeably, so `--text "Don't allow"` matches UI text rendered with a
-typographic apostrophe.
+Text/desc selectors match as a **normalized, case-insensitive substring** by
+default: before comparing, surrounding whitespace is collapsed, curly
+quotes/apostrophes/ellipsis are folded to ASCII, and zero-width characters are
+stripped — so `--text "sign in"` matches a `SIGN IN` button and `--text "Don't
+allow"` matches text rendered with a typographic apostrophe. Add `--exact` (on
+`ui find`/`tap`/`text`/`wait`/`focus`) to require a full match (so `--text Allow`
+won't hit a label reading "Allow Disney+…"), and `--clickable` to skip
+non-clickable labels. `--rid` is the most reliable target when a stable resource
+id exists. Matching is **literal** — `*`, `.`, `?` and other symbols match
+themselves, with no wildcards or regex (a value starting with `-` needs the
+`--text=-50%` equals form so it isn't read as a flag).
+
+Selector **actions** are **strict**: if `ui tap`/`text`/`focus` matches several
+elements and none is an exact match, they fail with a structured
+`ambiguous_match` error listing the candidates rather than guessing — narrow with
+`--exact`, `--rid`, or `--clickable`. On a hit, `ui tap`/`wait`/`focus` echo back
+the matched element so you can confirm the right node was targeted.
+
+`ui wait` also syncs on the foreground app, not just elements: `--pkg <package>`
+blocks until that app reaches the foreground (e.g. a Custom Tab or share sheet
+opened), and `--pkg-not <package>` blocks until the screen leaves it.
 
 Results go to **stdout**; ShadowDroid's own logs go to **stderr**, so `… | jq`
 already sees clean JSON. Add `--quiet`/`-q` (or `SHADOWDROID_QUIET=1`) to silence

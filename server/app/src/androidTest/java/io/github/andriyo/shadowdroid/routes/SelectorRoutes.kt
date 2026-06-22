@@ -14,6 +14,11 @@ import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.post
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.add
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 
 object SelectorRoutes {
     /** POST /v1/{find,find_tap,xpath}. */
@@ -30,9 +35,7 @@ object SelectorRoutes {
 
         route.post("/find_tap") {
             val request: SelectorReq = call.receive()
-            val match =
-                findElementMatches(request.copy(all = false), uiDevice, instr).firstOrNull()
-                    ?: throw NotFound("element_not_found", "no element matched selector")
+            val match = chooseUnique(findElementMatches(request.copy(all = true), uiDevice, instr), request)
             val tap = tapMatch(match, uiDevice)
             call.respond(FindTapResp(matched = match.element, x = tap.x, y = tap.y, action = tap.action))
         }
@@ -58,9 +61,9 @@ object SelectorRoutes {
         // the host loop if this route is absent (404) or there's no scrollable.
         route.post("/scroll") {
             val r: ScrollReq = call.receive()
-            val target =
-                bySelector(r.text, r.rid, r.desc)
-                    ?: throw BadRequest("empty_selector", "scroll needs one of text|rid|desc")
+            if (r.text == null && r.rid == null && r.desc == null) {
+                throw BadRequest("empty_selector", "scroll needs one of text|rid|desc")
+            }
             val scrollable =
                 (
                     if (r.container_rid != null) {
@@ -77,35 +80,74 @@ object SelectorRoutes {
                     "right" -> Direction.RIGHT
                     else -> Direction.DOWN
                 }
-            var found = uiDevice.findObject(target)
+            // Detect the target with the canonical normalized matcher (the same
+            // one `/find` uses) — not `By.textContains`, which is case-sensitive
+            // and unnormalized. A match with a usable tap point is on-screen.
+            val selector = SelectorReq(text = r.text, rid = r.rid, desc = r.desc)
+            fun visibleHit(): Element? =
+                findElementMatches(selector, uiDevice, instr)
+                    .map { it.element }
+                    .firstOrNull { it.tap != null }
+            var found = visibleHit()
             var swipes = 0
             while (found == null && swipes < r.max_swipes) {
                 val more = scrollable.scroll(dir, 0.8f)
                 swipes++
-                found = uiDevice.findObject(target)
+                found = visibleHit()
                 if (!more) break
             }
-            if (found == null) {
+            val hit = found
+            val tap = hit?.tap
+            if (tap == null) {
                 call.respond(ScrollResp(matched = false, x = -1, y = -1, swipes = swipes))
             } else {
-                val center = found.visibleCenter
-                if (r.tap) found.click()
-                call.respond(ScrollResp(matched = true, x = center.x, y = center.y, swipes = swipes))
+                if (r.tap) uiDevice.click(tap[0], tap[1])
+                call.respond(ScrollResp(matched = true, x = tap[0], y = tap[1], swipes = swipes))
             }
         }
     }
 }
 
-private fun bySelector(
-    text: String?,
-    rid: String?,
-    desc: String?,
-) = when {
-    rid != null -> By.res(rid)
-    text != null -> By.textContains(text)
-    desc != null -> By.descContains(desc)
-    else -> null
-}
+/**
+ * Resolve a selector to the single element to act on. A sole match wins; if
+ * several match, a unique *exact* match disambiguates (so `--text Allow` taps the
+ * bare "Allow" over "Allow all the time"); otherwise the selector is ambiguous
+ * and the agent must narrow it with --exact/--rid/--clickable. Mirrors the host's
+ * strict-ambiguity behavior for `ui focus`.
+ */
+internal fun chooseUnique(
+    matches: List<ElementMatch>,
+    request: SelectorReq,
+): ElementMatch =
+    when (matches.size) {
+        0 -> throw NotFound("element_not_found", "no element matched selector")
+        1 -> matches[0]
+        else -> {
+            val exact = matches.filter { request.copy(exact = true).matches(it.element) }
+            if (exact.size == 1) {
+                exact[0]
+            } else {
+                throw BadRequest(
+                    "ambiguous_match",
+                    "selector matched ${matches.size} elements; narrow with --exact, --rid, or --clickable",
+                    detail = mapOf("count" to matches.size, "candidates" to candidatesDetail(matches)),
+                )
+            }
+        }
+    }
+
+private fun candidatesDetail(matches: List<ElementMatch>): JsonElement =
+    buildJsonArray {
+        matches.take(10).forEach { m ->
+            add(
+                buildJsonObject {
+                    m.element.text?.let { put("text", it) }
+                    m.element.rid?.let { put("rid", it) }
+                    m.element.desc?.let { put("desc", it) }
+                },
+            )
+        }
+    }
 
 internal data class ElementMatch(
     val element: Element,
@@ -261,24 +303,46 @@ private fun matchString(
 }
 
 /**
- * Fold common typographic punctuation to ASCII before comparing, so a selector
- * typed with a straight apostrophe (`Don't allow`) matches UI text rendered with
- * a curly one (`Don't allow`) and vice-versa — even under `exact`. Covers the
- * single/double curly quote families; other characters pass through unchanged.
+ * Canonical text-selector normalization. MUST stay in lockstep with the host's
+ * Rust `selector::normalize` (cli/src/selector.rs) so a selector behaves the same
+ * whether matched on the device (find/tap/text/scroll) or on the host
+ * (wait/focus/watchers). Steps:
+ *   1. drop zero-width / bidirectional control characters,
+ *   2. fold typographic punctuation to ASCII — curly quotes/apostrophes/primes
+ *      and the ellipsis — but NOT dashes (an en/em dash is not a hyphen),
+ *   3. collapse every run of whitespace (NBSP, tabs, newlines, …) to one space
+ *      and trim the ends.
+ * Case is handled by the `ignoreCase` compares in [SelectorReq.matches], so this
+ * intentionally does not change case.
  */
 internal fun normalizeForMatch(s: String): String {
     val out = StringBuilder(s.length)
+    var pendingSpace = false
     for (c in s) {
-        out.append(
-            when (c) {
-                '‘', '’', 'ʼ', '′', '‛' -> '\'' // ‘ ’ ʼ ′ ‛
-                '“', '”', '″', '‟' -> '"' // “ ” ″ ‟
-                else -> c
-            },
-        )
+        if (isZeroWidthOrBidi(c)) continue
+        if (c.isWhitespace()) {
+            // Defer: emit one space only before the next real char, so leading,
+            // trailing, and repeated whitespace all collapse away.
+            if (out.isNotEmpty()) pendingSpace = true
+            continue
+        }
+        if (pendingSpace) {
+            out.append(' ')
+            pendingSpace = false
+        }
+        when (c) {
+            '‘', '’', 'ʼ', '′', '‛' -> out.append('\'')
+            '“', '”', '″', '‟' -> out.append('"')
+            '…' -> out.append("...")
+            else -> out.append(c)
+        }
     }
     return out.toString()
 }
+
+/** Zero-width and bidi marks: visually absent, but break a naive comparison. */
+private fun isZeroWidthOrBidi(c: Char): Boolean =
+    c in '\u200B'..'\u200F' || c in '\u202A'..'\u202E' || c == '\u2060' || c == '\uFEFF'
 
 private data class XpathMatcher(
     val clauses: List<XpathClause>,

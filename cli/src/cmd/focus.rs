@@ -45,6 +45,10 @@ pub struct FocusArgs {
     /// Press DPAD_CENTER once the target is focused (activate it).
     #[arg(long)]
     pub center: bool,
+    /// Match the selector value exactly instead of as a case-insensitive
+    /// substring. Use it to disambiguate when several elements match.
+    #[arg(long)]
+    pub exact: bool,
     /// Maximum D-pad presses before giving up.
     #[arg(long, default_value_t = 30)]
     pub max_steps: u32,
@@ -67,15 +71,13 @@ impl Selector {
         }
     }
 
-    fn matches(&self, el: &Element) -> bool {
+    fn matches(&self, el: &Element, exact: bool) -> bool {
         let (field, query) = match self {
             Selector::Text(q) => (&el.text, q),
             Selector::Rid(q) => (&el.rid, q),
             Selector::Desc(q) => (&el.desc, q),
         };
-        field
-            .as_deref()
-            .is_some_and(|v| v.to_lowercase().contains(&query.to_lowercase()))
+        crate::selector::text_matches(field.as_deref(), Some(query), exact)
     }
 
     fn label(&self) -> serde_json::Value {
@@ -85,6 +87,50 @@ impl Selector {
             Selector::Desc(q) => serde_json::json!({ "desc": q }),
         }
     }
+
+    fn describe(&self) -> String {
+        match self {
+            Selector::Text(q) => format!("--text {q:?}"),
+            Selector::Rid(q) => format!("--rid {q:?}"),
+            Selector::Desc(q) => format!("--desc {q:?}"),
+        }
+    }
+}
+
+/// Resolve the selector to the single element to drive focus toward. Sole match
+/// wins; if several match, a unique *exact* match disambiguates; otherwise the
+/// selector is ambiguous and the agent must narrow it (consistent with `ui tap`).
+fn resolve_target(
+    selector: &Selector,
+    elements: &[Element],
+    exact: bool,
+) -> Result<Option<Element>, crate::selector::AmbiguousMatch> {
+    let cands: Vec<&Element> = elements
+        .iter()
+        .filter(|e| selector.matches(e, exact))
+        .collect();
+    match cands.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some((*one).clone())),
+        many => {
+            let exacts: Vec<&Element> = many
+                .iter()
+                .copied()
+                .filter(|e| selector.matches(e, true))
+                .collect();
+            match exacts.as_slice() {
+                [one] => Ok(Some((*one).clone())),
+                _ => Err(crate::selector::AmbiguousMatch {
+                    query: selector.describe(),
+                    candidates: many.iter().map(|e| candidate_json(e)).collect(),
+                }),
+            }
+        }
+    }
+}
+
+fn candidate_json(e: &Element) -> serde_json::Value {
+    serde_json::json!({ "id": e.id, "text": e.text, "rid": e.rid, "desc": e.desc, "tap": e.tap })
 }
 
 pub async fn run(client: &ServerClient, args: &FocusArgs) -> Result<()> {
@@ -99,11 +145,10 @@ pub async fn run(client: &ServerClient, args: &FocusArgs) -> Result<()> {
     loop {
         let screen = client.screen().await?;
 
-        let target = screen.elements.iter().find(|e| selector.matches(e));
-        let Some(target) = target else {
-            return emit(&selector, false, steps, "not_found", None, false);
+        let target = match resolve_target(&selector, &screen.elements, args.exact)? {
+            Some(t) => t,
+            None => return emit(&selector, false, steps, "not_found", None, false),
         };
-        let target = target.clone();
 
         // The element that currently has D-pad focus. Many Compose/TV apps put the
         // `focused` flag on a bounds-less wrapper whose visible content is the next
@@ -112,7 +157,7 @@ pub async fn run(client: &ServerClient, args: &FocusArgs) -> Result<()> {
         let current = effective_focused(&screen.elements);
 
         // Arrived when the focused content is the selector target.
-        if current.is_some_and(|e| selector.matches(e)) {
+        if current.is_some_and(|e| selector.matches(e, args.exact)) {
             let activated = if args.center {
                 client.key("dpad_center").await?;
                 true
@@ -276,5 +321,35 @@ mod tests {
     fn kicks_down_when_nothing_is_focused() {
         let target = el(1, [0, 0, 100, 100], false);
         assert_eq!(direction_toward(None, &target), "dpad_down");
+    }
+
+    fn text_el(id: u32, text: &str) -> Element {
+        let mut e = el(id, [0, id as i32 * 20, 10, id as i32 * 20 + 10], false);
+        e.text = Some(text.into());
+        e
+    }
+
+    #[test]
+    fn resolve_target_prefers_exact_then_errors_on_ambiguity() {
+        let sel = Selector::Text("Allow".into());
+        // "Allow" substring-matches both, but exactly one is an exact match →
+        // the exact one wins (the agent's "Allow" vs "Allow all" case).
+        let got = resolve_target(
+            &sel,
+            &[text_el(0, "Allow"), text_el(1, "Allow all the time")],
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(got.text.as_deref(), Some("Allow"));
+
+        // Two substring matches and no exact → ambiguous; the agent must narrow.
+        let err = resolve_target(
+            &sel,
+            &[text_el(0, "Allow now"), text_el(1, "Allow all the time")],
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(err.candidates.len(), 2);
     }
 }

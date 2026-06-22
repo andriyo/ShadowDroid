@@ -21,8 +21,8 @@ use crate::cmd::app_install::AppInstallArgs;
 use crate::cmd::debug::{DebugArgs, DebugCmd};
 use crate::cmd::debugger::{DebugMode, DebuggerCmd};
 use crate::cmd::device_profile::ProfileApplyArgs;
-use crate::cmd::layout::{LayoutArgs, LayoutCmd};
 use crate::cmd::focus::FocusArgs;
+use crate::cmd::layout::{LayoutArgs, LayoutCmd};
 use crate::cmd::scroll::ScrollArgs;
 use crate::cmd::studio::{StudioArgs, StudioCmd};
 use crate::config::{expand_config_path, ShadowDroidConfig};
@@ -513,6 +513,13 @@ pub enum UiCmd {
     /// Press the Home button.
     Home,
     /// Wait for an element / activity / package to appear (or be --gone).
+    ///
+    /// Selector text matches as a case-insensitive substring by default; add
+    /// --exact for a full-string match. --package / --activity wait for the
+    /// foreground app to *be* (substring of) the given component; --package-not
+    /// waits for it to *leave* a package (e.g. confirm a Custom Tab / share sheet
+    /// opened, or that you returned from an external app). The result reports the
+    /// resulting `current_app` and, when a selector matched, the `element`.
     Wait {
         #[arg(long)]
         text: Option<String>,
@@ -524,8 +531,18 @@ pub enum UiCmd {
         klass: Option<String>,
         #[arg(long)]
         activity: Option<String>,
-        #[arg(long)]
+        /// Wait until the foreground app's package contains this (e.g. `chrome`).
+        #[arg(long, visible_alias = "pkg")]
         package: Option<String>,
+        /// Wait until the foreground app's package does NOT contain this — i.e.
+        /// the screen left this app (a browser/dialer/share-sheet opened, or you
+        /// navigated back out).
+        #[arg(long, visible_alias = "pkg-not")]
+        package_not: Option<String>,
+        /// Match selector values (--text/--rid/--desc/--klass) exactly instead of
+        /// as a case-insensitive substring.
+        #[arg(long)]
+        exact: bool,
         #[arg(long)]
         gone: bool,
         #[arg(long, default_value_t = 10000)]
@@ -732,8 +749,62 @@ pub struct NetDaemonArgs {
     pub anticomp: bool,
 }
 
+/// Parse argv, converting clap's plaintext usage errors into the same
+/// `{"type":"error",…}` contract as runtime failures (item: agents shouldn't
+/// have to special-case a `try '--help'` plaintext line). `--help`/`--version`
+/// are not errors and are rendered exactly as clap would.
+fn parse_cli() -> Cli {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            let kind = err.kind();
+            // Help/version: render to stdout as usual, exit success.
+            if matches!(kind, ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+                let _ = err.print();
+                std::process::exit(0);
+            }
+            // Bare invocation with no subcommand: clap prints help; keep its exit 2.
+            if kind == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand {
+                let _ = err.print();
+                std::process::exit(2);
+            }
+            // A genuine usage error → structured JSON that *names* the bad flag
+            // (and clap's spelling suggestion) instead of a `try '--help'` line.
+            let ctx_str = |k: ContextKind| -> Option<String> {
+                err.get(k).and_then(|v| match v {
+                    ContextValue::String(s) => Some(s.clone()),
+                    ContextValue::Strings(ss) => Some(ss.join(", ")),
+                    _ => None,
+                })
+            };
+            let msg = err
+                .to_string()
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("invalid command-line arguments")
+                .trim_start_matches("error: ")
+                .to_string();
+            let mut extra = serde_json::Map::new();
+            extra.insert("kind".into(), json!(format!("{kind:?}")));
+            if let Some(a) = ctx_str(ContextKind::InvalidArg) {
+                extra.insert("arg".into(), json!(a));
+            }
+            if let Some(s) = ctx_str(ContextKind::SuggestedArg) {
+                extra.insert("suggestion".into(), json!(s));
+            }
+            extra.insert(
+                "hint".into(),
+                json!("run `shadowdroid <command> --help` for usage"),
+            );
+            emit_error("usage", "usage", &msg, serde_json::Value::Object(extra));
+            std::process::exit(2);
+        }
+    }
+}
+
 pub async fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = parse_cli();
     let config = ShadowDroidConfig::load()?;
     let device = cli.device.or_else(|| config.device.clone());
     let apk = cli.apk;
@@ -743,7 +814,8 @@ pub async fn run() -> Result<()> {
     // Resolve `--any-apk-version` ourselves from the env (clap's strict bool env
     // parsing rejects `1`/`yes` and errors with `[possible values: true, false]`).
     // `env_truthy` accepts 1/true/yes/on; anything else (including 0/no/off) is false.
-    let any_apk_version = cli.any_apk_version || installer::env_truthy("SHADOWDROID_ANY_APK_VERSION");
+    let any_apk_version =
+        cli.any_apk_version || installer::env_truthy("SHADOWDROID_ANY_APK_VERSION");
     let mut cmd = cli.cmd;
     apply_config_defaults(&mut cmd, &config);
 
@@ -790,8 +862,15 @@ pub async fn run() -> Result<()> {
             force,
             json,
         } => {
-            return crate::cmd::doctor::run(device.as_deref(), *fix, *force, *json, app.as_deref(), project.as_deref())
-                .await
+            return crate::cmd::doctor::run(
+                device.as_deref(),
+                *fix,
+                *force,
+                *json,
+                app.as_deref(),
+                project.as_deref(),
+            )
+            .await
         }
         Cmd::Collect {
             app,
@@ -1077,6 +1156,8 @@ async fn dispatch_ui(
             klass,
             activity,
             package,
+            package_not,
+            exact,
             gone,
             timeout_ms,
             poll_ms,
@@ -1090,6 +1171,8 @@ async fn dispatch_ui(
                     klass,
                     activity,
                     package,
+                    package_not,
+                    exact,
                 },
                 gone,
                 timeout_ms,
@@ -1706,6 +1789,62 @@ async fn dispatch_files(c: FilesCmd, client: &ServerClient, serial: &str) -> Res
 fn emit(v: &impl serde::Serialize) {
     println!("{}", serde_json::to_string(v).unwrap());
 }
+
+/// Emit one structured error object on **stdout** — the same stream as results,
+/// so an agent reads a single stream and branches on `type`. `extra` is merged
+/// in (e.g. `status`, `arg`, `suggestion`). Mirrors `emit_action`'s shape.
+pub(crate) fn emit_error(stage: &str, code: &str, msg: &str, extra: serde_json::Value) {
+    let mut m = serde_json::Map::new();
+    m.insert("type".into(), json!("error"));
+    m.insert("stage".into(), json!(stage));
+    m.insert("code".into(), json!(code));
+    m.insert("msg".into(), json!(msg));
+    if let serde_json::Value::Object(b) = extra {
+        for (k, v) in b {
+            m.insert(k, v);
+        }
+    }
+    m.insert("ts".into(), json!(crate::events::now_ts()));
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::Value::Object(m)).unwrap()
+    );
+    // Callers (the clap usage path, `main`) often `process::exit` right after,
+    // which skips the normal at-exit flush. Force it so the line is never lost
+    // when stdout is block-buffered (piped/captured).
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+}
+
+/// Render a failed command as one `{"type":"error",…}` line on stdout. Walks the
+/// `anyhow` chain for a [`ServerError`] so the server's machine `code`
+/// (`element_not_found`, …) and HTTP `status` survive; otherwise falls back to a
+/// generic `error` code with the human message. Called by `main` on `Err`.
+pub fn report_error(err: &anyhow::Error) {
+    if let Some(se) = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<crate::device::client::ServerError>())
+    {
+        let mut extra = json!({ "status": se.status.as_u16() });
+        if let Some(detail) = &se.detail {
+            extra["detail"] = detail.clone();
+        }
+        emit_error("run", &se.code, &se.message, extra);
+    } else if let Some(amb) = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<crate::selector::AmbiguousMatch>())
+    {
+        emit_error(
+            "run",
+            "ambiguous_match",
+            &amb.to_string(),
+            json!({ "detail": { "candidates": amb.candidates } }),
+        );
+    } else {
+        emit_error("run", "error", &err.to_string(), json!({}));
+    }
+}
+
 fn emit_action(cmd: &str, body: &serde_json::Value) {
     let mut m = serde_json::Map::new();
     m.insert("type".into(), serde_json::Value::String("action".into()));
@@ -1794,14 +1933,85 @@ async fn cmd_screenshot(
         }
     };
     std::fs::write(&p, &bytes).with_context(|| format!("writing {}", p.display()))?;
-    emit_action(
-        "screenshot",
-        &json!({
-            "path": p.display().to_string(),
-            "bytes": bytes.len() as u64,
-        }),
-    );
+    let mut body = json!({
+        "path": p.display().to_string(),
+        "bytes": bytes.len() as u64,
+        "format": format.as_deref().unwrap_or("png"),
+    });
+    if let Some((w, h)) = image_dimensions(&bytes) {
+        body["width"] = json!(w);
+        body["height"] = json!(h);
+    }
+    // Best-effort structural screen hash so two screenshots are comparable
+    // without pixel-diffing — the same value `ui wait` / `ui dump` return. A slow
+    // or failed dump must not fail the screenshot, so the error is swallowed.
+    if let Ok(screen) = client.screen().await {
+        body["screen_hash"] = json!(screen.screen_hash);
+    }
+    emit_action("screenshot", &body);
     Ok(())
+}
+
+/// Parse pixel dimensions from a PNG or JPEG byte stream without pulling in an
+/// image-decoding dependency. `None` for anything unrecognized — the screenshot
+/// still succeeds; `width`/`height` are simply omitted.
+fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    // PNG: 8-byte signature, then an IHDR chunk whose data begins at offset 16
+    // with big-endian u32 width, height.
+    if bytes.len() >= 24
+        && bytes[0..8] == [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']
+        && &bytes[12..16] == b"IHDR"
+    {
+        let w = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+        let h = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+        return Some((w, h));
+    }
+    // JPEG: SOI (FF D8), then a chain of marker segments. A frame header
+    // (SOF0/2/…) carries height then width as big-endian u16.
+    if bytes.len() > 4 && bytes[0] == 0xFF && bytes[1] == 0xD8 {
+        let mut i = 2usize;
+        while i + 9 < bytes.len() {
+            if bytes[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            let marker = bytes[i + 1];
+            // 0xFF padding fill, or standalone markers that have no length field.
+            if marker == 0xFF {
+                i += 1;
+                continue;
+            }
+            if marker == 0xD8 || marker == 0xD9 || marker == 0x01 || (0xD0..=0xD7).contains(&marker)
+            {
+                i += 2;
+                continue;
+            }
+            let len = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
+            // SOF (frame header) markers carry the size; excludes DHT/JPG/DAC.
+            let is_sof = matches!(
+                marker,
+                0xC0 | 0xC1
+                    | 0xC2
+                    | 0xC3
+                    | 0xC5
+                    | 0xC6
+                    | 0xC7
+                    | 0xC9
+                    | 0xCA
+                    | 0xCB
+                    | 0xCD
+                    | 0xCE
+                    | 0xCF
+            );
+            if is_sof {
+                let h = u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]) as u32;
+                let w = u16::from_be_bytes([bytes[i + 7], bytes[i + 8]]) as u32;
+                return Some((w, h));
+            }
+            i += 2 + len;
+        }
+    }
+    None
 }
 
 /// `ui tap` covers four targeting modes: a selector (`--text/--rid/--desc/--xpath`),
@@ -1928,6 +2138,16 @@ struct WaitQuery {
     klass: Option<String>,
     activity: Option<String>,
     package: Option<String>,
+    package_not: Option<String>,
+    exact: bool,
+}
+
+/// Outcome of one `wait_query_matches` probe: whether the screen satisfies the
+/// query, and (when a selector was given) the element that satisfied it — so the
+/// result can echo the matched node back, like `ui tap` does.
+struct WaitOutcome {
+    matched: bool,
+    element: Option<Element>,
 }
 
 async fn cmd_wait(
@@ -1953,13 +2173,24 @@ async fn cmd_wait(
             }
             Err(err) => return Err(err),
         };
-        let matched = wait_query_matches(&query, &screen.current_app, &screen.elements);
+        let outcome = wait_query_matches(&query, &screen.current_app, &screen.elements);
+        let matched = outcome.matched;
         let screen_hash = screen.screen_hash;
+        let current_app = json!({
+            "package": screen.current_app.package,
+            "activity": screen.current_app.activity,
+        });
         if matched != gone {
-            emit_action(
-                "wait",
-                &json!({"matched":matched,"gone":gone,"screen_hash":screen_hash}),
-            );
+            let mut body = json!({
+                "matched": matched,
+                "gone": gone,
+                "screen_hash": screen_hash,
+                "current_app": current_app,
+            });
+            if let Some(el) = outcome.element {
+                body["element"] = json!(CompactElement::from(el));
+            }
+            emit_action("wait", &body);
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
@@ -1970,7 +2201,7 @@ async fn cmd_wait(
             };
             emit_action(
                 "wait",
-                &json!({"matched":matched,"gone":gone,"screen_hash":screen_hash,"timeout":true,"hint":hint}),
+                &json!({"matched":matched,"gone":gone,"screen_hash":screen_hash,"current_app":current_app,"timeout":true,"hint":hint}),
             );
             return Ok(());
         }
@@ -2005,15 +2236,31 @@ async fn reconnect_after_screen_error(
         .with_context(|| format!("screen request failed ({err}); reconnect failed"))
 }
 
-fn wait_query_matches(query: &WaitQuery, app: &crate::proto::AppRef, elements: &[Element]) -> bool {
+fn wait_query_matches(
+    query: &WaitQuery,
+    app: &crate::proto::AppRef,
+    elements: &[Element],
+) -> WaitOutcome {
+    let no_match = WaitOutcome {
+        matched: false,
+        element: None,
+    };
+    // Foreground-app gates: package (must be), package_not (must have left),
+    // activity (must be). Package names are case-sensitive, so these stay
+    // substring-but-case-sensitive regardless of --exact.
     if let Some(package) = &query.package {
         if !app.package.as_deref().unwrap_or("").contains(package) {
-            return false;
+            return no_match;
+        }
+    }
+    if let Some(package_not) = &query.package_not {
+        if app.package.as_deref().unwrap_or("").contains(package_not) {
+            return no_match;
         }
     }
     if let Some(activity) = &query.activity {
         if !app.activity.as_deref().unwrap_or("").contains(activity) {
-            return false;
+            return no_match;
         }
     }
     let has_element_query = query.text.is_some()
@@ -2021,23 +2268,31 @@ fn wait_query_matches(query: &WaitQuery, app: &crate::proto::AppRef, elements: &
         || query.desc.is_some()
         || query.klass.is_some();
     if !has_element_query {
-        return true;
+        // Pure foreground-app wait (package / package_not / activity satisfied).
+        return WaitOutcome {
+            matched: true,
+            element: None,
+        };
     }
-    elements.iter().any(|el| {
-        selector_string_matches(el.text.as_deref(), query.text.as_deref())
-            && selector_string_matches(el.rid.as_deref(), query.rid.as_deref())
-            && selector_string_matches(el.desc.as_deref(), query.desc.as_deref())
-            && selector_string_matches(el.klass.as_deref(), query.klass.as_deref())
-    })
-}
-
-fn selector_string_matches(actual: Option<&str>, expected: Option<&str>) -> bool {
-    let Some(expected) = expected else {
-        return true;
+    // Match against the canonical selector spec ([crate::selector]). When not in
+    // exact mode, prefer an exact hit for the *returned* element so the agent
+    // sees the most specific node (a pure presence / `--gone` check is
+    // unaffected — any match still satisfies the wait).
+    let matches = |el: &Element, exact: bool| {
+        crate::selector::text_matches(el.text.as_deref(), query.text.as_deref(), exact)
+            && crate::selector::text_matches(el.rid.as_deref(), query.rid.as_deref(), exact)
+            && crate::selector::text_matches(el.desc.as_deref(), query.desc.as_deref(), exact)
+            && crate::selector::text_matches(el.klass.as_deref(), query.klass.as_deref(), exact)
     };
-    actual
-        .map(|actual| actual.to_lowercase().contains(&expected.to_lowercase()))
-        .unwrap_or(false)
+    let element = elements
+        .iter()
+        .find(|el| !query.exact && matches(el, true))
+        .or_else(|| elements.iter().find(|el| matches(el, query.exact)))
+        .cloned();
+    WaitOutcome {
+        matched: element.is_some(),
+        element,
+    }
 }
 
 fn unix_ms() -> u64 {
@@ -2049,15 +2304,36 @@ fn unix_ms() -> u64 {
 
 // ── session subcommands ───────────────────────────────────────
 
+/// `devices` honors the "one JSON object per command" contract (it used to print
+/// bare serials). Each entry carries enough to pick `-d <serial>` without a
+/// second call: `state`, plus `device_model` / `device_manufacturer` /
+/// `android_release` / `android_sdk` for fully-online devices. Offline,
+/// unauthorized, or no-perm devices can't be queried over `getprop`, so they
+/// report `serial` + `state` only (and are still listed, unlike `connect`'s
+/// actionable-only view).
 async fn cmd_devices() -> Result<()> {
-    let devices = adb::list_devices().await?;
-    if devices.is_empty() {
-        eprintln!("no devices attached (start an emulator or plug in a phone)");
-    } else {
-        for d in devices {
-            println!("{d}");
+    let pairs = adb::list_devices_with_state().await?;
+    let mut devices = Vec::with_capacity(pairs.len());
+    for (serial, state) in pairs {
+        let mut obj = serde_json::Map::new();
+        obj.insert("serial".into(), json!(serial));
+        obj.insert("state".into(), json!(state));
+        if state == "device" {
+            if let serde_json::Value::Object(info) = adb::device_info(&serial).await {
+                for (k, v) in info {
+                    obj.insert(k, v);
+                }
+            }
         }
+        devices.push(serde_json::Value::Object(obj));
     }
+    let empty = devices.is_empty();
+    let mut body = json!({ "count": devices.len(), "devices": devices });
+    if empty {
+        body["hint"] =
+            json!("no devices attached — start an emulator or plug in a device with USB debugging");
+    }
+    emit_action("devices", &body);
     Ok(())
 }
 
@@ -2235,13 +2511,22 @@ mod tests {
         assert!(matches!(cli.cmd, Cmd::App(AppCmd::Current { json: true })));
         // And it still parses without the flag.
         let bare = Cli::try_parse_from(["shadowdroid", "app", "current"]).unwrap();
-        assert!(matches!(bare.cmd, Cmd::App(AppCmd::Current { json: false })));
+        assert!(matches!(
+            bare.cmd,
+            Cmd::App(AppCmd::Current { json: false })
+        ));
     }
 
     #[test]
     fn ui_tap_accepts_exact_and_clickable() {
         let cli = Cli::try_parse_from([
-            "shadowdroid", "ui", "tap", "--text", "Allow", "--exact", "--clickable",
+            "shadowdroid",
+            "ui",
+            "tap",
+            "--text",
+            "Allow",
+            "--exact",
+            "--clickable",
         ])
         .expect("`ui tap --exact --clickable` should parse");
         match cli.cmd {
@@ -2278,8 +2563,7 @@ mod tests {
     fn any_apk_version_is_a_plain_global_flag() {
         // The env var is resolved in `run()` (not by clap) so that `1`/`yes`/etc.
         // don't dead-end on clap's strict bool parser. The CLI flag still works.
-        let cli =
-            Cli::try_parse_from(["shadowdroid", "ui", "dump", "--any-apk-version"]).unwrap();
+        let cli = Cli::try_parse_from(["shadowdroid", "ui", "dump", "--any-apk-version"]).unwrap();
         assert!(cli.any_apk_version);
         let arg = Cli::command()
             .get_arguments()
@@ -2312,5 +2596,135 @@ mod tests {
                 .contains("shadowdroid disconnect"),
             "resolution should point at disconnect",
         );
+    }
+
+    // ── ui wait: foreground gates + match semantics ────────────────────
+
+    fn wait_query() -> WaitQuery {
+        WaitQuery {
+            text: None,
+            rid: None,
+            desc: None,
+            klass: None,
+            activity: None,
+            package: None,
+            package_not: None,
+            exact: false,
+        }
+    }
+
+    fn app_ref(package: Option<&str>) -> crate::proto::AppRef {
+        crate::proto::AppRef {
+            package: package.map(Into::into),
+            activity: None,
+            pid: None,
+        }
+    }
+
+    fn text_el(text: &str) -> Element {
+        Element {
+            id: 0,
+            text: Some(text.into()),
+            desc: None,
+            klass: None,
+            rid: None,
+            bounds: None,
+            tap: None,
+            clickable: false,
+            long_clickable: false,
+            scrollable: false,
+            checkable: false,
+            focusable: false,
+            enabled: true,
+            selected: false,
+            checked: false,
+            focused: false,
+            password: false,
+            input: false,
+        }
+    }
+
+    #[test]
+    fn ui_wait_accepts_package_not_exact_and_aliases() {
+        // --pkg-not is the visible alias for --package-not; --exact parses.
+        let cli = Cli::try_parse_from([
+            "shadowdroid",
+            "ui",
+            "wait",
+            "--pkg-not",
+            "com.livd",
+            "--exact",
+        ])
+        .expect("`ui wait --pkg-not --exact` should parse");
+        match cli.cmd {
+            Cmd::Ui(UiCmd::Wait {
+                package,
+                package_not,
+                exact,
+                ..
+            }) => {
+                assert_eq!(package_not.as_deref(), Some("com.livd"));
+                assert!(exact, "--exact should be set");
+                assert!(package.is_none());
+            }
+            _ => panic!("expected `ui wait`"),
+        }
+        // --pkg is the visible alias for --package.
+        let chrome = Cli::try_parse_from(["shadowdroid", "ui", "wait", "--pkg", "chrome"]).unwrap();
+        match chrome.cmd {
+            Cmd::Ui(UiCmd::Wait {
+                package,
+                package_not,
+                ..
+            }) => {
+                assert_eq!(package.as_deref(), Some("chrome"));
+                assert!(package_not.is_none());
+            }
+            _ => panic!("expected `ui wait`"),
+        }
+    }
+
+    #[test]
+    fn wait_exact_distinguishes_substring_from_full_match() {
+        let els = [text_el("Done")];
+        // Substring (default): "on" hits "Done", and the matched node is returned.
+        let sub = WaitQuery {
+            text: Some("on".into()),
+            ..wait_query()
+        };
+        let out = wait_query_matches(&sub, &app_ref(Some("com.x")), &els);
+        assert!(out.matched);
+        assert_eq!(out.element.unwrap().text.as_deref(), Some("Done"));
+        // Exact: "on" no longer matches "Done".
+        let exact = WaitQuery {
+            text: Some("on".into()),
+            exact: true,
+            ..wait_query()
+        };
+        assert!(!wait_query_matches(&exact, &app_ref(Some("com.x")), &els).matched);
+    }
+
+    #[test]
+    fn wait_package_not_matches_only_after_leaving_app() {
+        let q = WaitQuery {
+            package_not: Some("com.livd".into()),
+            ..wait_query()
+        };
+        // Still in com.livd → not satisfied.
+        assert!(!wait_query_matches(&q, &app_ref(Some("com.livd")), &[]).matched);
+        // Foreground moved to chrome → satisfied (left the package).
+        assert!(wait_query_matches(&q, &app_ref(Some("com.android.chrome")), &[]).matched);
+    }
+
+    #[test]
+    fn image_dimensions_parses_png_and_rejects_junk() {
+        let mut png = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        png.extend_from_slice(&[0, 0, 0, 13]); // IHDR chunk length
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&1080u32.to_be_bytes());
+        png.extend_from_slice(&2400u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0]); // bit depth / color type / …
+        assert_eq!(image_dimensions(&png), Some((1080, 2400)));
+        assert_eq!(image_dimensions(b"not an image"), None);
     }
 }

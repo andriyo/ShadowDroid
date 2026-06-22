@@ -229,12 +229,9 @@ fn permission_dialog_button_rule(name: &str, rid: &str) -> WatcherRule {
 }
 
 fn matches_text(actual: Option<&str>, expected: Option<&str>) -> bool {
-    let Some(expected) = expected else {
-        return true;
-    };
-    actual
-        .map(|actual| actual.to_lowercase().contains(&expected.to_lowercase()))
-        .unwrap_or(false)
+    // Route through the canonical selector spec so watcher rules normalize text
+    // (quotes, whitespace, invisibles) exactly like `ui find`/`tap`/`wait`.
+    crate::selector::text_matches(actual, expected, false)
 }
 
 #[cfg(test)]

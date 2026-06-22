@@ -43,9 +43,9 @@ object KeyTextRoutes {
             val r: TextReq = call.receive()
             val selector = r.selector()
             if (selector != null) {
-                val match =
-                    findElementMatches(selector, uiDevice, instr).firstOrNull()
-                        ?: throw NotFound("element_not_found", "no element matched text target selector")
+                // Strict ambiguity, like `find_tap`: a unique (or uniquely-exact)
+                // match, else `ambiguous_match` — never type into the wrong field.
+                val match = chooseUnique(findElementMatches(selector.copy(all = true), uiDevice, instr), selector)
                 if (!setAccessibilityText(match.node, r.value)) {
                     throw BadRequest(
                         "text_failed",

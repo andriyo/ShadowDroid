@@ -160,6 +160,9 @@ data class ErrorBody(
             detail?.mapValues {
                 when (val v = it.value) {
                     null -> kotlinx.serialization.json.JsonNull
+                    // Pre-built JSON (e.g. an `ambiguous_match` candidate array)
+                    // passes through structured instead of being stringified.
+                    is kotlinx.serialization.json.JsonElement -> v
                     is Number -> kotlinx.serialization.json.JsonPrimitive(v)
                     is Boolean -> kotlinx.serialization.json.JsonPrimitive(v)
                     else -> kotlinx.serialization.json.JsonPrimitive(v.toString())

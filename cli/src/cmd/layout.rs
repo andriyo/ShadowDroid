@@ -345,18 +345,9 @@ fn element_matches(element: &Element, args: &LayoutSourceArgs) -> bool {
     if let Some(id) = args.id {
         return element.id == id;
     }
-    option_contains(element.text.as_deref(), args.text.as_deref())
-        && option_contains(element.rid.as_deref(), args.rid.as_deref())
-        && option_contains(element.desc.as_deref(), args.desc.as_deref())
-}
-
-fn option_contains(actual: Option<&str>, expected: Option<&str>) -> bool {
-    let Some(expected) = expected else {
-        return true;
-    };
-    actual
-        .map(|actual| actual.to_lowercase().contains(&expected.to_lowercase()))
-        .unwrap_or(false)
+    crate::selector::text_matches(element.text.as_deref(), args.text.as_deref(), false)
+        && crate::selector::text_matches(element.rid.as_deref(), args.rid.as_deref(), false)
+        && crate::selector::text_matches(element.desc.as_deref(), args.desc.as_deref(), false)
 }
 
 fn read_snapshot(path: &Path) -> Result<Vec<Element>> {

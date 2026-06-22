@@ -20,13 +20,12 @@ mod dump;
 mod events;
 mod net;
 mod proto;
+mod selector;
 mod update;
 mod watch;
 
-use anyhow::Result;
-
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     // `--quiet`/`-q` (or SHADOWDROID_QUIET) suppresses our own operational logs so
     // stdout stays clean JSON even under `2>&1`. It's read here, ahead of clap,
     // because tracing is initialized before argument dispatch. An explicit
@@ -45,5 +44,10 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    cli::run().await
+    // A failed command prints one `{"type":"error",…}` line on stdout (not
+    // anyhow's `Error: …` on stderr) so the JSON contract holds for failures too.
+    if let Err(err) = cli::run().await {
+        cli::report_error(&err);
+        std::process::exit(1);
+    }
 }

@@ -694,7 +694,7 @@ flow, or inspect what's on screen. It is *not* for building/compiling the app
 ## First contact
 
 ```bash
-shadowdroid devices                 # attached devices/emulators
+shadowdroid devices                 # attached devices as JSON: serial, state, model, android version
 shadowdroid connect                 # install + start the on-device service
 shadowdroid commands --json         # the full command catalog, for discovery
 shadowdroid config schema --json    # config format, paths, fields, example
@@ -702,7 +702,8 @@ shadowdroid ui dump | jq            # current UI as a flat element list
 ```
 
 If no device is attached, ask the user to start one — don't boot an emulator
-silently. With multiple devices, pass `-d <serial>`.
+silently. With multiple devices, read `devices` (each entry has `model` /
+`android_release` / `state`) and pass `-d <serial>`.
 
 ## Low-token project config
 
@@ -743,9 +744,29 @@ shadowdroid ui tap --text "Sign in"        # or --rid / --desc / --xpath, or `ui
 shadowdroid ui text "alice@example.com"    # focused field; add --rid/--text/--id to target one
 shadowdroid ui key enter
 shadowdroid ui scroll-to --text "Privacy" --tap   # scroll a list until found, then tap
-shadowdroid ui wait --text "Welcome" --timeout-ms 8000   # block until it appears
-shadowdroid ui screenshot /tmp/after.png
+shadowdroid ui wait --text "Welcome" --timeout-ms 8000   # block until it appears; result echoes the matched element + current_app
+shadowdroid ui wait --pkg com.android.chrome      # wait for the foreground app to BE this (e.g. a Custom Tab / share sheet opened)
+shadowdroid ui wait --pkg-not com.example.app     # wait for the foreground to LEAVE this app (returned, or an external app took over)
+shadowdroid ui screenshot /tmp/after.png          # writes the PNG; result includes width/height + screen_hash (compare to ui wait's)
 ```
+
+`--text`/`--desc` match a **normalized, case-insensitive substring** by default:
+before comparing, surrounding whitespace is collapsed, curly quotes/ellipsis are
+folded to ASCII, and zero-width characters are stripped — so `--text "sign in"`
+matches a `SIGN IN` button and `--text "Don't"` matches a curly apostrophe. Add
+`--exact` (on `ui find`/`tap`/`text`/`wait`/`focus`) for a full-string match.
+
+Matching is **literal**: `*`, `.`, `?`, `[`, `$`, … match those characters — there
+are no wildcards or regex, so `--text "Bask*t"` will not match "Basket". (A
+selector value that *starts* with `-`, like `-50%`, must use the equals form
+`--text=-50%` so it isn't parsed as a flag.)
+
+Selector **actions** are **strict**: if `ui tap`/`text`/`focus` matches several
+elements and none is an exact match, they return `{"type":"error",
+"code":"ambiguous_match", ...}` listing the candidates — narrow with `--exact`,
+`--rid`, or `--clickable` (or use `ui find` to inspect all matches first). On a
+hit, `ui tap`/`wait`/`focus` echo the matched element (`rid`/`tap`/`text`) so you
+can confirm the right node.
 
 For a long flow, stream every change and watch for crashes:
 
@@ -816,7 +837,17 @@ shadowdroid collect --app com.example.app   # bundle logs+screen+screenshot+diag
 
 ## Output contract
 
-Every action prints one JSON object with `type` and `cmd`; reads print their
-payload. Parse stdout; never scrape human text. Tap by selector and re-read the
-screen rather than trusting fixed coordinates across layouts.
+Every command prints exactly one JSON object on **stdout**: successes as
+`{"type":"action","cmd":…}` (or a read's payload), failures as
+`{"type":"error","code":…,"msg":…}`. Even unknown-flag / usage errors are JSON
+and name the offending flag (with a spelling suggestion). Parse stdout and
+branch on `type`; never scrape human text.
+
+ShadowDroid's own operational logs go to **stderr**, so `… | jq` already sees
+clean JSON. If you merge streams with `2>&1`, or just want the tidiest output,
+add `--quiet`/`-q` (or set `SHADOWDROID_QUIET=1`) to silence those logs — then
+stdout is JSON and nothing else.
+
+Tap by selector and re-read the screen rather than trusting fixed coordinates
+across layouts.
 "#;

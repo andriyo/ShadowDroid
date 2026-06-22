@@ -67,9 +67,7 @@ impl Selector {
             Selector::Rid(q) => (&el.rid, q),
             Selector::Desc(q) => (&el.desc, q),
         };
-        field
-            .as_deref()
-            .is_some_and(|v| v.to_lowercase().contains(&query.to_lowercase()))
+        crate::selector::text_matches(field.as_deref(), Some(query), false)
     }
 
     fn label(&self) -> serde_json::Value {
