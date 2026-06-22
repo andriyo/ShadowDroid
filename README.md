@@ -107,11 +107,11 @@ It even follows the `android` CLI's own conventions (`init`, `skills`, `layout`,
 
 ```
         Laptop                         adb forward                Android device
-  ┌───────────────────────┐         tcp:7912 ⇆ 7912        ┌───────────────────────────┐
+  ┌───────────────────────┐         tcp:7912 ⇆ 7912         ┌───────────────────────────┐
   │  shadowdroid (Rust)   │  ── HTTP + JSON (loopback) ──▶  │  instrumentation APK      │
   │  • clap CLI           │                                 │  • Ktor 3 / CIO server    │
-  │  • XML → element JSON  │ ◀────────  adb logcat  ──────── │  • UiDevice (AndroidX     │
-  │  • watch/crash/watcher │                                 │    UI Automator 2.3.0+)   │
+  │  • XML → element JSON │ ◀────────  adb logcat  ──────── │  • UiDevice (AndroidX     │
+  │  • watch/crash/watcher│                                 │    UI Automator 2.3.0+)   │
   └───────────────────────┘                                 └───────────────────────────┘
 ```
 
