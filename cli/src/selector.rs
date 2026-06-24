@@ -85,24 +85,12 @@ pub fn text_matches(actual: Option<&str>, expected: Option<&str>, exact: bool) -
 /// with `--exact`, `--rid`, or `--clickable`. Carries the candidates it saw.
 /// Surfaced by `cli::report_error` as `{"type":"error","code":"ambiguous_match",
 /// "detail":{"candidates":[…]}}`. Mirrors the server's `ambiguous_match`.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("selector {query} matched {} elements; narrow with --exact, --rid, or --clickable", self.candidates.len())]
 pub struct AmbiguousMatch {
     pub query: String,
     pub candidates: Vec<serde_json::Value>,
 }
-
-impl std::fmt::Display for AmbiguousMatch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "selector {} matched {} elements; narrow with --exact, --rid, or --clickable",
-            self.query,
-            self.candidates.len()
-        )
-    }
-}
-
-impl std::error::Error for AmbiguousMatch {}
 
 #[cfg(test)]
 mod tests {

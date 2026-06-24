@@ -510,7 +510,8 @@ pub(crate) fn is_transient_transport_error(err: &anyhow::Error) -> bool {
 /// (`cli::report_error`) to render a `{"type":"error","code":…}` object on
 /// stdout instead of an opaque string. The `Display` form is kept identical to
 /// the prior `bail!` message so log/string consumers see no change.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("server error {status}: {message} ({code})")]
 pub struct ServerError {
     pub status: reqwest::StatusCode,
     pub code: String,
@@ -519,18 +520,6 @@ pub struct ServerError {
     /// candidate list), surfaced verbatim in the CLI's error JSON.
     pub detail: Option<serde_json::Value>,
 }
-
-impl std::fmt::Display for ServerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "server error {}: {} ({})",
-            self.status, self.message, self.code
-        )
-    }
-}
-
-impl std::error::Error for ServerError {}
 
 /// Check response status; on non-2xx, try to parse our wire-error envelope
 /// for a useful Rust error instead of just `error decoding response body`.

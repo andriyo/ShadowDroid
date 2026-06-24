@@ -43,7 +43,7 @@ regex = "1.12"
 
 # ── Utility ─────────────────────────────────────────────────────────────
 anyhow = "1.0"
-thiserror = "2.0"         # NB: 2.x reworks #[error(...)] macro paths; we don't use it yet
+thiserror = "2.0"         # derives Display + Error for ServerError / AmbiguousMatch
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 directories = "6.0"       # NB: 6.x renames ProjectDirs::from() variants — sites in installer.rs
