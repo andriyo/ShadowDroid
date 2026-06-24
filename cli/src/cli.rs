@@ -11,6 +11,24 @@
 //! Dispatch is two-phase: host-only commands (no on-device server) run first
 //! and return; everything else shares one `ensure_ready` bring-up, then routes
 //! through per-namespace sub-dispatchers.
+//!
+//! ## Adding a command (the canonical recipe)
+//!
+//! 1. **Declare it.** Add a variant to the relevant `*Cmd` enum (e.g. `UiCmd`),
+//!    or a flat `Cmd` variant for a top-level verb. Give every flag a `///` doc
+//!    comment — `--help` and `commands --json` (the agent catalog) render from
+//!    it, and a `tests/contract.rs`-style reviewer will notice if it's missing.
+//! 2. **Route it.** Add a match arm in the relevant dispatcher (`dispatch_ui`,
+//!    `dispatch_net`, …) or in `run()` for a host-only verb.
+//! 3. **Emit the result** with [`crate::events::emit_action`] — never hand-roll
+//!    `println!("{\"type\":\"action\"…")`. That keeps the one-JSON-line contract
+//!    (asserted by `cli/tests/contract.rs`). Errors propagate as `anyhow` and
+//!    surface uniformly via [`report_error`]; a structured server error should
+//!    carry a machine `code` ([`crate::device::client::ServerError`]).
+//! 4. **If it reads config defaults** (app/project/studio-url/…), wire them in
+//!    `apply_config_defaults` so flags fall back to `.shadowdroid.json`.
+//! 5. **Match selectors** through [`crate::selector`] (host side) so `--text`
+//!    normalization stays consistent with `ui find`/`tap`.
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
