@@ -48,10 +48,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 directories = "6.0"       # NB: 6.x renames ProjectDirs::from() variants — sites in installer.rs
 blake3 = "1.8"            # screen hashing
-sha2 = "0.10"             # release APK checksum verification
+sha2 = "0.11"             # release APK checksum verification
 futures = "0.3"
 urlencoding = "2.1"   # used for ?package= query strings
-zip = { version = "2.4", default-features = false, features = ["deflate"] }
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 # once_cell removed: std::sync::OnceLock (stable since 1.70) covers our use case.
 # Bring it back if we need the &'static initialisation guarantee for ergonomics.
 

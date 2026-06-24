@@ -1086,4 +1086,38 @@ mod tests {
     fn rejects_bad_plugin_checksum() {
         assert!(normalize_sha256("not-a-sha").is_err());
     }
+
+    #[test]
+    fn zipbump_smoke_install_plugin_zip_roundtrips() {
+        use std::io::Write;
+        use zip::write::{SimpleFileOptions, ZipWriter};
+        use zip::CompressionMethod;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = tmp.path().join("plugin.zip");
+        {
+            let file = fs::File::create(&zip_path).unwrap();
+            let mut zw = ZipWriter::new(file);
+            let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            zw.start_file("shadowdroid-plugin/lib/plugin.jar", deflated).unwrap();
+            zw.write_all(b"JARBYTES-deflated").unwrap();
+            zw.start_file("shadowdroid-plugin/META-INF/plugin.xml", stored).unwrap();
+            zw.write_all(b"<idea-plugin/>").unwrap();
+            zw.finish().unwrap();
+        }
+
+        let plugins_dir = tmp.path().join("plugins");
+        let installed = install_plugin_zip(&zip_path, &plugins_dir).unwrap();
+
+        assert!(installed.join("lib").is_dir());
+        assert_eq!(
+            fs::read(installed.join("lib").join("plugin.jar")).unwrap(),
+            b"JARBYTES-deflated"
+        );
+        assert_eq!(
+            fs::read(installed.join("META-INF").join("plugin.xml")).unwrap(),
+            b"<idea-plugin/>"
+        );
+    }
 }
