@@ -450,7 +450,7 @@ pub async fn run(
         report.healthy = report.checks.iter().all(|c| c.status == Status::Ok);
     }
 
-    // `--project <path>` (or config `project`): append the in-app debug-agent
+    // `--project-root <path>` (or config `project`): append the in-app debug-agent
     // wiring status (the same thing `aar status` reports). Source-side and
     // read-only — independent of the device, sits outside the fix flow.
     if let Some(project) = project {

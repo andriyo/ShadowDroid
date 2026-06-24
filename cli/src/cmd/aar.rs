@@ -358,7 +358,7 @@ fn status(args: &TargetArgs, root: &Path) -> Result<()> {
         println!("✗ agent AAR not fully installed in `{}` (module :{})", report.app, report.module);
         println!("  dependency line: {}", yes_no(report.dependency_present));
         println!("  aar file:        {}", yes_no(report.aar_present));
-        println!("  install with: shadowdroid aar install --project {}", report.app);
+        println!("  install with: shadowdroid aar install --project-root {}", report.app);
     }
     Ok(())
 }

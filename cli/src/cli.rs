@@ -89,8 +89,17 @@ pub struct Cli {
     /// Path to an app's source project (Gradle root). Used by `aar` to install
     /// the in-app debug agent and surfaced by `doctor`. Defaults to the
     /// `project` field in config.
+    //
+    // Implementation note (kept as a plain comment so it does NOT leak into every
+    // subcommand's `--help`): the flag is `--project-root`, NOT `--project`. This
+    // is `global = true`, so clap injects it into every subcommand, and several
+    // subcommands define their own `project` arg (`config init`'s scope flag,
+    // `debug break`/`eval`'s source root). Two args with the same name on one
+    // command make clap panic on a TypeId downcast at access time (the duplicate-id
+    // debug_assert is compiled out in release). Keep this name distinct from every
+    // per-subcommand `project`.
     #[arg(long, global = true, env = "SHADOWDROID_PROJECT", value_name = "PATH")]
-    pub project: Option<PathBuf>,
+    pub project_root: Option<PathBuf>,
 
     /// Silence ShadowDroid's own operational logs (the `tracing` lines written to
     /// stderr) so command output on stdout stays clean — handy when piping with
@@ -924,7 +933,7 @@ pub async fn run() -> Result<()> {
     let device = cli.device.or_else(|| config.device.clone());
     let apk = cli.apk;
     let project = cli
-        .project
+        .project_root
         .or_else(|| config.project.as_deref().map(PathBuf::from));
     // Resolve `--any-apk-version` ourselves from the env (clap's strict bool env
     // parsing rejects `1`/`yes` and errors with `[possible values: true, false]`).
