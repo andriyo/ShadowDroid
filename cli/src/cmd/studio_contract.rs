@@ -42,6 +42,7 @@ pub(crate) mod route {
 pub(crate) mod query {
     pub(crate) const ACCESS: &str = "access";
     pub(crate) const ACTION: &str = "action";
+    pub(crate) const BOUNDS: &str = "bounds";
     pub(crate) const CAUGHT: &str = "caught";
     pub(crate) const CLASS: &str = "class";
     pub(crate) const CLEAR_CONDITION: &str = "clear_condition";

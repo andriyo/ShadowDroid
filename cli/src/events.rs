@@ -3,7 +3,7 @@
 //! IMPORTANT: this shape is the public API. Keep it stable so existing watch
 //! stream consumers and generated agent integrations continue to work.
 
-use crate::proto::{AppRef, Element, ScreenResponse, Viewport};
+use crate::proto::{AppRef, Element, ImeState, ScreenResponse, Viewport};
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -32,6 +32,7 @@ pub enum Event {
         viewport: Viewport,
         screen_hash: String,
         element_count: u32,
+        ime: ImeState,
         elements: Vec<Element>,
     },
     ScreenCompact {
@@ -42,6 +43,7 @@ pub enum Event {
         viewport: Viewport,
         screen_hash: String,
         element_count: u32,
+        ime: CompactIme,
         elements: Vec<CompactElement>,
     },
     Crash(CrashEvent),
@@ -123,7 +125,7 @@ pub enum Event {
     },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CompactElement {
     pub id: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -151,6 +153,34 @@ pub struct CompactElement {
     pub selected: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub checked: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CompactIme {
+    pub keyboard_visible: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused_element: Option<CompactElement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused_input: Option<CompactElement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detection: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggested_actions: Vec<String>,
+}
+
+impl From<ImeState> for CompactIme {
+    fn from(ime: ImeState) -> Self {
+        Self {
+            keyboard_visible: ime.keyboard_visible,
+            focused_element: ime.focused_element.map(CompactElement::from),
+            focused_input: ime.focused_input.map(CompactElement::from),
+            detection: ime.detection,
+            reason: ime.reason,
+            suggested_actions: ime.suggested_actions,
+        }
+    }
 }
 
 impl From<Element> for CompactElement {
@@ -224,6 +254,7 @@ pub fn screen_event(device: &str, screen: ScreenResponse, format: ScreenFormat) 
             viewport: screen.viewport,
             screen_hash: screen.screen_hash,
             element_count: screen.element_count,
+            ime: screen.ime,
             elements: screen.elements,
         },
         ScreenFormat::Compact => Event::ScreenCompact {
@@ -234,6 +265,7 @@ pub fn screen_event(device: &str, screen: ScreenResponse, format: ScreenFormat) 
             viewport: screen.viewport,
             screen_hash: screen.screen_hash,
             element_count: screen.element_count,
+            ime: CompactIme::from(screen.ime),
             elements: screen
                 .elements
                 .into_iter()

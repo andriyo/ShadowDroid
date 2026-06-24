@@ -740,8 +740,10 @@ Read the screen, act by **selector** (don't hard-code coordinates), confirm.
 
 ```bash
 shadowdroid ui dump | jq '.elements[] | {id, text, rid, tap}'
+shadowdroid ui dump | jq '.ime'     # keyboard_visible + focused input context
 shadowdroid ui tap --text "Sign in"        # or --rid / --desc / --xpath, or `ui tap <id>`
 shadowdroid ui text "alice@example.com"    # focused field; add --rid/--text/--id to target one
+shadowdroid ui hide-keyboard        # safe no-op when the keyboard is already hidden
 shadowdroid ui key enter
 shadowdroid ui scroll-to --text "Privacy" --tap   # scroll a list until found, then tap
 shadowdroid ui wait --text "Welcome" --timeout-ms 8000   # block until it appears; result echoes the matched element + current_app
@@ -813,9 +815,17 @@ Use `layout snapshot --compose --semantics --source-map` when the question is
 visual structure or Compose source; use `layout source` to map a node back to
 code (`--id` for UIAutomator nodes, `--draw-id` for Android Studio Layout
 Inspector nodes) and `layout recompositions --reset` to isolate Compose
-recomposition counts during one interaction. Debugger read commands are bounded
-and return structured JSON warnings/errors instead of waiting indefinitely when
-the app is running or stopped on a frame without debug information.
+recomposition counts during one interaction:
+
+```bash
+shadowdroid layout recompositions --reset
+# perform one tap/type/scroll or wait through one state change
+shadowdroid layout recompositions | jq '{valid: .sample_valid, summary, top: (.nodes // [] | sort_by(-(.recomposition.count // 0), -(.recomposition.skips // 0))[:10])}'
+```
+
+Debugger read commands are bounded and return structured JSON warnings/errors
+instead of waiting indefinitely when the app is running or stopped on a frame
+without debug information.
 
 ## Make a device deterministic before driving
 

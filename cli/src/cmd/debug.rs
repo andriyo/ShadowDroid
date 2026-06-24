@@ -433,11 +433,16 @@ async fn debug_auto(
         studio_url,
     )
     .await?;
+    let sample_valid = snapshot
+        .get("sample_valid")
+        .cloned()
+        .unwrap_or_else(|| json!(false));
 
     emit_json(&json!({
         "type": "debug_auto",
         "schema_version": 1,
         "ok": ok,
+        "sample_valid": sample_valid,
         "device": serial,
         "app": {
             "requested": requested,
@@ -606,10 +611,13 @@ async fn snapshot_value(
         adb::recent_logcat(serial, args.logs).await
     };
     let debugger = debugger_snapshot(studio_url, args.depth).await;
+    let sample = debug_sample_value(args, &screen, &debugger, &foreground_activity);
 
     Ok(json!({
         "type": "debug_snapshot",
         "schema_version": 1,
+        "sample_valid": sample.get("valid").cloned().unwrap_or_else(|| json!(false)),
+        "sample": sample,
         "ts": now_ms(),
         "device": {
             "serial": serial,
@@ -1339,6 +1347,15 @@ async fn final_snapshot_best_effort(
                     "type": "debug_snapshot",
                     "schema_version": 1,
                     "ok": false,
+                    "sample_valid": false,
+                    "sample": {
+                        "valid": false,
+                        "reasons": [{
+                            "code": "snapshot_failed",
+                            "detail": error.clone()
+                        }],
+                        "next_commands": ["shadowdroid doctor", "shadowdroid collect"]
+                    },
                     "error": error,
                     "device": {
                         "serial": serial,
@@ -1513,6 +1530,66 @@ async fn final_snapshot(
         studio_url,
     )
     .await
+}
+
+fn debug_sample_value(
+    args: &SnapshotArgs,
+    screen: &crate::proto::ScreenResponse,
+    debugger: &Value,
+    foreground_activity: &Option<String>,
+) -> Value {
+    let mut reasons = Vec::<Value>::new();
+    let mut next_commands = BTreeSet::<String>::new();
+    if screen.element_count == 0 {
+        reasons.push(json!({
+            "code": "empty_uiautomator_tree",
+            "detail": "UiAutomation returned no actionable elements for the active window"
+        }));
+        next_commands.insert("shadowdroid doctor --fix".into());
+        next_commands.insert("shadowdroid ui dump".into());
+    }
+    if let Some(expected) = args.app.as_deref() {
+        if screen.current_app.package.as_deref() != Some(expected) {
+            reasons.push(json!({
+                "code": "foreground_app_mismatch",
+                "expected_package": expected,
+                "actual_package": screen.current_app.package.clone(),
+                "foreground_activity": foreground_activity,
+                "detail": "The sampled UI is not from the requested app package"
+            }));
+            next_commands.insert(format!("shadowdroid app start {expected}"));
+            next_commands.insert(format!("shadowdroid ui wait --pkg {expected}"));
+        }
+    }
+    if !debugger
+        .get("available")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        reasons.push(json!({
+            "code": "studio_debugger_unavailable",
+            "detail": debugger
+                .get("error")
+                .or_else(|| debugger.get("reason"))
+                .or_else(|| debugger.get("type"))
+                .cloned()
+                .unwrap_or_else(|| json!("Android Studio debugger bridge is unavailable"))
+        }));
+        next_commands.insert("shadowdroid studio status --json".into());
+        next_commands.insert("shadowdroid init".into());
+        next_commands.insert("shadowdroid doctor".into());
+    }
+    json!({
+        "valid": reasons.is_empty(),
+        "reasons": reasons,
+        "requested_app": args.app.clone(),
+        "screen_hash": screen.screen_hash.clone(),
+        "element_count": screen.element_count,
+        "current_app": screen.current_app.clone(),
+        "foreground_activity": foreground_activity.clone(),
+        "debugger_available": debugger.get("available").and_then(Value::as_bool).unwrap_or(false),
+        "next_commands": next_commands.into_iter().collect::<Vec<_>>(),
+    })
 }
 
 async fn device_file_list(serial: &Serial, list_cmd: &str) -> Result<Vec<String>> {

@@ -8,6 +8,8 @@ import io.github.andriyo.shadowdroid.ErrorBody
 import io.github.andriyo.shadowdroid.ErrorEnvelope
 import io.github.andriyo.shadowdroid.dump.TreeWalker
 import io.github.andriyo.shadowdroid.proto.AppRef
+import io.github.andriyo.shadowdroid.proto.Element
+import io.github.andriyo.shadowdroid.proto.ImeState
 import io.github.andriyo.shadowdroid.proto.ScreenResponse
 import io.github.andriyo.shadowdroid.proto.Viewport
 import io.ktor.http.ContentType
@@ -37,6 +39,7 @@ object ScreenRoutes {
             }
             val root = instr.uiAutomation.rootInActiveWindow
             val elements = TreeWalker.walk(root, uiDevice.displayWidth, uiDevice.displayHeight)
+            val ime = detectImeState(uiDevice, elements)
             val pkg = uiDevice.currentPackageName
             val activity = currentFocusedActivity(uiDevice)
             val pid = pidForPackage(uiDevice, pkg)
@@ -46,6 +49,7 @@ object ScreenRoutes {
                     viewport = Viewport(uiDevice.displayWidth, uiDevice.displayHeight),
                     current_app = AppRef(`package` = pkg, activity = activity, pid = pid),
                     element_count = elements.size,
+                    ime = ime,
                     elements = elements,
                 ),
             )
@@ -97,5 +101,64 @@ object ScreenRoutes {
                 tmp.delete()
             }
         }
+    }
+}
+
+private fun detectImeState(
+    uiDevice: UiDevice,
+    elements: List<Element>,
+): ImeState {
+    val focusedElement = elements.firstOrNull { it.focused }
+    val focusedInput = elements.firstOrNull { it.focused && it.input }
+    val dumpsys = runCatching { uiDevice.executeShellCommand("dumpsys input_method") }
+    val keyboardVisible = dumpsys.getOrNull()?.let(::parseKeyboardVisible)
+    val suggestedActions =
+        if (keyboardVisible == true) {
+            listOf("shadowdroid ui key back", "shadowdroid ui hide-keyboard")
+        } else {
+            emptyList()
+        }
+    return ImeState(
+        keyboard_visible = keyboardVisible ?: false,
+        focused_element = focusedElement,
+        focused_input = focusedInput,
+        detection =
+            when {
+                keyboardVisible != null -> "dumpsys input_method"
+                dumpsys.isFailure -> "unavailable"
+                else -> "unavailable"
+            },
+        reason =
+            when {
+                keyboardVisible != null -> null
+                dumpsys.isFailure -> dumpsys.exceptionOrNull()?.message ?: "dumpsys input_method failed"
+                else -> "dumpsys input_method did not expose a recognized keyboard visibility field"
+            },
+        suggested_actions = suggestedActions,
+    )
+}
+
+private fun parseKeyboardVisible(dumpsys: String): Boolean? {
+    Regex("""\bmInputShown=(true|false)\b""")
+        .find(dumpsys)
+        ?.groupValues
+        ?.get(1)
+        ?.let { return it == "true" }
+    Regex("""\bmImeWindowVis=([0-9A-Fa-fx]+)\b""")
+        .find(dumpsys)
+        ?.groupValues
+        ?.get(1)
+        ?.let { raw ->
+            parseMaybeHex(raw)?.let { return it != 0 }
+        }
+    return null
+}
+
+private fun parseMaybeHex(raw: String): Int? {
+    val value = raw.trim()
+    return if (value.startsWith("0x", ignoreCase = true)) {
+        value.removePrefix("0x").removePrefix("0X").toIntOrNull(16)
+    } else {
+        value.toIntOrNull()
     }
 }

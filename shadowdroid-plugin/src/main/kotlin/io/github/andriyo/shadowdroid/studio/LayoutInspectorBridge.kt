@@ -3,6 +3,9 @@ package io.github.andriyo.shadowdroid.studio
 import com.android.ide.common.rendering.api.ResourceReference
 import com.android.tools.idea.layoutinspector.LayoutInspector
 import com.android.tools.idea.layoutinspector.LayoutInspectorProjectService
+import com.android.tools.idea.layoutinspector.setLayoutInspectorSelectedProcess
+import com.android.tools.idea.layoutinspector.pipeline.appinspection.AppInspectionInspectorClient
+import com.android.tools.idea.appinspection.inspector.api.process.ProcessDescriptor
 import com.android.tools.idea.layoutinspector.model.AndroidWindow
 import com.android.tools.idea.layoutinspector.model.ComposeViewNode
 import com.android.tools.idea.layoutinspector.model.InspectorModel
@@ -19,8 +22,12 @@ import com.intellij.psi.xml.XmlTag
 import java.awt.Rectangle
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.min
 
 internal object LayoutInspectorBridge {
+    private const val DEFAULT_LAYOUT_WAIT_MS = 5_000
+    private const val LAYOUT_POLL_MS = 100L
+
     private val sourceResolvers = ConcurrentHashMap<String, SourceResolver>()
 
     @JvmStatic
@@ -28,6 +35,7 @@ internal object LayoutInspectorBridge {
         if (project == null) return BridgeProtocol.bad("no project")
         return try {
             val sourceResolver = sourceResolver(project)
+            val activation = activateAndWait(project, query)
             StudioThreading.onIdeaThread {
                 val state = layoutState(project)
                 if (!state.available) {
@@ -37,6 +45,7 @@ internal object LayoutInspectorBridge {
                         "available", false,
                         "reason", state.reason,
                         "project", projectInfo(project),
+                        "activation", activation,
                         "features", layoutFeatures(false, false, false),
                     )
                 }
@@ -52,6 +61,7 @@ internal object LayoutInspectorBridge {
                     "type", BridgeValues.LAYOUT_SNAPSHOT,
                     "available", true,
                     "project", projectInfo(project),
+                    "activation", activation,
                     "client", layoutClientInfo(state.client),
                     "window_count", windows.size,
                     "node_count", nodeCount,
@@ -70,6 +80,7 @@ internal object LayoutInspectorBridge {
         val reset = BridgeProtocol.booleanParam(query, BridgeQuery.RESET, false)
         return try {
             val sourceResolver = sourceResolver(project)
+            val activation = activateAndWait(project, query)
             StudioThreading.onIdeaThread {
                 val state = layoutState(project)
                 if (!state.available) {
@@ -80,8 +91,11 @@ internal object LayoutInspectorBridge {
                         "reset_requested", reset,
                         "reason", state.reason,
                         "project", projectInfo(project),
+                        "activation", activation,
                     )
                 }
+                state.model?.recompositionModel?.observeAll()
+                (state.client as? AppInspectionInspectorClient)?.updateRecompositionCountSettings()
                 if (reset) {
                     state.model?.resetRecompositionCounts()
                 }
@@ -108,6 +122,7 @@ internal object LayoutInspectorBridge {
                     "available", true,
                     "reset_requested", reset,
                     "project", projectInfo(project),
+                    "activation", activation,
                     "summary", BridgeProtocol.map("nodes", nodes.size, "count", count, "skips", skips, "child_count", childCount),
                     "nodes", nodes,
                 )
@@ -122,6 +137,7 @@ internal object LayoutInspectorBridge {
         if (project == null) return BridgeProtocol.bad("no project")
         return try {
             val sourceResolver = sourceResolver(project)
+            val activation = activateAndWait(project, query)
             StudioThreading.onIdeaThread {
                 val state = layoutState(project)
                 if (!state.available) {
@@ -131,16 +147,18 @@ internal object LayoutInspectorBridge {
                         "available", false,
                         "reason", state.reason,
                         "project", projectInfo(project),
+                        "activation", activation,
                     )
                 }
-                for (node in allLayoutNodes(state.model)) {
-                    if (!layoutNodeMatches(project, node, query, sourceResolver)) continue
+                val node = bestLayoutNode(project, allLayoutNodes(state.model), query, sourceResolver)
+                if (node != null) {
                     val source = layoutSourceInfo(project, node, sourceResolver)
                     return@onIdeaThread BridgeProtocol.ok(
                         "ok", true,
                         "type", BridgeValues.LAYOUT_SOURCE,
                         "available", source["available"] == true,
                         "project", projectInfo(project),
+                        "activation", activation,
                         "matched", layoutNodeInfo(project, node, sourceResolver),
                         "source", source,
                     )
@@ -151,12 +169,110 @@ internal object LayoutInspectorBridge {
                     "available", false,
                     "reason", "no matching Android Studio Layout Inspector node",
                     "project", projectInfo(project),
+                    "activation", activation,
                 )
             }
         } catch (t: Throwable) {
             BridgeProtocol.bad(t.message)
         }
     }
+
+    private fun activateAndWait(project: Project, query: Map<String, String>): MutableMap<String, Any?> {
+        val timeoutMs = layoutTimeoutMs(query)
+        val deadline = BridgeProtocol.nowMs() + timeoutMs
+        var activation = StudioThreading.onIdeaThread { activateLayoutInspector(project, query) }
+
+        while (activation["requested"] == true && activation["ok"] != true && BridgeProtocol.nowMs() < deadline) {
+            Thread.sleep(min(LAYOUT_POLL_MS, (deadline - BridgeProtocol.nowMs()).coerceAtLeast(1)))
+            activation = StudioThreading.onIdeaThread { activateLayoutInspector(project, query) }
+        }
+
+        var state = StudioThreading.onIdeaThread { layoutState(project) }
+        while (!state.available && BridgeProtocol.nowMs() < deadline) {
+            Thread.sleep(min(LAYOUT_POLL_MS, (deadline - BridgeProtocol.nowMs()).coerceAtLeast(1)))
+            state = StudioThreading.onIdeaThread { layoutState(project) }
+        }
+
+        activation["timeout_ms"] = timeoutMs
+        activation["model_ready"] = state.available
+        if (state.reason != null) {
+            activation["final_reason"] = state.reason
+        }
+        return activation
+    }
+
+    private fun activateLayoutInspector(project: Project, query: Map<String, String>): MutableMap<String, Any?> {
+        val inspector = LayoutInspectorProjectService.getInstance(project).getLayoutInspector()
+        val target = LayoutTarget.from(query)
+        val currentClient = inspector.currentClient
+        val currentProcess = currentClient.process
+        val payload = BridgeProtocol.map(
+            "requested", target.requested,
+            "target", target.info(),
+            "project", projectInfo(project),
+            "current_client", processInfo(currentProcess),
+        )
+
+        if (!target.requested) {
+            payload["ok"] = currentClient.isConnected && !inspector.inspectorModel.isEmpty
+            payload["reason"] = "no package or pid target supplied"
+            return payload
+        }
+
+        val processModel = inspector.processModel ?: run {
+            payload["ok"] = false
+            payload["reason"] = "Android Studio Layout Inspector process model is unavailable"
+            return payload
+        }
+        val launcher = inspector.launcher ?: run {
+            payload["ok"] = false
+            payload["reason"] = "Android Studio Layout Inspector launcher is unavailable"
+            return payload
+        }
+
+        if (!target.device.isNullOrBlank()) {
+            inspector.deviceModel?.forcedDeviceSerialNumber = target.device
+            inspector.foregroundProcessDetection?.start(target.device)
+        }
+        launcher.enabled = true
+        inspector.inspectorClientSettings.inLiveMode = true
+
+        if (target.matches(currentProcess) && currentClient.isConnected) {
+            currentClient.refresh()
+            payload["ok"] = true
+            payload["selected"] = processInfo(currentProcess)
+            payload["reused_client"] = true
+            return payload
+        }
+
+        val visibleProcesses = processModel.processes
+        val candidates = visibleProcesses
+            .filter { target.matches(it) }
+            .sortedWith(compareByDescending<ProcessDescriptor> { it.isRunning }
+                .thenByDescending { target.exactPackageMatch(it) }
+                .thenBy { it.pid })
+
+        payload["visible_process_count"] = visibleProcesses.size
+        if (candidates.isEmpty()) {
+            payload["ok"] = false
+            payload["reason"] = "no matching process visible to Android Studio Layout Inspector"
+            payload["visible_processes"] = visibleProcesses.take(20).map { processInfo(it) }
+            return payload
+        }
+
+        val selected = candidates.first()
+        inspector.deviceModel?.setSelectedDevice(selected.device)
+        processModel.setLayoutInspectorSelectedProcess(selected)
+        inspector.currentClient.refresh()
+
+        payload["ok"] = true
+        payload["selected"] = processInfo(selected)
+        payload["candidate_count"] = candidates.size
+        return payload
+    }
+
+    private fun layoutTimeoutMs(query: Map<String, String>): Int =
+        BridgeProtocol.intParam(query, BridgeQuery.TIMEOUT_MS, DEFAULT_LAYOUT_WAIT_MS, 100, 30_000)
 
     private fun layoutState(project: Project): LayoutState =
         try {
@@ -377,6 +493,79 @@ internal object LayoutInspectorBridge {
         )
     }
 
+    private fun processInfo(process: ProcessDescriptor): Map<String, Any?> =
+        BridgeProtocol.map(
+            "name", process.name,
+            "package", process.packageName,
+            "pid", process.pid,
+            "running", process.isRunning,
+            "stream_id", process.streamId,
+            "abi", process.abiCpuArch,
+            "device", BridgeProtocol.map(
+                "serial", process.device.serial,
+                "manufacturer", process.device.manufacturer,
+                "model", process.device.model,
+                "emulator", process.device.isEmulator,
+                "api", process.device.apiLevel.toString(),
+                "version", process.device.version,
+                "codename", process.device.codename,
+            ),
+        )
+
+    private data class LayoutTarget(
+        val device: String?,
+        val packageName: String?,
+        val pid: Int?,
+    ) {
+        val requested: Boolean
+            get() = !packageName.isNullOrBlank() || pid != null
+
+        fun matches(process: ProcessDescriptor): Boolean =
+            deviceMatches(process) && pidMatches(process) && packageMatches(process)
+
+        fun exactPackageMatch(process: ProcessDescriptor): Boolean {
+            if (packageName.isNullOrBlank()) return false
+            return packageName == process.packageName || packageName == process.name
+        }
+
+        fun info(): Map<String, Any?> =
+            BridgeProtocol.map(
+                "device", device,
+                "package", packageName,
+                "pid", pid,
+            )
+
+        private fun deviceMatches(process: ProcessDescriptor): Boolean {
+            if (device.isNullOrBlank()) return true
+            val descriptor = process.device
+            return device == descriptor.serial || device == descriptor.model
+        }
+
+        private fun pidMatches(process: ProcessDescriptor): Boolean =
+            pid == null || pid == process.pid
+
+        private fun packageMatches(process: ProcessDescriptor): Boolean {
+            if (packageName.isNullOrBlank()) return true
+            return packageName == process.packageName ||
+                packageName == process.name ||
+                process.name.startsWith("$packageName:")
+        }
+
+        companion object {
+            fun from(query: Map<String, String>): LayoutTarget =
+                LayoutTarget(
+                    device = query[BridgeQuery.DEVICE]?.takeIf { it.isNotBlank() },
+                    packageName = query[BridgeQuery.PACKAGE]?.takeIf { it.isNotBlank() },
+                    pid = optionalInt(query[BridgeQuery.PID]),
+                )
+
+            private fun optionalInt(value: String?): Int? {
+                if (value.isNullOrBlank()) return null
+                return value.toIntOrNull() ?: throw IllegalArgumentException("invalid integer: $value")
+            }
+        }
+    }
+
     private fun layoutFeatures(compose: Boolean, semantics: Boolean, sourceMap: Boolean): Map<String, Any?> =
         BridgeProtocol.map(
             "compose", BridgeProtocol.map("available", compose, "source", BridgeValues.LAYOUT_INSPECTOR_SOURCE),
@@ -397,25 +586,113 @@ internal object LayoutInspectorBridge {
         return false
     }
 
-    private fun layoutNodeMatches(
+    private fun bestLayoutNode(
+        project: Project,
+        nodes: List<ViewNode>,
+        query: Map<String, String>,
+        sourceResolver: SourceResolver,
+    ): ViewNode? =
+        nodes.mapNotNull { node ->
+            layoutNodeScore(project, node, query, sourceResolver)?.let { score ->
+                ScoredLayoutNode(score, nodeArea(node), node)
+            }
+        }.minWithOrNull(compareBy<ScoredLayoutNode> { it.score }.thenBy { it.area })?.node
+
+    private fun layoutNodeScore(
         project: Project,
         node: ViewNode,
         query: Map<String, String>,
         sourceResolver: SourceResolver,
-    ): Boolean {
+    ): Double? {
         val drawId = optionalLong(query[BridgeQuery.DRAW_ID])
-        if (drawId != null && node.drawId != drawId) return false
-        if (!containsIgnoreCase(node.textValue, query[BridgeQuery.TEXT])) return false
-        if (!containsIgnoreCase(resourceSearchText(node.viewId), query[BridgeQuery.RID])) return false
-        if (!containsIgnoreCase(node.qualifiedName, query[BridgeQuery.CLASS])) return false
+        if (drawId != null) return if (node.drawId == drawId) 0.0 else null
 
         val file = query[BridgeQuery.FILE]
         if (!file.isNullOrBlank()) {
             val sourceFile = layoutSourceInfo(project, node, sourceResolver)["file"] as? String
-            if (sourceFile == null || !sourceFile.endsWith(file)) return false
+            if (sourceFile == null || !sourceFile.endsWith(file)) return null
         }
-        return true
+
+        val requestedBounds = Bounds.parse(query[BridgeQuery.BOUNDS])
+        if (requestedBounds != null) {
+            val nodeBounds = nodeBounds(node) ?: return null
+            val coverage = requestedBounds.coverageBy(nodeBounds)
+            val centerDistance = requestedBounds.centerDistance(nodeBounds)
+            if (coverage <= 0.0 && centerDistance > 96.0) return null
+            val areaDelta = kotlin.math.abs(nodeBounds.area - requestedBounds.area).toDouble() /
+                requestedBounds.area.coerceAtLeast(1).toDouble()
+            var score = ((1.0 - coverage) * 10.0) + areaDelta + (centerDistance / 10_000.0)
+            if (containsIgnoreCase(node.textValue, query[BridgeQuery.TEXT])) score -= 0.20
+            if (containsIgnoreCase(resourceSearchText(node.viewId), query[BridgeQuery.RID])) score -= 0.10
+            if (containsIgnoreCase(node.qualifiedName, query[BridgeQuery.CLASS])) score -= 0.05
+            val source = layoutSourceInfo(project, node, sourceResolver)
+            val sourceFile = source["file"] as? String
+            when {
+                source["available"] == true && sourceFile != null -> score -= 1.00
+                source["available"] == true -> score -= 0.10
+                else -> score += 0.25
+            }
+            if (node.isSystemNode) score += 0.50
+            return score
+        }
+
+        if (!containsIgnoreCase(node.textValue, query[BridgeQuery.TEXT])) return null
+        if (!containsIgnoreCase(resourceSearchText(node.viewId), query[BridgeQuery.RID])) return null
+        if (!containsIgnoreCase(node.qualifiedName, query[BridgeQuery.CLASS])) return null
+        return 0.0
     }
+
+    private data class ScoredLayoutNode(
+        val score: Double,
+        val area: Int,
+        val node: ViewNode,
+    )
+
+    private data class Bounds(
+        val left: Int,
+        val top: Int,
+        val right: Int,
+        val bottom: Int,
+    ) {
+        val width: Int
+            get() = (right - left).coerceAtLeast(0)
+        val height: Int
+            get() = (bottom - top).coerceAtLeast(0)
+        val area: Int
+            get() = width * height
+
+        fun coverageBy(other: Bounds): Double {
+            val intersectionWidth = (minOf(right, other.right) - maxOf(left, other.left)).coerceAtLeast(0)
+            val intersectionHeight = (minOf(bottom, other.bottom) - maxOf(top, other.top)).coerceAtLeast(0)
+            val intersection = intersectionWidth * intersectionHeight
+            return intersection.toDouble() / area.coerceAtLeast(1).toDouble()
+        }
+
+        fun centerDistance(other: Bounds): Double {
+            val dx = ((left + right) / 2.0) - ((other.left + other.right) / 2.0)
+            val dy = ((top + bottom) / 2.0) - ((other.top + other.bottom) / 2.0)
+            return kotlin.math.sqrt(dx * dx + dy * dy)
+        }
+
+        companion object {
+            fun parse(value: String?): Bounds? {
+                if (value.isNullOrBlank()) return null
+                val parts = value.split(',').map { it.trim().toIntOrNull() }
+                if (parts.size != 4 || parts.any { it == null }) {
+                    throw IllegalArgumentException("invalid bounds: $value")
+                }
+                return Bounds(parts[0]!!, parts[1]!!, parts[2]!!, parts[3]!!)
+            }
+        }
+    }
+
+    private fun nodeBounds(node: ViewNode): Bounds? {
+        val rect = node.renderBounds.bounds
+        return Bounds(rect.x, rect.y, rect.x + rect.width, rect.y + rect.height)
+    }
+
+    private fun nodeArea(node: ViewNode): Int =
+        nodeBounds(node)?.area ?: Int.MAX_VALUE
 
     private fun resourceSearchText(ref: ResourceReference?): String? {
         if (ref == null) return null

@@ -587,6 +587,8 @@ pub enum UiCmd {
     },
     /// Press a named key or keycode.
     Key { name: String },
+    /// Hide the soft keyboard if ShadowDroid sees it; no-op when already hidden.
+    HideKeyboard,
     /// Press the Back button.
     Back,
     /// Press the Home button.
@@ -1279,6 +1281,22 @@ async fn dispatch_ui(
         UiCmd::Key { name } => {
             let injected = client.key(&name).await?;
             emit_action("key", &json!({"name":name,"injected":injected}));
+        }
+        UiCmd::HideKeyboard => {
+            let screen = read_screen_with_reconnect(serial, apk, any_apk_version, client).await?;
+            let injected = if screen.ime.keyboard_visible {
+                client.key("back").await?
+            } else {
+                false
+            };
+            emit_action(
+                "hide_keyboard",
+                &json!({
+                    "keyboard_visible": screen.ime.keyboard_visible,
+                    "injected": injected,
+                    "ime": compact_ime(&screen.ime),
+                }),
+            );
         }
         UiCmd::Back => {
             let injected = client.key("back").await?;
@@ -1993,6 +2011,7 @@ async fn cmd_screen(
         emit(&screen);
         return Ok(());
     }
+    let ime = compact_ime(&screen.ime);
     let elements: Vec<CompactElement> = screen
         .elements
         .into_iter()
@@ -2003,9 +2022,37 @@ async fn cmd_screen(
         "viewport": screen.viewport,
         "current_app": screen.current_app,
         "element_count": screen.element_count,
+        "ime": ime,
         "elements": elements,
     }));
     Ok(())
+}
+
+fn compact_ime(ime: &crate::proto::ImeState) -> serde_json::Value {
+    let mut value = json!({
+        "keyboard_visible": ime.keyboard_visible,
+    });
+    if let serde_json::Value::Object(map) = &mut value {
+        if let Some(element) = ime.focused_element.clone() {
+            map.insert(
+                "focused_element".into(),
+                json!(CompactElement::from(element)),
+            );
+        }
+        if let Some(element) = ime.focused_input.clone() {
+            map.insert("focused_input".into(), json!(CompactElement::from(element)));
+        }
+        if let Some(detection) = &ime.detection {
+            map.insert("detection".into(), json!(detection));
+        }
+        if let Some(reason) = &ime.reason {
+            map.insert("reason".into(), json!(reason));
+        }
+        if !ime.suggested_actions.is_empty() {
+            map.insert("suggested_actions".into(), json!(ime.suggested_actions));
+        }
+    }
+    value
 }
 
 async fn cmd_screenshot(

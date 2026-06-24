@@ -8,13 +8,15 @@ use crate::cmd::debugger::BridgeClient;
 use crate::cmd::studio_contract::{query, route, value};
 use crate::device::client::ServerClient;
 use crate::ids::Serial;
-use crate::proto::{Element, ScreenResponse};
+use crate::proto::{AppRef, Element, ScreenResponse};
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const DEFAULT_LAYOUT_STUDIO_WAIT_MS: u64 = 5_000;
 
 #[derive(Args)]
 pub struct LayoutArgs {
@@ -54,6 +56,15 @@ pub struct LayoutSnapshotArgs {
     /// Android Studio plugin bridge URL for Layout Inspector enrichment.
     #[arg(long, env = "SHADOWDROID_STUDIO_DEBUGGER_URL")]
     pub studio_url: Option<String>,
+    /// Override the app package/process selected in Android Studio Layout Inspector.
+    #[arg(long)]
+    pub app: Option<String>,
+    /// Override the process id selected in Android Studio Layout Inspector.
+    #[arg(long)]
+    pub pid: Option<i32>,
+    /// How long to wait for Android Studio Layout Inspector to produce a model.
+    #[arg(long, default_value_t = DEFAULT_LAYOUT_STUDIO_WAIT_MS)]
+    pub studio_wait_ms: u64,
 }
 
 #[derive(Args)]
@@ -70,6 +81,15 @@ pub struct RecompositionArgs {
     /// Android Studio plugin bridge URL.
     #[arg(long, env = "SHADOWDROID_STUDIO_DEBUGGER_URL")]
     pub studio_url: Option<String>,
+    /// Override the app package/process selected in Android Studio Layout Inspector.
+    #[arg(long)]
+    pub app: Option<String>,
+    /// Override the process id selected in Android Studio Layout Inspector.
+    #[arg(long)]
+    pub pid: Option<i32>,
+    /// How long to wait for Android Studio Layout Inspector to produce a model.
+    #[arg(long, default_value_t = DEFAULT_LAYOUT_STUDIO_WAIT_MS)]
+    pub studio_wait_ms: u64,
 }
 
 #[derive(Args)]
@@ -92,13 +112,22 @@ pub struct LayoutSourceArgs {
     /// Android Studio plugin bridge URL.
     #[arg(long, env = "SHADOWDROID_STUDIO_DEBUGGER_URL")]
     pub studio_url: Option<String>,
+    /// Override the app package/process selected in Android Studio Layout Inspector.
+    #[arg(long)]
+    pub app: Option<String>,
+    /// Override the process id selected in Android Studio Layout Inspector.
+    #[arg(long)]
+    pub pid: Option<i32>,
+    /// How long to wait for Android Studio Layout Inspector to produce a model.
+    #[arg(long, default_value_t = DEFAULT_LAYOUT_STUDIO_WAIT_MS)]
+    pub studio_wait_ms: u64,
 }
 
 pub async fn run(serial: &Serial, client: &ServerClient, args: LayoutArgs) -> Result<()> {
     match args.cmd {
         LayoutCmd::Snapshot(args) => snapshot_cmd(serial, client, args).await,
         LayoutCmd::Diff(args) => diff_cmd(args),
-        LayoutCmd::Recompositions(args) => recompositions_cmd(args).await,
+        LayoutCmd::Recompositions(args) => recompositions_cmd(serial, client, args).await,
         LayoutCmd::Source(args) => source_cmd(serial, client, args).await,
     }
 }
@@ -109,16 +138,33 @@ async fn snapshot_cmd(
     args: LayoutSnapshotArgs,
 ) -> Result<()> {
     let screen = client.screen().await.context("reading screen tree")?;
+    let screen_for_sample = screen.clone();
+    let current_app = screen.current_app.clone();
     let screenshot = if args.screenshot {
         Some(write_screenshot(client, args.out.as_deref()).await?)
     } else {
         None
     };
     let mut value = layout_snapshot_value(serial, screen, screenshot, &args);
+    let mut target_for_sample = None;
     if args.compose || args.semantics || args.source_map {
-        let studio = studio_layout_snapshot(args.studio_url.as_deref()).await;
+        let target = LayoutStudioTarget::from_ref(
+            serial,
+            &current_app,
+            args.app.as_deref(),
+            args.pid,
+            args.studio_wait_ms,
+        );
+        let studio = studio_layout_snapshot(args.studio_url.as_deref(), &target).await;
         merge_studio_layout(&mut value, studio);
+        target_for_sample = Some(target);
     }
+    annotate_layout_sample(
+        &mut value,
+        &screen_for_sample,
+        target_for_sample.as_ref(),
+        args.compose || args.semantics || args.source_map,
+    );
     if let Some(path) = args.out {
         write_json_file(&path, &value)?;
     } else {
@@ -138,7 +184,7 @@ fn layout_snapshot_value(
         "schema_version": 1,
         "ts": now_ms(),
         "device": serial,
-        "screen_hash": screen.screen_hash,
+        "screen_hash": screen.screen_hash.clone(),
         "viewport": screen.viewport,
         "current_app": screen.current_app,
         "element_count": screen.element_count,
@@ -148,9 +194,9 @@ fn layout_snapshot_value(
             "compose_requested": args.compose,
             "semantics_requested": args.semantics,
             "source_map_requested": args.source_map,
-            "compose": {"available": false, "source": "android_studio_layout_inspector_not_wired_yet"},
+            "compose": {"available": false, "source": "android_studio_layout_inspector"},
             "semantics": {"available": false, "source": "uiautomator_accessibility_fields_only"},
-            "source_map": {"available": false, "source": "android_studio_layout_inspector_not_wired_yet"}
+            "source_map": {"available": false, "source": "android_studio_layout_inspector"}
         }
     })
 }
@@ -206,21 +252,32 @@ fn diff_cmd(args: LayoutDiffArgs) -> Result<()> {
     Ok(())
 }
 
-async fn recompositions_cmd(args: RecompositionArgs) -> Result<()> {
+async fn recompositions_cmd(
+    serial: &Serial,
+    client: &ServerClient,
+    args: RecompositionArgs,
+) -> Result<()> {
+    let screen = client.screen().await.context("reading screen tree")?;
+    let target = LayoutStudioTarget::from_ref(
+        serial,
+        &screen.current_app,
+        args.app.as_deref(),
+        args.pid,
+        args.studio_wait_ms,
+    );
     let reset_s = args.reset.to_string();
     let value = match BridgeClient::new(args.studio_url.as_deref()) {
-        Ok(bridge) => match bridge
-            .get(
-                route::LAYOUT_RECOMPOSITIONS,
-                &[(query::RESET, Some(reset_s.as_str()))],
-            )
-            .await
-        {
-            Ok(value) => value,
-            Err(err) => studio_layout_unavailable(args.reset, err.to_string()),
-        },
+        Ok(bridge) => {
+            let params = target.params_with(&[(query::RESET, Some(reset_s.as_str()))]);
+            match bridge.get(route::LAYOUT_RECOMPOSITIONS, &params).await {
+                Ok(value) => value,
+                Err(err) => studio_layout_unavailable(args.reset, err.to_string()),
+            }
+        }
         Err(err) => studio_layout_unavailable(args.reset, err.to_string()),
     };
+    let mut value = value;
+    annotate_layout_sample(&mut value, &screen, Some(&target), true);
     println!("{}", serde_json::to_string(&value)?);
     Ok(())
 }
@@ -246,7 +303,15 @@ async fn source_cmd(serial: &Serial, client: &ServerClient, args: LayoutSourceAr
     } else {
         None
     };
-    let studio = studio_layout_source(args.studio_url.as_deref(), element.as_ref(), &args).await;
+    let target = LayoutStudioTarget::from_ref(
+        serial,
+        &screen.current_app,
+        args.app.as_deref(),
+        args.pid,
+        args.studio_wait_ms,
+    );
+    let studio =
+        studio_layout_source(args.studio_url.as_deref(), element.as_ref(), &args, &target).await;
     let source = studio
         .get("source")
         .cloned()
@@ -255,15 +320,18 @@ async fn source_cmd(serial: &Serial, client: &ServerClient, args: LayoutSourceAr
                 .get("error")
                 .map(|error| json!({"available": false, "reason": error}))
         })
+        .or_else(|| {
+            studio
+                .get("reason")
+                .map(|reason| json!({"available": false, "reason": reason}))
+        })
         .unwrap_or_else(|| {
             json!({
                 "available": false,
                 "reason": "Android Studio Layout Inspector source mapping is unavailable"
             })
         });
-    println!(
-        "{}",
-        serde_json::to_string(&json!({
+    let mut output = json!({
             "type": value::LAYOUT_SOURCE,
             "schema_version": 1,
             "device": serial,
@@ -271,20 +339,26 @@ async fn source_cmd(serial: &Serial, client: &ServerClient, args: LayoutSourceAr
             "matched": element,
             "source": source,
             "android_studio_layout": studio
-        }))?
-    );
+    });
+    annotate_layout_sample(&mut output, &screen, Some(&target), true);
+    println!("{}", serde_json::to_string(&output)?);
     Ok(())
 }
 
-async fn studio_layout_snapshot(studio_url: Option<&str>) -> Result<Value> {
+async fn studio_layout_snapshot(
+    studio_url: Option<&str>,
+    target: &LayoutStudioTarget,
+) -> Result<Value> {
     let bridge = BridgeClient::new(studio_url)?;
-    bridge.get(route::LAYOUT_SNAPSHOT, &[]).await
+    let params = target.params();
+    bridge.get(route::LAYOUT_SNAPSHOT, &params).await
 }
 
 async fn studio_layout_source(
     studio_url: Option<&str>,
     element: Option<&Element>,
     args: &LayoutSourceArgs,
+    target: &LayoutStudioTarget,
 ) -> Value {
     let bridge = match BridgeClient::new(studio_url) {
         Ok(bridge) => bridge,
@@ -300,13 +374,20 @@ async fn studio_layout_source(
         .or_else(|| element.and_then(|element| element.rid.as_deref()));
     let class = element.and_then(|element| element.klass.as_deref());
     let draw_id = args.draw_id.map(|draw_id| draw_id.to_string());
+    let bounds = element.and_then(|element| {
+        element
+            .bounds
+            .map(|bounds| format!("{},{},{},{}", bounds[0], bounds[1], bounds[2], bounds[3]))
+    });
     let params = [
         (query::DRAW_ID, draw_id.as_deref()),
         (query::TEXT, text),
         (query::RID, rid),
         (query::CLASS, class),
         (query::DESC, args.desc.as_deref()),
+        (query::BOUNDS, bounds.as_deref()),
     ];
+    let params = target.params_with(&params);
     match bridge.get(route::LAYOUT_SOURCE, &params).await {
         Ok(value) => value,
         Err(err) => json!({"available": false, "error": err.to_string()}),
@@ -316,14 +397,8 @@ async fn studio_layout_source(
 fn merge_studio_layout(value: &mut Value, studio: Result<Value>) {
     match studio {
         Ok(studio) => {
-            if studio
-                .get("available")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                if let Some(features) = studio.get("features").cloned() {
-                    value["features"] = features;
-                }
+            if let Some(features) = studio.get("features").cloned() {
+                value["features"] = features;
             }
             value["android_studio_layout"] = studio;
         }
@@ -344,6 +419,197 @@ fn studio_layout_unavailable(reset: bool, reason: String) -> Value {
         "reset_requested": reset,
         "reason": reason
     })
+}
+
+fn annotate_layout_sample(
+    value: &mut Value,
+    screen: &ScreenResponse,
+    target: Option<&LayoutStudioTarget>,
+    studio_required: bool,
+) {
+    let sample = layout_sample_value(value, screen, target, studio_required);
+    value["sample_valid"] = sample.get("valid").cloned().unwrap_or_else(|| json!(false));
+    value["sample"] = sample;
+}
+
+fn layout_sample_value(
+    value: &Value,
+    screen: &ScreenResponse,
+    target: Option<&LayoutStudioTarget>,
+    studio_required: bool,
+) -> Value {
+    let mut reasons = Vec::<Value>::new();
+    let mut next_commands = BTreeSet::<String>::new();
+    if screen.element_count == 0 {
+        reasons.push(json!({
+            "code": "empty_uiautomator_tree",
+            "detail": "UiAutomation returned no actionable elements for the active window"
+        }));
+        next_commands.insert("shadowdroid doctor --fix".into());
+        next_commands.insert("shadowdroid ui dump".into());
+    }
+    if let Some(target) = target {
+        if let Some(expected) = target.package.as_deref() {
+            if screen.current_app.package.as_deref() != Some(expected) {
+                reasons.push(json!({
+                    "code": "foreground_app_mismatch",
+                    "expected_package": expected,
+                    "actual_package": screen.current_app.package.clone(),
+                    "detail": "The sampled UI is not from the package selected for the Layout Inspector target"
+                }));
+                next_commands.insert(format!("shadowdroid app start {expected}"));
+                next_commands.insert(format!("shadowdroid ui wait --pkg {expected}"));
+            }
+        }
+        if let Some(expected) = target.pid.as_deref() {
+            let actual = screen.current_app.pid.map(|pid| pid.to_string());
+            if actual.as_deref() != Some(expected) {
+                reasons.push(json!({
+                    "code": "foreground_pid_mismatch",
+                    "expected_pid": expected,
+                    "actual_pid": actual,
+                    "detail": "The app process changed after the Layout Inspector target was selected"
+                }));
+                next_commands.insert("shadowdroid layout snapshot --compose".into());
+            }
+        }
+    }
+
+    let studio = studio_payload(value);
+    if studio_required {
+        match studio {
+            Some(studio) => {
+                let available = studio
+                    .get("available")
+                    .and_then(Value::as_bool)
+                    .unwrap_or_else(|| studio.get("ok").and_then(Value::as_bool).unwrap_or(false));
+                if !available {
+                    reasons.push(json!({
+                        "code": "layout_inspector_unavailable",
+                        "detail": studio_problem_detail(studio)
+                    }));
+                    next_commands.insert("shadowdroid studio status --json".into());
+                    next_commands.insert("shadowdroid init".into());
+                    next_commands.insert("shadowdroid doctor".into());
+                } else if inspector_node_count(studio) == Some(0) {
+                    reasons.push(json!({
+                        "code": "empty_layout_inspector_sample",
+                        "detail": "Android Studio Layout Inspector returned zero nodes"
+                    }));
+                    next_commands.insert("shadowdroid layout snapshot --compose".into());
+                    next_commands.insert("shadowdroid studio status --json".into());
+                }
+            }
+            None => {
+                reasons.push(json!({
+                    "code": "layout_inspector_missing",
+                    "detail": "This command requires Android Studio Layout Inspector data, but no inspector payload was attached"
+                }));
+                next_commands.insert("shadowdroid studio status --json".into());
+                next_commands.insert("shadowdroid init".into());
+            }
+        }
+    }
+
+    json!({
+        "valid": reasons.is_empty(),
+        "reasons": reasons,
+        "screen_hash": screen.screen_hash,
+        "element_count": screen.element_count,
+        "current_app": screen.current_app.clone(),
+        "target": target.map(LayoutStudioTarget::to_value),
+        "studio_required": studio_required,
+        "next_commands": next_commands.into_iter().collect::<Vec<_>>(),
+    })
+}
+
+fn studio_payload(value: &Value) -> Option<&Value> {
+    value.get("android_studio_layout").or_else(|| {
+        if value.get("available").is_some() || value.get("activation").is_some() {
+            Some(value)
+        } else {
+            None
+        }
+    })
+}
+
+fn studio_problem_detail(studio: &Value) -> Value {
+    studio
+        .get("reason")
+        .or_else(|| studio.get("error"))
+        .or_else(|| studio.get("message"))
+        .cloned()
+        .unwrap_or_else(|| json!("Android Studio Layout Inspector data is unavailable"))
+}
+
+fn inspector_node_count(studio: &Value) -> Option<u64> {
+    if let Some(nodes) = studio
+        .get("summary")
+        .and_then(|summary| summary.get("nodes"))
+        .and_then(Value::as_u64)
+    {
+        return Some(nodes);
+    }
+    if let Some(nodes) = studio.get("node_count").and_then(Value::as_u64) {
+        return Some(nodes);
+    }
+    if let Some(nodes) = studio.get("nodes").and_then(Value::as_array) {
+        return Some(nodes.len() as u64);
+    }
+    None
+}
+
+#[derive(Debug, Clone)]
+struct LayoutStudioTarget {
+    device: String,
+    package: Option<String>,
+    pid: Option<String>,
+    timeout_ms: String,
+}
+
+impl LayoutStudioTarget {
+    fn from_ref(
+        serial: &Serial,
+        app: &AppRef,
+        package_override: Option<&str>,
+        pid_override: Option<i32>,
+        timeout_ms: u64,
+    ) -> Self {
+        Self {
+            device: serial.to_string(),
+            package: package_override
+                .map(str::to_string)
+                .or_else(|| app.package.clone()),
+            pid: pid_override.or(app.pid).map(|pid| pid.to_string()),
+            timeout_ms: timeout_ms.to_string(),
+        }
+    }
+
+    fn params(&self) -> Vec<(&str, Option<&str>)> {
+        self.params_with(&[])
+    }
+
+    fn params_with<'a>(
+        &'a self,
+        extra: &[(&'a str, Option<&'a str>)],
+    ) -> Vec<(&'a str, Option<&'a str>)> {
+        let mut params = Vec::with_capacity(4 + extra.len());
+        params.push((query::DEVICE, Some(self.device.as_str())));
+        params.push((query::PACKAGE, self.package.as_deref()));
+        params.push((query::PID, self.pid.as_deref()));
+        params.push((query::TIMEOUT_MS, Some(self.timeout_ms.as_str())));
+        params.extend(extra.iter().copied());
+        params
+    }
+
+    fn to_value(&self) -> Value {
+        json!({
+            "device": self.device.clone(),
+            "package": self.package.clone(),
+            "pid": self.pid.clone(),
+            "timeout_ms": self.timeout_ms.clone(),
+        })
+    }
 }
 
 fn element_matches(element: &Element, args: &LayoutSourceArgs) -> bool {
@@ -434,4 +700,57 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::{AppRef, ImeState, Viewport};
+
+    fn screen(package: &str, pid: i32, element_count: u32) -> ScreenResponse {
+        ScreenResponse {
+            screen_hash: "abc123".into(),
+            viewport: Viewport { w: 1, h: 2 },
+            current_app: AppRef {
+                package: Some(package.into()),
+                activity: Some(format!("{package}/.MainActivity")),
+                pid: Some(pid),
+            },
+            element_count,
+            ime: ImeState::default(),
+            elements: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn layout_sample_marks_target_and_inspector_failures_invalid() {
+        let target = LayoutStudioTarget {
+            device: "emulator-5554".into(),
+            package: Some("com.expected".into()),
+            pid: Some("42".into()),
+            timeout_ms: "5000".into(),
+        };
+        let value = json!({
+            "available": false,
+            "reason": "Android Studio Layout Inspector process model is unavailable"
+        });
+        let sample = layout_sample_value(&value, &screen("com.actual", 24, 3), Some(&target), true);
+        assert_eq!(sample["valid"], false);
+        let codes = sample["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|reason| reason["code"].as_str())
+            .collect::<Vec<_>>();
+        assert!(codes.contains(&"foreground_app_mismatch"), "{codes:?}");
+        assert!(codes.contains(&"foreground_pid_mismatch"), "{codes:?}");
+        assert!(codes.contains(&"layout_inspector_unavailable"), "{codes:?}");
+    }
+
+    #[test]
+    fn layout_sample_accepts_valid_uiautomator_only_snapshot() {
+        let sample = layout_sample_value(&json!({}), &screen("com.app", 7, 2), None, false);
+        assert_eq!(sample["valid"], true);
+        assert!(sample["reasons"].as_array().unwrap().is_empty());
+    }
 }

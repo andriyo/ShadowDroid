@@ -42,6 +42,7 @@ internal object BridgeRoutes {
 internal object BridgeQuery {
     const val ACCESS = "access"
     const val ACTION = "action"
+    const val BOUNDS = "bounds"
     const val CAUGHT = "caught"
     const val CLASS = "class"
     const val CLEAR_CONDITION = "clear_condition"
@@ -49,6 +50,7 @@ internal object BridgeQuery {
     const val CONDITION = "condition"
     const val CONFIGURATION = "configuration"
     const val DEBUGGER = "debugger"
+    const val DESC = "desc"
     const val DEPTH = "depth"
     const val DEVICE = "device"
     const val DIALOG = "dialog"

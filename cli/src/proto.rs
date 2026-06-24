@@ -44,7 +44,36 @@ pub struct ScreenResponse {
     pub viewport: Viewport,
     pub current_app: AppRef,
     pub element_count: u32,
+    #[serde(default, skip_serializing_if = "ImeState::is_empty")]
+    pub ime: ImeState,
     pub elements: Vec<Element>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ImeState {
+    #[serde(default)]
+    pub keyboard_visible: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused_element: Option<Element>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused_input: Option<Element>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detection: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggested_actions: Vec<String>,
+}
+
+impl ImeState {
+    pub fn is_empty(&self) -> bool {
+        !self.keyboard_visible
+            && self.focused_element.is_none()
+            && self.focused_input.is_none()
+            && self.detection.is_none()
+            && self.reason.is_none()
+            && self.suggested_actions.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,6 +321,22 @@ mod tests {
             password: false,
             input: false,
         }
+    }
+
+    #[test]
+    fn screen_response_keeps_ime_backward_compatible() {
+        let body = r#"{
+            "screen_hash":"abc",
+            "viewport":{"w":1,"h":2},
+            "current_app":{},
+            "element_count":0,
+            "elements":[]
+        }"#;
+        let screen: ScreenResponse = serde_json::from_str(body).unwrap();
+        assert!(screen.ime.is_empty());
+
+        let json = serde_json::to_string(&screen).unwrap();
+        assert!(!json.contains("\"ime\""), "{json}");
     }
 
     #[test]

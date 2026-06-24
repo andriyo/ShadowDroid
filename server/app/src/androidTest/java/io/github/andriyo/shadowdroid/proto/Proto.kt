@@ -47,7 +47,18 @@ data class ScreenResponse(
     val viewport: Viewport,
     val current_app: AppRef,
     val element_count: Int,
+    val ime: ImeState = ImeState(),
     val elements: List<Element>,
+)
+
+@Serializable
+data class ImeState(
+    val keyboard_visible: Boolean = false,
+    val focused_element: Element? = null,
+    val focused_input: Element? = null,
+    val detection: String? = null,
+    val reason: String? = null,
+    val suggested_actions: List<String> = emptyList(),
 )
 
 @Serializable
