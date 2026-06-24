@@ -1162,12 +1162,20 @@ async fn dispatch_ui(
             };
             let r = client.find(&query).await?;
             if full {
-                emit_action("find", &json!({"matched":r.matched,"elements":r.elements}));
+                let found = r.matched.is_some();
+                emit_action(
+                    "find",
+                    &json!({"matched":found,"element":r.matched,"elements":r.elements}),
+                );
             } else {
                 let matched = r.matched.map(CompactElement::from);
+                let found = matched.is_some();
                 let elements: Vec<CompactElement> =
                     r.elements.into_iter().map(CompactElement::from).collect();
-                emit_action("find", &json!({"matched":matched,"elements":elements}));
+                emit_action(
+                    "find",
+                    &json!({"matched":found,"element":matched,"elements":elements}),
+                );
             }
         }
         UiCmd::Tap {
@@ -2120,7 +2128,7 @@ async fn cmd_tap(
         let r = client.xpath_tap(&query).await?;
         emit_action(
             "tap",
-            &json!({"via":"xpath","xpath":query,"x":r.x,"y":r.y,"action":r.action,"matched":r.matched}),
+            &json!({"via":"xpath","xpath":query,"x":r.x,"y":r.y,"action":r.action,"matched":true,"element":r.matched}),
         );
         return Ok(());
     }
@@ -2137,7 +2145,7 @@ async fn cmd_tap(
             .await?;
         emit_action(
             "tap",
-            &json!({"via":"selector","x":r.x,"y":r.y,"action":r.action,"matched":r.matched}),
+            &json!({"via":"selector","x":r.x,"y":r.y,"action":r.action,"matched":true,"element":r.matched}),
         );
         return Ok(());
     }
@@ -2175,7 +2183,7 @@ async fn tap_element_id(client: &ServerClient, id: u32) -> Result<()> {
         "tap",
         &json!({
             "via":"id","id": id, "x": r.x, "y": r.y, "action": r.action,
-            "matched": r.matched
+            "matched": true, "element": r.matched
         }),
     );
     Ok(())

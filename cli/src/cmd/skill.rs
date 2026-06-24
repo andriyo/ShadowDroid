@@ -765,8 +765,9 @@ Selector **actions** are **strict**: if `ui tap`/`text`/`focus` matches several
 elements and none is an exact match, they return `{"type":"error",
 "code":"ambiguous_match", ...}` listing the candidates — narrow with `--exact`,
 `--rid`, or `--clickable` (or use `ui find` to inspect all matches first). On a
-hit, `ui tap`/`wait`/`focus` echo the matched element (`rid`/`tap`/`text`) so you
-can confirm the right node.
+hit, `ui tap`/`find`/`wait`/`scroll-to`/`focus` all use the same shape — a
+`matched` boolean plus the echoed node under `element` (`rid`/`tap`/`text`) — so
+you can confirm the right node the same way for every command.
 
 For a long flow, stream every change and watch for crashes:
 
