@@ -254,10 +254,9 @@ pub fn emit(value: &impl Serialize) {
     );
 }
 
-/// Emit one `{"type":"action","cmd":…, …body}` result line — the shape every
-/// one-shot command prints. `body`'s fields are merged in after `type`/`cmd`.
-/// The single builder for the action envelope (was reimplemented per module).
-pub fn emit_action(cmd: &str, body: &serde_json::Value) {
+/// Build the `{"type":"action","cmd":…, …body}` envelope. Split from
+/// [`emit_action`] so the contract can be unit-tested without capturing stdout.
+fn action_envelope(cmd: &str, body: &serde_json::Value) -> serde_json::Value {
     let mut m = serde_json::Map::new();
     m.insert("type".into(), "action".into());
     m.insert("cmd".into(), cmd.into());
@@ -266,14 +265,23 @@ pub fn emit_action(cmd: &str, body: &serde_json::Value) {
             m.insert(k.clone(), v.clone());
         }
     }
-    emit(&serde_json::Value::Object(m));
+    serde_json::Value::Object(m)
 }
 
-/// Emit one `{"type":"error","stage":…,"code":…,"msg":…, …extra, "ts":…}` line
-/// on stdout — the same stream as results, so an agent reads one stream and
-/// branches on `type`. The trailing flush guards callers that `process::exit`
-/// immediately after (clap usage path, `main`).
-pub fn emit_error(stage: &str, code: &str, msg: &str, extra: serde_json::Value) {
+/// Emit one `{"type":"action","cmd":…, …body}` result line — the shape every
+/// one-shot command prints. The single builder for the action envelope (was
+/// reimplemented per module).
+pub fn emit_action(cmd: &str, body: &serde_json::Value) {
+    emit(&action_envelope(cmd, body));
+}
+
+/// Build the `{"type":"error","stage":…,"code":…,"msg":…, …extra}` envelope.
+fn error_envelope(
+    stage: &str,
+    code: &str,
+    msg: &str,
+    extra: serde_json::Value,
+) -> serde_json::Value {
     let mut m = serde_json::Map::new();
     m.insert("type".into(), "error".into());
     m.insert("stage".into(), stage.into());
@@ -284,8 +292,17 @@ pub fn emit_error(stage: &str, code: &str, msg: &str, extra: serde_json::Value) 
             m.insert(k, v);
         }
     }
-    m.insert("ts".into(), now_ts().into());
-    emit(&serde_json::Value::Object(m));
+    serde_json::Value::Object(m)
+}
+
+/// Emit one `{"type":"error","stage":…,"code":…,"msg":…, …extra}` line on
+/// stdout — the same stream as results, so an agent reads one stream and
+/// branches on `type`. Like one-shot action results, it carries no `ts`: only
+/// streamed timeline events (`watch`) are timestamped, since only they need
+/// ordering. The trailing flush guards callers that `process::exit` right after
+/// (the clap usage path, `main`).
+pub fn emit_error(stage: &str, code: &str, msg: &str, extra: serde_json::Value) {
+    emit(&error_envelope(stage, code, msg, extra));
     use std::io::Write;
     let _ = std::io::stdout().flush();
 }
@@ -294,6 +311,33 @@ pub fn emit_error(stage: &str, code: &str, msg: &str, extra: serde_json::Value) 
 mod tests {
     use super::*;
     use crate::proto::Element;
+
+    #[test]
+    fn action_envelope_has_type_and_cmd_and_no_ts() {
+        let v = action_envelope("tap", &serde_json::json!({"x": 1, "matched": true}));
+        assert_eq!(v["type"], "action");
+        assert_eq!(v["cmd"], "tap");
+        assert_eq!(v["x"], 1);
+        assert_eq!(v["matched"], true);
+        // One-shot results carry no `ts` (only streamed timeline events do).
+        assert!(v.get("ts").is_none(), "action must not carry ts: {v}");
+    }
+
+    #[test]
+    fn error_envelope_has_required_fields_and_no_ts() {
+        let v = error_envelope(
+            "usage",
+            "usage",
+            "bad flag",
+            serde_json::json!({"arg": "--x"}),
+        );
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["stage"], "usage");
+        assert_eq!(v["code"], "usage");
+        assert_eq!(v["msg"], "bad flag");
+        assert_eq!(v["arg"], "--x");
+        assert!(v.get("ts").is_none(), "error must not carry ts: {v}");
+    }
 
     fn full() -> Element {
         Element {

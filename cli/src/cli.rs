@@ -77,7 +77,13 @@ pub struct Cli {
     /// stderr) so command output on stdout stays clean — handy when piping with
     /// `2>&1` or for the tidiest agent output. Real errors are still reported, and
     /// an explicit `RUST_LOG` still takes precedence.
-    #[arg(short = 'q', long, global = true, env = "SHADOWDROID_QUIET")]
+    ///
+    /// Also settable via the SHADOWDROID_QUIET env var (1/true/yes/on). The env is
+    /// resolved manually in `main` rather than wired through clap: clap's strict
+    /// bool env parser only accepts `true`/`false`, so `SHADOWDROID_QUIET=1` (the
+    /// documented spelling) would otherwise dead-end every command on a parse
+    /// error — exactly the trap `--any-apk-version` avoids the same way.
+    #[arg(short = 'q', long, global = true)]
     pub quiet: bool,
 
     #[command(subcommand)]
@@ -2550,6 +2556,13 @@ mod tests {
             .expect("global --quiet flag should be defined");
         assert_eq!(quiet.get_short(), Some('q'));
         assert!(quiet.is_global_set(), "--quiet must be global");
+        // The env must NOT be wired through clap: its strict bool parser rejects
+        // `SHADOWDROID_QUIET=1`, which would dead-end every command. `main`
+        // resolves the env manually instead (truthy spellings).
+        assert!(
+            quiet.get_env().is_none(),
+            "SHADOWDROID_QUIET must be resolved manually, not via clap",
+        );
     }
 
     #[test]
