@@ -16,6 +16,20 @@ fn emit(cmd: &str, body: serde_json::Value) {
     crate::events::emit_action(cmd, &body);
 }
 
+/// Best-effort terminate a wedged daemon by pid when the control socket is
+/// unreachable. Portable: `kill` on Unix, `taskkill` on Windows (the control
+/// socket is TCP precisely so `net` works on Windows, so the fallback must too).
+fn kill_pid(pid: u32) {
+    #[cfg(unix)]
+    let _ = std::process::Command::new("kill")
+        .arg(pid.to_string())
+        .status();
+    #[cfg(windows)]
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
+        .status();
+}
+
 // ── lifecycle ─────────────────────────────────────────────────
 
 pub async fn start(
@@ -85,9 +99,7 @@ pub async fn stop(serial: &str, revoke_ca: bool) -> Result<()> {
         Err(_) => {
             // Socket unreachable — kill a possibly-wedged daemon by pid.
             if let Some(pid) = control::daemon_pid(serial) {
-                let _ = std::process::Command::new("kill")
-                    .arg(pid.to_string())
-                    .status();
+                kill_pid(pid);
             }
             false
         }
