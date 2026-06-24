@@ -98,7 +98,11 @@ pub async fn serve_client(
                 on_timeout_drop: req.get("on_timeout").and_then(Value::as_str) == Some("drop"),
             };
             *shared.intercept.write().unwrap() = Some(cfg);
-            write_json(&mut wr, &json!({"ok": true, "intercepting": true, "at": at})).await?;
+            write_json(
+                &mut wr,
+                &json!({"ok": true, "intercepting": true, "at": at}),
+            )
+            .await?;
         }
         "resume" => {
             let id = req.get("id").and_then(Value::as_str).unwrap_or("");
@@ -157,8 +161,11 @@ pub async fn serve_client(
                 .and_then(|v| serde_json::from_value(v).ok());
             match spec {
                 None => {
-                    write_json(&mut wr, &json!({"ok": false, "error": "missing/invalid rule spec"}))
-                        .await?
+                    write_json(
+                        &mut wr,
+                        &json!({"ok": false, "error": "missing/invalid rule spec"}),
+                    )
+                    .await?
                 }
                 Some(spec) => match validate_rule(&spec) {
                     Err(e) => write_json(&mut wr, &json!({"ok": false, "error": e})).await?,
@@ -194,7 +201,11 @@ pub async fn serve_client(
                 rules.retain(|(rid, _)| rid != id);
                 rules.len() < before
             };
-            write_json(&mut wr, &json!({"ok": removed, "id": id, "removed": removed})).await?;
+            write_json(
+                &mut wr,
+                &json!({"ok": removed, "id": id, "removed": removed}),
+            )
+            .await?;
         }
         "rule_clear" => {
             let n = {
@@ -310,13 +321,11 @@ fn validate_rule(spec: &RuleSpec) -> Result<(), String> {
 }
 
 /// Hand a held flow its decision (fires the proxy's oneshot). Returns whether a
-/// held flow with that id was present + reachable.
+/// held flow with that id was present + reachable. Shares the atomic claim with
+/// the proxy's deadline path ([`crate::net::proxy::release_held`]) so the two
+/// can't both resolve the same flow.
 fn release(shared: &SharedState, id: &str, decision: HoldDecision) -> bool {
-    if let Some(held) = shared.held.lock().unwrap().remove(id) {
-        held.tx.send(decision).is_ok()
-    } else {
-        false
-    }
+    crate::net::proxy::release_held(&shared.held, id, decision)
 }
 
 fn released_reply(id: &str, released: bool) -> Value {
@@ -362,7 +371,9 @@ async fn connect(serial: &str) -> Result<TcpStream> {
         anyhow!("no net proxy daemon for {serial}. Is `shadowdroid net start` running?")
     })?;
     TcpStream::connect(("127.0.0.1", port)).await.map_err(|e| {
-        anyhow!("cannot reach the net proxy daemon on 127.0.0.1:{port}: {e}. Is `net start` running?")
+        anyhow!(
+            "cannot reach the net proxy daemon on 127.0.0.1:{port}: {e}. Is `net start` running?"
+        )
     })
 }
 

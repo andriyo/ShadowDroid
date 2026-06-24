@@ -280,23 +280,28 @@ async fn proxy_request(
 
     // ── replay (P3): serve a saved response, never hitting upstream ──
     if in_scope {
-        if let Some((status, headers, body)) = replay_lookup(&ctx.shared, method.as_str(), &host, &path) {
-            capture(&ctx, FlowParts {
-                id: &id,
-                method: method.as_str(),
-                scheme: &scheme,
-                host: &host,
-                path: &path,
-                req_headers: &req_headers,
-                req_bytes: &req_bytes,
-                status: Some(status),
-                resp_headers: &headers,
-                resp_bytes: &body,
-                dur_ms: 0,
-                error: None,
-                matched: Some("replay".into()),
-                modified: true,
-            });
+        if let Some((status, headers, body)) =
+            replay_lookup(&ctx.shared, method.as_str(), &host, &path)
+        {
+            capture(
+                &ctx,
+                FlowParts {
+                    id: &id,
+                    method: method.as_str(),
+                    scheme: &scheme,
+                    host: &host,
+                    path: &path,
+                    req_headers: &req_headers,
+                    req_bytes: &req_bytes,
+                    status: Some(status),
+                    resp_headers: &headers,
+                    resp_bytes: &body,
+                    dur_ms: 0,
+                    error: None,
+                    matched: Some("replay".into()),
+                    modified: true,
+                },
+            );
             return Ok(build_client_response(status, &headers, body));
         }
     }
@@ -313,22 +318,25 @@ async fn proxy_request(
             tokio::time::sleep(Duration::from_millis(r.delay_ms as u64)).await;
         }
         if let Some((status, headers, body)) = r.short_circuit {
-            capture(&ctx, FlowParts {
-                id: &id,
-                method: method.as_str(),
-                scheme: &scheme,
-                host: &host,
-                path: &path,
-                req_headers: &req_headers,
-                req_bytes: &req_bytes,
-                status: Some(status),
-                resp_headers: &headers,
-                resp_bytes: &body,
-                dur_ms: 0,
-                error: None,
-                matched: Some("rule".into()),
-                modified: true,
-            });
+            capture(
+                &ctx,
+                FlowParts {
+                    id: &id,
+                    method: method.as_str(),
+                    scheme: &scheme,
+                    host: &host,
+                    path: &path,
+                    req_headers: &req_headers,
+                    req_bytes: &req_bytes,
+                    status: Some(status),
+                    resp_headers: &headers,
+                    resp_bytes: &body,
+                    dur_ms: 0,
+                    error: None,
+                    matched: Some("rule".into()),
+                    modified: true,
+                },
+            );
             return Ok(build_client_response(status, &headers, body));
         }
     }
@@ -360,22 +368,25 @@ async fn proxy_request(
                     headers,
                 } => {
                     let resp_bytes = Bytes::from(body);
-                    capture(&ctx, FlowParts {
-                        id: &id,
-                        method: method.as_str(),
-                        scheme: &scheme,
-                        host: &host,
-                        path: &path,
-                        req_headers: &req_headers,
-                        req_bytes: &req_bytes,
-                        status: Some(status),
-                        resp_headers: &headers,
-                        resp_bytes: &resp_bytes,
-                        dur_ms: 0,
-                        error: None,
-                        matched: Some("intercept:respond".into()),
-                        modified: true,
-                    });
+                    capture(
+                        &ctx,
+                        FlowParts {
+                            id: &id,
+                            method: method.as_str(),
+                            scheme: &scheme,
+                            host: &host,
+                            path: &path,
+                            req_headers: &req_headers,
+                            req_bytes: &req_bytes,
+                            status: Some(status),
+                            resp_headers: &headers,
+                            resp_bytes: &resp_bytes,
+                            dur_ms: 0,
+                            error: None,
+                            matched: Some("intercept:respond".into()),
+                            modified: true,
+                        },
+                    );
                     return Ok(build_client_response(status, &headers, resp_bytes));
                 }
                 HoldDecision::Resume(m) => {
@@ -476,7 +487,12 @@ async fn proxy_request(
                     if !m.is_noop() {
                         modified = true;
                         matched = Some("intercept".into());
-                        apply_response_mutation(&mut status, &mut resp_headers, &mut resp_bytes, &m);
+                        apply_response_mutation(
+                            &mut status,
+                            &mut resp_headers,
+                            &mut resp_bytes,
+                            &m,
+                        );
                     }
                     if let Some(d) = m.delay_ms {
                         tokio::time::sleep(Duration::from_millis(d as u64)).await;
@@ -488,22 +504,25 @@ async fn proxy_request(
 
     // ── capture + return ──
     if in_scope {
-        capture(&ctx, FlowParts {
-            id: &id,
-            method: method.as_str(),
-            scheme: &scheme,
-            host: &host,
-            path: &path,
-            req_headers: &req_headers,
-            req_bytes: &req_bytes,
-            status,
-            resp_headers: &resp_headers,
-            resp_bytes: &resp_bytes,
-            dur_ms,
-            error: error.clone(),
-            matched,
-            modified,
-        });
+        capture(
+            &ctx,
+            FlowParts {
+                id: &id,
+                method: method.as_str(),
+                scheme: &scheme,
+                host: &host,
+                path: &path,
+                req_headers: &req_headers,
+                req_bytes: &req_bytes,
+                status,
+                resp_headers: &resp_headers,
+                resp_bytes: &resp_bytes,
+                dur_ms,
+                error: error.clone(),
+                matched,
+                modified,
+            },
+        );
     }
 
     Ok(match status {
@@ -585,7 +604,10 @@ async fn forward_upstream(
     let resp = rb.send().await.map_err(|e| anyhow!("upstream: {e}"))?;
     let status = resp.status().as_u16();
     let headers = header_pairs(resp.headers());
-    let bytes = resp.bytes().await.map_err(|e| anyhow!("upstream body: {e}"))?;
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| anyhow!("upstream body: {e}"))?;
     Ok((status, headers, bytes))
 }
 
@@ -636,7 +658,8 @@ struct FlowParts<'a> {
 fn make_flow(p: FlowParts<'_>) -> FlowRecord {
     let req_type = flow::content_type(p.req_headers);
     let resp_type = flow::content_type(p.resp_headers);
-    let (req_body, req_truncated) = flow::body_to_text(req_type.as_deref(), p.req_bytes, flow::BODY_CAP);
+    let (req_body, req_truncated) =
+        flow::body_to_text(req_type.as_deref(), p.req_bytes, flow::BODY_CAP);
     let (resp_body, resp_truncated) =
         flow::body_to_text(resp_type.as_deref(), p.resp_bytes, flow::BODY_CAP);
     FlowRecord {
@@ -687,34 +710,86 @@ async fn hold(ctx: &ProxyContext, snap: FlowRecord, phase: &'static str) -> Opti
 
     let (tx, rx) = oneshot::channel();
     let id = snap.id.clone();
-    ctx.shared
-        .held
-        .lock()
-        .unwrap()
-        .insert(id.clone(), HeldFlow { tx, meta: snap.clone() });
+    ctx.shared.held.lock().unwrap().insert(
+        id.clone(),
+        HeldFlow {
+            tx,
+            meta: snap.clone(),
+        },
+    );
     let _ = ctx
         .shared
         .events
         .send(Arc::new(intercept_event(&snap, phase, cfg.hold_ms)));
 
-    let decision = match tokio::time::timeout(
-        Duration::from_millis(cfg.hold_ms.max(1) as u64),
+    let decision = resolve_held(
+        &ctx.shared.held,
+        &id,
         rx,
-    )
-    .await
-    {
-        Ok(Ok(d)) => d,
-        // Timeout or the sender was dropped → fail-open (resume) by default.
-        _ => {
+        Duration::from_millis(cfg.hold_ms.max(1) as u64),
+        || {
+            // Fail-open (resume) by default; drop only if so configured.
             if cfg.on_timeout_drop {
                 HoldDecision::Drop(None)
             } else {
                 HoldDecision::Resume(Mutation::default())
             }
-        }
-    };
-    ctx.shared.held.lock().unwrap().remove(&id);
+        },
+    )
+    .await;
     Some(decision)
+}
+
+/// Resolve a held flow into the single decision the proxy applies to the device.
+///
+/// `held.remove` is the **atomic claim**: for a given id, exactly one of {a
+/// release, this deadline} removes the entry and decides the flow. `rx` is kept
+/// alive across the deadline via `select!` rather than a plain
+/// `tokio::time::timeout` (which holds — then drops — `rx` for the whole match):
+/// a release landing in the window between the deadline firing and the fail-open
+/// decision used to `send` successfully (so `net resume` reported `released:true`)
+/// while the device got fail-open. Now the claim decides the single winner, and
+/// a release that wins the claim after the deadline still delivers via the
+/// still-open `rx`. `fail_open` is evaluated only on a genuine timeout / dropped
+/// sender.
+pub(crate) async fn resolve_held(
+    held: &Mutex<HashMap<String, HeldFlow>>,
+    id: &str,
+    mut rx: oneshot::Receiver<HoldDecision>,
+    deadline: Duration,
+    fail_open: impl Fn() -> HoldDecision,
+) -> HoldDecision {
+    tokio::select! {
+        biased;
+        r = &mut rx => r.unwrap_or_else(|_| fail_open()),
+        _ = tokio::time::sleep(deadline) => {
+            if held.lock().unwrap().remove(id).is_some() {
+                // We claimed the entry first → the deadline wins → fail open.
+                fail_open()
+            } else {
+                // A release already claimed it and is sending its decision;
+                // `rx` is still alive, so receive it (fail open only if the
+                // sender vanished without sending).
+                (&mut rx).await.unwrap_or_else(|_| fail_open())
+            }
+        }
+    }
+}
+
+/// Hand a held flow its decision, claiming it atomically (the mirror of
+/// [`resolve_held`]'s claim). Returns whether a held flow with that id was
+/// present **and** its receiver still alive — i.e. whether the agent's decision
+/// actually reached the proxy, so `net resume` never reports a delivery that
+/// didn't happen.
+pub(crate) fn release_held(
+    held: &Mutex<HashMap<String, HeldFlow>>,
+    id: &str,
+    decision: HoldDecision,
+) -> bool {
+    match held.lock().unwrap().remove(id) {
+        Some(h) => h.tx.send(decision).is_ok(),
+        None => false,
+    }
 }
 
 fn intercept_event(snap: &FlowRecord, phase: &str, hold_ms: u32) -> Event {
@@ -777,7 +852,10 @@ fn apply_header_mutations(headers: &mut Vec<(String, String)>, m: &Mutation) {
         headers.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
     }
     for (name, value) in &m.set_headers {
-        if let Some(slot) = headers.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
+        if let Some(slot) = headers
+            .iter_mut()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        {
             slot.1 = value.clone();
         } else {
             headers.push((name.clone(), value.clone()));
@@ -852,7 +930,11 @@ fn apply_request_rules(
         }
         match spec.kind.as_str() {
             "block" => {
-                let status = spec.args.first().and_then(|s| s.parse().ok()).unwrap_or(444);
+                let status = spec
+                    .args
+                    .first()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(444);
                 out.short_circuit = Some((status, Vec::new(), Bytes::new()));
                 out.modified = true;
                 return out;
@@ -995,7 +1077,10 @@ fn guess_content_type(path: &str) -> String {
 }
 
 fn set_header_vec(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
-    if let Some(slot) = headers.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
+    if let Some(slot) = headers
+        .iter_mut()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+    {
         slot.1 = value.to_string();
     } else {
         headers.push((name.to_string(), value.to_string()));
@@ -1013,12 +1098,16 @@ fn decompress(headers: &[(String, String)], body: &[u8]) -> Option<Vec<u8>> {
         .map(|(_, v)| v.trim().to_lowercase())?;
     let mut out = Vec::new();
     match enc.as_str() {
-        "gzip" | "x-gzip" => flate2::read::GzDecoder::new(body).read_to_end(&mut out).ok()?,
+        "gzip" | "x-gzip" => flate2::read::GzDecoder::new(body)
+            .read_to_end(&mut out)
+            .ok()?,
         "deflate" => match flate2::read::ZlibDecoder::new(body).read_to_end(&mut out) {
             Ok(n) => n,
             Err(_) => {
                 out.clear();
-                flate2::read::DeflateDecoder::new(body).read_to_end(&mut out).ok()?
+                flate2::read::DeflateDecoder::new(body)
+                    .read_to_end(&mut out)
+                    .ok()?
             }
         },
         _ => return None,
@@ -1074,7 +1163,11 @@ struct Rewind<T> {
 
 impl<T> Rewind<T> {
     fn new(inner: T, prefix: Vec<u8>) -> Self {
-        Self { prefix, pos: 0, inner }
+        Self {
+            prefix,
+            pos: 0,
+            inner,
+        }
     }
 }
 
@@ -1113,7 +1206,66 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Rewind<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::host_glob_match;
+    use super::{host_glob_match, release_held, resolve_held, HeldFlow, HoldDecision};
+    use crate::net::flow::FlowRecord;
+    use crate::net::Mutation;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    fn insert_held(
+        held: &Mutex<HashMap<String, HeldFlow>>,
+        id: &str,
+    ) -> oneshot::Receiver<HoldDecision> {
+        let (tx, rx) = oneshot::channel();
+        held.lock().unwrap().insert(
+            id.to_string(),
+            HeldFlow {
+                tx,
+                meta: FlowRecord::default(),
+            },
+        );
+        rx
+    }
+
+    fn fail_open() -> HoldDecision {
+        HoldDecision::Resume(Mutation::default())
+    }
+
+    /// The core of the held-flow fix: an agent's decision that arrives before the
+    /// deadline must reach the proxy — never get silently replaced by fail-open.
+    #[tokio::test]
+    async fn release_decision_is_delivered_not_dropped() {
+        let held = Mutex::new(HashMap::new());
+        let rx = insert_held(&held, "f1");
+        // Agent releases with a distinctive decision before the (long) deadline.
+        assert!(release_held(&held, "f1", HoldDecision::Drop(Some(599))));
+        let d = resolve_held(&held, "f1", rx, Duration::from_secs(5), fail_open).await;
+        assert!(
+            matches!(d, HoldDecision::Drop(Some(599))),
+            "the agent's decision must win, not fail-open"
+        );
+    }
+
+    /// The honest-reporting half: when the deadline wins, it claims the entry, so
+    /// a later release reports `false` instead of lying that it was delivered.
+    #[tokio::test]
+    async fn timeout_claims_the_entry_and_a_late_release_reports_false() {
+        let held = Mutex::new(HashMap::new());
+        let rx = insert_held(&held, "f1");
+        let d = resolve_held(&held, "f1", rx, Duration::from_millis(0), fail_open).await;
+        assert!(matches!(d, HoldDecision::Resume(_)), "fail-open on timeout");
+        assert!(
+            held.lock().unwrap().is_empty(),
+            "the deadline removed (claimed) the entry"
+        );
+        // A release arriving after the timeout finds nothing → must report false.
+        assert!(
+            !release_held(&held, "f1", HoldDecision::Drop(Some(1))),
+            "a release after the deadline must not claim success"
+        );
+    }
 
     #[test]
     fn host_globs() {

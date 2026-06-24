@@ -17,7 +17,7 @@ pub const BODY_CAP: usize = 64 * 1024;
 /// Max bytes of body shown inline in an `http_intercept` preview.
 pub const PREVIEW_CAP: usize = 512;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FlowRecord {
     pub id: String,
     pub ts: f64,
@@ -172,7 +172,11 @@ pub fn is_textual(content_type: Option<&str>) -> bool {
 
 /// Reduce a raw body to a capped textual string for storage. Returns
 /// `(text, truncated)`; `text` is `None` for binary or empty bodies.
-pub fn body_to_text(content_type: Option<&str>, bytes: &[u8], cap: usize) -> (Option<String>, bool) {
+pub fn body_to_text(
+    content_type: Option<&str>,
+    bytes: &[u8],
+    cap: usize,
+) -> (Option<String>, bool) {
     if bytes.is_empty() || !is_textual(content_type) {
         return (None, false);
     }
@@ -236,7 +240,10 @@ mod tests {
             path: "/v1/login".into(),
             status: Some(401),
             dur_ms: Some(10),
-            req_headers: vec![("Content-Type".into(), "application/json; charset=utf-8".into())],
+            req_headers: vec![(
+                "Content-Type".into(),
+                "application/json; charset=utf-8".into(),
+            )],
             resp_headers: vec![],
             req_type: None,
             resp_type: None,
@@ -250,12 +257,27 @@ mod tests {
             modified: false,
             error: None,
         };
-        assert_eq!(content_type(&rec.req_headers).as_deref(), Some("application/json"));
+        assert_eq!(
+            content_type(&rec.req_headers).as_deref(),
+            Some("application/json")
+        );
         assert!(!rec.ok());
-        assert!(rec.matches(&Matcher { host: Some("livd".into()), ..Default::default() }));
-        assert!(rec.matches(&Matcher { status: Some(401), ..Default::default() }));
-        assert!(!rec.matches(&Matcher { status: Some(200), ..Default::default() }));
-        assert!(!rec.matches(&Matcher { method: Some("GET".into()), ..Default::default() }));
+        assert!(rec.matches(&Matcher {
+            host: Some("livd".into()),
+            ..Default::default()
+        }));
+        assert!(rec.matches(&Matcher {
+            status: Some(401),
+            ..Default::default()
+        }));
+        assert!(!rec.matches(&Matcher {
+            status: Some(200),
+            ..Default::default()
+        }));
+        assert!(!rec.matches(&Matcher {
+            method: Some("GET".into()),
+            ..Default::default()
+        }));
         rec.status = Some(204);
         assert!(rec.ok());
     }
