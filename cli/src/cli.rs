@@ -113,8 +113,10 @@ pub enum Cmd {
     },
     /// Check whether this CLI is older than the latest GitHub Release.
     Update {
+        /// Only report whether an update is available; don't modify anything.
         #[arg(long)]
         check: bool,
+        /// Emit the result as JSON instead of human text.
         #[arg(long)]
         json: bool,
     },
@@ -140,10 +142,13 @@ pub enum Cmd {
     /// recent logcat + crash buffer, and — if the server is up — screen dump,
     /// screenshot, current activity, app info) into a directory.
     Collect {
+        /// App package to scope the bundle to (defaults to the configured app).
         #[arg(long)]
         app: Option<String>,
+        /// Output directory for the bundle (default: a timestamped temp dir).
         #[arg(short = 'o', long)]
         out: Option<PathBuf>,
+        /// Skip capturing a screenshot.
         #[arg(long)]
         no_screenshot: bool,
     },
@@ -167,12 +172,23 @@ pub enum Cmd {
         /// Only emit app-scoped events for this package. Permission dialogs are still allowed.
         #[arg(long)]
         app: Option<String>,
+        /// Safety-net poll interval (ms). Catches in-screen changes that emit no
+        /// logcat transition — a counter ticking, async content loading — by
+        /// re-dumping on this cadence. Navigation changes are caught immediately
+        /// via logcat, independent of this; lower = notice silent changes sooner
+        /// at the cost of more dumps.
         #[arg(long, default_value_t = 1000)]
         poll_ms: u32,
+        /// Settle delay (ms) after a logcat transition before dumping, so a burst
+        /// of transition events (an animation, a multi-step navigation) collapses
+        /// into one dump of the final screen instead of every intermediate frame.
+        /// Not applied to poll ticks or post-command refreshes.
         #[arg(long, default_value_t = 80)]
         debounce_ms: u32,
+        /// Don't read interactive commands from stdin; only stream events.
         #[arg(long)]
         no_stdin: bool,
+        /// Don't parse logcat for crashes/ANRs (skip the crash watcher).
         #[arg(long)]
         no_crash_detect: bool,
         /// Screen event payload shape. `compact` is the default for fast agent
@@ -184,6 +200,8 @@ pub enum Cmd {
         /// `allow` taps PermissionController allow buttons; `deny` taps deny buttons.
         #[arg(long, value_enum, default_value_t = PermissionDialogPolicy::Ignore)]
         permission_dialogs: PermissionDialogPolicy,
+        /// Load a JSON watcher-rules file (declarative popup auto-handlers).
+        /// Repeatable to stack multiple rule files.
         #[arg(long)]
         watcher_file: Vec<String>,
         /// Do not try to attach live HTTP events from a running `net` proxy daemon.
@@ -244,8 +262,10 @@ pub enum AppCmd {
     /// Wait for the app to launch (or, with --front, reach the foreground).
     Wait {
         package: String,
+        /// Give up after this many milliseconds.
         #[arg(long, default_value_t = 20000)]
         timeout_ms: u32,
+        /// Wait until the app reaches the foreground, not just until it launches.
         #[arg(long)]
         front: bool,
     },
@@ -262,12 +282,14 @@ pub enum PermCmd {
     /// Grant one or more runtime permissions (verify-by-readback).
     Grant {
         package: String,
+        /// Permissions to grant (e.g. android.permission.CAMERA); one or more.
         #[arg(required = true)]
         perms: Vec<String>,
     },
     /// Revoke one or more runtime permissions.
     Revoke {
         package: String,
+        /// Permissions to revoke (e.g. android.permission.CAMERA); one or more.
         #[arg(required = true)]
         perms: Vec<String>,
     },
@@ -293,6 +315,7 @@ pub enum AppopsCmd {
 pub enum ProfileCmd {
     /// Capture the display profile as JSON, optionally to a file.
     Snapshot {
+        /// Write the snapshot to this file instead of stdout.
         #[arg(short = 'o', long)]
         out: Option<PathBuf>,
     },
@@ -309,6 +332,7 @@ pub enum DeviceCmd {
     /// Run a shell command on the device.
     Shell {
         cmd: String,
+        /// Kill the command and fail if it runs longer than this (milliseconds).
         #[arg(long, default_value_t = 30000)]
         timeout_ms: u32,
     },
@@ -338,6 +362,7 @@ pub enum FilesCmd {
     Push {
         local: String,
         remote: String,
+        /// Unix permission bits for the pushed file (octal, e.g. 644).
         #[arg(long, default_value_t = 0o644)]
         mode: u32,
     },
@@ -382,12 +407,16 @@ pub enum UiCmd {
     },
     /// Find elements by selector (--text/--rid/--desc/--xpath); does not tap.
     Find {
+        /// Match by visible text (normalized, case-insensitive substring; add --exact for a full match).
         #[arg(long)]
         text: Option<String>,
+        /// Match by resource-id (substring).
         #[arg(long)]
         rid: Option<String>,
+        /// Match by content-description (normalized substring).
         #[arg(long)]
         desc: Option<String>,
+        /// Match by xpath, e.g. //*[@text='Foo'] or //*[contains(@text,'Foo')].
         #[arg(long)]
         xpath: Option<String>,
         /// Return all matches instead of the first.
@@ -412,12 +441,16 @@ pub enum UiCmd {
         a: Option<i32>,
         /// Y coordinate (with X for a coordinate tap).
         b: Option<i32>,
+        /// Tap the element matching this visible text (normalized substring; --exact for full).
         #[arg(long)]
         text: Option<String>,
+        /// Tap the element matching this resource-id (substring).
         #[arg(long)]
         rid: Option<String>,
+        /// Tap the element matching this content-description (substring).
         #[arg(long)]
         desc: Option<String>,
+        /// Tap the element matching this xpath.
         #[arg(long)]
         xpath: Option<String>,
         /// Match selector values exactly instead of as a substring. Avoids tapping a
@@ -435,6 +468,7 @@ pub enum UiCmd {
     LongTap {
         x: i32,
         y: i32,
+        /// How long to hold the press, in milliseconds.
         #[arg(long, default_value_t = 600)]
         duration_ms: u32,
     },
@@ -444,6 +478,7 @@ pub enum UiCmd {
         y1: i32,
         x2: i32,
         y2: i32,
+        /// Swipe duration in milliseconds (longer = slower, more deliberate).
         #[arg(long, default_value_t = 200)]
         duration_ms: u32,
     },
@@ -453,28 +488,37 @@ pub enum UiCmd {
         y1: i32,
         x2: i32,
         y2: i32,
+        /// Drag duration in milliseconds (longer = slower, for drag-and-drop).
         #[arg(long, default_value_t = 500)]
         duration_ms: u32,
     },
     /// Swipe a fraction (--scale) of the screen in a direction (up/down/left/right).
     SwipeExt {
+        /// Direction to swipe.
         #[arg(value_parser = ["up", "down", "left", "right"])]
         direction: String,
+        /// Fraction of the screen to travel, 0.0–1.0.
         #[arg(long, default_value_t = 0.9)]
         scale: f32,
+        /// Swipe duration in milliseconds.
         #[arg(long, default_value_t = 200)]
         duration_ms: u32,
     },
     /// Pinch in (zoom out) or out (zoom in) on the element matched by a selector.
     Pinch {
+        /// Pinch `in` (zoom out) or `out` (zoom in).
         #[arg(value_parser = ["in", "out"])]
         direction: String,
+        /// Match the target element by resource-id (substring).
         #[arg(long)]
         rid: Option<String>,
+        /// Match the target element by visible text (substring).
         #[arg(long)]
         text: Option<String>,
+        /// Match the target element by content-description (substring).
         #[arg(long)]
         desc: Option<String>,
+        /// Pinch distance as a percent of the element's size (1–100).
         #[arg(long, default_value_t = 50)]
         percent: u32,
     },
@@ -485,6 +529,7 @@ pub enum UiCmd {
     /// Type into the focused field, or into an element matched by --id/--text/--rid/--desc/--xpath.
     Text {
         value: String,
+        /// Clear the field's existing contents before typing.
         #[arg(long)]
         clear: bool,
         /// Element id from a fresh `ui dump` to receive text.
@@ -521,14 +566,19 @@ pub enum UiCmd {
     /// opened, or that you returned from an external app). The result reports the
     /// resulting `current_app` and, when a selector matched, the `element`.
     Wait {
+        /// Wait for an element whose visible text matches (substring; --exact for full).
         #[arg(long)]
         text: Option<String>,
+        /// Wait for an element whose resource-id matches (substring).
         #[arg(long)]
         rid: Option<String>,
+        /// Wait for an element whose content-description matches (substring).
         #[arg(long)]
         desc: Option<String>,
+        /// Wait for an element whose class name matches (substring).
         #[arg(long)]
         klass: Option<String>,
+        /// Wait until the foreground activity name contains this (substring).
         #[arg(long)]
         activity: Option<String>,
         /// Wait until the foreground app's package contains this (e.g. `chrome`).
@@ -543,15 +593,19 @@ pub enum UiCmd {
         /// as a case-insensitive substring.
         #[arg(long)]
         exact: bool,
+        /// Invert: wait until the matched element is *gone* instead of present.
         #[arg(long)]
         gone: bool,
+        /// Give up after this many milliseconds.
         #[arg(long, default_value_t = 10000)]
         timeout_ms: u32,
+        /// How often to re-check, in milliseconds.
         #[arg(long, default_value_t = 200)]
         poll_ms: u32,
     },
     /// Capture recent toast messages.
     Toast {
+        /// How long to listen for a toast, in milliseconds.
         #[arg(long, default_value_t = 5000)]
         wait_ms: u32,
     },
@@ -574,6 +628,7 @@ pub enum NetCmd {
     },
     /// Start the MITM proxy: spawn the daemon, `adb reverse`, set `http_proxy`.
     Start {
+        /// Proxy listen port (wired to the device via `adb reverse`).
         #[arg(long, default_value_t = crate::net::DEFAULT_PROXY_PORT)]
         port: u16,
         /// Limit capture/MITM to these host globs, e.g. '*.livd.app' (repeatable;
@@ -601,22 +656,29 @@ pub enum NetCmd {
     Status,
     /// Recall past flows from the session log.
     Log {
+        /// Filter by host (substring), e.g. api.example.com.
         #[arg(long)]
         host: Option<String>,
+        /// Filter by URL path (substring).
         #[arg(long)]
         path: Option<String>,
+        /// Filter by HTTP method (GET, POST, …).
         #[arg(long)]
         method: Option<String>,
+        /// Filter by response status code.
         #[arg(long)]
         status: Option<u16>,
+        /// Max number of flows to return (most recent first).
         #[arg(short = 'n', long, default_value_t = 50)]
         limit: usize,
     },
     /// Full headers + bodies for one flow.
     Show {
         id: String,
+        /// Include request/response bodies (not just headers).
         #[arg(long)]
         body: bool,
+        /// Emit the flow as a single-entry HAR object.
         #[arg(long)]
         har: bool,
     },
@@ -625,6 +687,7 @@ pub enum NetCmd {
     /// GraphQL POSTs are keyed by operationName). Framework-specific setups are
     /// generated from the neutral fixtures manifest by your own tooling.
     Export {
+        /// Export format: har, curl, or fixtures.
         #[arg(value_parser = ["har", "curl", "fixtures"])]
         format: String,
         id: Option<String>,
@@ -634,12 +697,16 @@ pub enum NetCmd {
     },
     /// Pause matching flows for agent-in-the-loop editing.
     Intercept {
+        /// Only intercept flows whose host contains this (substring).
         #[arg(long)]
         host: Option<String>,
+        /// Only intercept flows whose URL path contains this (substring).
         #[arg(long)]
         path: Option<String>,
+        /// Only intercept flows with this HTTP method.
         #[arg(long)]
         method: Option<String>,
+        /// Only intercept flows with this response status (response phase).
         #[arg(long)]
         status: Option<u16>,
         /// Hold at the request phase, response phase, or both.
@@ -655,38 +722,51 @@ pub enum NetCmd {
     /// Release a held flow (optionally mutated).
     Resume {
         id: String,
+        /// Override the response status code.
         #[arg(long)]
         set_status: Option<u16>,
+        /// Set (or replace) a header; repeatable.
         #[arg(long, value_name = "NAME=VALUE")]
         set_header: Vec<String>,
+        /// Remove a header; repeatable.
         #[arg(long, value_name = "NAME")]
         remove_header: Vec<String>,
+        /// Replace the body with this literal string.
         #[arg(long)]
         body: Option<String>,
+        /// Replace the body with the contents of this file.
         #[arg(long)]
         body_file: Option<PathBuf>,
+        /// Regex-replace within the body: --replace <REGEX> <REPL>.
         #[arg(long, num_args = 2, value_names = ["REGEX", "REPL"])]
         replace: Option<Vec<String>>,
+        /// Delay the release by this many milliseconds (simulate latency).
         #[arg(long)]
         delay: Option<u32>,
+        /// Rewrite the request URL before forwarding (request phase).
         #[arg(long)]
         set_url: Option<String>,
     },
     /// Kill a held flow (device sees a connection error, or the given status).
     Drop {
         id: String,
+        /// Return this status to the device instead of a connection error.
         #[arg(long)]
         status: Option<u16>,
     },
     /// Short-circuit a held request with a canned response (never hits the server).
     Respond {
         id: String,
+        /// Status code of the canned response.
         #[arg(long, default_value_t = 200)]
         status: u16,
+        /// Response body as a literal string.
         #[arg(long)]
         body: Option<String>,
+        /// Response body from this file.
         #[arg(long)]
         body_file: Option<PathBuf>,
+        /// Set a response header; repeatable.
         #[arg(long, value_name = "NAME=VALUE")]
         set_header: Vec<String>,
     },
@@ -697,8 +777,10 @@ pub enum NetCmd {
     Rules { file: PathBuf },
     /// Serve saved responses without a backend.
     Replay {
+        /// Directory of saved responses to serve (a `fixtures` export).
         #[arg(long)]
         from: PathBuf,
+        /// Only replay for this host; let other hosts pass through.
         #[arg(long)]
         host: Option<String>,
     },
@@ -723,12 +805,16 @@ pub enum NetRuleCmd {
 pub struct NetRuleAddArgs {
     /// map-local | map-remote | set-status | set-header | replace | block | delay
     pub kind: String,
+    /// Match flows whose host contains this (substring).
     #[arg(long)]
     pub host: Option<String>,
+    /// Match flows whose URL path contains this (substring).
     #[arg(long)]
     pub path: Option<String>,
+    /// Match flows with this HTTP method.
     #[arg(long)]
     pub method: Option<String>,
+    /// Match flows with this response content-type (substring).
     #[arg(long)]
     pub content_type: Option<String>,
     /// Kind-specific positional args (e.g. set-status <code>, set-header <name> <value>).
@@ -737,14 +823,19 @@ pub struct NetRuleAddArgs {
 
 #[derive(clap::Args)]
 pub struct NetDaemonArgs {
+    /// ADB serial the daemon wires itself to.
     #[arg(long)]
     pub serial: String,
+    /// Port the daemon listens on.
     #[arg(long, default_value_t = crate::net::DEFAULT_PROXY_PORT)]
     pub port: u16,
+    /// Host globs to scope capture to (repeatable; empty = all).
     #[arg(long)]
     pub app: Vec<String>,
+    /// Strip cache-validation request headers.
     #[arg(long)]
     pub anticache: bool,
+    /// Strip Accept-Encoding to force uncompressed responses.
     #[arg(long)]
     pub anticomp: bool,
 }

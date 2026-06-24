@@ -447,6 +447,7 @@ pub enum WatchCmd {
     List(WatchListArgs),
     /// Remove a watch by id.
     Remove {
+        /// Id of the watch to remove (from `debug watch list`).
         #[arg(long)]
         id: String,
     },
