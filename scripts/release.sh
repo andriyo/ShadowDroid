@@ -5,8 +5,9 @@
 # cli/Cargo.toml's version is the source of truth for `shadowdroid --version`,
 # and the release tag MUST match it (the workflow builds with --locked and the
 # installer smoke-test asserts `shadowdroid --version` == tag minus the "v").
-# This script keeps the three in lockstep: it bumps Cargo.toml, refreshes
-# Cargo.lock, commits, tags vX.Y.Z, and pushes.
+# This script keeps the release-owned version stamps in lockstep: it bumps
+# Cargo.toml, refreshes Cargo.lock, syncs runtime BuildInfo fallbacks, commits,
+# tags vX.Y.Z, and pushes.
 #
 # Pushing the tag triggers .github/workflows/release.yml, which builds every
 # artifact (APKs, Studio plugin, agent AAR, CLI for 5 targets), publishes the
@@ -79,8 +80,8 @@ if [ "$dry_run" = 1 ]; then
 [dry-run] would:
   1. set version in $cargo_toml -> $version
   2. cargo update -p $crate --precise $version --offline   (refresh Cargo.lock)
-  2b. sync server fallback version literals (build.gradle.kts, BuildInfo.kt) -> $version
-  3. git commit Cargo.toml + Cargo.lock + the two server files -m "Release $tag"
+  2b. sync server fallback + agent/server BuildInfo version literals -> $version
+  3. git commit Cargo.toml + Cargo.lock + server/agent version files -m "Release $tag"
   4. git tag -a $tag -m "ShadowDroid $tag"
   5. git push origin $branch $tag
 EOF
@@ -94,11 +95,12 @@ awk -v new="$version" '!done && /^version = "/ { sub(/"[^"]*"/, "\"" new "\""); 
 # --- 2. refresh Cargo.lock (offline; touches only the local crate entry) -
 ( cd cli && cargo update -p "$crate" --precise "$version" --offline )
 
-# --- 2b. keep the on-device server's fallback version literals in lockstep -
+# --- 2b. keep runtime fallback version literals in lockstep ---------------
 # The release workflow stamps the APK versionName from the tag via -Pversion, so
-# these literals are only the fallback for local/dev builds. But a stale fallback
-# is exactly the drift that shipped mislabeled APKs, so bump it here too. Each is
-# a precise, anchored substitution; a miss warns rather than blocks the release.
+# server literals are only the fallback for local/dev builds. The agent AAR
+# reports its BuildInfo marker directly at runtime, so stale source here ships a
+# mislabeled artifact. Each substitution is anchored; a miss warns rather than
+# blocks the release.
 sync_version_literal() {  # <file> <anchored-ERE-with-group-1-prefix>
   local file="$1" pattern="$2"
   if [ ! -f "$file" ]; then echo "warning: $file missing; version sync skipped" >&2; return; fi
@@ -114,11 +116,16 @@ sync_version_literal "server/app/build.gradle.kts" '(\?: )"[0-9][^"]*"'
 sync_version_literal \
   "server/app/src/androidTest/java/io/github/andriyo/shadowdroid/BuildInfo.kt" \
   '(const val SERVER_VERSION: String = )"[^"]*"'
+# Agent AAR runtime marker: const val VERSION = "X.Y.Z"
+sync_version_literal \
+  "agent/shadowdroid-agent/src/main/kotlin/io/github/andriyo/shadowdroid/agent/BuildInfo.kt" \
+  '(const val VERSION = )"[^"]*"'
 
 # --- 3. commit ----------------------------------------------------------
 git add cli/Cargo.toml cli/Cargo.lock \
   server/app/build.gradle.kts \
-  server/app/src/androidTest/java/io/github/andriyo/shadowdroid/BuildInfo.kt
+  server/app/src/androidTest/java/io/github/andriyo/shadowdroid/BuildInfo.kt \
+  agent/shadowdroid-agent/src/main/kotlin/io/github/andriyo/shadowdroid/agent/BuildInfo.kt
 git commit -m "Release $tag"
 
 # --- 4. tag -------------------------------------------------------------
