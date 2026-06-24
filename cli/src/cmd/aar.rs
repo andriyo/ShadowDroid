@@ -60,7 +60,7 @@ pub struct CaptureArgs {
     #[arg(long)]
     pub clear: bool,
     /// Write the flows as FlowRecord JSONL to this file.
-    #[arg(long)]
+    #[arg(short = 'o', long)]
     pub out: Option<PathBuf>,
     /// Generate a fixtures manifest + response files into this directory.
     #[arg(long)]

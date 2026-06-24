@@ -191,10 +191,10 @@ pub enum Cmd {
         /// Don't parse logcat for crashes/ANRs (skip the crash watcher).
         #[arg(long)]
         no_crash_detect: bool,
-        /// Screen event payload shape. `compact` is the default for fast agent
-        /// parsing; use `full` when you need bounds and every UIAutomator flag.
-        #[arg(long, value_enum, default_value_t = ScreenFormat::Compact)]
-        screen_format: ScreenFormat,
+        /// Emit the full element set (bounds + every UIAutomator flag) instead of
+        /// the compact agent shape — the same flag as `ui dump --full`.
+        #[arg(long)]
+        full: bool,
         /// Built-in Android permission dialog policy.
         ///
         /// `allow` taps PermissionController allow buttons; `deny` taps deny buttons.
@@ -632,10 +632,9 @@ pub enum NetCmd {
         #[arg(long, default_value_t = crate::net::DEFAULT_PROXY_PORT)]
         port: u16,
         /// Limit capture/MITM to these host globs, e.g. '*.livd.app' (repeatable;
-        /// empty = all hosts). NB: matches by host today — per-app uid attribution
-        /// is planned but not yet wired, so this is host-scoping, not app-scoping.
+        /// empty = all hosts). Same `--host` filter used by `net log`/`intercept`.
         #[arg(long)]
-        app: Vec<String>,
+        host: Vec<String>,
         /// Run the proxy in the foreground instead of detaching a daemon.
         #[arg(long)]
         foreground: bool,
@@ -692,7 +691,7 @@ pub enum NetCmd {
         format: String,
         id: Option<String>,
         /// Output directory for `fixtures` (default: ./shadowdroid-fixtures).
-        #[arg(long)]
+        #[arg(short = 'o', long)]
         out: Option<PathBuf>,
     },
     /// Pause matching flows for agent-in-the-loop editing.
@@ -742,7 +741,7 @@ pub enum NetCmd {
         replace: Option<Vec<String>>,
         /// Delay the release by this many milliseconds (simulate latency).
         #[arg(long)]
-        delay: Option<u32>,
+        delay_ms: Option<u32>,
         /// Rewrite the request URL before forwarding (request phase).
         #[arg(long)]
         set_url: Option<String>,
@@ -752,14 +751,14 @@ pub enum NetCmd {
         id: String,
         /// Return this status to the device instead of a connection error.
         #[arg(long)]
-        status: Option<u16>,
+        set_status: Option<u16>,
     },
     /// Short-circuit a held request with a canned response (never hits the server).
     Respond {
         id: String,
         /// Status code of the canned response.
         #[arg(long, default_value_t = 200)]
-        status: u16,
+        set_status: u16,
         /// Response body as a literal string.
         #[arg(long)]
         body: Option<String>,
@@ -831,7 +830,7 @@ pub struct NetDaemonArgs {
     pub port: u16,
     /// Host globs to scope capture to (repeatable; empty = all).
     #[arg(long)]
-    pub app: Vec<String>,
+    pub host: Vec<String>,
     /// Strip cache-validation request headers.
     #[arg(long)]
     pub anticache: bool,
@@ -1045,12 +1044,17 @@ pub async fn run() -> Result<()> {
             debounce_ms,
             no_stdin,
             no_crash_detect,
-            screen_format,
+            full,
             permission_dialogs,
             watcher_file,
             no_net,
         } => {
             let app = resolve_app_package(&config, Some(&serial), app).await?;
+            let screen_format = if full {
+                ScreenFormat::Full
+            } else {
+                ScreenFormat::Compact
+            };
             crate::watch::r#loop::run(crate::watch::r#loop::WatchConfig {
                 serial,
                 client,
@@ -1557,7 +1561,7 @@ async fn dispatch_net(c: &NetCmd, serial: &str) -> Result<()> {
         NetCmd::Trust { system, ui } => nc::trust(serial, *system, *ui).await,
         NetCmd::Start {
             port,
-            app,
+            host,
             foreground,
             anticache,
             anticomp,
@@ -1565,7 +1569,7 @@ async fn dispatch_net(c: &NetCmd, serial: &str) -> Result<()> {
             nc::start(
                 serial,
                 *port,
-                app.clone(),
+                host.clone(),
                 *foreground,
                 *anticache,
                 *anticomp,
@@ -1611,7 +1615,7 @@ async fn dispatch_net(c: &NetCmd, serial: &str) -> Result<()> {
             body,
             body_file,
             replace,
-            delay,
+            delay_ms,
             set_url,
         } => {
             let replace = match replace {
@@ -1625,15 +1629,15 @@ async fn dispatch_net(c: &NetCmd, serial: &str) -> Result<()> {
                 remove_headers: remove_header.clone(),
                 body: read_body_arg(body, body_file)?,
                 replace,
-                delay_ms: *delay,
+                delay_ms: *delay_ms,
                 set_url: set_url.clone(),
             };
             nc::resume(serial, id, mutation).await
         }
-        NetCmd::Drop { id, status } => nc::drop_flow(serial, id, *status).await,
+        NetCmd::Drop { id, set_status } => nc::drop_flow(serial, id, *set_status).await,
         NetCmd::Respond {
             id,
-            status,
+            set_status,
             body,
             body_file,
             set_header,
@@ -1641,7 +1645,7 @@ async fn dispatch_net(c: &NetCmd, serial: &str) -> Result<()> {
             nc::respond(
                 serial,
                 id,
-                *status,
+                *set_status,
                 read_body_arg(body, body_file)?,
                 parse_header_pairs(set_header)?,
             )
@@ -1672,7 +1676,7 @@ async fn dispatch_net(c: &NetCmd, serial: &str) -> Result<()> {
             crate::net::daemon::run(DaemonConfig {
                 serial: a.serial.clone(),
                 port: a.port,
-                app_filters: a.app.clone(),
+                app_filters: a.host.clone(),
                 anticache: a.anticache,
                 anticomp: a.anticomp,
             })

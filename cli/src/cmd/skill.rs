@@ -30,7 +30,7 @@ pub struct SkillArgs {
     #[arg(value_parser = ["claude-code", "cursor", "codex", "gemini", "antigravity"])]
     pub agent: Option<String>,
     /// Write the generated file to this path (default: print to stdout).
-    #[arg(long)]
+    #[arg(short = 'o', long)]
     pub out: Option<PathBuf>,
     /// Write to the agent's conventional location instead of stdout.
     ///
