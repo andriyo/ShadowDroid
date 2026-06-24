@@ -2,6 +2,7 @@
 //! ([crate::net::proxy]) + the control socket ([crate::net::control]) until
 //! `net stop` (or Ctrl-C). Entry point for the hidden `net daemon` subcommand.
 
+use crate::ids::Serial;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -22,8 +23,11 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
     paths::ensure_net_dir()?;
     // Each `net start` is a fresh capture session.
     let _ = store::clear(&cfg.serial);
-    std::fs::write(paths::pid_path(&cfg.serial)?, std::process::id().to_string())
-        .context("write pidfile")?;
+    std::fs::write(
+        paths::pid_path(&cfg.serial)?,
+        std::process::id().to_string(),
+    )
+    .context("write pidfile")?;
 
     let ca = CertAuthority::load_or_generate()?;
     let (flow_tx, mut flow_rx) = mpsc::unbounded_channel::<FlowRecord>();
@@ -90,7 +94,11 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
     let ctl_port = listener.local_addr().context("control addr")?.port();
     let ctl_path = paths::ctl_path(&cfg.serial)?;
     std::fs::write(&ctl_path, ctl_port.to_string()).context("write control port file")?;
-    tracing::info!("net daemon up: proxy :{}, control 127.0.0.1:{}", cfg.port, ctl_port);
+    tracing::info!(
+        "net daemon up: proxy :{}, control 127.0.0.1:{}",
+        cfg.port,
+        ctl_port
+    );
 
     let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
     loop {
@@ -136,7 +144,7 @@ pub fn spawn(cfg: &DaemonConfig) -> Result<u32> {
     cmd.arg("net")
         .arg("daemon")
         .arg("--serial")
-        .arg(&cfg.serial)
+        .arg(cfg.serial.as_str())
         .arg("--port")
         .arg(cfg.port.to_string());
     for app in &cfg.app_filters {
@@ -162,7 +170,7 @@ pub fn spawn(cfg: &DaemonConfig) -> Result<u32> {
 
 /// Wait (up to `timeout_ms`) for a freshly-spawned daemon's control socket to
 /// accept connections. Returns false on timeout.
-pub async fn await_ready(serial: &str, timeout_ms: u64) -> bool {
+pub async fn await_ready(serial: &Serial, timeout_ms: u64) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     while std::time::Instant::now() < deadline {
         if control::is_running(serial).await {

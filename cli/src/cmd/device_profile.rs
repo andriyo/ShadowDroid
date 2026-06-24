@@ -15,6 +15,7 @@
 //! emitted `now` reflects what the device actually reports (`adb shell` has no
 //! exit code).
 
+use crate::ids::Serial;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -53,7 +54,7 @@ struct Profile {
 /// no-op on devices/Android versions without the setting. Returns the observed
 /// state. Called automatically by `connect` and folded into the `automation`
 /// preset, so text input "just works" for the common workflow.
-pub async fn disable_stylus_tutorial(serial: &str) -> bool {
+pub async fn disable_stylus_tutorial(serial: &Serial) -> bool {
     put_secure(serial, "stylus_handwriting_enabled", "0").await;
     get_secure(serial, "stylus_handwriting_enabled")
         .await
@@ -88,7 +89,7 @@ pub struct ProfileApplyArgs {
 
 // ── snapshot ─────────────────────────────────────────────────────────────────
 
-pub async fn snapshot(serial: &str, out: Option<&PathBuf>) -> Result<()> {
+pub async fn snapshot(serial: &Serial, out: Option<&PathBuf>) -> Result<()> {
     let profile = read_profile(serial).await;
     let value = serde_json::to_value(&profile)?;
     let saved = match out {
@@ -108,7 +109,7 @@ pub async fn snapshot(serial: &str, out: Option<&PathBuf>) -> Result<()> {
 
 // ── apply ────────────────────────────────────────────────────────────────────
 
-pub async fn apply(serial: &str, args: &ProfileApplyArgs) -> Result<()> {
+pub async fn apply(serial: &Serial, args: &ProfileApplyArgs) -> Result<()> {
     let profile = profile_from_args(args)?;
     apply_profile(serial, &profile).await;
     let now = read_profile(serial).await;
@@ -170,7 +171,7 @@ fn profile_from_args(a: &ProfileApplyArgs) -> Result<Profile> {
 
 // ── reset ────────────────────────────────────────────────────────────────────
 
-pub async fn reset(serial: &str) -> Result<()> {
+pub async fn reset(serial: &Serial) -> Result<()> {
     // wm overrides clear via their own `reset` subcommands; the rest go back to
     // stock defaults.
     let _ = adb::shell(serial, "wm size reset").await;
@@ -197,7 +198,7 @@ pub async fn reset(serial: &str) -> Result<()> {
 
 // ── read / write device state ────────────────────────────────────────────────
 
-async fn read_profile(serial: &str) -> Profile {
+async fn read_profile(serial: &Serial) -> Profile {
     Profile {
         window_animation_scale: get_global(serial, "window_animation_scale").await,
         transition_animation_scale: get_global(serial, "transition_animation_scale").await,
@@ -211,7 +212,7 @@ async fn read_profile(serial: &str) -> Profile {
     }
 }
 
-async fn apply_profile(serial: &str, p: &Profile) {
+async fn apply_profile(serial: &Serial, p: &Profile) {
     if let Some(v) = &p.window_animation_scale {
         put_global(serial, "window_animation_scale", v).await;
     }
@@ -242,7 +243,7 @@ async fn apply_profile(serial: &str, p: &Profile) {
     }
 }
 
-async fn get_global(serial: &str, key: &str) -> Option<String> {
+async fn get_global(serial: &Serial, key: &str) -> Option<String> {
     setting_value(
         adb::shell(serial, format!("settings get global {key}"))
             .await
@@ -250,7 +251,7 @@ async fn get_global(serial: &str, key: &str) -> Option<String> {
     )
 }
 
-async fn get_system(serial: &str, key: &str) -> Option<String> {
+async fn get_system(serial: &Serial, key: &str) -> Option<String> {
     setting_value(
         adb::shell(serial, format!("settings get system {key}"))
             .await
@@ -258,15 +259,15 @@ async fn get_system(serial: &str, key: &str) -> Option<String> {
     )
 }
 
-async fn put_global(serial: &str, key: &str, value: &str) {
+async fn put_global(serial: &Serial, key: &str, value: &str) {
     let _ = adb::shell(serial, format!("settings put global {key} {value}")).await;
 }
 
-async fn put_system(serial: &str, key: &str, value: &str) {
+async fn put_system(serial: &Serial, key: &str, value: &str) {
     let _ = adb::shell(serial, format!("settings put system {key} {value}")).await;
 }
 
-async fn get_secure(serial: &str, key: &str) -> Option<String> {
+async fn get_secure(serial: &Serial, key: &str) -> Option<String> {
     setting_value(
         adb::shell(serial, format!("settings get secure {key}"))
             .await
@@ -274,14 +275,14 @@ async fn get_secure(serial: &str, key: &str) -> Option<String> {
     )
 }
 
-async fn put_secure(serial: &str, key: &str, value: &str) {
+async fn put_secure(serial: &Serial, key: &str, value: &str) {
     let _ = adb::shell(serial, format!("settings put secure {key} {value}")).await;
 }
 
 /// Read `wm <sub>` and pull the effective value: the `Override <label>` line if
 /// present, else the `Physical <label>` line. e.g. `wm size` →
 /// "Physical size: 1080x2424" / "Override size: 1080x2400".
-async fn get_wm(serial: &str, sub: &str, label: &str) -> Option<String> {
+async fn get_wm(serial: &Serial, sub: &str, label: &str) -> Option<String> {
     let out = adb::shell(serial, format!("wm {sub}")).await.ok()?;
     parse_wm(&out, &format!("Override {label}"))
         .or_else(|| parse_wm(&out, &format!("Physical {label}")))

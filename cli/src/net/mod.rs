@@ -89,7 +89,7 @@ pub struct RuleSpec {
 /// Config handed to the daemon process at spawn.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DaemonConfig {
-    pub serial: String,
+    pub serial: crate::ids::Serial,
     pub port: u16,
     /// Best-effort app scoping (host allowlist is the practical filter today).
     pub app_filters: Vec<String>,

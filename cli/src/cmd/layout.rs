@@ -7,6 +7,7 @@
 use crate::cmd::debugger::BridgeClient;
 use crate::cmd::studio_contract::{query, route, value};
 use crate::device::client::ServerClient;
+use crate::ids::Serial;
 use crate::proto::{Element, ScreenResponse};
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
@@ -93,7 +94,7 @@ pub struct LayoutSourceArgs {
     pub studio_url: Option<String>,
 }
 
-pub async fn run(serial: &str, client: &ServerClient, args: LayoutArgs) -> Result<()> {
+pub async fn run(serial: &Serial, client: &ServerClient, args: LayoutArgs) -> Result<()> {
     match args.cmd {
         LayoutCmd::Snapshot(args) => snapshot_cmd(serial, client, args).await,
         LayoutCmd::Diff(args) => diff_cmd(args),
@@ -102,7 +103,11 @@ pub async fn run(serial: &str, client: &ServerClient, args: LayoutArgs) -> Resul
     }
 }
 
-async fn snapshot_cmd(serial: &str, client: &ServerClient, args: LayoutSnapshotArgs) -> Result<()> {
+async fn snapshot_cmd(
+    serial: &Serial,
+    client: &ServerClient,
+    args: LayoutSnapshotArgs,
+) -> Result<()> {
     let screen = client.screen().await.context("reading screen tree")?;
     let screenshot = if args.screenshot {
         Some(write_screenshot(client, args.out.as_deref()).await?)
@@ -123,7 +128,7 @@ async fn snapshot_cmd(serial: &str, client: &ServerClient, args: LayoutSnapshotA
 }
 
 fn layout_snapshot_value(
-    serial: &str,
+    serial: &Serial,
     screen: ScreenResponse,
     screenshot: Option<Value>,
     args: &LayoutSnapshotArgs,
@@ -220,7 +225,7 @@ async fn recompositions_cmd(args: RecompositionArgs) -> Result<()> {
     Ok(())
 }
 
-async fn source_cmd(serial: &str, client: &ServerClient, args: LayoutSourceArgs) -> Result<()> {
+async fn source_cmd(serial: &Serial, client: &ServerClient, args: LayoutSourceArgs) -> Result<()> {
     if args.id.is_none()
         && args.draw_id.is_none()
         && args.text.is_none()

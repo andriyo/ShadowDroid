@@ -12,6 +12,7 @@
 //! share the host [FlowRecord] shape, so they feed `net export fixtures` and the
 //! `net` session store unchanged.
 
+use crate::ids::Serial;
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
@@ -48,7 +49,7 @@ fn parse_agent_port(logcat: &str) -> Option<i32> {
 }
 
 /// Find the agent's control port from the most recent readiness marker.
-pub async fn discover_port(serial: &str) -> Result<u16> {
+pub async fn discover_port(serial: &Serial) -> Result<u16> {
     let logcat = adb::shell(serial, "logcat -d -s ShadowDroidAgent:I").await?;
     match parse_agent_port(&logcat) {
         Some(p) if p > 0 => Ok(p as u16),
@@ -61,7 +62,7 @@ pub async fn discover_port(serial: &str) -> Result<u16> {
 }
 
 /// Send one command line; return the parsed single-line JSON response.
-pub async fn send(serial: &str, command: String) -> Result<Value> {
+pub async fn send(serial: &Serial, command: String) -> Result<Value> {
     let agent_port = discover_port(serial).await?;
     adb::forward(serial, HOST_PORT, agent_port).await?;
     let exchanged = tokio::task::spawn_blocking(move || exchange(HOST_PORT, &command))
@@ -94,7 +95,7 @@ fn exchange(host_port: u16, command: &str) -> Result<Value> {
 // ── verb handlers ─────────────────────────────────────────────────────────
 
 /// `aar status` — agent info, armed matcher, held flows, capture count.
-pub async fn status(serial: &str, json: bool) -> Result<()> {
+pub async fn status(serial: &Serial, json: bool) -> Result<()> {
     let resp = send(serial, "status".into()).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&resp)?);
@@ -140,7 +141,7 @@ pub async fn status(serial: &str, json: bool) -> Result<()> {
 
 /// `aar capture` — drain buffered flows; optionally export or persist them.
 pub async fn capture(
-    serial: &str,
+    serial: &Serial,
     clear: bool,
     out: Option<&PathBuf>,
     fixtures: Option<&PathBuf>,
@@ -214,7 +215,7 @@ pub async fn capture(
 
 /// `aar intercept` — arm in-app interception for matching flows.
 pub async fn intercept(
-    serial: &str,
+    serial: &Serial,
     host: Option<&str>,
     path: Option<&str>,
     method: Option<&str>,
@@ -244,7 +245,7 @@ pub async fn intercept(
 }
 
 /// `aar intercept --clear` — disarm.
-pub async fn intercept_clear(serial: &str, json: bool) -> Result<()> {
+pub async fn intercept_clear(serial: &Serial, json: bool) -> Result<()> {
     let resp = send(serial, "intercept-clear".into()).await?;
     print_simple(&resp, json, "disarmed in-app interception");
     Ok(())
@@ -252,7 +253,7 @@ pub async fn intercept_clear(serial: &str, json: bool) -> Result<()> {
 
 /// `aar resume <id>` — release a held flow, optionally mutating the response.
 pub async fn resume(
-    serial: &str,
+    serial: &Serial,
     id: &str,
     set_status: Option<u16>,
     body: Option<String>,
@@ -280,7 +281,7 @@ pub async fn resume(
 }
 
 /// `aar drop <id>` — fail a held flow (the app sees a connection error).
-pub async fn drop_flow(serial: &str, id: &str, json: bool) -> Result<()> {
+pub async fn drop_flow(serial: &Serial, id: &str, json: bool) -> Result<()> {
     let resp = send(serial, format!("drop {id}")).await?;
     print_simple(&resp, json, "dropped");
     Ok(())

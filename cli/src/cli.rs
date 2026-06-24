@@ -30,6 +30,7 @@
 //! 5. **Match selectors** through [`crate::selector`] (host side) so `--text`
 //!    normalization stays consistent with `ui find`/`tap`.
 
+use crate::ids::Serial;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::json;
@@ -1021,7 +1022,9 @@ pub async fn run() -> Result<()> {
             // The detached daemon carries its own `--serial` and must not depend
             // on a live device being attached; everything else resolves one.
             if matches!(c, NetCmd::Daemon(_)) {
-                return dispatch_net(c, "").await;
+                // The daemon ignores this arg (it reads its serial from the
+                // deserialized DaemonConfig); pass an empty sentinel.
+                return dispatch_net(c, &Serial::new("")).await;
             }
             let serial = resolve_serial(device.as_deref()).await?;
             return dispatch_net(c, &serial).await;
@@ -1101,7 +1104,7 @@ pub async fn run() -> Result<()> {
 async fn dispatch_ui(
     c: UiCmd,
     client: &ServerClient,
-    serial: &str,
+    serial: &Serial,
     apk: Option<&std::path::Path>,
     any_apk_version: bool,
 ) -> Result<()> {
@@ -1532,7 +1535,7 @@ async fn resolve_app_package(
 
 // ── namespace sub-dispatchers ─────────────────────────────────
 
-async fn dispatch_perm(c: &PermCmd, serial: &str) -> Result<()> {
+async fn dispatch_perm(c: &PermCmd, serial: &Serial) -> Result<()> {
     use crate::cmd::permissions;
     match c {
         PermCmd::Grant { package, perms } => permissions::grant(serial, package, perms).await,
@@ -1542,7 +1545,7 @@ async fn dispatch_perm(c: &PermCmd, serial: &str) -> Result<()> {
     }
 }
 
-async fn dispatch_appops(c: &AppopsCmd, serial: &str) -> Result<()> {
+async fn dispatch_appops(c: &AppopsCmd, serial: &Serial) -> Result<()> {
     use crate::cmd::permissions;
     match c {
         AppopsCmd::Get { package, op } => {
@@ -1554,7 +1557,7 @@ async fn dispatch_appops(c: &AppopsCmd, serial: &str) -> Result<()> {
     }
 }
 
-async fn dispatch_profile(c: &ProfileCmd, serial: &str) -> Result<()> {
+async fn dispatch_profile(c: &ProfileCmd, serial: &Serial) -> Result<()> {
     use crate::cmd::device_profile;
     match c {
         ProfileCmd::Snapshot { out } => device_profile::snapshot(serial, out.as_ref()).await,
@@ -1566,7 +1569,7 @@ async fn dispatch_profile(c: &ProfileCmd, serial: &str) -> Result<()> {
 /// Route a parsed `net` command to its host-side handler. `net` owns its own
 /// daemon + adb wiring, so (unlike server-backed namespaces) this never touches
 /// `ensure_ready`. Clap types stay here; the handlers speak plain structs.
-async fn dispatch_net(c: &NetCmd, serial: &str) -> Result<()> {
+async fn dispatch_net(c: &NetCmd, serial: &Serial) -> Result<()> {
     use crate::net::commands as nc;
     use crate::net::{DaemonConfig, Matcher, RuleSpec};
 
@@ -1698,7 +1701,7 @@ async fn dispatch_net(c: &NetCmd, serial: &str) -> Result<()> {
         NetCmd::Replay { from, host } => nc::replay(serial, from, host.clone()).await,
         NetCmd::Daemon(a) => {
             crate::net::daemon::run(DaemonConfig {
-                serial: a.serial.clone(),
+                serial: Serial::new(a.serial.clone()),
                 port: a.port,
                 app_filters: a.host.clone(),
                 anticache: a.anticache,
@@ -1786,7 +1789,7 @@ async fn dispatch_app(c: AppCmd, client: &ServerClient) -> Result<()> {
     Ok(())
 }
 
-async fn dispatch_device(c: DeviceCmd, client: &ServerClient, serial: &str) -> Result<()> {
+async fn dispatch_device(c: DeviceCmd, client: &ServerClient, serial: &Serial) -> Result<()> {
     match c {
         DeviceCmd::Info => cmd_device_info(client, serial).await?,
         DeviceCmd::Shell { cmd, timeout_ms } => {
@@ -1844,7 +1847,7 @@ async fn dispatch_device(c: DeviceCmd, client: &ServerClient, serial: &str) -> R
     Ok(())
 }
 
-async fn dispatch_files(c: FilesCmd, client: &ServerClient, serial: &str) -> Result<()> {
+async fn dispatch_files(c: FilesCmd, client: &ServerClient, serial: &Serial) -> Result<()> {
     match c {
         FilesCmd::Ls { remote } => {
             // Server first (app-accessible storage); fall back to `adb shell ls`
@@ -1936,7 +1939,7 @@ pub fn report_error(err: &anyhow::Error) {
 
 // ── specific handlers ──────────────────────────────────────────
 
-async fn cmd_device_info(client: &ServerClient, serial: &str) -> Result<()> {
+async fn cmd_device_info(client: &ServerClient, serial: &Serial) -> Result<()> {
     match client.device().await {
         // 0.1.4+ server: rich device facts.
         Ok(d) => emit_action("device_info", &serde_json::to_value(&d).unwrap_or_default()),
@@ -1962,7 +1965,7 @@ async fn cmd_device_info(client: &ServerClient, serial: &str) -> Result<()> {
 /// omitted) — the loop reads this every iteration, so it pays for itself in
 /// tokens. `--full` restores the complete UIAutomator element set.
 async fn cmd_screen(
-    serial: &str,
+    serial: &Serial,
     apk: Option<&std::path::Path>,
     any_apk_version: bool,
     client: &ServerClient,
@@ -2230,7 +2233,7 @@ async fn cmd_wait(
     gone: bool,
     timeout_ms: u32,
     poll_ms: u32,
-    serial: &str,
+    serial: &Serial,
     apk: Option<&std::path::Path>,
     any_apk_version: bool,
 ) -> Result<()> {
@@ -2284,7 +2287,7 @@ async fn cmd_wait(
 }
 
 async fn read_screen_with_reconnect(
-    serial: &str,
+    serial: &Serial,
     apk: Option<&std::path::Path>,
     any_apk_version: bool,
     client: &ServerClient,
@@ -2300,7 +2303,7 @@ async fn read_screen_with_reconnect(
 }
 
 async fn reconnect_after_screen_error(
-    serial: &str,
+    serial: &Serial,
     apk: Option<&std::path::Path>,
     any_apk_version: bool,
     err: &anyhow::Error,
@@ -2478,7 +2481,7 @@ async fn cmd_disconnect(device: Option<&str>) -> Result<()> {
 /// Release the device's single UiAutomation slot held by ShadowDroid's
 /// instrumentation: force-stop our packages, kill instrument zombies, drop the
 /// port forward. Shared by `disconnect` and `test`.
-async fn free_ui_automation_slot(serial: &str) -> Result<()> {
+async fn free_ui_automation_slot(serial: &Serial) -> Result<()> {
     adb::am_force_stop(serial, installer::TEST_PACKAGE).await?;
     adb::am_force_stop(serial, installer::APP_PACKAGE).await?;
     adb::kill_instrument_zombies(serial).await?;
@@ -2542,14 +2545,14 @@ async fn cmd_test(
     }
 }
 
-pub(crate) async fn resolve_serial(explicit: Option<&str>) -> Result<String> {
+pub(crate) async fn resolve_serial(explicit: Option<&str>) -> Result<Serial> {
     if let Some(s) = explicit {
-        return Ok(s.to_string());
+        return Ok(Serial::from(s));
     }
     let devices = adb::list_devices().await.context("listing devices")?;
     match devices.len() {
         0 => Err(anyhow!("no Android devices attached. Run `shadowdroid devices` to check.")),
-        1 => Ok(devices.into_iter().next().unwrap()),
+        1 => Ok(Serial::from(devices.into_iter().next().unwrap())),
         _ => Err(anyhow!(
             "multiple devices attached ({}). Pass --device <serial> or set $SHADOWDROID_DEVICE.\nattached: {}",
             devices.len(),

@@ -12,6 +12,7 @@
 //! to verify rather than pulling+parsing it. (Cronet/QUIC + pinning caveats are
 //! surfaced as notes — those bypass a user-CA proxy regardless.)
 
+use crate::ids::Serial;
 use anyhow::{bail, Result};
 use serde::Serialize;
 
@@ -36,7 +37,7 @@ pub struct CheckReport {
 
 /// Inspect an installed package and produce a verdict. Errors only if the
 /// package isn't installed.
-pub async fn inspect(serial: &str, package: &str) -> Result<CheckReport> {
+pub async fn inspect(serial: &Serial, package: &str) -> Result<CheckReport> {
     if adb::pm_path(serial, package).await?.is_none() {
         bail!("{package} is not installed on {serial}");
     }
@@ -78,7 +79,7 @@ pub async fn inspect(serial: &str, package: &str) -> Result<CheckReport> {
 }
 
 /// `net check <pkg>` — inspect + emit.
-pub async fn run(serial: &str, package: &str) -> Result<()> {
+pub async fn run(serial: &Serial, package: &str) -> Result<()> {
     let report = inspect(serial, package).await?;
     let mut v = serde_json::to_value(&report).unwrap_or_default();
     if let serde_json::Value::Object(map) = &mut v {

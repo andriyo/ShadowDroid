@@ -17,6 +17,7 @@ mod cmd;
 mod config;
 mod device;
 mod events;
+mod ids;
 mod net;
 mod proto;
 mod selector;

@@ -15,6 +15,7 @@
 
 use crate::device::client::ServerClient;
 use crate::events::{self, emit_action, now_ts, Event, ScreenFormat};
+use crate::ids::Serial;
 use crate::proto::{AppRef, Element, SelectorQuery};
 use crate::watch::watcher::{PermissionDialogPolicy, WatcherRule, WatcherSet};
 use crate::watch::{logcat, stdin};
@@ -36,7 +37,7 @@ pub enum Wake {
 }
 
 pub struct WatchConfig {
-    pub serial: String,
+    pub serial: Serial,
     pub client: ServerClient,
     pub app_filter: Option<String>,
     pub poll_ms: u32,
@@ -71,7 +72,7 @@ pub async fn run(cfg: WatchConfig) -> Result<()> {
         .await
         .context("reading initial server state")?;
     events::emit(&Event::Ready {
-        device: cfg.serial.clone(),
+        device: cfg.serial.to_string(),
         viewport: state.viewport,
         server_version: state.server_version,
         app_filter: cfg.app_filter.clone(),
@@ -135,7 +136,7 @@ pub async fn run(cfg: WatchConfig) -> Result<()> {
     Ok(())
 }
 
-fn spawn_net_events(serial: String, event_tx: mpsc::Sender<Event>) {
+fn spawn_net_events(serial: Serial, event_tx: mpsc::Sender<Event>) {
     tokio::spawn(async move {
         let req = serde_json::json!({"op": "watch", "matcher": {}});
         if let Err(err) = crate::net::control::request_stream(&serial, req).await {
@@ -155,7 +156,7 @@ fn spawn_net_events(serial: String, event_tx: mpsc::Sender<Event>) {
     });
 }
 
-fn spawn_crash_detector(serial: String, app_filter: Option<String>, event_tx: mpsc::Sender<Event>) {
+fn spawn_crash_detector(serial: Serial, app_filter: Option<String>, event_tx: mpsc::Sender<Event>) {
     tokio::spawn(async move {
         if let Err(err) = logcat::run(serial, app_filter, event_tx.clone()).await {
             let _ = event_tx
@@ -171,7 +172,7 @@ fn spawn_crash_detector(serial: String, app_filter: Option<String>, event_tx: mp
 }
 
 fn spawn_wake_logcat(
-    serial: String,
+    serial: Serial,
     watch_tx: mpsc::Sender<WatchMsg>,
     event_tx: mpsc::Sender<Event>,
 ) {
@@ -189,7 +190,7 @@ fn spawn_wake_logcat(
     });
 }
 
-async fn run_wake_logcat(serial: String, watch_tx: mpsc::Sender<WatchMsg>) -> Result<()> {
+async fn run_wake_logcat(serial: Serial, watch_tx: mpsc::Sender<WatchMsg>) -> Result<()> {
     let mut child = Command::new("adb")
         .args([
             "-s",

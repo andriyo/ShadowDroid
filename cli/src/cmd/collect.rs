@@ -12,6 +12,7 @@
 //! Privacy: the bundle is written locally and never uploaded. Screenshots and
 //! logs may contain PII — treat the directory accordingly before sharing it.
 
+use crate::ids::Serial;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -61,7 +62,7 @@ impl Bundle {
 }
 
 pub async fn run(
-    serial: &str,
+    serial: &Serial,
     app: Option<String>,
     out: Option<PathBuf>,
     screenshot: bool,

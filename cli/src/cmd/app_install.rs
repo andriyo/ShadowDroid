@@ -16,6 +16,7 @@
 //! `aapt2 dump badging` of the APK (aapt2 is located on PATH or in the Android
 //! SDK build-tools). `--package` overrides the package when aapt2 is absent.
 
+use crate::ids::Serial;
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -79,7 +80,7 @@ impl Step {
     }
 }
 
-pub async fn run(serial: &str, args: &AppInstallArgs, reinstall: bool) -> Result<()> {
+pub async fn run(serial: &Serial, args: &AppInstallArgs, reinstall: bool) -> Result<()> {
     if !args.apk.is_file() {
         bail!("APK not found: {}", args.apk.display());
     }
@@ -189,7 +190,7 @@ pub async fn run(serial: &str, args: &AppInstallArgs, reinstall: bool) -> Result
 
 /// Poll the foreground component until it belongs to `package` or the timeout
 /// elapses. Returns `(matched, last_seen_foreground)`.
-async fn wait_front(serial: &str, package: &str, timeout_ms: u32) -> (bool, Option<String>) {
+async fn wait_front(serial: &Serial, package: &str, timeout_ms: u32) -> (bool, Option<String>) {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
     let prefix = format!("{package}/");
     loop {

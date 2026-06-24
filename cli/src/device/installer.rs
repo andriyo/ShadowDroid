@@ -17,6 +17,7 @@
 //! if bytes changed). Sources 5-6 are *user* sources; versionName must match
 //! the CLI's baked-in `EXPECTED_APK_VERSION`.
 
+use crate::ids::Serial;
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -453,7 +454,7 @@ fn shadowdroid_home() -> Result<PathBuf> {
 /// Make sure the device has our server running and reachable, then return
 /// a connected ServerClient ready to use.
 pub async fn ensure_ready(
-    serial: &str,
+    serial: &Serial,
     explicit_apk: Option<&Path>,
     any_apk_version: bool,
 ) -> Result<ServerClient> {
@@ -502,7 +503,7 @@ pub async fn ensure_ready(
 /// Heavy-handed cleanup for the case where system_server is holding a stale
 /// `UiAutomationService` registration. Force-stop everything, then wait long
 /// enough for system_server to actually release the slot (~5-10s observed).
-async fn long_cooldown(serial: &str) -> Result<()> {
+async fn long_cooldown(serial: &Serial) -> Result<()> {
     adb::am_force_stop(serial, TEST_PACKAGE).await?;
     adb::am_force_stop(serial, APP_PACKAGE).await?;
     adb::kill_instrument_zombies(serial).await?;
@@ -510,7 +511,7 @@ async fn long_cooldown(serial: &str) -> Result<()> {
     Ok(())
 }
 
-async fn cleanup_stale_server(serial: &str) -> Result<()> {
+async fn cleanup_stale_server(serial: &Serial) -> Result<()> {
     adb::forward_remove(serial, DEFAULT_PORT).await.ok();
     adb::kill_instrument_zombies(serial).await?;
     adb::am_force_stop(serial, TEST_PACKAGE).await.ok();
@@ -519,7 +520,7 @@ async fn cleanup_stale_server(serial: &str) -> Result<()> {
     Ok(())
 }
 
-async fn install_if_needed(serial: &str, pair: &ApkPair, any_apk_version: bool) -> Result<()> {
+async fn install_if_needed(serial: &Serial, pair: &ApkPair, any_apk_version: bool) -> Result<()> {
     let installed_main = adb::pm_path(serial, APP_PACKAGE).await?.is_some();
     let installed_test = adb::pm_path(serial, TEST_PACKAGE).await?.is_some();
     if !installed_main || !installed_test {
@@ -577,7 +578,7 @@ async fn install_if_needed(serial: &str, pair: &ApkPair, any_apk_version: bool) 
 /// Failing fast with actionable guidance beats letting the version gate retry the
 /// installer and stall on every subsequent command.
 async fn verify_installed_version(
-    serial: &str,
+    serial: &Serial,
     source: ApkSource,
     any_apk_version: bool,
 ) -> Result<()> {
@@ -617,7 +618,7 @@ fn mislabeled_apk_error(source: ApkSource, found: Option<&str>) -> anyhow::Error
 /// so on that error we uninstall both and install fresh — this is what makes
 /// `doctor --fix` (and `connect`) able to recover a cross-signed device instead
 /// of dead-ending.
-async fn install_pair(serial: &str, pair: &ApkPair) -> Result<()> {
+async fn install_pair(serial: &Serial, pair: &ApkPair) -> Result<()> {
     match try_install_pair(serial, pair).await {
         Ok(()) => Ok(()),
         Err(e) if is_signature_mismatch(&e) => {
@@ -634,7 +635,7 @@ async fn install_pair(serial: &str, pair: &ApkPair) -> Result<()> {
     }
 }
 
-async fn try_install_pair(serial: &str, pair: &ApkPair) -> Result<()> {
+async fn try_install_pair(serial: &Serial, pair: &ApkPair) -> Result<()> {
     adb::install(serial, pair.main.clone()).await?;
     adb::install(serial, pair.test.clone()).await?;
     Ok(())
@@ -643,7 +644,7 @@ async fn try_install_pair(serial: &str, pair: &ApkPair) -> Result<()> {
 /// True when the locally-built test APK differs (by SHA-256) from the copy
 /// installed on the device. Lets the dev loop honour "reinstall iff bytes
 /// changed" for repo/drop-in builds without a manual uninstall.
-async fn test_apk_changed(serial: &str, local_test: &Path) -> Result<bool> {
+async fn test_apk_changed(serial: &Serial, local_test: &Path) -> Result<bool> {
     let device_path = adb::pm_path(serial, TEST_PACKAGE)
         .await?
         .ok_or_else(|| anyhow!("{TEST_PACKAGE} not installed"))?;
@@ -662,7 +663,7 @@ fn is_signature_mismatch(e: &anyhow::Error) -> bool {
     s.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE") || s.contains("signatures do not match")
 }
 
-async fn start_instrumentation(serial: &str) -> Result<()> {
+async fn start_instrumentation(serial: &Serial) -> Result<()> {
     // Kill any zombie app_process from previous runs — they hold the
     // UiAutomation slot and would cause "already registered" errors.
     adb::kill_instrument_zombies(serial).await?;
@@ -692,7 +693,11 @@ async fn probe(client: &ServerClient, any_apk_version: bool) -> ProbeResult {
     }
 }
 
-async fn wait_for_server(serial: &str, client: &ServerClient, any_apk_version: bool) -> Result<()> {
+async fn wait_for_server(
+    serial: &Serial,
+    client: &ServerClient,
+    any_apk_version: bool,
+) -> Result<()> {
     // 10s gives Ktor + UiAutomation + JUnit setup enough headroom on slower
     // emulators (Android 16 emulator with fresh APK install can take ~3s
     // for the test framework to fully initialise before our @Before runs).
@@ -735,7 +740,7 @@ async fn wait_for_server(serial: &str, client: &ServerClient, any_apk_version: b
     )
 }
 
-async fn ui_automation_failure_hint(serial: &str) -> Option<String> {
+async fn ui_automation_failure_hint(serial: &Serial) -> Option<String> {
     let log = adb::shell(serial, format!("cat {INSTRUMENT_LOG_PATH} 2>/dev/null"))
         .await
         .ok()?;

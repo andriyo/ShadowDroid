@@ -11,6 +11,7 @@
 //! daemon replies with one JSON line (most ops) or a stream of event lines
 //! (`watch`) until the client disconnects.
 
+use crate::ids::Serial;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -347,7 +348,7 @@ async fn write_json(wr: &mut OwnedWriteHalf, v: &Value) -> Result<()> {
 // ── client side (used by the `net` verbs) ─────────────────────
 
 /// Is a daemon for `serial` reachable on its control socket?
-pub async fn is_running(serial: &str) -> bool {
+pub async fn is_running(serial: &Serial) -> bool {
     match read_ctl_port(serial) {
         Some(port) => TcpStream::connect(("127.0.0.1", port)).await.is_ok(),
         None => false,
@@ -355,18 +356,18 @@ pub async fn is_running(serial: &str) -> bool {
 }
 
 /// The daemon's loopback control port from its `.ctl` file, if present.
-fn read_ctl_port(serial: &str) -> Option<u16> {
+fn read_ctl_port(serial: &Serial) -> Option<u16> {
     let path = paths::ctl_path(serial).ok()?;
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 /// The daemon pid from its pidfile, if present + parseable.
-pub fn daemon_pid(serial: &str) -> Option<u32> {
+pub fn daemon_pid(serial: &Serial) -> Option<u32> {
     let path = paths::pid_path(serial).ok()?;
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-async fn connect(serial: &str) -> Result<TcpStream> {
+async fn connect(serial: &Serial) -> Result<TcpStream> {
     let port = read_ctl_port(serial).ok_or_else(|| {
         anyhow!("no net proxy daemon for {serial}. Is `shadowdroid net start` running?")
     })?;
@@ -378,7 +379,7 @@ async fn connect(serial: &str) -> Result<TcpStream> {
 }
 
 /// Send one request, read one JSON response line.
-pub async fn request(serial: &str, req: Value) -> Result<Value> {
+pub async fn request(serial: &Serial, req: Value) -> Result<Value> {
     let stream = connect(serial).await?;
     let (rd, mut wr) = stream.into_split();
     write_request(&mut wr, &req).await?;
@@ -392,7 +393,7 @@ pub async fn request(serial: &str, req: Value) -> Result<Value> {
 
 /// Send a streaming request (`watch`) and print each response line to stdout
 /// until EOF or Ctrl-C.
-pub async fn request_stream(serial: &str, req: Value) -> Result<()> {
+pub async fn request_stream(serial: &Serial, req: Value) -> Result<()> {
     let stream = connect(serial).await?;
     let (rd, mut wr) = stream.into_split();
     write_request(&mut wr, &req).await?;

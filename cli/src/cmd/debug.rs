@@ -12,6 +12,7 @@ use crate::config::{ResolvedApp, ShadowDroidConfig};
 use crate::device::adb;
 use crate::device::client::ServerClient;
 use crate::events::CrashEvent;
+use crate::ids::Serial;
 use crate::watch::logcat;
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
@@ -302,7 +303,7 @@ pub async fn run_host_only(args: &DebugArgs) -> Result<()> {
     }
 }
 
-pub async fn run(serial: &str, client: &ServerClient, args: DebugArgs) -> Result<()> {
+pub async fn run(serial: &Serial, client: &ServerClient, args: DebugArgs) -> Result<()> {
     let studio_url = args.studio_url;
     match args.cmd {
         DebugCmd::Auto(args) => debug_auto(serial, client, args, studio_url.as_deref()).await,
@@ -325,7 +326,7 @@ pub async fn run(serial: &str, client: &ServerClient, args: DebugArgs) -> Result
 }
 
 async fn debug_auto(
-    serial: &str,
+    serial: &Serial,
     client: &ServerClient,
     args: AutoArgs,
     studio_url: Option<&str>,
@@ -451,7 +452,7 @@ async fn debug_auto(
 }
 
 async fn resolve_auto_app(
-    serial: &str,
+    serial: &Serial,
     client: &ServerClient,
     config: &ShadowDroidConfig,
     requested: Option<&str>,
@@ -483,7 +484,7 @@ async fn resolve_auto_app(
 }
 
 async fn resolve_app_by_label(
-    serial: &str,
+    serial: &Serial,
     client: &ServerClient,
     requested: &str,
 ) -> Result<Option<(String, String)>> {
@@ -518,7 +519,7 @@ async fn resolve_app_by_label(
 }
 
 async fn auto_attach_debugger(
-    serial: &str,
+    serial: &Serial,
     package: &str,
     resolved: &ResolvedApp,
     args: &AutoArgs,
@@ -567,7 +568,7 @@ async fn auto_attach_debugger(
 }
 
 async fn snapshot_cmd(
-    serial: &str,
+    serial: &Serial,
     client: &ServerClient,
     args: SnapshotArgs,
     studio_url: Option<&str>,
@@ -582,7 +583,7 @@ async fn snapshot_cmd(
 }
 
 async fn snapshot_value(
-    serial: &str,
+    serial: &Serial,
     client: &ServerClient,
     args: &SnapshotArgs,
     studio_url: Option<&str>,
@@ -717,7 +718,7 @@ fn studio_problem_value(stage: &str, err: anyhow::Error) -> Value {
 }
 
 async fn record_cmd(
-    serial: &str,
+    serial: &Serial,
     client: &ServerClient,
     args: RecordArgs,
     studio_url: Option<&str>,
@@ -754,7 +755,7 @@ async fn record_cmd(
     )?;
 
     let (log_tx, mut log_rx) = mpsc::channel(256);
-    spawn_logcat(serial.to_string(), log_tx);
+    spawn_logcat(serial.clone(), log_tx);
 
     let mut last_screen_hash: Option<String> = None;
     let mut last_app: Option<Value> = None;
@@ -866,7 +867,7 @@ async fn record_cmd(
     Ok(())
 }
 
-fn spawn_logcat(serial: String, out: mpsc::Sender<Value>) {
+fn spawn_logcat(serial: Serial, out: mpsc::Sender<Value>) {
     tokio::spawn(async move {
         let child = Command::new("adb")
             .args(["-s", &serial, "logcat", "-v", "threadtime", "-T", "1"])
@@ -1099,7 +1100,7 @@ fn find_divergences(runs: &[Vec<String>]) -> Vec<Value> {
 }
 
 async fn step_until_screen_change(
-    serial: &str,
+    serial: &Serial,
     client: &ServerClient,
     args: StudioWaitArgs,
     studio_url: Option<&str>,
@@ -1147,7 +1148,7 @@ async fn step_until_screen_change(
 }
 
 async fn step_until_log(
-    serial: &str,
+    serial: &Serial,
     client: &ServerClient,
     args: StepUntilLogArgs,
     studio_url: Option<&str>,
@@ -1155,7 +1156,7 @@ async fn step_until_log(
     let bridge = BridgeClient::new(studio_url)?;
     let session_s = args.wait.session.map(|s| s.to_string());
     let (log_tx, mut log_rx) = mpsc::channel(256);
-    spawn_logcat(serial.to_string(), log_tx);
+    spawn_logcat(serial.clone(), log_tx);
     let deadline = Instant::now() + Duration::from_millis(args.wait.timeout_ms);
     let mut steps = 0u64;
 
@@ -1219,7 +1220,7 @@ async fn step_until_log(
 }
 
 async fn run_until_crash(
-    serial: &str,
+    serial: &Serial,
     client: &ServerClient,
     args: RunUntilCrashArgs,
     studio_url: Option<&str>,
@@ -1231,7 +1232,7 @@ async fn run_until_crash(
     };
     let session_s = args.session.map(|s| s.to_string());
     let (crash_tx, mut crash_rx) = mpsc::channel(32);
-    spawn_crash_logcat(serial.to_string(), args.app.clone(), crash_tx);
+    spawn_crash_logcat(serial.clone(), args.app.clone(), crash_tx);
     let resume = if let Some(bridge) = &bridge {
         match studio_control(bridge, session_action::RESUME, session_s.as_deref()).await {
             Ok(value) => json!({"attempted": true, "ok": true, "result": value}),
@@ -1322,7 +1323,7 @@ async fn run_until_crash(
 }
 
 async fn final_snapshot_best_effort(
-    serial: &str,
+    serial: &Serial,
     client: &ServerClient,
     app: &Option<String>,
     studio_url: Option<&str>,
@@ -1353,7 +1354,7 @@ async fn final_snapshot_best_effort(
 }
 
 async fn native_cmd(
-    serial: &str,
+    serial: &Serial,
     client: &ServerClient,
     cmd: NativeCmd,
     studio_url: Option<&str>,
@@ -1364,7 +1365,7 @@ async fn native_cmd(
 }
 
 async fn native_status(
-    serial: &str,
+    serial: &Serial,
     client: &ServerClient,
     args: NativeStatusArgs,
     studio_url: Option<&str>,
@@ -1440,7 +1441,7 @@ async fn native_status(
     }))
 }
 
-async fn tombstones_cmd(serial: &str, cmd: TombstonesCmd) -> Result<()> {
+async fn tombstones_cmd(serial: &Serial, cmd: TombstonesCmd) -> Result<()> {
     match cmd {
         TombstonesCmd::List(args) => {
             let status = tombstone_status(serial).await;
@@ -1472,7 +1473,7 @@ async fn tombstones_cmd(serial: &str, cmd: TombstonesCmd) -> Result<()> {
     }
 }
 
-async fn tombstone_status(serial: &str) -> Value {
+async fn tombstone_status(serial: &Serial) -> Value {
     match device_file_list(
         serial,
         "ls -1t /data/tombstones/tombstone_* 2>/dev/null | head -n 5",
@@ -1491,7 +1492,7 @@ async fn tombstone_status(serial: &str) -> Value {
 }
 
 async fn final_snapshot(
-    serial: &str,
+    serial: &Serial,
     client: &ServerClient,
     app: &Option<String>,
     studio_url: Option<&str>,
@@ -1514,7 +1515,7 @@ async fn final_snapshot(
     .await
 }
 
-async fn device_file_list(serial: &str, list_cmd: &str) -> Result<Vec<String>> {
+async fn device_file_list(serial: &Serial, list_cmd: &str) -> Result<Vec<String>> {
     let out = adb::shell(serial, list_cmd).await?;
     Ok(out
         .lines()
@@ -1525,7 +1526,7 @@ async fn device_file_list(serial: &str, list_cmd: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-fn spawn_crash_logcat(serial: String, app_filter: Option<String>, out: mpsc::Sender<CrashEvent>) {
+fn spawn_crash_logcat(serial: Serial, app_filter: Option<String>, out: mpsc::Sender<CrashEvent>) {
     tokio::spawn(async move {
         let _ = logcat::run_crashes(serial, app_filter, out).await;
     });
@@ -1660,7 +1661,7 @@ impl CrashBundle {
 }
 
 async fn write_crash_bundle(
-    serial: &str,
+    serial: &Serial,
     app: &Option<String>,
     crash: &CrashEvent,
     snapshot: &Value,
@@ -1734,7 +1735,7 @@ async fn write_crash_bundle(
 }
 
 async fn collect_matching_device_files(
-    serial: &str,
+    serial: &Serial,
     bundle: &mut CrashBundle,
     prefix: &str,
     list_cmd: &str,

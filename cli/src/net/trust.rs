@@ -14,6 +14,7 @@
 //! non-root device. Verify-by-readback throughout: `<hash>` is the OpenSSL
 //! `subject_hash_old` (the filename Android keys CAs by).
 
+use crate::ids::Serial;
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
@@ -26,7 +27,7 @@ const USER_CACERTS: &str = "/data/misc/user/0/cacerts-added";
 const TMP_CA: &str = "/data/local/tmp/shadowdroid-ca.pem";
 
 /// `net trust [--system|--ui]`.
-pub async fn run(serial: &str, system: bool, ui: bool) -> Result<()> {
+pub async fn run(serial: &Serial, system: bool, ui: bool) -> Result<()> {
     let _ = CertAuthority::load_or_generate()?;
     if ui {
         return ui_install(serial).await;
@@ -75,7 +76,7 @@ pub async fn run(serial: &str, system: bool, ui: bool) -> Result<()> {
     Ok(())
 }
 
-async fn try_system_store(serial: &str, hash: &str) -> (bool, Vec<Value>) {
+async fn try_system_store(serial: &Serial, hash: &str) -> (bool, Vec<Value>) {
     let dest = format!("{SYSTEM_CACERTS}/{hash}.0");
     let mut steps = Vec::new();
     let remount = adb::shell(
@@ -95,7 +96,7 @@ async fn try_system_store(serial: &str, hash: &str) -> (bool, Vec<Value>) {
     (cert_present(serial, &dest).await, steps)
 }
 
-async fn try_user_store(serial: &str, hash: &str) -> bool {
+async fn try_user_store(serial: &Serial, hash: &str) -> bool {
     let dest = format!("{USER_CACERTS}/{hash}.0");
     let _ = adb::shell(
         serial,
@@ -110,14 +111,14 @@ async fn try_user_store(serial: &str, hash: &str) -> bool {
 
 /// Verify-by-readback that avoids the false positive where `ls:`'s *error*
 /// message echoes the path (so a plain `contains(hash)` wrongly matches).
-async fn cert_present(serial: &str, dest: &str) -> bool {
+async fn cert_present(serial: &Serial, dest: &str) -> bool {
     let out = adb::shell(serial, format!("ls {dest} 2>&1"))
         .await
         .unwrap_or_default();
     !out.to_lowercase().contains("no such file") && out.contains(dest)
 }
 
-async fn ui_install(serial: &str) -> Result<()> {
+async fn ui_install(serial: &Serial) -> Result<()> {
     let dest = "/sdcard/Download/shadowdroid-ca.crt";
     adb::push(serial, paths::ca_cert_path()?, dest.to_string()).await?;
     let _ = adb::shell(serial, "am start -a android.settings.SECURITY_SETTINGS").await;
@@ -136,7 +137,7 @@ async fn ui_install(serial: &str) -> Result<()> {
 }
 
 /// Remove the ShadowDroid CA from both stores (root). Returns whether it's gone.
-pub async fn remove(serial: &str) -> Result<bool> {
+pub async fn remove(serial: &Serial) -> Result<bool> {
     if adb::shell(serial, "id -u").await.unwrap_or_default().trim() != "0" {
         return Ok(false);
     }

@@ -14,6 +14,7 @@
 //! UiAutomation owner is gated behind `--force` — we don't kill processes we
 //! didn't spawn without explicit consent.
 
+use crate::ids::Serial;
 use anyhow::Result;
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -67,7 +68,7 @@ enum OwnerClass {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DoctorReport {
-    pub target: Option<String>,
+    pub target: Option<Serial>,
     pub checks: Vec<Check>,
     /// Every check is `ok`.
     pub healthy: bool,
@@ -76,7 +77,7 @@ pub struct DoctorReport {
 }
 
 impl DoctorReport {
-    fn from_checks(target: Option<String>, checks: Vec<Check>) -> Self {
+    fn from_checks(target: Option<Serial>, checks: Vec<Check>) -> Self {
         let healthy = checks.iter().all(|c| c.status == Status::Ok);
         Self {
             target,
@@ -176,18 +177,18 @@ pub async fn gather(device: Option<&str>) -> DoctorReport {
 }
 
 /// `device` flag wins; otherwise the sole device in "device" state; else none.
-fn resolve_target(device: Option<&str>, devices: &[(String, String)]) -> Option<String> {
+fn resolve_target(device: Option<&str>, devices: &[(String, String)]) -> Option<Serial> {
     if let Some(d) = device {
-        return Some(d.to_string());
+        return Some(Serial::from(d));
     }
     let ready: Vec<_> = devices.iter().filter(|(_, st)| st == "device").collect();
     match ready.as_slice() {
-        [(serial, _)] => Some(serial.clone()),
+        [(serial, _)] => Some(Serial::from(serial.as_str())),
         _ => None,
     }
 }
 
-async fn apk_check(serial: &str) -> Check {
+async fn apk_check(serial: &Serial) -> Check {
     let main = adb::pm_path(serial, APP_PACKAGE).await.unwrap_or(None);
     let test = adb::pm_path(serial, TEST_PACKAGE).await.unwrap_or(None);
     if main.is_none() || test.is_none() {
@@ -231,7 +232,7 @@ async fn apk_check(serial: &str) -> Check {
 /// `(check, reachable)` where `reachable` means the server answered at all
 /// (regardless of version). A not-yet-started server is a `warn`, not a `fail` —
 /// `shadowdroid connect` is the normal way to start it.
-async fn server_check(serial: &str) -> (Check, bool) {
+async fn server_check(serial: &Serial) -> (Check, bool) {
     // The forward is required to reach the device server and is idempotent.
     adb::forward(serial, DEFAULT_PORT, DEFAULT_PORT).await.ok();
     let Ok(client) = ServerClient::new(DEFAULT_PORT) else {
@@ -286,7 +287,7 @@ async fn server_check(serial: &str) -> (Check, bool) {
     }
 }
 
-async fn owners_check(serial: &str, reachable: bool) -> Check {
+async fn owners_check(serial: &Serial, reachable: bool) -> Check {
     let owners = adb::ps_ui_automation_owners(serial)
         .await
         .unwrap_or_default();
@@ -355,7 +356,7 @@ const CLOCK_TOLERANCE_SECS: i64 = 2;
 /// own toast capture (the CLI computes `since_ts` from the host clock while the
 /// server timestamps toasts with the device clock). Read-only / warn-only:
 /// device time isn't settable without root, so `--fix` can't repair it.
-async fn clock_check(serial: &str) -> Check {
+async fn clock_check(serial: &Serial) -> Check {
     // Sample the host clock right before the round-trip.
     let host = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -453,32 +454,33 @@ pub async fn run(
     // wiring status (the same thing `aar status` reports). Source-side and
     // read-only — independent of the device, sits outside the fix flow.
     if let Some(project) = project {
-        let check = match crate::cmd::aar::inspect(project, None) {
-            Ok(s) if s.installed => Check {
-                code: "agent",
-                status: Status::Ok,
-                detail: format!("in-app debug agent wired into :{} ({})", s.module, s.app),
-                remedy: None,
-            },
-            Ok(s) => Check {
-                code: "agent",
-                status: Status::Warn,
-                detail: format!(
+        let check =
+            match crate::cmd::aar::inspect(project, None) {
+                Ok(s) if s.installed => Check {
+                    code: "agent",
+                    status: Status::Ok,
+                    detail: format!("in-app debug agent wired into :{} ({})", s.module, s.app),
+                    remedy: None,
+                },
+                Ok(s) => Check {
+                    code: "agent",
+                    status: Status::Warn,
+                    detail: format!(
                     "in-app debug agent not installed in {} (module :{}): dependency {}, aar {}",
                     s.app,
                     s.module,
                     if s.dependency_present { "present" } else { "missing" },
                     if s.aar_present { "present" } else { "missing" },
                 ),
-                remedy: Some("shadowdroid aar install".to_string()),
-            },
-            Err(e) => Check {
-                code: "agent",
-                status: Status::Warn,
-                detail: format!("agent status for {}: {e}", project.display()),
-                remedy: None,
-            },
-        };
+                    remedy: Some("shadowdroid aar install".to_string()),
+                },
+                Err(e) => Check {
+                    code: "agent",
+                    status: Status::Warn,
+                    detail: format!("agent status for {}: {e}", project.display()),
+                    remedy: None,
+                },
+            };
         report.checks.push(check);
         report.healthy = report.checks.iter().all(|c| c.status == Status::Ok);
     }
@@ -503,7 +505,11 @@ async fn apply_fix(device: Option<&str>, report: DoctorReport, force: bool) -> D
     // Net: a dangling `http_proxy` (set, but no daemon) silently kills the
     // device's networking. Clearing it is independent of the UiAutomation slot,
     // so do it first — even if the owner/apk fixes below get gated.
-    if report.checks.iter().any(|c| c.code == "net" && c.status != Status::Ok) {
+    if report
+        .checks
+        .iter()
+        .any(|c| c.code == "net" && c.status != Status::Ok)
+    {
         clear_dangling_proxy(&serial).await;
     }
 
@@ -564,7 +570,7 @@ fn is_fixable(code: &str) -> bool {
 /// **dangling** `http_proxy` (set, but no daemon listening) — that silently
 /// breaks the device's networking, and `--fix` clears it. A clean no-proxy state
 /// is `Ok` ("inactive"), so this never nags people who don't use `net`.
-async fn net_check(serial: &str) -> Check {
+async fn net_check(serial: &Serial) -> Check {
     let running = crate::net::control::is_running(serial).await;
     let http_proxy = adb::shell(serial, "settings get global http_proxy")
         .await
@@ -602,7 +608,7 @@ async fn net_check(serial: &str) -> Check {
 }
 
 /// Clear a dangling system proxy (and any leftover reverse on the default port).
-async fn clear_dangling_proxy(serial: &str) {
+async fn clear_dangling_proxy(serial: &Serial) {
     let _ = adb::shell(serial, "settings put global http_proxy :0").await;
     let _ = adb::reverse_remove(serial, crate::net::DEFAULT_PROXY_PORT).await;
 }

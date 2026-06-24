@@ -10,6 +10,7 @@
 
 use crate::device::adb;
 use crate::events::{now_ts, CausedBy, CrashEvent, Event};
+use crate::ids::Serial;
 use anyhow::{Context, Result};
 use regex::Regex;
 use std::process::Stdio;
@@ -23,7 +24,7 @@ const CONTEXT_LINES: u32 = 60;
 const QUIET_WINDOW: Duration = Duration::from_secs(1);
 
 pub async fn run(
-    serial: String,
+    serial: Serial,
     app_filter: Option<String>,
     out: mpsc::Sender<Event>,
 ) -> Result<()> {
@@ -38,7 +39,7 @@ pub async fn run(
 }
 
 pub async fn run_crashes(
-    serial: String,
+    serial: Serial,
     app_filter: Option<String>,
     out: mpsc::Sender<CrashEvent>,
 ) -> Result<()> {
@@ -96,7 +97,7 @@ pub async fn run_crashes(
 }
 
 async fn emit_if_matches(
-    serial: &str,
+    serial: &Serial,
     app_filter: &Option<String>,
     out: &mpsc::Sender<CrashEvent>,
     mut evt: CrashEvent,
@@ -374,7 +375,7 @@ fn extract_msg(line: &String) -> String {
         .unwrap_or_else(|| line.clone())
 }
 
-async fn fetch_context(serial: &str) -> Vec<String> {
+async fn fetch_context(serial: &Serial) -> Vec<String> {
     adb::shell(
         serial,
         format!("logcat -d -v threadtime -t {CONTEXT_LINES}"),
@@ -384,7 +385,7 @@ async fn fetch_context(serial: &str) -> Vec<String> {
     .unwrap_or_default()
 }
 
-async fn fetch_device_info(serial: &str) -> serde_json::Value {
+async fn fetch_device_info(serial: &Serial) -> serde_json::Value {
     // Shared with `collect` so the device-fact shape stays identical across
     // crash events and diagnostic bundles.
     adb::device_info(serial).await

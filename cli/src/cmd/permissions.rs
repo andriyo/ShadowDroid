@@ -14,6 +14,7 @@
 //! `dumpsys package` / `cmd appops get` and reports the observed result. The
 //! agent can always tell from `now` whether a change actually took.
 
+use crate::ids::Serial;
 use anyhow::Result;
 use std::collections::BTreeMap;
 
@@ -21,11 +22,11 @@ use crate::device::adb;
 
 // ── runtime permissions ─────────────────────────────────────────────────────
 
-pub async fn grant(serial: &str, package: &str, perms: &[String]) -> Result<()> {
+pub async fn grant(serial: &Serial, package: &str, perms: &[String]) -> Result<()> {
     change(serial, package, perms, "grant", "perm_grant").await
 }
 
-pub async fn revoke(serial: &str, package: &str, perms: &[String]) -> Result<()> {
+pub async fn revoke(serial: &Serial, package: &str, perms: &[String]) -> Result<()> {
     change(serial, package, perms, "revoke", "perm_revoke").await
 }
 
@@ -33,7 +34,7 @@ pub async fn revoke(serial: &str, package: &str, perms: &[String]) -> Result<()>
 /// each, then re-read and report `now` (observed state of the requested perms)
 /// and `changed` (those that actually flipped).
 async fn change(
-    serial: &str,
+    serial: &Serial,
     package: &str,
     perms: &[String],
     pm_verb: &str,
@@ -66,7 +67,7 @@ async fn change(
     Ok(())
 }
 
-pub async fn list(serial: &str, package: &str) -> Result<()> {
+pub async fn list(serial: &Serial, package: &str) -> Result<()> {
     let perms = runtime_perms(serial, package).await?;
     emit(
         "perm_list",
@@ -79,7 +80,7 @@ pub async fn list(serial: &str, package: &str) -> Result<()> {
 /// fresh-install prompt state (runtime perms default to denied). Revoking may
 /// kill the app's process — expected. Permissions fixed by policy simply stay
 /// granted in the readback.
-pub async fn reset(serial: &str, package: &str) -> Result<()> {
+pub async fn reset(serial: &Serial, package: &str) -> Result<()> {
     let before = runtime_perms(serial, package).await?;
     let granted: Vec<&String> = before.iter().filter(|(_, &g)| g).map(|(p, _)| p).collect();
     for p in &granted {
@@ -102,7 +103,7 @@ pub async fn reset(serial: &str, package: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn runtime_perms(serial: &str, package: &str) -> Result<BTreeMap<String, bool>> {
+pub async fn runtime_perms(serial: &Serial, package: &str) -> Result<BTreeMap<String, bool>> {
     let dump = adb::shell(serial, format!("dumpsys package {package}")).await?;
     Ok(parse_runtime_perms(&dump))
 }
@@ -111,7 +112,7 @@ pub async fn runtime_perms(serial: &str, package: &str) -> Result<BTreeMap<Strin
 /// verbs (e.g. `app-install --grant-all`). Returns the post-grant runtime-perm
 /// state so the caller can report what actually took.
 pub async fn grant_quiet(
-    serial: &str,
+    serial: &Serial,
     package: &str,
     perms: &[String],
 ) -> Result<BTreeMap<String, bool>> {
@@ -123,7 +124,7 @@ pub async fn grant_quiet(
 
 // ── appops ──────────────────────────────────────────────────────────────────
 
-pub async fn appop_get(serial: &str, package: &str, op: Option<&str>) -> Result<()> {
+pub async fn appop_get(serial: &Serial, package: &str, op: Option<&str>) -> Result<()> {
     let cmd = match op {
         Some(op) => format!("cmd appops get {package} {op}"),
         None => format!("cmd appops get {package}"),
@@ -136,7 +137,7 @@ pub async fn appop_get(serial: &str, package: &str, op: Option<&str>) -> Result<
     Ok(())
 }
 
-pub async fn appop_set(serial: &str, package: &str, op: &str, mode: &str) -> Result<()> {
+pub async fn appop_set(serial: &Serial, package: &str, op: &str, mode: &str) -> Result<()> {
     let _ = adb::shell(serial, format!("cmd appops set {package} {op} {mode}")).await;
     let out = adb::shell(serial, format!("cmd appops get {package} {op}")).await?;
     let now = parse_appops(&out).get(op).cloned();

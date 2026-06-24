@@ -2,6 +2,7 @@
 //! the daemon over the control socket ([crate::net::control]); `check`/`trust`
 //! run host-only logic. `cli::dispatch_net` routes the parsed clap command here.
 
+use crate::ids::Serial;
 use anyhow::{bail, Context, Result};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -33,7 +34,7 @@ fn kill_pid(pid: u32) {
 // ── lifecycle ─────────────────────────────────────────────────
 
 pub async fn start(
-    serial: &str,
+    serial: &Serial,
     port: u16,
     apps: Vec<String>,
     foreground: bool,
@@ -41,7 +42,7 @@ pub async fn start(
     anticomp: bool,
 ) -> Result<()> {
     let cfg = DaemonConfig {
-        serial: serial.to_string(),
+        serial: serial.clone(),
         port,
         app_filters: apps.clone(),
         anticache,
@@ -86,7 +87,7 @@ pub async fn start(
     Ok(())
 }
 
-pub async fn stop(serial: &str, revoke_ca: bool) -> Result<()> {
+pub async fn stop(serial: &Serial, revoke_ca: bool) -> Result<()> {
     // Learn the port from a live daemon (falls back to default for teardown).
     let port = control::request(serial, json!({"op": "status"}))
         .await
@@ -127,7 +128,7 @@ pub async fn stop(serial: &str, revoke_ca: bool) -> Result<()> {
     Ok(())
 }
 
-pub async fn status(serial: &str) -> Result<()> {
+pub async fn status(serial: &Serial) -> Result<()> {
     let running = control::is_running(serial).await;
     let daemon = if running {
         control::request(serial, json!({"op": "status"})).await.ok()
@@ -166,7 +167,7 @@ pub async fn status(serial: &str) -> Result<()> {
 
 /// Point the device at the host proxy: `adb reverse` so device-localhost tunnels
 /// to the host, then set the system `http_proxy` to that localhost port.
-async fn setup_wiring(serial: &str, port: u16) -> Result<()> {
+async fn setup_wiring(serial: &Serial, port: u16) -> Result<()> {
     adb::reverse(serial, port, port).await?;
     adb::shell(
         serial,
@@ -178,7 +179,7 @@ async fn setup_wiring(serial: &str, port: u16) -> Result<()> {
 
 /// Undo [setup_wiring]. Best-effort: clearing a dangling proxy is exactly what
 /// `doctor --fix` also does, so failures here aren't fatal.
-async fn teardown_wiring(serial: &str, port: u16) -> Result<()> {
+async fn teardown_wiring(serial: &Serial, port: u16) -> Result<()> {
     let _ = adb::shell(serial, "settings put global http_proxy :0").await;
     let _ = adb::reverse_remove(serial, port).await;
     Ok(())
@@ -186,7 +187,7 @@ async fn teardown_wiring(serial: &str, port: u16) -> Result<()> {
 
 // ── observe (task 8) ──────────────────────────────────────────
 
-pub async fn log(serial: &str, matcher: Matcher, limit: usize) -> Result<()> {
+pub async fn log(serial: &Serial, matcher: Matcher, limit: usize) -> Result<()> {
     let flows = store::read_filtered(serial, &matcher, limit)?;
     for f in &flows {
         events::emit(&f.http_event());
@@ -195,7 +196,7 @@ pub async fn log(serial: &str, matcher: Matcher, limit: usize) -> Result<()> {
     Ok(())
 }
 
-pub async fn show(serial: &str, id: &str, body: bool, har: bool) -> Result<()> {
+pub async fn show(serial: &Serial, id: &str, body: bool, har: bool) -> Result<()> {
     if har {
         // Single-flow HAR export lives in `net export har <id>`.
         emit(
@@ -222,16 +223,16 @@ pub async fn show(serial: &str, id: &str, body: bool, har: bool) -> Result<()> {
 
 // ── not yet implemented (later tasks) ─────────────────────────
 
-pub async fn check(serial: &str, package: &str) -> Result<()> {
+pub async fn check(serial: &Serial, package: &str) -> Result<()> {
     crate::net::check::run(serial, package).await
 }
 
-pub async fn trust(serial: &str, system: bool, ui: bool) -> Result<()> {
+pub async fn trust(serial: &Serial, system: bool, ui: bool) -> Result<()> {
     crate::net::trust::run(serial, system, ui).await
 }
 
 pub async fn export(
-    serial: &str,
+    serial: &Serial,
     format: &str,
     id: Option<String>,
     out: Option<PathBuf>,
@@ -266,7 +267,7 @@ pub async fn export(
 }
 
 pub async fn intercept(
-    serial: &str,
+    serial: &Serial,
     matcher: Matcher,
     at: String,
     hold_ms: u32,
@@ -281,7 +282,7 @@ pub async fn intercept(
     Ok(())
 }
 
-pub async fn resume(serial: &str, id: &str, mutation: Mutation) -> Result<()> {
+pub async fn resume(serial: &Serial, id: &str, mutation: Mutation) -> Result<()> {
     let reply = control::request(
         serial,
         json!({"op": "resume", "id": id, "mutation": mutation}),
@@ -291,14 +292,14 @@ pub async fn resume(serial: &str, id: &str, mutation: Mutation) -> Result<()> {
     Ok(())
 }
 
-pub async fn drop_flow(serial: &str, id: &str, status: Option<u16>) -> Result<()> {
+pub async fn drop_flow(serial: &Serial, id: &str, status: Option<u16>) -> Result<()> {
     let reply = control::request(serial, json!({"op": "drop", "id": id, "status": status})).await?;
     emit("net_drop", reply);
     Ok(())
 }
 
 pub async fn respond(
-    serial: &str,
+    serial: &Serial,
     id: &str,
     status: u16,
     body: Option<Vec<u8>>,
@@ -313,31 +314,31 @@ pub async fn respond(
     Ok(())
 }
 
-pub async fn rule_add(serial: &str, spec: RuleSpec) -> Result<()> {
+pub async fn rule_add(serial: &Serial, spec: RuleSpec) -> Result<()> {
     let reply = control::request(serial, json!({"op": "rule_add", "spec": spec})).await?;
     emit("net_rule_add", reply);
     Ok(())
 }
 
-pub async fn rule_list(serial: &str) -> Result<()> {
+pub async fn rule_list(serial: &Serial) -> Result<()> {
     let reply = control::request(serial, json!({"op": "rule_list"})).await?;
     emit("net_rule_list", reply);
     Ok(())
 }
 
-pub async fn rule_rm(serial: &str, id: &str) -> Result<()> {
+pub async fn rule_rm(serial: &Serial, id: &str) -> Result<()> {
     let reply = control::request(serial, json!({"op": "rule_rm", "id": id})).await?;
     emit("net_rule_rm", reply);
     Ok(())
 }
 
-pub async fn rule_clear(serial: &str) -> Result<()> {
+pub async fn rule_clear(serial: &Serial) -> Result<()> {
     let reply = control::request(serial, json!({"op": "rule_clear"})).await?;
     emit("net_rule_clear", reply);
     Ok(())
 }
 
-pub async fn rules_apply(serial: &str, file: &Path) -> Result<()> {
+pub async fn rules_apply(serial: &Serial, file: &Path) -> Result<()> {
     let text = std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
     // Accept a JSON array of rule specs, or one spec per line.
     let specs: Vec<RuleSpec> = if text.trim_start().starts_with('[') {
@@ -363,7 +364,7 @@ pub async fn rules_apply(serial: &str, file: &Path) -> Result<()> {
     Ok(())
 }
 
-pub async fn replay(serial: &str, from: &Path, host: Option<String>) -> Result<()> {
+pub async fn replay(serial: &Serial, from: &Path, host: Option<String>) -> Result<()> {
     let text = std::fs::read_to_string(from).with_context(|| format!("read {}", from.display()))?;
     let mut flows: Vec<serde_json::Value> = text
         .lines()
