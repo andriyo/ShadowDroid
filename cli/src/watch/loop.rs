@@ -14,7 +14,7 @@
 //!   - update `last_hash`
 
 use crate::device::client::ServerClient;
-use crate::events::{self, now_ts, Event, ScreenFormat};
+use crate::events::{self, emit_action, now_ts, Event, ScreenFormat};
 use crate::proto::{AppRef, Element, SelectorQuery};
 use crate::watch::watcher::{PermissionDialogPolicy, WatcherRule, WatcherSet};
 use crate::watch::{logcat, stdin};
@@ -388,7 +388,7 @@ async fn dispatch_command(
     let op = req_str(cmd, "cmd")?;
     match op {
         "quit" => {
-            emit_json(json!({"type":"action","cmd":"quit"}));
+            emit_action("quit", &json!({}));
             return Ok(DispatchOutcome::Quit);
         }
         "screen" => {
@@ -407,15 +407,16 @@ async fn dispatch_command(
             let x = req_i32(cmd, "x")?;
             let y = req_i32(cmd, "y")?;
             cfg.client.double_tap(x, y).await?;
-            emit_json(json!({"type":"action","cmd":"double_tap","x":x,"y":y}));
+            emit_action("double_tap", &json!({"x":x, "y":y}));
         }
         "long_tap" => {
             let x = req_i32(cmd, "x")?;
             let y = req_i32(cmd, "y")?;
             let duration_ms = duration_ms(cmd, 600)?;
             cfg.client.long_tap(x, y, duration_ms).await?;
-            emit_json(
-                json!({"type":"action","cmd":"long_tap","x":x,"y":y,"duration_ms":duration_ms}),
+            emit_action(
+                "long_tap",
+                &json!({"x":x, "y":y, "duration_ms":duration_ms}),
             );
         }
         "swipe" | "drag" => {
@@ -427,8 +428,9 @@ async fn dispatch_command(
             } else {
                 cfg.client.swipe(x1, y1, x2, y2, duration_ms).await?;
             }
-            emit_json(
-                json!({"type":"action","cmd":op,"from":[x1,y1],"to":[x2,y2],"duration_ms":duration_ms}),
+            emit_action(
+                op,
+                &json!({"from":[x1,y1], "to":[x2,y2], "duration_ms":duration_ms}),
             );
         }
         "swipe_ext" => {
@@ -436,14 +438,15 @@ async fn dispatch_command(
             let scale = opt_f32(cmd, "scale")?.unwrap_or(0.9);
             let duration_ms = duration_ms(cmd, 200)?;
             cfg.client.swipe_ext(direction, scale, duration_ms).await?;
-            emit_json(
-                json!({"type":"action","cmd":"swipe_ext","direction":direction,"scale":scale,"duration_ms":duration_ms}),
+            emit_action(
+                "swipe_ext",
+                &json!({"direction":direction, "scale":scale, "duration_ms":duration_ms}),
             );
         }
         "key" => {
             let name = req_str(cmd, "name")?;
             let injected = cfg.client.key(name).await?;
-            emit_json(json!({"type":"action","cmd":"key","name":name,"injected":injected}));
+            emit_action("key", &json!({"name":name, "injected":injected}));
         }
         "text" => {
             let value = req_str(cmd, "value")?;
@@ -452,41 +455,43 @@ async fn dispatch_command(
             cfg.client
                 .text_with_target(value, clear, target.as_ref())
                 .await?;
-            emit_json(
-                json!({"type":"action","cmd":"text","value":value,"clear":clear,"target":target}),
+            emit_action(
+                "text",
+                &json!({"value":value, "clear":clear, "target":target}),
             );
         }
         "launch" => {
             let package = req_str(cmd, "package")?;
             cfg.client.app_start(package).await?;
-            emit_json(json!({"type":"action","cmd":"launch","package":package}));
+            emit_action("launch", &json!({"package":package}));
         }
         "stop" => {
             let package = req_str(cmd, "package")?;
             cfg.client.app_stop(package).await?;
-            emit_json(json!({"type":"action","cmd":"stop","package":package}));
+            emit_action("stop", &json!({"package":package}));
         }
         "app_clear" => {
             let package = req_str(cmd, "package")?;
             cfg.client.app_clear(package).await?;
-            emit_json(json!({"type":"action","cmd":"app_clear","package":package}));
+            emit_action("app_clear", &json!({"package":package}));
         }
         "app_wait" => {
             let package = req_str(cmd, "package")?;
             let timeout_ms = timeout_ms(cmd, 20_000)?;
             let front = opt_bool(cmd, "front").unwrap_or(false);
             let r = cfg.client.app_wait(package, timeout_ms, front).await?;
-            emit_json(
-                json!({"type":"action","cmd":"app_wait","package":package,"matched":r.matched,"current":r.current}),
+            emit_action(
+                "app_wait",
+                &json!({"package":package, "matched":r.matched, "current":r.current}),
             );
         }
         "app_info" => {
             let package = req_str(cmd, "package")?;
             let info = cfg.client.app_info(package).await?;
-            emit_json(json!({
-                "type":"action","cmd":"app_info","package":package,
-                "version_name":info.version_name,"version_code":info.version_code,"label":info.label
-            }));
+            emit_action(
+                "app_info",
+                &json!({"package":package, "version_name":info.version_name, "version_code":info.version_code, "label":info.label}),
+            );
         }
         "wait_activity" => {
             let name = req_str(cmd, "name")?;
@@ -496,62 +501,63 @@ async fn dispatch_command(
         "screenshot" => {
             let path = cmd.get("path").and_then(Value::as_str).map(String::from);
             let (path, bytes) = write_screenshot(&cfg.client, path).await?;
-            emit_json(json!({"type":"action","cmd":"screenshot","path":path,"bytes":bytes}));
+            emit_action("screenshot", &json!({"path":path, "bytes":bytes}));
         }
         "shell" => {
             let value = req_any_str(cmd, &["value", "input", "cmdline"])?;
             let timeout_ms = timeout_ms(cmd, 30_000)?;
             let r = cfg.client.shell(value, timeout_ms).await?;
-            emit_json(
-                json!({"type":"action","cmd":"shell","input":r.input,"output":r.output,"exit_code":r.exit_code}),
+            emit_action(
+                "shell",
+                &json!({"input":r.input, "output":r.output, "exit_code":r.exit_code}),
             );
         }
         "screen_on" => {
             cfg.client.screen_on().await?;
-            emit_json(json!({"type":"action","cmd":"screen_on"}));
+            emit_action("screen_on", &json!({}));
         }
         "screen_off" => {
             cfg.client.screen_off().await?;
-            emit_json(json!({"type":"action","cmd":"screen_off"}));
+            emit_action("screen_off", &json!({}));
         }
         "unlock" => {
             cfg.client.unlock().await?;
-            emit_json(json!({"type":"action","cmd":"unlock"}));
+            emit_action("unlock", &json!({}));
         }
         "wakeup" => {
             cfg.client.wakeup().await?;
-            emit_json(json!({"type":"action","cmd":"wakeup"}));
+            emit_action("wakeup", &json!({}));
         }
         "orientation" => {
             let value = cfg.client.orientation_get().await?;
-            emit_json(json!({"type":"action","cmd":"orientation","value":value}));
+            emit_action("orientation", &json!({"value":value}));
         }
         "set_orientation" => {
             let value = req_str(cmd, "value")?;
             cfg.client.orientation_set(value).await?;
-            emit_json(json!({"type":"action","cmd":"set_orientation","value":value}));
+            emit_action("set_orientation", &json!({"value":value}));
         }
         "clipboard" => {
             let value = cfg.client.clipboard_get().await?;
-            emit_json(json!({"type":"action","cmd":"clipboard","value":value}));
+            emit_action("clipboard", &json!({"value":value}));
         }
         "set_clipboard" => {
             let value = req_str(cmd, "value")?;
             cfg.client.clipboard_set(value).await?;
-            emit_json(json!({"type":"action","cmd":"set_clipboard","value":value}));
+            emit_action("set_clipboard", &json!({"value":value}));
         }
         "open_notification" => {
             cfg.client.open_notifications().await?;
-            emit_json(json!({"type":"action","cmd":"open_notification"}));
+            emit_action("open_notification", &json!({}));
         }
         "open_quick_settings" => {
             cfg.client.open_quick_settings().await?;
-            emit_json(json!({"type":"action","cmd":"open_quick_settings"}));
+            emit_action("open_quick_settings", &json!({}));
         }
         "open_url" => {
             let url = req_str(cmd, "url")?;
             cfg.client.open_url(url).await?;
-            emit_json(json!({"type":"action","cmd":"open_url","url":url}));
+            emit_action("open_url", &json!({"url":url}));
         }
         "tap_text" | "tap_rid" | "tap_desc" | "tap_text_and_wait" | "tap_rid_and_wait"
         | "tap_desc_and_wait" => {
@@ -574,8 +580,9 @@ async fn dispatch_command(
             };
             let start_hash = state.last_hash.clone();
             let r = cfg.client.find_tap(&query).await?;
-            emit_json(
-                json!({"type":"action","cmd":base_op,"value":value,"x":r.x,"y":r.y,"action":r.action,"matched":r.matched}),
+            emit_action(
+                base_op,
+                &json!({"value":value, "x":r.x, "y":r.y, "action":r.action, "matched":r.matched}),
             );
             if op.ends_with("_and_wait") {
                 wait_after_action(
@@ -598,15 +605,17 @@ async fn dispatch_command(
         "xpath" => {
             let query = req_any_str(cmd, &["query", "value"])?;
             let r = cfg.client.xpath(query, false).await?;
-            emit_json(
-                json!({"type":"action","cmd":"xpath","query":query,"matched":r.matched,"elements":r.elements}),
+            emit_action(
+                "xpath",
+                &json!({"query":query, "matched":r.matched, "elements":r.elements}),
             );
         }
         "xpath_tap" => {
             let query = req_any_str(cmd, &["query", "value"])?;
             let r = cfg.client.xpath_tap(query).await?;
-            emit_json(
-                json!({"type":"action","cmd":"xpath_tap","query":query,"x":r.x,"y":r.y,"action":r.action,"matched":r.matched}),
+            emit_action(
+                "xpath_tap",
+                &json!({"query":query, "x":r.x, "y":r.y, "action":r.action, "matched":r.matched}),
             );
         }
         "toast" => {
@@ -617,7 +626,7 @@ async fn dispatch_command(
             loop {
                 let recent = cfg.client.toast_recent(start).await?;
                 if !recent.toasts.is_empty() || std::time::Instant::now() >= deadline {
-                    emit_json(json!({"type":"action","cmd":"toast","toasts":recent.toasts}));
+                    emit_action("toast", &json!({"toasts":recent.toasts}));
                     break;
                 }
                 sleep(Duration::from_millis(100)).await;
@@ -628,8 +637,9 @@ async fn dispatch_command(
             let remote = req_str(cmd, "remote")?;
             let bytes = std::fs::read(local).with_context(|| format!("reading {local}"))?;
             let r = cfg.client.push_file(remote, bytes).await?;
-            emit_json(
-                json!({"type":"action","cmd":"push","local":local,"remote":remote,"path":r.path,"bytes":r.bytes}),
+            emit_action(
+                "push",
+                &json!({"local":local, "remote":remote, "path":r.path, "bytes":r.bytes}),
             );
         }
         "pull" => {
@@ -637,8 +647,9 @@ async fn dispatch_command(
             let local = req_str(cmd, "local")?;
             let bytes = cfg.client.pull_file(remote).await?;
             std::fs::write(local, &bytes).with_context(|| format!("writing {local}"))?;
-            emit_json(
-                json!({"type":"action","cmd":"pull","remote":remote,"local":local,"bytes":bytes.len() as u64}),
+            emit_action(
+                "pull",
+                &json!({"remote":remote, "local":local, "bytes":bytes.len() as u64}),
             );
         }
         "wait_for" => {
@@ -657,32 +668,26 @@ async fn dispatch_command(
             });
             let rule: WatcherRule = serde_json::from_value(rule_value)?;
             watchers.add(rule.clone());
-            emit_json(json!({"type":"action","cmd":"add_watcher","name":rule.name}));
+            emit_action("add_watcher", &json!({"name":rule.name}));
         }
         "remove_watcher" => {
             let name = req_str(cmd, "name")?;
             let removed = watchers.remove(name);
-            emit_json(
-                json!({"type":"action","cmd":"remove_watcher","name":name,"removed":removed}),
-            );
+            emit_action("remove_watcher", &json!({"name":name, "removed":removed}));
         }
         "list_watchers" => {
-            emit_json(json!({"type":"action","cmd":"list_watchers","watchers":watchers.list()}));
+            emit_action("list_watchers", &json!({"watchers":watchers.list()}));
         }
         "clear_watchers" => {
             watchers.clear();
-            emit_json(json!({"type":"action","cmd":"clear_watchers"}));
+            emit_action("clear_watchers", &json!({}));
         }
         "permission_dialogs" => {
             let policy = req_str(cmd, "policy")?;
             let policy = PermissionDialogPolicy::parse(policy)
                 .ok_or_else(|| anyhow!("permission_dialogs policy must be ignore|allow|deny"))?;
             watchers.set_permission_dialog_policy(policy);
-            emit_json(json!({
-                "type":"action",
-                "cmd":"permission_dialogs",
-                "policy": policy.as_str()
-            }));
+            emit_action("permission_dialogs", &json!({"policy": policy.as_str()}));
         }
         _ => bail!("unknown cmd: {op}"),
     }
@@ -712,11 +717,10 @@ async fn dispatch_tap(
             })
             .await?;
         let source = r.action.clone().unwrap_or_else(|| "server".to_string());
-        emit_json(json!({
-            "type":"action","cmd":action_cmd,"id":id,"x":r.x,"y":r.y,
-            "source":source,
-            "matched":r.matched
-        }));
+        emit_action(
+            action_cmd,
+            &json!({"id":id, "x":r.x, "y":r.y, "source":source, "matched":r.matched}),
+        );
         return Ok(TapOutcome {
             id: Some(id),
             x: r.x,
@@ -728,7 +732,7 @@ async fn dispatch_tap(
     let x = req_i32(cmd, "x")?;
     let y = req_i32(cmd, "y")?;
     cfg.client.tap_xy(x, y).await?;
-    emit_json(json!({"type":"action","cmd":action_cmd,"x":x,"y":y,"source":"coordinates"}));
+    emit_action(action_cmd, &json!({"x":x, "y":y, "source":"coordinates"}));
     Ok(TapOutcome {
         id: None,
         x: Some(x),
@@ -756,10 +760,10 @@ async fn wait_after_action(
         if let Some(filter) = &cfg.app_filter {
             if !should_emit_package(Some(filter.as_str()), screen.current_app.package.as_deref()) {
                 if std::time::Instant::now() >= deadline {
-                    emit_json(json!({
-                        "type":"action","cmd":action_cmd,"matched":false,
-                        "timeout":true,"reason":"app_filter"
-                    }));
+                    emit_action(
+                        action_cmd,
+                        &json!({"matched":false, "timeout":true, "reason":"app_filter"}),
+                    );
                     return Ok(());
                 }
                 sleep(Duration::from_millis(poll_ms as u64)).await;
@@ -786,20 +790,15 @@ async fn wait_after_action(
                 screen.clone(),
                 cfg.screen_format,
             ));
-            emit_json(json!({
-                "type":"action",
-                "cmd":action_cmd,
-                "matched":done,
-                "timeout": timed_out && !done,
-                "screen_hash":screen.screen_hash,
-                "hash_changed":hash_changed,
-                "tap": tap.map(|tap| json!({
+            emit_action(
+                action_cmd,
+                &json!({"matched":done, "timeout": timed_out && !done, "screen_hash":screen.screen_hash, "hash_changed":hash_changed, "tap": tap.map(|tap| json!({
                     "id":tap.id,
                     "x":tap.x,
                     "y":tap.y,
                     "source":tap.source
-                }))
-            }));
+                }))}),
+            );
             return Ok(());
         }
 
@@ -818,14 +817,16 @@ async fn wait_activity(client: &ServerClient, name: &str, timeout_ms: u32) -> Re
     loop {
         let cur = client.app_current().await?;
         if cur.activity.as_deref().unwrap_or("").contains(name) {
-            emit_json(
-                json!({"type":"action","cmd":"wait_activity","name":name,"matched":true,"current":cur}),
+            emit_action(
+                "wait_activity",
+                &json!({"name":name, "matched":true, "current":cur}),
             );
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
-            emit_json(
-                json!({"type":"action","cmd":"wait_activity","name":name,"matched":false,"current":cur}),
+            emit_action(
+                "wait_activity",
+                &json!({"name":name, "matched":false, "current":cur}),
             );
             return Ok(());
         }
@@ -845,17 +846,17 @@ async fn wait_for(
         let screen = cfg.client.screen().await?;
         let matched = wait_query_matches(cmd, &screen.current_app, &screen.elements);
         if matched != gone {
-            emit_json(json!({
-                "type":"action","cmd":"wait_for","matched":matched,"gone":gone,
-                "screen_hash":screen.screen_hash
-            }));
+            emit_action(
+                "wait_for",
+                &json!({"matched":matched, "gone":gone, "screen_hash":screen.screen_hash}),
+            );
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
-            emit_json(json!({
-                "type":"action","cmd":"wait_for","matched":matched,"gone":gone,
-                "screen_hash":screen.screen_hash,"timeout":true
-            }));
+            emit_action(
+                "wait_for",
+                &json!({"matched":matched, "gone":gone, "screen_hash":screen.screen_hash, "timeout":true}),
+            );
             return Ok(());
         }
         sleep(Duration::from_millis(poll_ms as u64)).await;
@@ -939,10 +940,6 @@ async fn write_screenshot(client: &ServerClient, path: Option<String>) -> Result
     };
     std::fs::write(&path, &bytes).with_context(|| format!("writing {}", path.display()))?;
     Ok((path.display().to_string(), bytes.len() as u64))
-}
-
-fn emit_json(value: Value) {
-    crate::events::emit(&value);
 }
 
 fn unix_ms() -> u64 {
