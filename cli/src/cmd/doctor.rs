@@ -70,7 +70,9 @@ enum OwnerClass {
 pub struct DoctorReport {
     pub target: Option<Serial>,
     pub checks: Vec<Check>,
-    /// Every check is `ok`.
+    /// Every non-advisory check is `ok`. The Studio / debugger-bridge checks are
+    /// advisory (they describe an optional capability, not the driving pipe) and
+    /// do not gate this flag — see `from_checks`.
     pub healthy: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fixed: Option<bool>,
@@ -78,7 +80,14 @@ pub struct DoctorReport {
 
 impl DoctorReport {
     fn from_checks(target: Option<Serial>, checks: Vec<Check>) -> Self {
-        let healthy = checks.iter().all(|c| c.status == Status::Ok);
+        // The Studio / debugger-bridge checks describe an OPTIONAL capability (the
+        // Android Studio debugger), not the host↔device pipe needed to drive the
+        // UI. A missing or idle bridge shouldn't flip `healthy` to false and read
+        // as "device pipe broken" to an agent — gate health on the core checks.
+        const ADVISORY_CODES: &[&str] = &["studio", "studio_plugin", "debugger_bridge"];
+        let healthy = checks
+            .iter()
+            .all(|c| c.status == Status::Ok || ADVISORY_CODES.contains(&c.code));
         Self {
             target,
             checks,

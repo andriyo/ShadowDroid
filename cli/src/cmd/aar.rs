@@ -410,7 +410,7 @@ fn canonical_root(app: &Path) -> Result<PathBuf> {
         .with_context(|| format!("app path does not exist: {}", app.display()))?;
     if !settings_file(&root).is_some() {
         bail!(
-            "`{}` is not a Gradle root (no settings.gradle[.kts]). Pass --app <project root>.",
+            "`{}` is not a Gradle root (no settings.gradle[.kts]). Pass --project-root <path>.",
             root.display()
         );
     }
