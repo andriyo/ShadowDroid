@@ -218,16 +218,10 @@ fn parse_appops(out: &str) -> BTreeMap<String, String> {
 
 // ── output ──────────────────────────────────────────────────────────────────
 
-/// Emit one `{"type":"action","cmd":...}` JSON line, matching the shape the rest
-/// of the CLI prints for one-shot verbs.
+/// Emit one `{"type":"action","cmd":…}` result line — thin adapter over the
+/// shared [`crate::events::emit_action`].
 fn emit(cmd: &str, body: serde_json::Value) {
-    let mut m = serde_json::Map::new();
-    m.insert("type".into(), serde_json::Value::String("action".into()));
-    m.insert("cmd".into(), serde_json::Value::String(cmd.into()));
-    if let serde_json::Value::Object(b) = body {
-        m.extend(b);
-    }
-    println!("{}", serde_json::Value::Object(m));
+    crate::events::emit_action(cmd, &body);
 }
 
 #[cfg(test)]

@@ -243,8 +243,51 @@ pub fn screen_event(device: &str, screen: ScreenResponse, format: ScreenFormat) 
     }
 }
 
-pub fn emit(e: &Event) {
-    println!("{}", serde_json::to_string(e).unwrap());
+/// The single stdout sink for the agent-facing contract: print one JSON line.
+/// Generic so it serves both the typed [`Event`] stream and ad-hoc result
+/// objects. A serialization failure (practically impossible for our types)
+/// degrades to `{}` rather than panicking the process.
+pub fn emit(value: &impl Serialize) {
+    println!(
+        "{}",
+        serde_json::to_string(value).unwrap_or_else(|_| "{}".into())
+    );
+}
+
+/// Emit one `{"type":"action","cmd":…, …body}` result line — the shape every
+/// one-shot command prints. `body`'s fields are merged in after `type`/`cmd`.
+/// The single builder for the action envelope (was reimplemented per module).
+pub fn emit_action(cmd: &str, body: &serde_json::Value) {
+    let mut m = serde_json::Map::new();
+    m.insert("type".into(), "action".into());
+    m.insert("cmd".into(), cmd.into());
+    if let serde_json::Value::Object(b) = body {
+        for (k, v) in b {
+            m.insert(k.clone(), v.clone());
+        }
+    }
+    emit(&serde_json::Value::Object(m));
+}
+
+/// Emit one `{"type":"error","stage":…,"code":…,"msg":…, …extra, "ts":…}` line
+/// on stdout — the same stream as results, so an agent reads one stream and
+/// branches on `type`. The trailing flush guards callers that `process::exit`
+/// immediately after (clap usage path, `main`).
+pub fn emit_error(stage: &str, code: &str, msg: &str, extra: serde_json::Value) {
+    let mut m = serde_json::Map::new();
+    m.insert("type".into(), "error".into());
+    m.insert("stage".into(), stage.into());
+    m.insert("code".into(), code.into());
+    m.insert("msg".into(), msg.into());
+    if let serde_json::Value::Object(b) = extra {
+        for (k, v) in b {
+            m.insert(k, v);
+        }
+    }
+    m.insert("ts".into(), now_ts().into());
+    emit(&serde_json::Value::Object(m));
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
 }
 
 #[cfg(test)]

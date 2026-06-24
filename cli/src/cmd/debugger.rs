@@ -1116,7 +1116,7 @@ async fn control(
 }
 
 fn emit(value: &Value) -> Result<()> {
-    println!("{}", serde_json::to_string(value)?);
+    crate::events::emit(value);
     Ok(())
 }
 

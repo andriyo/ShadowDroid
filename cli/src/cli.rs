@@ -28,7 +28,7 @@ use crate::cmd::studio::{StudioArgs, StudioCmd};
 use crate::config::{expand_config_path, ShadowDroidConfig};
 use crate::device::client::{is_transient_transport_error, ServerClient};
 use crate::device::{adb, installer};
-use crate::events::{CompactElement, ScreenFormat};
+use crate::events::{emit, emit_action, emit_error, CompactElement, ScreenFormat};
 use crate::proto::{Element, SelectorQuery};
 use crate::watch::watcher::PermissionDialogPolicy;
 
@@ -1881,36 +1881,6 @@ async fn dispatch_files(c: FilesCmd, client: &ServerClient, serial: &str) -> Res
 
 // ── emit helpers ────────────────────────────────────────────
 
-fn emit(v: &impl serde::Serialize) {
-    println!("{}", serde_json::to_string(v).unwrap());
-}
-
-/// Emit one structured error object on **stdout** — the same stream as results,
-/// so an agent reads a single stream and branches on `type`. `extra` is merged
-/// in (e.g. `status`, `arg`, `suggestion`). Mirrors `emit_action`'s shape.
-pub(crate) fn emit_error(stage: &str, code: &str, msg: &str, extra: serde_json::Value) {
-    let mut m = serde_json::Map::new();
-    m.insert("type".into(), json!("error"));
-    m.insert("stage".into(), json!(stage));
-    m.insert("code".into(), json!(code));
-    m.insert("msg".into(), json!(msg));
-    if let serde_json::Value::Object(b) = extra {
-        for (k, v) in b {
-            m.insert(k, v);
-        }
-    }
-    m.insert("ts".into(), json!(crate::events::now_ts()));
-    println!(
-        "{}",
-        serde_json::to_string(&serde_json::Value::Object(m)).unwrap()
-    );
-    // Callers (the clap usage path, `main`) often `process::exit` right after,
-    // which skips the normal at-exit flush. Force it so the line is never lost
-    // when stdout is block-buffered (piped/captured).
-    use std::io::Write;
-    let _ = std::io::stdout().flush();
-}
-
 /// Render a failed command as one `{"type":"error",…}` line on stdout. Walks the
 /// `anyhow` chain for a [`ServerError`] so the server's machine `code`
 /// (`element_not_found`, …) and HTTP `status` survive; otherwise falls back to a
@@ -1938,21 +1908,6 @@ pub fn report_error(err: &anyhow::Error) {
     } else {
         emit_error("run", "error", &err.to_string(), json!({}));
     }
-}
-
-fn emit_action(cmd: &str, body: &serde_json::Value) {
-    let mut m = serde_json::Map::new();
-    m.insert("type".into(), serde_json::Value::String("action".into()));
-    m.insert("cmd".into(), serde_json::Value::String(cmd.into()));
-    if let serde_json::Value::Object(b) = body {
-        for (k, v) in b {
-            m.insert(k.clone(), v.clone());
-        }
-    }
-    println!(
-        "{}",
-        serde_json::to_string(&serde_json::Value::Object(m)).unwrap()
-    );
 }
 
 // ── specific handlers ──────────────────────────────────────────

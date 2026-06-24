@@ -257,11 +257,9 @@ fn emit(
     element: Option<&Element>,
     activated: bool,
 ) -> Result<()> {
-    println!(
-        "{}",
-        serde_json::json!({
-            "type": "action",
-            "cmd": "focus",
+    crate::events::emit_action(
+        "focus",
+        &serde_json::json!({
             "selector": selector.label(),
             "matched": matched,
             "steps": steps,
@@ -271,7 +269,7 @@ fn emit(
                 "id": e.id, "text": e.text, "rid": e.rid, "desc": e.desc,
                 "focused": e.focused, "tap": e.tap,
             })),
-        })
+        }),
     );
     Ok(())
 }

@@ -226,11 +226,9 @@ fn emit(
     element: Option<&Element>,
     tapped: bool,
 ) -> Result<()> {
-    println!(
-        "{}",
-        serde_json::json!({
-            "type": "action",
-            "cmd": "scroll_to",
+    crate::events::emit_action(
+        "scroll_to",
+        &serde_json::json!({
             "selector": selector.label(),
             "matched": matched,
             "swipes": swipes,
@@ -239,7 +237,7 @@ fn emit(
             "element": element.map(|e| serde_json::json!({
                 "id": e.id, "text": e.text, "rid": e.rid, "desc": e.desc, "tap": e.tap,
             })),
-        })
+        }),
     );
     Ok(())
 }

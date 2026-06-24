@@ -311,13 +311,7 @@ fn is_empty(p: &Profile) -> bool {
 }
 
 fn emit(cmd: &str, body: serde_json::Value) {
-    let mut m = serde_json::Map::new();
-    m.insert("type".into(), serde_json::Value::String("action".into()));
-    m.insert("cmd".into(), serde_json::Value::String(cmd.into()));
-    if let serde_json::Value::Object(b) = body {
-        m.extend(b);
-    }
-    println!("{}", serde_json::Value::Object(m));
+    crate::events::emit_action(cmd, &body);
 }
 
 #[cfg(test)]

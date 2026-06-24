@@ -78,9 +78,12 @@ pub async fn run(serial: &str, system: bool, ui: bool) -> Result<()> {
 async fn try_system_store(serial: &str, hash: &str) -> (bool, Vec<Value>) {
     let dest = format!("{SYSTEM_CACERTS}/{hash}.0");
     let mut steps = Vec::new();
-    let remount = adb::shell(serial, "mount -o rw,remount / 2>&1; mount -o rw,remount /system 2>&1")
-        .await
-        .unwrap_or_default();
+    let remount = adb::shell(
+        serial,
+        "mount -o rw,remount / 2>&1; mount -o rw,remount /system 2>&1",
+    )
+    .await
+    .unwrap_or_default();
     steps.push(json!({"remount": remount.trim()}));
     let copy = adb::shell(
         serial,
@@ -154,7 +157,14 @@ pub async fn remove(serial: &str) -> Result<bool> {
 fn ca_subject_hash() -> Result<String> {
     let ca = paths::ca_cert_path()?;
     let out = std::process::Command::new("openssl")
-        .args(["x509", "-inform", "PEM", "-subject_hash_old", "-noout", "-in"])
+        .args([
+            "x509",
+            "-inform",
+            "PEM",
+            "-subject_hash_old",
+            "-noout",
+            "-in",
+        ])
         .arg(&ca)
         .output()
         .map_err(|e| anyhow::anyhow!("run openssl (is it on PATH?): {e}"))?;
@@ -166,13 +176,5 @@ fn ca_subject_hash() -> Result<String> {
 }
 
 fn emit(body: Value) {
-    let mut m = serde_json::Map::new();
-    m.insert("type".into(), json!("action"));
-    m.insert("cmd".into(), json!("net_trust"));
-    if let Value::Object(b) = body {
-        for (k, v) in b {
-            m.insert(k, v);
-        }
-    }
-    println!("{}", serde_json::to_string(&serde_json::Value::Object(m)).unwrap());
+    crate::events::emit_action("net_trust", &body);
 }

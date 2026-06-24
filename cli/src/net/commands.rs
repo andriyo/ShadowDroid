@@ -10,17 +10,10 @@ use crate::device::adb;
 use crate::events;
 use crate::net::{control, daemon, paths, store, DaemonConfig, Matcher, Mutation, RuleSpec};
 
-/// Emit a `{"type":"action","cmd":<cmd>, …}` line (the existing CLI envelope).
+/// Emit a `{"type":"action","cmd":<cmd>, …}` line — thin adapter over the shared
+/// [`crate::events::emit_action`].
 fn emit(cmd: &str, body: serde_json::Value) {
-    let mut m = serde_json::Map::new();
-    m.insert("type".into(), json!("action"));
-    m.insert("cmd".into(), json!(cmd));
-    if let serde_json::Value::Object(b) = body {
-        for (k, v) in b {
-            m.insert(k, v);
-        }
-    }
-    println!("{}", serde_json::to_string(&serde_json::Value::Object(m)).unwrap());
+    crate::events::emit_action(cmd, &body);
 }
 
 // ── lifecycle ─────────────────────────────────────────────────
@@ -163,7 +156,11 @@ pub async fn status(serial: &str) -> Result<()> {
 /// to the host, then set the system `http_proxy` to that localhost port.
 async fn setup_wiring(serial: &str, port: u16) -> Result<()> {
     adb::reverse(serial, port, port).await?;
-    adb::shell(serial, format!("settings put global http_proxy localhost:{port}")).await?;
+    adb::shell(
+        serial,
+        format!("settings put global http_proxy localhost:{port}"),
+    )
+    .await?;
     Ok(())
 }
 
@@ -189,7 +186,10 @@ pub async fn log(serial: &str, matcher: Matcher, limit: usize) -> Result<()> {
 pub async fn show(serial: &str, id: &str, body: bool, har: bool) -> Result<()> {
     if har {
         // Single-flow HAR export lives in `net export har <id>`.
-        emit("net_show", json!({"id": id, "hint": "use `net export har <id>` for HAR"}));
+        emit(
+            "net_show",
+            json!({"id": id, "hint": "use `net export har <id>` for HAR"}),
+        );
     }
     // Completed flows live in the session log; a *held* (in-flight) flow lives
     // only in the daemon — try the store first, then ask the daemon.
@@ -270,8 +270,11 @@ pub async fn intercept(
 }
 
 pub async fn resume(serial: &str, id: &str, mutation: Mutation) -> Result<()> {
-    let reply =
-        control::request(serial, json!({"op": "resume", "id": id, "mutation": mutation})).await?;
+    let reply = control::request(
+        serial,
+        json!({"op": "resume", "id": id, "mutation": mutation}),
+    )
+    .await?;
     emit("net_resume", reply);
     Ok(())
 }
@@ -323,8 +326,7 @@ pub async fn rule_clear(serial: &str) -> Result<()> {
 }
 
 pub async fn rules_apply(serial: &str, file: &Path) -> Result<()> {
-    let text =
-        std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
+    let text = std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
     // Accept a JSON array of rule specs, or one spec per line.
     let specs: Vec<RuleSpec> = if text.trim_start().starts_with('[') {
         serde_json::from_str(&text).context("parse rules JSON array")?
@@ -350,8 +352,7 @@ pub async fn rules_apply(serial: &str, file: &Path) -> Result<()> {
 }
 
 pub async fn replay(serial: &str, from: &Path, host: Option<String>) -> Result<()> {
-    let text =
-        std::fs::read_to_string(from).with_context(|| format!("read {}", from.display()))?;
+    let text = std::fs::read_to_string(from).with_context(|| format!("read {}", from.display()))?;
     let mut flows: Vec<serde_json::Value> = text
         .lines()
         .filter(|l| !l.trim().is_empty())

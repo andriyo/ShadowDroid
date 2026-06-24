@@ -1864,7 +1864,7 @@ fn int_field(value: &Value, key: &str) -> Result<i32> {
 }
 
 fn emit_json(value: &Value) -> Result<()> {
-    println!("{}", serde_json::to_string(value)?);
+    crate::events::emit(value);
     Ok(())
 }
 

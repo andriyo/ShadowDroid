@@ -942,7 +942,7 @@ async fn write_screenshot(client: &ServerClient, path: Option<String>) -> Result
 }
 
 fn emit_json(value: Value) {
-    println!("{}", serde_json::to_string(&value).unwrap());
+    crate::events::emit(&value);
 }
 
 fn unix_ms() -> u64 {
