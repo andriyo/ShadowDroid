@@ -292,9 +292,15 @@ impl ServerClient {
     /// delivered, so this is advisory (`injected`) rather than a success flag —
     /// the call still resolves `Ok` for any valid key.
     pub async fn key(&self, name: &str) -> Result<bool> {
-        let r: OkResponse = self
-            .post("/key", &serde_json::json!({"name": name}))
-            .await?;
+        // The on-device `/key` route accepts either a named key (`name`, mapped
+        // server-side) or a raw Android KeyEvent keycode (`code`). The CLI exposes
+        // a single `<NAME>` arg documented as "named key or keycode", so route a
+        // bare integer to `code` and everything else to `name`.
+        let body = match name.trim().parse::<i32>() {
+            Ok(code) => serde_json::json!({ "code": code }),
+            Err(_) => serde_json::json!({ "name": name }),
+        };
+        let r: OkResponse = self.post("/key", &body).await?;
         Ok(r.ok)
     }
     pub async fn text(&self, value: &str, clear: bool) -> Result<()> {
