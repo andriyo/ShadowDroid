@@ -44,7 +44,6 @@ pub enum Event {
         element_count: u32,
         elements: Vec<CompactElement>,
     },
-    Action(ActionResult),
     Crash(CrashEvent),
     WatcherFired {
         name: String,
@@ -175,44 +174,6 @@ impl From<Element> for CompactElement {
 
 fn is_false(value: &bool) -> bool {
     !*value
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "cmd", rename_all = "snake_case")]
-pub enum ActionResult {
-    Tap {
-        id: Option<u32>,
-        x: i32,
-        y: i32,
-    },
-    Swipe {
-        from: [i32; 2],
-        to: [i32; 2],
-        duration_ms: u32,
-    },
-    Key {
-        name: String,
-    },
-    Text {
-        value: String,
-        clear: bool,
-    },
-    Launch {
-        package: String,
-    },
-    Stop {
-        package: String,
-    },
-    Screenshot {
-        path: String,
-        bytes: u64,
-    },
-    Shell {
-        input: String,
-        output: String,
-        exit_code: Option<i32>,
-    },
-    // …etc, one variant per cmd
 }
 
 #[derive(Debug, Clone, Serialize)]

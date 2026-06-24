@@ -13,11 +13,9 @@
 //!   - run watcher rules → dispatch actions, emit `watcher_fired` events
 //!   - update `last_hash`
 
-#![allow(dead_code)]
-
 use crate::device::client::ServerClient;
 use crate::events::{self, now_ts, Event, ScreenFormat};
-use crate::proto::{AppRef, Element, ScreenResponse, SelectorQuery};
+use crate::proto::{AppRef, Element, SelectorQuery};
 use crate::watch::watcher::{PermissionDialogPolicy, WatcherRule, WatcherSet};
 use crate::watch::{logcat, stdin};
 use anyhow::{anyhow, bail, Context, Result};
@@ -60,7 +58,6 @@ enum WatchMsg {
 #[derive(Default)]
 struct WatchState {
     last_hash: Option<String>,
-    last_screen: Option<ScreenResponse>,
 }
 
 pub async fn run(cfg: WatchConfig) -> Result<()> {
@@ -279,7 +276,6 @@ async fn handle_screen_wake(
                 return;
             }
             state.last_hash = Some(screen.screen_hash.clone());
-            state.last_screen = Some(screen.clone());
             let hits = watchers.matches(&screen.screen_hash, &screen.elements);
             events::emit(&events::screen_event(
                 &cfg.serial,
@@ -785,7 +781,6 @@ async fn wait_after_action(
 
         if done || timed_out {
             state.last_hash = Some(screen.screen_hash.clone());
-            state.last_screen = Some(screen.clone());
             events::emit(&events::screen_event(
                 &cfg.serial,
                 screen.clone(),

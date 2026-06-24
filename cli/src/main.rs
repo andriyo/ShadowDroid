@@ -5,8 +5,8 @@
 //!   cmd         — larger multi-step subcommands (doctor, collect, …)
 //!   device      — talking to the on-device server (HTTP) + adb (ADB protocol)
 //!   watch       — event loop, debounce, crash watcher, watcher rule engine
-//!   dump        — XML / element JSON model
 //!   proto       — wire types for the on-device HTTP API
+//!   selector    — canonical text-selector normalization + matching
 //!   events      — JSON event emission (stdout) + types
 //!
 //! Each module is documented in the file header. See README.md for the public
@@ -16,7 +16,6 @@ mod cli;
 mod cmd;
 mod config;
 mod device;
-mod dump;
 mod events;
 mod net;
 mod proto;

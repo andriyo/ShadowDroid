@@ -8,8 +8,6 @@
 //! On a 4xx/5xx response, we try to deserialise the wire error envelope so the
 //! caller gets the structured `code` + `message` rather than just a raw status.
 
-#![allow(dead_code)]
-
 use crate::proto::*;
 use anyhow::{anyhow, Result};
 use reqwest::{Client, Response};
@@ -103,16 +101,6 @@ impl ServerClient {
     pub async fn screen(&self) -> Result<ScreenResponse> {
         self.get_retry("/screen", 4, Duration::from_millis(75))
             .await
-    }
-
-    pub async fn screen_xml(&self) -> Result<String> {
-        let resp = self
-            .http
-            .get(format!("{}/screen?format=xml", self.base))
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(resp.text().await?)
     }
 
     pub async fn screenshot_png(&self) -> Result<Vec<u8>> {
@@ -309,12 +297,6 @@ impl ServerClient {
             .await?;
         Ok(r.ok)
     }
-    pub async fn key_code(&self, code: i32) -> Result<bool> {
-        let r: OkResponse = self
-            .post("/key", &serde_json::json!({"code": code}))
-            .await?;
-        Ok(r.ok)
-    }
     pub async fn text(&self, value: &str, clear: bool) -> Result<()> {
         self.text_with_target(value, clear, None).await
     }
@@ -469,11 +451,6 @@ impl ServerClient {
                 &serde_json::json!({"buffer_size": buffer_size}),
             )
             .await?;
-        Ok(())
-    }
-
-    pub async fn toast_stop(&self) -> Result<()> {
-        let _: OkResponse = self.post_empty("/toast/stop").await?;
         Ok(())
     }
 

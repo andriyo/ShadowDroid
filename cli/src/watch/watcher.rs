@@ -12,8 +12,6 @@
 //! mark rule fired (anti-loop: skip if screen_hash unchanged from last fire),
 //! dispatch each command in `then`, emit `watcher_fired`.
 
-#![allow(dead_code)]
-
 use crate::proto::Element;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};

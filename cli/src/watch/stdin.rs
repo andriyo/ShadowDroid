@@ -7,8 +7,6 @@
 //! Keeps the watch stream's historical shorthand grammar so existing piped
 //! scripts and generated agent integrations keep working.
 
-#![allow(dead_code)]
-
 use anyhow::{anyhow, bail, Result};
 use serde_json::Value;
 

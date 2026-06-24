@@ -8,8 +8,6 @@
 //! On finalise, fetch ~60 lines of broader context via `adb logcat -d -t 60`
 //! and `adb shell getprop` for device info, then emit a `crash` event.
 
-#![allow(dead_code)]
-
 use crate::device::adb;
 use crate::events::{now_ts, CausedBy, CrashEvent, Event};
 use anyhow::{Context, Result};
