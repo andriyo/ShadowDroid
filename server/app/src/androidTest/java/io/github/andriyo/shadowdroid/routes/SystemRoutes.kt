@@ -80,11 +80,25 @@ object SystemRoutes {
 
         route.get("/clipboard") {
             val cm = instr.targetContext.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            // Android 10+ (API 29) denies clipboard reads to apps that are neither
+            // the foreground app nor the default IME. The instrumentation server is
+            // neither, so a plain getPrimaryClip() returns null regardless of the
+            // real contents. Briefly adopt the shell UID's permission identity (shell
+            // holds READ_CLIPBOARD_IN_BACKGROUND) so the read returns the actual clip;
+            // after this a null genuinely means "empty". (Adopt affects the whole
+            // instrumentation process, but clipboard reads are rare and quick.)
+            val automation = instr.uiAutomation
+            val adopt = Build.VERSION.SDK_INT >= 29
+            if (adopt) automation.adoptShellPermissionIdentity()
             val text =
-                cm.primaryClip
-                    ?.getItemAt(0)
-                    ?.coerceToText(instr.targetContext)
-                    ?.toString()
+                try {
+                    cm.primaryClip
+                        ?.getItemAt(0)
+                        ?.coerceToText(instr.targetContext)
+                        ?.toString()
+                } finally {
+                    if (adopt) automation.dropShellPermissionIdentity()
+                }
             call.respond(ClipResp(text))
         }
         route.post("/clipboard") {
