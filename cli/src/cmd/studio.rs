@@ -1088,7 +1088,7 @@ mod tests {
     }
 
     #[test]
-    fn zipbump_smoke_install_plugin_zip_roundtrips() {
+    fn install_plugin_zip_extracts_nested_entries() {
         use std::io::Write;
         use zip::write::{SimpleFileOptions, ZipWriter};
         use zip::CompressionMethod;

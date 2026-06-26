@@ -94,7 +94,7 @@ dependencies {
 
     // ── HTTP server: Ktor 3 (JetBrains-maintained, coroutines-native). ─
     // Engine: CIO (pure-Kotlin, no Netty).
-    val ktor = "3.2.0"
+    val ktor = "3.5.0"
     androidTestImplementation("io.ktor:ktor-server-core:$ktor")
     androidTestImplementation("io.ktor:ktor-server-cio:$ktor")
     androidTestImplementation("io.ktor:ktor-server-content-negotiation:$ktor")
@@ -103,8 +103,8 @@ dependencies {
     androidTestImplementation("io.ktor:ktor-server-call-logging:$ktor")
 
     // ── Coroutines + serialization runtime ─────────────────────────────
-    androidTestImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
-    androidTestImplementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
+    androidTestImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
+    androidTestImplementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
 
     // ── JUnit 4 + AndroidX test core ───────────────────────────────────
     // We use a @Test method that loops forever to keep the Instrumentation

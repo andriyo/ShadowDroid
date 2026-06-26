@@ -9,7 +9,10 @@
 
 plugins {
     id("com.android.application") version "9.2.1" apply false
-    id("org.jetbrains.kotlin.plugin.serialization") version "2.2.0" apply false
+    // Must MATCH AGP 9.2.x's built-in Kotlin (KGP 2.3.10) — the serialization
+    // compiler plugin runs inside that compiler, so it tracks AGP's Kotlin, not
+    // standalone Kotlin releases. Bump in lockstep when AGP's bundled KGP moves.
+    id("org.jetbrains.kotlin.plugin.serialization") version "2.3.10" apply false
     id("org.jlleitschuh.gradle.ktlint") version "14.2.0"
 }
 
