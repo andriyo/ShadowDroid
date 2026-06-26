@@ -962,7 +962,6 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                 "name", session.sessionName,
                 "project", projectInfo(session.project),
                 "suspended", session.isSuspended,
-                "mixed_mode", session.isMixedMode,
                 "process", session.debugProcess.javaClass.name,
                 "position", sourcePositionInfo(pos),
             )

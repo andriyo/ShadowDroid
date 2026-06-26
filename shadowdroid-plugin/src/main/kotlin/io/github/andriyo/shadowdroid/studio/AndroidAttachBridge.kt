@@ -12,8 +12,10 @@ import com.intellij.execution.RunnerAndConfigurationSettings
 import com.intellij.execution.configurations.RunConfiguration
 import com.intellij.openapi.actionSystem.ActionManager
 import com.intellij.openapi.actionSystem.ActionPlaces
+import com.intellij.openapi.actionSystem.ActionUiKind
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.CommonDataKeys
+import com.intellij.openapi.actionSystem.ex.ActionUtil
 import com.intellij.openapi.actionSystem.impl.SimpleDataContext
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.project.Project
@@ -74,9 +76,18 @@ internal object AndroidAttachBridge {
             val dataContext = SimpleDataContext.builder()
                 .add(CommonDataKeys.PROJECT, project)
                 .build()
-            @Suppress("DEPRECATION")
-            val event = AnActionEvent.createFromAnAction(action, null, ActionPlaces.UNKNOWN, dataContext)
-            action.actionPerformed(event)
+            // Build the event with the current factory (createFromAnAction is
+            // deprecated-for-removal) and perform it through ActionUtil --
+            // calling AnAction.actionPerformed directly is @ApiStatus.OverrideOnly.
+            val event = AnActionEvent.createEvent(
+                action,
+                dataContext,
+                null,
+                ActionPlaces.UNKNOWN,
+                ActionUiKind.NONE,
+                null,
+            )
+            ActionUtil.performAction(action, event)
         }
         return BridgeProtocol.ok("ok", true, "action", BridgeValues.ANDROID_CONNECT_DEBUGGER_ACTION, "project", projectInfo(project))
     }
