@@ -713,6 +713,10 @@ pub enum NetCmd {
         /// Include request/response bodies (not just headers).
         #[arg(long)]
         body: bool,
+        /// Write the full response body to this file (avoids inline-JSON
+        /// truncation for large responses) instead of printing the flow.
+        #[arg(long, value_name = "PATH")]
+        body_file: Option<PathBuf>,
         /// Emit the flow as a single-entry HAR object.
         #[arg(long)]
         har: bool,
@@ -826,7 +830,9 @@ pub enum NetCmd {
 
 #[derive(Subcommand)]
 pub enum NetRuleCmd {
-    /// Add a rule (kind = map-local|map-remote|set-status|set-header|replace|block|delay).
+    /// Add a rule. Request-phase kinds: block, delay, map-local, map-remote,
+    /// set-request-header. Response-phase kinds: set-status, set-response-header,
+    /// replace.
     Add(NetRuleAddArgs),
     /// List active rules.
     List,
@@ -838,7 +844,8 @@ pub enum NetRuleCmd {
 
 #[derive(clap::Args)]
 pub struct NetRuleAddArgs {
-    /// map-local | map-remote | set-status | set-header | replace | block | delay
+    /// block | delay | map-local | map-remote | set-request-header | set-status
+    /// | set-response-header | replace
     pub kind: String,
     /// Match flows whose host contains this (substring).
     #[arg(long)]
@@ -852,7 +859,9 @@ pub struct NetRuleAddArgs {
     /// Match flows with this response content-type (substring).
     #[arg(long)]
     pub content_type: Option<String>,
-    /// Kind-specific positional args (e.g. set-status <code>, set-header <name> <value>).
+    /// Kind-specific positional args (e.g. set-status <code>,
+    /// set-request-header / set-response-header <name> <value>, map-remote
+    /// <host:port>).
     pub args: Vec<String>,
 }
 
@@ -1647,7 +1656,12 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial) -> Result<()> {
             status,
             limit,
         } => nc::log(serial, matcher(host, path, method, status), *limit).await,
-        NetCmd::Show { id, body, har } => nc::show(serial, id, *body, *har).await,
+        NetCmd::Show {
+            id,
+            body,
+            body_file,
+            har,
+        } => nc::show(serial, id, *body, *har, body_file.as_deref()).await,
         NetCmd::Export { format, id, out } => {
             nc::export(serial, format, id.clone(), out.clone()).await
         }
@@ -2338,11 +2352,15 @@ async fn cmd_wait(
             let hint = if gone {
                 "still present after timeout — the selector may be too broad, or the element is re-created each frame"
             } else {
-                "never matched — verify the selector against the live screen (`shadowdroid ui find …` or `ui audit`), or the target screen may not have finished loading"
+                "never matched — verify the selector against the live screen (`shadowdroid ui find …` or `ui audit`), or the screen may have changed (see `top_texts`); the target screen may also just not have finished loading"
             };
+            // The most common timeout cause is the screen having *changed* to
+            // something unexpected (e.g. an error page). Echo the visible texts
+            // so the caller sees what the screen became without a second probe.
+            let top_texts = top_screen_texts(&screen.elements, 12);
             emit_action(
                 "wait",
-                &json!({"matched":matched,"gone":gone,"screen_hash":screen_hash,"current_app":current_app,"timeout":true,"hint":hint}),
+                &json!({"matched":matched,"gone":gone,"screen_hash":screen_hash,"current_app":current_app,"timeout":true,"hint":hint,"top_texts":top_texts}),
             );
             return Ok(());
         }
@@ -2375,6 +2393,24 @@ async fn reconnect_after_screen_error(
     installer::ensure_ready(serial, apk, any_apk_version)
         .await
         .with_context(|| format!("screen request failed ({err}); reconnect failed"))
+}
+
+/// Up to `n` distinct, non-empty visible texts in document order — returned on
+/// `ui wait` timeout so a caller that timed out because the screen changed (e.g.
+/// to an error page) sees *what* it shows now without issuing a second probe.
+fn top_screen_texts(elements: &[Element], n: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for el in elements {
+        if let Some(t) = el.text.as_deref().map(str::trim) {
+            if !t.is_empty() && !out.iter().any(|x| x == t) {
+                out.push(t.to_string());
+                if out.len() >= n {
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 fn wait_query_matches(
@@ -2790,6 +2826,21 @@ mod tests {
             password: false,
             input: false,
         }
+    }
+
+    #[test]
+    fn top_screen_texts_dedupes_trims_and_caps() {
+        let els = [
+            text_el("  Something went wrong  "),
+            text_el(""),
+            text_el("Retry"),
+            text_el("Something went wrong"), // dup after trim — dropped
+            text_el("Contact support"),
+        ];
+        let got = top_screen_texts(&els, 12);
+        assert_eq!(got, ["Something went wrong", "Retry", "Contact support"]);
+        // Cap is honored.
+        assert_eq!(top_screen_texts(&els, 2), ["Something went wrong", "Retry"]);
     }
 
     #[test]

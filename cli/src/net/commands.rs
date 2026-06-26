@@ -65,9 +65,15 @@ pub async fn start(
     }
     daemon::spawn(&cfg)?;
     if !daemon::await_ready(serial, 5000).await {
+        let log = paths::daemon_log_path(serial)?;
+        let reason = match daemon::log_tail(&log, 10) {
+            Some(t) => format!("last log lines:\n{t}"),
+            None => format!("no output in {}", log.display()),
+        };
         bail!(
-            "net daemon did not come up (see {})",
-            paths::daemon_log_path(serial)?.display()
+            "net daemon did not come up within 5s ({}). {}",
+            log.display(),
+            reason
         );
     }
     setup_wiring(serial, port).await?;
@@ -196,7 +202,13 @@ pub async fn log(serial: &Serial, matcher: Matcher, limit: usize) -> Result<()> 
     Ok(())
 }
 
-pub async fn show(serial: &Serial, id: &str, body: bool, har: bool) -> Result<()> {
+pub async fn show(
+    serial: &Serial,
+    id: &str,
+    body: bool,
+    har: bool,
+    body_file: Option<&Path>,
+) -> Result<()> {
     if har {
         // Single-flow HAR export lives in `net export har <id>`.
         emit(
@@ -207,18 +219,56 @@ pub async fn show(serial: &Serial, id: &str, body: bool, har: bool) -> Result<()
     // Completed flows live in the session log; a *held* (in-flight) flow lives
     // only in the daemon — try the store first, then ask the daemon.
     if let Some(flow) = store::find_by_id(serial, id)? {
+        if let Some(path) = body_file {
+            return write_body_file(id, flow.resp_body.as_deref(), flow.resp_truncated, path);
+        }
         println!("{}", serde_json::to_string(&flow.detail(body))?);
         return Ok(());
     }
     if control::is_running(serial).await {
+        // Ask the daemon with bodies so `--body-file` works on a held flow too.
         if let Ok(reply) = control::request(serial, json!({"op": "show", "id": id})).await {
             if let Some(flow) = reply.get("flow").filter(|v| !v.is_null()) {
+                if let Some(path) = body_file {
+                    let resp_body = flow.get("resp_body").and_then(|v| v.as_str());
+                    let truncated = flow
+                        .get("resp_truncated")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    return write_body_file(id, resp_body, truncated, path);
+                }
                 println!("{}", serde_json::to_string(flow)?);
                 return Ok(());
             }
         }
     }
     bail!("no flow `{id}` in the session log or held set (try `net log`)");
+}
+
+/// Write a flow's captured response body to `path` and emit a summary instead of
+/// inlining a large body in the JSON. The body is whatever was stored (up to
+/// [`crate::net::flow::BODY_CAP`]); `truncated` is surfaced so the caller knows
+/// if the response exceeded the capture cap.
+fn write_body_file(
+    id: &str,
+    resp_body: Option<&str>,
+    truncated: bool,
+    path: &Path,
+) -> Result<()> {
+    let Some(b) = resp_body else {
+        bail!("flow `{id}` has no captured response body (binary, empty, or non-textual content-type)");
+    };
+    std::fs::write(path, b).with_context(|| format!("writing {}", path.display()))?;
+    emit(
+        "net_show",
+        json!({
+            "id": id,
+            "saved_body": path.display().to_string(),
+            "bytes": b.len(),
+            "truncated": truncated,
+        }),
+    );
+    Ok(())
 }
 
 // ── not yet implemented (later tasks) ─────────────────────────
@@ -315,9 +365,35 @@ pub async fn respond(
 }
 
 pub async fn rule_add(serial: &Serial, spec: RuleSpec) -> Result<()> {
-    let reply = control::request(serial, json!({"op": "rule_add", "spec": spec})).await?;
+    let warning = map_remote_path_warning(&spec);
+    let mut reply = control::request(serial, json!({"op": "rule_add", "spec": spec})).await?;
+    if let Some(w) = warning {
+        if let Some(obj) = reply.as_object_mut() {
+            obj.insert("warning".into(), json!(w));
+        }
+    }
     emit("net_rule_add", reply);
     Ok(())
+}
+
+/// `map-remote` rewrites scheme+host only and keeps the original request path. If
+/// the replacement URL carries its own path, that path is *prepended* to every
+/// matched request path (→ duplicated segments like `/api/v2/api/v2/...`), which
+/// is almost never intended. Warn so callers pass host+port only.
+fn map_remote_path_warning(spec: &RuleSpec) -> Option<String> {
+    if spec.kind != "map-remote" {
+        return None;
+    }
+    let repl = spec.args.first()?;
+    let after_scheme = repl.split_once("://").map(|(_, r)| r).unwrap_or(repl);
+    let (_authority, path) = after_scheme.split_once('/')?;
+    let path = path.trim_end_matches('/');
+    if path.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "map-remote replaces scheme+host only and keeps the original request path; the `/{path}` in `{repl}` will be prepended to every matched request (duplicated path segments). Pass host+port only unless you intend that."
+    ))
 }
 
 pub async fn rule_list(serial: &Serial) -> Result<()> {
@@ -386,4 +462,38 @@ pub async fn replay(serial: &Serial, from: &Path, host: Option<String>) -> Resul
         json!({"loaded": count, "from": from.display().to_string(), "daemon": reply}),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::Matcher;
+
+    fn spec(kind: &str, arg: &str) -> RuleSpec {
+        RuleSpec {
+            kind: kind.into(),
+            matcher: Matcher::default(),
+            content_type: None,
+            args: vec![arg.into()],
+        }
+    }
+
+    #[test]
+    fn map_remote_warns_only_when_replacement_has_a_path() {
+        // host+port only (with or without scheme, trailing slash) — no warning.
+        assert!(map_remote_path_warning(&spec("map-remote", "localhost:8080")).is_none());
+        assert!(map_remote_path_warning(&spec("map-remote", "https://localhost:8080")).is_none());
+        assert!(map_remote_path_warning(&spec("map-remote", "https://localhost:8080/")).is_none());
+
+        // A path in the replacement is the foot-gun — warn and name the path.
+        let w = map_remote_path_warning(&spec(
+            "map-remote",
+            "http://localhost:8080/device-ips/screens/v2",
+        ))
+        .expect("path should trigger a warning");
+        assert!(w.contains("/device-ips/screens/v2"));
+
+        // Other rule kinds never warn.
+        assert!(map_remote_path_warning(&spec("set-request-header", "x-debug")).is_none());
+    }
 }

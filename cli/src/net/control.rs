@@ -314,9 +314,9 @@ fn validate_rule(spec: &RuleSpec) -> Result<(), String> {
     match spec.kind.as_str() {
         "block" => Ok(()),
         "delay" | "map-local" | "map-remote" | "set-status" => need(1),
-        "set-header" | "replace" => need(2),
+        "set-request-header" | "set-response-header" | "replace" => need(2),
         other => Err(format!(
-            "unknown rule kind {other:?} (block|delay|map-local|map-remote|set-status|set-header|replace)"
+            "unknown rule kind {other:?} (block|delay|map-local|map-remote|set-status|set-request-header|set-response-header|replace)"
         )),
     }
 }
@@ -416,4 +416,31 @@ async fn write_request(wr: &mut OwnedWriteHalf, req: &Value) -> Result<()> {
     wr.write_all(line.as_bytes()).await?;
     wr.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::{Matcher, RuleSpec};
+
+    fn spec(kind: &str, args: &[&str]) -> RuleSpec {
+        RuleSpec {
+            kind: kind.into(),
+            matcher: Matcher::default(),
+            content_type: None,
+            args: args.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn validate_rule_knows_request_and_response_header_kinds() {
+        // Both header kinds need name + value.
+        assert!(validate_rule(&spec("set-request-header", &["x-debug", "1"])).is_ok());
+        assert!(validate_rule(&spec("set-response-header", &["cache-control", "no-store"])).is_ok());
+        assert!(validate_rule(&spec("set-request-header", &["x-debug"])).is_err());
+
+        // The old umbrella `set-header` is gone — it now reads as unknown so a
+        // stale rule fails loudly instead of silently applying to the wrong phase.
+        assert!(validate_rule(&spec("set-header", &["a", "b"])).is_err());
+    }
 }

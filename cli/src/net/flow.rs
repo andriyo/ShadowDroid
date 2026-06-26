@@ -13,7 +13,10 @@ use crate::events::Event;
 use crate::net::Matcher;
 
 /// Max bytes of a textual body stored in the session log (per direction).
-pub const BODY_CAP: usize = 64 * 1024;
+/// Generous enough that most JSON/dictionary responses are captured whole;
+/// `net show --body-file` writes whatever was stored, and `resp_truncated`
+/// flags anything that exceeded this cap.
+pub const BODY_CAP: usize = 1024 * 1024;
 /// Max bytes of body shown inline in an `http_intercept` preview.
 pub const PREVIEW_CAP: usize = 512;
 

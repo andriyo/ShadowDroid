@@ -168,6 +168,41 @@ pub fn spawn(cfg: &DaemonConfig) -> Result<u32> {
     Ok(child.id())
 }
 
+/// Last `n` non-empty lines of the daemon log — used to surface a startup
+/// failure reason (e.g. "Address already in use") when [`await_ready`] times
+/// out, instead of leaving the caller to guess why the daemon never came up.
+/// ANSI color codes (the tracing subscriber emits them even to the log file)
+/// are stripped so the reason reads cleanly inside the JSON error envelope.
+pub fn log_tail(path: &std::path::Path, n: usize) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let start = lines.len().saturating_sub(n);
+    Some(strip_ansi(&lines[start..].join("\n")))
+}
+
+/// Drop ANSI SGR escape sequences (`\x1b[…m`) from a string.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip until the sequence terminator (`m` for the SGR codes tracing
+            // emits); tolerate a missing terminator by consuming to end.
+            for e in chars.by_ref() {
+                if e == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Wait (up to `timeout_ms`) for a freshly-spawned daemon's control socket to
 /// accept connections. Returns false on timeout.
 pub async fn await_ready(serial: &Serial, timeout_ms: u64) -> bool {
@@ -179,4 +214,20 @@ pub async fn await_ready(serial: &Serial, timeout_ms: u64) -> bool {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_ansi;
+
+    #[test]
+    fn strip_ansi_removes_sgr_codes() {
+        let raw = "\u{1b}[2m2026\u{1b}[0m \u{1b}[31mERROR\u{1b}[0m proxy run error: bind 127.0.0.1:9988: Address already in use";
+        assert_eq!(
+            strip_ansi(raw),
+            "2026 ERROR proxy run error: bind 127.0.0.1:9988: Address already in use"
+        );
+        // No escapes — unchanged.
+        assert_eq!(strip_ansi("plain line"), "plain line");
+    }
 }

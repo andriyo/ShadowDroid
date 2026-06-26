@@ -307,9 +307,17 @@ async fn proxy_request(
     }
 
     // ── request-phase rules (P3): block / map-local short-circuit; map-remote
-    //    rewrites the URL; delay sleeps before forwarding ──
+    //    rewrites the URL; set-request-header mutates request headers; delay
+    //    sleeps before forwarding ──
     if in_scope {
-        let r = apply_request_rules(&ctx.shared, method.as_str(), &host, &path, &mut url);
+        let r = apply_request_rules(
+            &ctx.shared,
+            method.as_str(),
+            &host,
+            &path,
+            &mut url,
+            &mut req_headers,
+        );
         if r.modified {
             modified = true;
             matched = Some("rule".into());
@@ -432,7 +440,7 @@ async fn proxy_request(
         }
     }
 
-    // ── response-phase rules (P3): set-status / set-header / replace ──
+    // ── response-phase rules (P3): set-status / set-response-header / replace ──
     if in_scope
         && error.is_none()
         && apply_response_rules(
@@ -917,6 +925,7 @@ fn apply_request_rules(
     host: &str,
     path: &str,
     url: &mut String,
+    headers: &mut Vec<(String, String)>,
 ) -> ReqRules {
     let rules = shared.rules.read().unwrap();
     let mut out = ReqRules {
@@ -958,6 +967,12 @@ fn apply_request_rules(
                     out.modified = true;
                 }
             }
+            "set-request-header" => {
+                if let (Some(n), Some(v)) = (spec.args.first(), spec.args.get(1)) {
+                    set_header_vec(headers, n, v);
+                    out.modified = true;
+                }
+            }
             "delay" => {
                 if let Some(ms) = spec.args.first().and_then(|s| s.parse::<u32>().ok()) {
                     out.delay_ms = out.delay_ms.max(ms);
@@ -992,7 +1007,7 @@ fn apply_response_rules(
                     modified = true;
                 }
             }
-            "set-header" => {
+            "set-response-header" => {
                 if let (Some(n), Some(v)) = (spec.args.first(), spec.args.get(1)) {
                     set_header_vec(headers, n, v);
                     modified = true;
@@ -1037,8 +1052,11 @@ fn replay_lookup(
     Some((f.status.unwrap_or(200), f.resp_headers.clone(), body))
 }
 
-/// Rewrite the scheme+authority of a URL (keeping the path), or the authority
-/// only if `repl` has no scheme. `repl` like `https://localhost:8080`.
+/// Rewrite the scheme+authority of a URL (keeping the *original* request path),
+/// or the authority only if `repl` has no scheme. `repl` is like
+/// `https://localhost:8080` — pass host+port only. A path in `repl` is kept and
+/// the original path appended after it, which duplicates segments; `rule_add`
+/// warns about this so callers don't pass a full URL by mistake.
 fn rewrite_url(url: &mut String, repl: &str) {
     let Some(scheme_end) = url.find("://").map(|i| i + 3) else {
         if repl.contains("://") {
