@@ -1,7 +1,6 @@
 # ---- Rust ----
 target/
 **/*.rs.bk
-Cargo.lock         # keep in apps if you want reproducible builds; we'll commit it later
 
 # ---- Android / Gradle ----
 .gradle/
