@@ -411,6 +411,10 @@ Backed by an optional Android Studio plugin:
   Inspector is live) with Compose source locations, semantics, and recomposition
   counters.
 
+Multiple devices debugged in one Studio are addressable: `debug sessions` reports
+each session's device, and the global `-d <serial>` selects that device's session
+for the session-bound commands (an explicit `--session <index>` still wins).
+
 Everything degrades gracefully: with no Studio plugin running, the device and UI
 commands still work and the debugger section just reports `available:false`.
 Run `shadowdroid debug --help` and `shadowdroid layout --help` for the live

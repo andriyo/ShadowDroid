@@ -809,6 +809,12 @@ shadowdroid debug native status
 shadowdroid debug watch add 'this.state'
 ```
 
+Debugging several devices in one Studio: `debug sessions` reports each session's
+`device`, and `-d <serial>` selects that device's session for `pause`/`resume`/
+`step`/`stack`/`variables`/`eval` (otherwise the focused session is used; an
+explicit `--session <index>` still wins). Unknown device → `no debugger session`
+rather than acting on the wrong one.
+
 Prefer `debug record` for longer investigations; it writes a JSONL timeline of
 screen changes, logcat, debugger snapshots, screenshots, and app lifecycle.
 Use `layout snapshot --compose --semantics --source-map` when the question is
