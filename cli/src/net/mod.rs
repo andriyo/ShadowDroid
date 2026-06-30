@@ -90,7 +90,15 @@ pub struct RuleSpec {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DaemonConfig {
     pub serial: crate::ids::Serial,
+    /// The device-facing proxy port: the device's `http_proxy` points here and
+    /// `adb reverse` maps it back to the host. Stays stable (default 8080) — it
+    /// lives in the device's per-device adb namespace, so two devices can both
+    /// use it without colliding.
     pub port: u16,
+    /// The host-side loopback port the proxy actually binds, and the target of
+    /// `adb reverse`. Allocated per-serial so concurrent daemons for different
+    /// devices don't fight over one host port.
+    pub host_port: u16,
     /// Best-effort app scoping (host allowlist is the practical filter today).
     pub app_filters: Vec<String>,
     pub anticache: bool,

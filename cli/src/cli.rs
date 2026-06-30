@@ -870,9 +870,12 @@ pub struct NetDaemonArgs {
     /// ADB serial the daemon wires itself to.
     #[arg(long)]
     pub serial: String,
-    /// Port the daemon listens on.
+    /// Device-facing proxy port (`http_proxy` target; reverse-mapped to the host).
     #[arg(long, default_value_t = crate::net::DEFAULT_PROXY_PORT)]
     pub port: u16,
+    /// Host loopback port the proxy binds (per-serial; set by the parent `net start`).
+    #[arg(long, default_value_t = crate::net::DEFAULT_PROXY_PORT)]
+    pub host_port: u16,
     /// Host globs to scope capture to (repeatable; empty = all).
     #[arg(long)]
     pub host: Vec<String>,
@@ -1752,6 +1755,7 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial) -> Result<()> {
             crate::net::daemon::run(DaemonConfig {
                 serial: Serial::new(a.serial.clone()),
                 port: a.port,
+                host_port: a.host_port,
                 app_filters: a.host.clone(),
                 anticache: a.anticache,
                 anticomp: a.anticomp,
@@ -2585,7 +2589,12 @@ async fn free_ui_automation_slot(serial: &Serial) -> Result<()> {
     adb::am_force_stop(serial, installer::TEST_PACKAGE).await?;
     adb::am_force_stop(serial, installer::APP_PACKAGE).await?;
     adb::kill_instrument_zombies(serial).await?;
-    // Best-effort remove forward; ignore error if it wasn't set.
+    // Best-effort remove forward; ignore error if it wasn't set. Drop the
+    // per-serial host port mapping so the next session reallocates cleanly, and
+    // also clear any legacy fixed-port forward left by an older CLI.
+    if let Some(host_port) = crate::device::portmap::release(serial, installer::UI_CHANNEL) {
+        let _ = adb::forward_remove(serial, host_port).await;
+    }
     let _ = adb::forward_remove(serial, installer::DEFAULT_PORT).await;
     Ok(())
 }

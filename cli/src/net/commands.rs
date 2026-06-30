@@ -41,16 +41,20 @@ pub async fn start(
     anticache: bool,
     anticomp: bool,
 ) -> Result<()> {
+    // Host loopback port is per-serial so concurrent daemons for different
+    // devices don't fight over one port; the device-facing `port` stays stable.
+    let host_port = crate::device::portmap::free_loopback_port()?;
     let cfg = DaemonConfig {
         serial: serial.clone(),
         port,
+        host_port,
         app_filters: apps.clone(),
         anticache,
         anticomp,
     };
 
     if foreground {
-        setup_wiring(serial, port).await?;
+        setup_wiring(serial, port, host_port).await?;
         emit(
             "net_start",
             json!({"device": serial, "port": port, "mode": "foreground"}),
@@ -76,7 +80,7 @@ pub async fn start(
             reason
         );
     }
-    setup_wiring(serial, port).await?;
+    setup_wiring(serial, port, host_port).await?;
     emit(
         "net_start",
         json!({
@@ -171,10 +175,13 @@ pub async fn status(serial: &Serial) -> Result<()> {
     Ok(())
 }
 
-/// Point the device at the host proxy: `adb reverse` so device-localhost tunnels
-/// to the host, then set the system `http_proxy` to that localhost port.
-async fn setup_wiring(serial: &Serial, port: u16) -> Result<()> {
-    adb::reverse(serial, port, port).await?;
+/// Point the device at the host proxy: `adb reverse` so the device's
+/// `localhost:<port>` tunnels to the host's `localhost:<host_port>` (where the
+/// daemon binds), then set the system `http_proxy` to the device-facing port.
+/// `port` and `host_port` differ so concurrent devices share the device-side
+/// port but each own a distinct host port.
+async fn setup_wiring(serial: &Serial, port: u16, host_port: u16) -> Result<()> {
+    adb::reverse(serial, port, host_port).await?;
     adb::shell(
         serial,
         format!("settings put global http_proxy localhost:{port}"),

@@ -20,13 +20,11 @@ use std::net::TcpStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::device::adb;
+use crate::device::{adb, portmap};
 use crate::net::export;
 use crate::net::flow::FlowRecord;
 use crate::net::store;
 
-/// Host-side `adb forward` port used to reach the agent's loopback channel.
-const HOST_PORT: u16 = 8129;
 /// Readiness marker logged once by [ShadowDroidAgent.start]; carries `port=N`.
 const MARKER: &str = "shadowdroid-agent-ready";
 
@@ -64,12 +62,15 @@ pub async fn discover_port(serial: &Serial) -> Result<u16> {
 /// Send one command line; return the parsed single-line JSON response.
 pub async fn send(serial: &Serial, command: String) -> Result<Value> {
     let agent_port = discover_port(serial).await?;
-    adb::forward(serial, HOST_PORT, agent_port).await?;
-    let exchanged = tokio::task::spawn_blocking(move || exchange(HOST_PORT, &command))
+    // A per-call ephemeral host port (torn down right after) so two sessions
+    // talking to in-app agents on different devices don't share a forward.
+    let host_port = portmap::free_loopback_port()?;
+    adb::forward(serial, host_port, agent_port).await?;
+    let exchanged = tokio::task::spawn_blocking(move || exchange(host_port, &command))
         .await
         .context("agent exchange task panicked")?;
     // Best-effort cleanup; the result is what matters.
-    let _ = adb::forward_remove(serial, HOST_PORT).await;
+    let _ = adb::forward_remove(serial, host_port).await;
     exchanged
 }
 

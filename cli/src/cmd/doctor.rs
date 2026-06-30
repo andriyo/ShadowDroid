@@ -242,9 +242,21 @@ async fn apk_check(serial: &Serial) -> Check {
 /// (regardless of version). A not-yet-started server is a `warn`, not a `fail` —
 /// `shadowdroid connect` is the normal way to start it.
 async fn server_check(serial: &Serial) -> (Check, bool) {
-    // The forward is required to reach the device server and is idempotent.
-    adb::forward(serial, DEFAULT_PORT, DEFAULT_PORT).await.ok();
-    let Ok(client) = ServerClient::new(DEFAULT_PORT) else {
+    // The forward is required to reach the device server and is idempotent. The
+    // host port is per-serial (see installer::ensure_forward) so doctor probes
+    // the same loopback port the rest of the CLI uses for this device.
+    let Ok(host_port) = installer::ensure_forward(serial).await else {
+        return (
+            Check {
+                code: "server",
+                status: Status::Fail,
+                detail: "could not set up the adb forward to the device server".into(),
+                remedy: None,
+            },
+            false,
+        );
+    };
+    let Ok(client) = ServerClient::new(host_port) else {
         return (
             Check {
                 code: "server",

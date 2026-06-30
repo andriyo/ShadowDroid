@@ -70,9 +70,11 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         });
     }
 
-    // Proxy listener.
+    // Proxy listener. Binds the per-serial host port (`adb reverse` maps the
+    // device-facing `cfg.port` to it), not `cfg.port` itself, so daemons for
+    // different devices don't collide on one loopback port.
     let (proxy_stop_tx, proxy_stop_rx) = oneshot::channel();
-    let addr: SocketAddr = ([127, 0, 0, 1], cfg.port).into();
+    let addr: SocketAddr = ([127, 0, 0, 1], cfg.host_port).into();
     {
         let ctx = ctx.clone();
         tokio::spawn(async move {
@@ -95,8 +97,9 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
     let ctl_path = paths::ctl_path(&cfg.serial)?;
     std::fs::write(&ctl_path, ctl_port.to_string()).context("write control port file")?;
     tracing::info!(
-        "net daemon up: proxy :{}, control 127.0.0.1:{}",
+        "net daemon up: proxy device :{} -> host 127.0.0.1:{}, control 127.0.0.1:{}",
         cfg.port,
+        cfg.host_port,
         ctl_port
     );
 
@@ -146,7 +149,9 @@ pub fn spawn(cfg: &DaemonConfig) -> Result<u32> {
         .arg("--serial")
         .arg(cfg.serial.as_str())
         .arg("--port")
-        .arg(cfg.port.to_string());
+        .arg(cfg.port.to_string())
+        .arg("--host-port")
+        .arg(cfg.host_port.to_string());
     for app in &cfg.app_filters {
         cmd.arg("--app").arg(app);
     }

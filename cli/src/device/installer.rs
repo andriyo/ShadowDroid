@@ -24,11 +24,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-use crate::device::{adb, client::ServerClient};
+use crate::device::{adb, client::ServerClient, portmap};
 
 pub const EXPECTED_APK_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const APP_PACKAGE: &str = "io.github.andriyo.shadowdroid";
 pub const TEST_PACKAGE: &str = "io.github.andriyo.shadowdroid.test";
+/// [`portmap`] channel for the on-device UI server's host-side `adb forward`.
+pub const UI_CHANNEL: &str = "ui";
 /// Standard AndroidJUnitRunner — we run a normal @Test method in
 /// `SERVER_TEST_CLASS` that holds the process open. See ShadowDroidServerTest.kt
 /// for why this is the proven pattern over a custom runner subclass.
@@ -451,6 +453,21 @@ fn shadowdroid_home() -> Result<PathBuf> {
 
 // ── full lifecycle: resolve → install → forward → instrument → poll ──────
 
+/// Set up `adb forward <host_port> -> tcp:7912` for `serial`, returning the
+/// per-serial host port. Reuses the persisted port (idempotent re-assert); if
+/// that port is now held by an unrelated process, reallocates once. Scoping the
+/// host port to the serial is what lets concurrent sessions drive different
+/// devices without rebinding each other's forward.
+pub async fn ensure_forward(serial: &Serial) -> Result<u16> {
+    let port = portmap::assign(serial, UI_CHANNEL)?;
+    if adb::forward(serial, port, DEFAULT_PORT).await.is_ok() {
+        return Ok(port);
+    }
+    let port = portmap::reassign(serial, UI_CHANNEL)?;
+    adb::forward(serial, port, DEFAULT_PORT).await?;
+    Ok(port)
+}
+
 /// Make sure the device has our server running and reachable, then return
 /// a connected ServerClient ready to use.
 pub async fn ensure_ready(
@@ -460,9 +477,10 @@ pub async fn ensure_ready(
 ) -> Result<ServerClient> {
     // Probe early: if the server is already up from a previous connect, we can
     // skip APK resolution, install checks, and any cooldowns. Warm path stays
-    // <100ms.
-    adb::forward(serial, DEFAULT_PORT, DEFAULT_PORT).await.ok();
-    let client = ServerClient::new(DEFAULT_PORT)?;
+    // <100ms. The host port is per-serial so two sessions on different devices
+    // each connect to their own loopback port.
+    let host_port = ensure_forward(serial).await?;
+    let client = ServerClient::new(host_port)?;
     match probe(&client, any_apk_version).await {
         ProbeResult::Ready => {
             info!("server already up — reusing");
@@ -473,7 +491,7 @@ pub async fn ensure_ready(
                 "server version mismatch: expected {EXPECTED_APK_VERSION}, got {found}; \
                  stopping stale server before reconnect"
             );
-            cleanup_stale_server(serial).await?;
+            cleanup_stale_server(serial, host_port).await?;
         }
         ProbeResult::Down => {}
     }
@@ -483,7 +501,7 @@ pub async fn ensure_ready(
     // claiming it.
     let pair = resolve_apk(explicit_apk).await?;
     install_if_needed(serial, &pair, any_apk_version).await?;
-    adb::forward(serial, DEFAULT_PORT, DEFAULT_PORT).await?;
+    adb::forward(serial, host_port, DEFAULT_PORT).await?;
     start_instrumentation(serial).await?;
     if wait_for_server(serial, &client, any_apk_version)
         .await
@@ -511,12 +529,12 @@ async fn long_cooldown(serial: &Serial) -> Result<()> {
     Ok(())
 }
 
-async fn cleanup_stale_server(serial: &Serial) -> Result<()> {
-    adb::forward_remove(serial, DEFAULT_PORT).await.ok();
+async fn cleanup_stale_server(serial: &Serial, host_port: u16) -> Result<()> {
+    adb::forward_remove(serial, host_port).await.ok();
     adb::kill_instrument_zombies(serial).await?;
     adb::am_force_stop(serial, TEST_PACKAGE).await.ok();
     adb::am_force_stop(serial, APP_PACKAGE).await.ok();
-    adb::forward(serial, DEFAULT_PORT, DEFAULT_PORT).await.ok();
+    adb::forward(serial, host_port, DEFAULT_PORT).await.ok();
     Ok(())
 }
 
