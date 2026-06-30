@@ -296,11 +296,11 @@ impl DebugArgs {
     }
 }
 
-pub async fn run_host_only(args: &DebugArgs) -> Result<()> {
+pub async fn run_host_only(args: &DebugArgs, device: Option<&str>) -> Result<()> {
     match &args.cmd {
-        // Host-only path: no resolved device, so session selection falls back to
-        // the focused/first session as before.
-        DebugCmd::Studio(cmd) => debugger::run(cmd, None, args.studio_url.as_deref()).await,
+        // Host-only path: no device resolution, but an explicit --device still
+        // selects the matching debug session (else falls back to focused/first).
+        DebugCmd::Studio(cmd) => debugger::run(cmd, device, args.studio_url.as_deref()).await,
         _ => anyhow::bail!("debug command requires an Android device connection"),
     }
 }

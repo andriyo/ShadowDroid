@@ -975,7 +975,9 @@ pub async fn run() -> Result<()> {
         // agent and resolve a device serial internally.
         Cmd::Aar(c) => return crate::cmd::aar::run(c, project.as_deref(), device.as_deref()).await,
         Cmd::Debug(args) if args.is_host_only() => {
-            return crate::cmd::debug::run_host_only(args).await
+            // Host-only debugger commands skip device resolution / ensure_ready,
+            // but still honor an explicit --device to pick the matching session.
+            return crate::cmd::debug::run_host_only(args, device.as_deref()).await
         }
         Cmd::Connect => {
             return cmd_connect(device.as_deref(), apk.as_deref(), any_apk_version).await

@@ -973,8 +973,11 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
 
         // The device a debug session is attached to, resolved by matching the
         // session's JDWP connection port to a ddmlib client's debugger port.
-        // Best-effort: returns null for non-Java sessions or when ddmlib can't
-        // be reached, so the rest of the session payload still renders.
+        // ddmlib (`AndroidSdkUtils.getDebugBridge`) must be touched on the IDEA
+        // thread — the HTTP handler runs on the HttpServer thread — so the match
+        // is hopped onto the EDT (mirroring AndroidAttachBridge.clients). Best-
+        // effort: null for non-Java sessions or when ddmlib isn't reachable, so
+        // the rest of the session payload still renders.
         private fun sessionDevice(session: XDebugSession): IDevice? {
             val java = session.debugProcess as? JavaDebugProcess ?: return null
             val ports = try {
@@ -983,23 +986,26 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                     connection.address,
                     connection.debuggerAddress,
                     connection.applicationAddress,
-                ).mapNotNull { it.trim().toIntOrNull() }.toSet()
+                ).mapNotNull { portOf(it) }.toSet()
             } catch (t: Throwable) {
                 emptySet()
             }
             if (ports.isEmpty()) return null
-            val bridge = try {
-                AndroidSdkUtils.getDebugBridge(session.project)
+            return try {
+                StudioThreading.onIdeaThread {
+                    AndroidSdkUtils.getDebugBridge(session.project)?.devices?.firstOrNull { device ->
+                        device.clients.any { it.isValid && it.debuggerListenPort in ports }
+                    }
+                }
             } catch (t: Throwable) {
                 null
-            } ?: return null
-            for (device in bridge.devices) {
-                for (client in device.clients) {
-                    if (client.isValid && client.debuggerListenPort in ports) return device
-                }
             }
-            return null
         }
+
+        // A RemoteConnection address may be "host:port" (e.g. "localhost:64879")
+        // or a bare "port"; take the trailing numeric component either way.
+        private fun portOf(address: String?): Int? =
+            address?.trim()?.takeUnless { it.isEmpty() }?.substringAfterLast(':')?.toIntOrNull()
 
         private fun deviceBrief(device: IDevice): Map<String, Any?> =
             BridgeProtocol.map(
