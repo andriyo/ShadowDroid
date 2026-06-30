@@ -298,7 +298,9 @@ impl DebugArgs {
 
 pub async fn run_host_only(args: &DebugArgs) -> Result<()> {
     match &args.cmd {
-        DebugCmd::Studio(cmd) => debugger::run(cmd, args.studio_url.as_deref()).await,
+        // Host-only path: no resolved device, so session selection falls back to
+        // the focused/first session as before.
+        DebugCmd::Studio(cmd) => debugger::run(cmd, None, args.studio_url.as_deref()).await,
         _ => anyhow::bail!("debug command requires an Android device connection"),
     }
 }
@@ -310,7 +312,7 @@ pub async fn run(serial: &Serial, client: &ServerClient, args: DebugArgs) -> Res
         DebugCmd::Snapshot(args) => snapshot_cmd(serial, client, args, studio_url.as_deref()).await,
         DebugCmd::Record(args) => record_cmd(serial, client, args, studio_url.as_deref()).await,
         DebugCmd::Replay(args) => replay_cmd(client, args).await,
-        DebugCmd::Studio(cmd) => debugger::run(&cmd, studio_url.as_deref()).await,
+        DebugCmd::Studio(cmd) => debugger::run(&cmd, Some(serial.as_str()), studio_url.as_deref()).await,
         DebugCmd::StepUntilScreenChange(args) => {
             step_until_screen_change(serial, client, args, studio_url.as_deref()).await
         }
@@ -610,7 +612,7 @@ async fn snapshot_value(
     } else {
         adb::recent_logcat(serial, args.logs).await
     };
-    let debugger = debugger_snapshot(studio_url, args.depth).await;
+    let debugger = debugger_snapshot(Some(serial.as_str()), studio_url, args.depth).await;
     let sample = debug_sample_value(args, &screen, &debugger, &foreground_activity);
 
     Ok(json!({
@@ -647,8 +649,8 @@ async fn snapshot_value(
     }))
 }
 
-async fn debugger_snapshot(studio_url: Option<&str>, depth: u32) -> Value {
-    let bridge = match BridgeClient::new(studio_url) {
+async fn debugger_snapshot(device: Option<&str>, studio_url: Option<&str>, depth: u32) -> Value {
+    let bridge = match BridgeClient::with_device(studio_url, device) {
         Ok(bridge) => bridge,
         Err(err) => return studio_problem_value("resolve_bridge", err),
     };
@@ -821,7 +823,7 @@ async fn record_cmd(
                     logs: 0,
                     depth: args.depth,
                 };
-                let debugger = debugger_snapshot(studio_url, snap_args.depth).await;
+                let debugger = debugger_snapshot(Some(serial.as_str()), studio_url, snap_args.depth).await;
                 let suspended = debugger_suspended(&debugger);
                 if suspended == Some(true) && last_debugger_suspended != Some(true) {
                     write_event(&mut out, &json!({

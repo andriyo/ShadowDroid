@@ -1,5 +1,7 @@
 package io.github.andriyo.shadowdroid.studio
 
+import com.android.ddmlib.IDevice
+import com.intellij.debugger.engine.JavaDebugProcess
 import com.intellij.debugger.engine.JavaStackFrame
 import com.intellij.debugger.jdi.LocalVariableProxyImpl
 import com.intellij.debugger.jdi.StackFrameProxyImpl
@@ -34,6 +36,7 @@ import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
+import org.jetbrains.android.sdk.AndroidSdkUtils
 
 class ShadowDroidDebuggerBridge : ProjectActivity {
     override suspend fun execute(project: Project) {
@@ -961,10 +964,56 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                 "index", index,
                 "name", session.sessionName,
                 "project", projectInfo(session.project),
+                "device", sessionDevice(session)?.let { deviceBrief(it) },
                 "suspended", session.isSuspended,
                 "process", session.debugProcess.javaClass.name,
                 "position", sourcePositionInfo(pos),
             )
+        }
+
+        // The device a debug session is attached to, resolved by matching the
+        // session's JDWP connection port to a ddmlib client's debugger port.
+        // Best-effort: returns null for non-Java sessions or when ddmlib can't
+        // be reached, so the rest of the session payload still renders.
+        private fun sessionDevice(session: XDebugSession): IDevice? {
+            val java = session.debugProcess as? JavaDebugProcess ?: return null
+            val ports = try {
+                val connection = java.debuggerSession.process.connection
+                listOfNotNull(
+                    connection.address,
+                    connection.debuggerAddress,
+                    connection.applicationAddress,
+                ).mapNotNull { it.trim().toIntOrNull() }.toSet()
+            } catch (t: Throwable) {
+                emptySet()
+            }
+            if (ports.isEmpty()) return null
+            val bridge = try {
+                AndroidSdkUtils.getDebugBridge(session.project)
+            } catch (t: Throwable) {
+                null
+            } ?: return null
+            for (device in bridge.devices) {
+                for (client in device.clients) {
+                    if (client.isValid && client.debuggerListenPort in ports) return device
+                }
+            }
+            return null
+        }
+
+        private fun deviceBrief(device: IDevice): Map<String, Any?> =
+            BridgeProtocol.map(
+                "serial", device.serialNumber,
+                "avd", deviceAvdName(device),
+                "online", device.isOnline,
+            )
+
+        @Suppress("DEPRECATION")
+        private fun deviceAvdName(device: IDevice): String? = device.avdName
+
+        private fun deviceMatches(device: IDevice?, requested: String): Boolean {
+            if (device == null) return false
+            return requested == device.serialNumber || requested == deviceAvdName(device)
         }
 
         private fun sourcePositionInfo(pos: XSourcePosition?): Map<String, Any?>? {
@@ -993,6 +1042,13 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
             val sessions = allSessions()
             query[BridgeQuery.SESSION]?.toIntOrNull()?.let { index ->
                 if (index in sessions.indices) return sessions[index]
+            }
+            // An explicit device selects the session on that device — and only
+            // that device, never a silent fall-through to an unrelated session.
+            // This is what makes the CLI's `--device` target the right session
+            // when several devices are debugged at once.
+            query[BridgeQuery.DEVICE]?.takeUnless { it.isBlank() }?.let { requested ->
+                return sessions.firstOrNull { deviceMatches(sessionDevice(it), requested) }
             }
             for (project in liveProjects()) {
                 XDebuggerManager.getInstance(project).currentSession?.let { return it }

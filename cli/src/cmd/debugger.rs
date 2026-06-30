@@ -547,8 +547,8 @@ pub struct AndroidClientArgs {
     pub device: Option<String>,
 }
 
-pub async fn run(cmd: &DebuggerCmd, studio_url: Option<&str>) -> Result<()> {
-    let bridge = BridgeClient::new(studio_url)?;
+pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&str>) -> Result<()> {
+    let bridge = BridgeClient::with_device(studio_url, device)?;
     let value = match cmd {
         DebuggerCmd::Status => bridge.get(route::STATUS, &[]).await?,
         DebuggerCmd::Sessions => bridge.get(route::SESSIONS, &[]).await?,
@@ -1009,7 +1009,7 @@ async fn continue_until(bridge: &BridgeClient, args: &ContinueUntilArgs) -> Resu
             }
             tokio::time::sleep(std::time::Duration::from_millis(args.poll_ms.max(25))).await;
             let status = bridge.get(route::STATUS, &[]).await?;
-            if !selected_session_suspended(&status, args.session) {
+            if !selected_session_suspended(&status, args.session, bridge.device()) {
                 continue;
             }
             let stack = bridge
@@ -1056,18 +1056,35 @@ async fn continue_until(bridge: &BridgeClient, args: &ContinueUntilArgs) -> Resu
     }
 }
 
-fn selected_session_suspended(status: &Value, selected: Option<usize>) -> bool {
+fn selected_session_suspended(status: &Value, selected: Option<usize>, device: Option<&str>) -> bool {
     status
         .get("sessions")
         .and_then(Value::as_array)
         .and_then(|sessions| {
-            selected
-                .and_then(|index| sessions.get(index))
-                .or_else(|| sessions.first())
+            // Mirror the plugin's selectSession precedence: explicit index, then
+            // device, then the first session.
+            if let Some(index) = selected {
+                sessions.get(index)
+            } else if let Some(dev) = device {
+                sessions
+                    .iter()
+                    .find(|session| session_matches_device(session, dev))
+            } else {
+                sessions.first()
+            }
         })
         .and_then(|session| session.get("suspended"))
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+/// Whether a status `sessions[]` entry is on `device` (serial or AVD name),
+/// using the `device` block the plugin now embeds in each session payload.
+fn session_matches_device(session: &Value, device: &str) -> bool {
+    let block = session.get("device");
+    let serial = block.and_then(|d| d.get("serial")).and_then(Value::as_str);
+    let avd = block.and_then(|d| d.get("avd")).and_then(Value::as_str);
+    serial == Some(device) || avd == Some(device)
 }
 
 fn stack_top_matches(stack: &Value, file: &str, line: u32) -> bool {
@@ -1137,17 +1154,33 @@ fn canonicalize_for_bridge(path: &Path) -> Result<String> {
 pub(crate) struct BridgeClient {
     base_url: String,
     http: reqwest::Client,
+    /// The target device serial, if known. Auto-appended to session-scoped
+    /// routes so the global `--device` picks the matching debug session when
+    /// several devices are debugged in one Studio. `None` for host-only callers.
+    device: Option<String>,
 }
 
 impl BridgeClient {
     pub(crate) fn new(explicit_url: Option<&str>) -> Result<Self> {
+        Self::with_device(explicit_url, None)
+    }
+
+    pub(crate) fn with_device(explicit_url: Option<&str>, device: Option<&str>) -> Result<Self> {
         let base_url = resolve_url(explicit_url)?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_millis(DEFAULT_BRIDGE_TIMEOUT_MS))
             .connect_timeout(Duration::from_millis(2_000))
             .build()
             .context("creating debugger bridge HTTP client")?;
-        Ok(Self { base_url, http })
+        Ok(Self {
+            base_url,
+            http,
+            device: device.map(str::to_string),
+        })
+    }
+
+    pub(crate) fn device(&self) -> Option<&str> {
+        self.device.as_deref()
     }
 
     pub(crate) async fn get(&self, path: &str, params: &[(&str, Option<&str>)]) -> Result<Value> {
@@ -1182,7 +1215,7 @@ impl BridgeClient {
 
     fn url(&self, path: &str, params: &[(&str, Option<&str>)]) -> String {
         let mut url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
-        let query = params
+        let mut pairs: Vec<String> = params
             .iter()
             .filter_map(|(key, value)| value.map(|v| (*key, v)))
             .map(|(key, value)| {
@@ -1192,14 +1225,34 @@ impl BridgeClient {
                     urlencoding::encode(value)
                 )
             })
-            .collect::<Vec<_>>()
-            .join("&");
-        if !query.is_empty() {
+            .collect();
+        // Session-scoped routes default to the session on this client's device
+        // when the caller didn't pin an explicit `session=` index. Harmless when
+        // a session index IS given — the plugin prefers the index.
+        if let Some(device) = &self.device {
+            let already = params.iter().any(|(key, _)| *key == query::DEVICE);
+            if route_is_session_scoped(path) && !already {
+                pairs.push(format!(
+                    "{}={}",
+                    urlencoding::encode(query::DEVICE),
+                    urlencoding::encode(device)
+                ));
+            }
+        }
+        if !pairs.is_empty() {
             url.push('?');
-            url.push_str(&query);
+            url.push_str(&pairs.join("&"));
         }
         url
     }
+}
+
+/// Routes that operate on a single debug session, so the client's `--device`
+/// can pick the matching one. The session-control/stack/variables/evaluate/
+/// inspect/coroutines endpoints all live under `/v1/session/`; the watches list
+/// (`/v1/watches`) also refreshes against a suspended session.
+fn route_is_session_scoped(path: &str) -> bool {
+    path.starts_with("/v1/session/") || path == route::WATCHES
 }
 
 fn resolve_url(explicit_url: Option<&str>) -> Result<String> {
@@ -1229,4 +1282,77 @@ fn registry_url() -> Result<Option<String>> {
         .and_then(Value::as_str)
         .filter(|url| !url.trim().is_empty())
         .map(|url| url.trim().to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const URL: &str = "http://127.0.0.1:50576";
+
+    #[test]
+    fn route_scoping_classification() {
+        assert!(route_is_session_scoped(route::SESSION_STACK));
+        assert!(route_is_session_scoped(route::SESSION_CONTROL));
+        assert!(route_is_session_scoped(route::SESSION_COROUTINES_FLOW));
+        assert!(route_is_session_scoped(route::WATCHES));
+        assert!(!route_is_session_scoped(route::STATUS));
+        assert!(!route_is_session_scoped(route::SESSIONS));
+        assert!(!route_is_session_scoped(route::WATCHES_ADD));
+        assert!(!route_is_session_scoped(route::ATTACH));
+    }
+
+    #[test]
+    fn session_routes_carry_the_clients_device() {
+        let bridge = BridgeClient::with_device(Some(URL), Some("emulator-5556")).unwrap();
+        let u = bridge.url(route::SESSION_STACK, &[(query::LIMIT, Some("4"))]);
+        assert!(u.contains("limit=4"));
+        assert!(u.contains("device=emulator-5556"), "session route should carry device: {u}");
+        assert!(bridge.url(route::WATCHES, &[]).contains("device=emulator-5556"));
+    }
+
+    #[test]
+    fn non_session_routes_omit_the_device() {
+        let bridge = BridgeClient::with_device(Some(URL), Some("emulator-5556")).unwrap();
+        assert!(!bridge.url(route::STATUS, &[]).contains("device="));
+        assert!(!bridge.url(route::SESSIONS, &[]).contains("device="));
+        assert!(!bridge
+            .url(route::WATCHES_ADD, &[(query::EXPRESSION, Some("x"))])
+            .contains("device="));
+    }
+
+    #[test]
+    fn explicit_device_param_is_not_duplicated() {
+        let bridge = BridgeClient::with_device(Some(URL), Some("dev-A")).unwrap();
+        let u = bridge.url(route::SESSION_CONTROL, &[(query::DEVICE, Some("dev-B"))]);
+        assert_eq!(u.matches("device=").count(), 1, "no duplicate device param: {u}");
+        assert!(u.contains("device=dev-B"));
+    }
+
+    #[test]
+    fn no_device_means_no_append() {
+        let bridge = BridgeClient::new(Some(URL)).unwrap();
+        assert!(!bridge.url(route::SESSION_STACK, &[]).contains("device="));
+        assert_eq!(bridge.device(), None);
+    }
+
+    #[test]
+    fn suspension_selects_session_by_device() {
+        let status = json!({"sessions": [
+            {"index": 0, "suspended": false, "device": {"serial": "emulator-5554", "avd": "Pixel_9"}},
+            {"index": 1, "suspended": true,  "device": {"serial": "emulator-5556", "avd": "Pixel_9_Pro_XL"}},
+        ]});
+        // by serial
+        assert!(selected_session_suspended(&status, None, Some("emulator-5556")));
+        assert!(!selected_session_suspended(&status, None, Some("emulator-5554")));
+        // by avd name
+        assert!(selected_session_suspended(&status, None, Some("Pixel_9_Pro_XL")));
+        // explicit index wins over device
+        assert!(!selected_session_suspended(&status, Some(0), Some("emulator-5556")));
+        // unknown device matches nothing (does not fall back to first)
+        assert!(!selected_session_suspended(&status, None, Some("emulator-9999")));
+        // no index, no device -> first session
+        assert!(!selected_session_suspended(&status, None, None));
+    }
 }
