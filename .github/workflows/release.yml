@@ -367,7 +367,8 @@ jobs:
           else
             git add Formula/shadowdroid.rb
             git commit -m "Bump ShadowDroid formula to ${RELEASE_TAG#v}"
-            git push
+            git remote set-url origin "https://x-access-token:${PACKAGE_BOT_TOKEN}@github.com/andriyo/homebrew-tap.git"
+            git push origin HEAD
           fi
 
       - name: Push Scoop bucket update
@@ -381,5 +382,6 @@ jobs:
           else
             git add bucket/shadowdroid.json
             git commit -m "Bump ShadowDroid manifest to ${RELEASE_TAG#v}"
-            git push
+            git remote set-url origin "https://x-access-token:${PACKAGE_BOT_TOKEN}@github.com/andriyo/scoop-bucket.git"
+            git push origin HEAD
           fi
