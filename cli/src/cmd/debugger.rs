@@ -31,14 +31,20 @@ impl DebugMode {
         }
     }
 
+    /// Parse a config-file value. Delegates to the ValueEnum derive so config
+    /// validation and `--mode` accept exactly the same spellings.
     pub fn from_config(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "auto" => Some(DebugMode::Auto),
-            "java" => Some(DebugMode::Java),
-            "native" => Some(DebugMode::Native),
-            "mixed" => Some(DebugMode::Mixed),
-            _ => None,
-        }
+        <Self as clap::ValueEnum>::from_str(value.trim(), true).ok()
+    }
+
+    /// The accepted spellings, for error messages ("auto, java, native, mixed").
+    pub fn allowed_values() -> String {
+        <Self as clap::ValueEnum>::value_variants()
+            .iter()
+            .filter_map(|v| v.to_possible_value())
+            .map(|p| p.get_name().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -1056,7 +1062,11 @@ async fn continue_until(bridge: &BridgeClient, args: &ContinueUntilArgs) -> Resu
     }
 }
 
-fn selected_session_suspended(status: &Value, selected: Option<usize>, device: Option<&str>) -> bool {
+fn selected_session_suspended(
+    status: &Value,
+    selected: Option<usize>,
+    device: Option<&str>,
+) -> bool {
     status
         .get("sessions")
         .and_then(Value::as_array)
@@ -1308,8 +1318,13 @@ mod tests {
         let bridge = BridgeClient::with_device(Some(URL), Some("emulator-5556")).unwrap();
         let u = bridge.url(route::SESSION_STACK, &[(query::LIMIT, Some("4"))]);
         assert!(u.contains("limit=4"));
-        assert!(u.contains("device=emulator-5556"), "session route should carry device: {u}");
-        assert!(bridge.url(route::WATCHES, &[]).contains("device=emulator-5556"));
+        assert!(
+            u.contains("device=emulator-5556"),
+            "session route should carry device: {u}"
+        );
+        assert!(bridge
+            .url(route::WATCHES, &[])
+            .contains("device=emulator-5556"));
     }
 
     #[test]
@@ -1326,7 +1341,11 @@ mod tests {
     fn explicit_device_param_is_not_duplicated() {
         let bridge = BridgeClient::with_device(Some(URL), Some("dev-A")).unwrap();
         let u = bridge.url(route::SESSION_CONTROL, &[(query::DEVICE, Some("dev-B"))]);
-        assert_eq!(u.matches("device=").count(), 1, "no duplicate device param: {u}");
+        assert_eq!(
+            u.matches("device=").count(),
+            1,
+            "no duplicate device param: {u}"
+        );
         assert!(u.contains("device=dev-B"));
     }
 
@@ -1344,14 +1363,34 @@ mod tests {
             {"index": 1, "suspended": true,  "device": {"serial": "emulator-5556", "avd": "Pixel_9_Pro_XL"}},
         ]});
         // by serial
-        assert!(selected_session_suspended(&status, None, Some("emulator-5556")));
-        assert!(!selected_session_suspended(&status, None, Some("emulator-5554")));
+        assert!(selected_session_suspended(
+            &status,
+            None,
+            Some("emulator-5556")
+        ));
+        assert!(!selected_session_suspended(
+            &status,
+            None,
+            Some("emulator-5554")
+        ));
         // by avd name
-        assert!(selected_session_suspended(&status, None, Some("Pixel_9_Pro_XL")));
+        assert!(selected_session_suspended(
+            &status,
+            None,
+            Some("Pixel_9_Pro_XL")
+        ));
         // explicit index wins over device
-        assert!(!selected_session_suspended(&status, Some(0), Some("emulator-5556")));
+        assert!(!selected_session_suspended(
+            &status,
+            Some(0),
+            Some("emulator-5556")
+        ));
         // unknown device matches nothing (does not fall back to first)
-        assert!(!selected_session_suspended(&status, None, Some("emulator-9999")));
+        assert!(!selected_session_suspended(
+            &status,
+            None,
+            Some("emulator-9999")
+        ));
         // no index, no device -> first session
         assert!(!selected_session_suspended(&status, None, None));
     }

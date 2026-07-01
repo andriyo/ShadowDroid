@@ -412,12 +412,12 @@ fn validate_config(
 }
 
 fn validate_debug_mode(path: &Path, field: &str, mode: &str, errors: &mut Vec<String>) {
-    match mode.trim().to_ascii_lowercase().as_str() {
-        "auto" | "java" | "native" | "mixed" => {}
-        _ => errors.push(format!(
-            "{}: {field} must be one of auto, java, native, mixed",
-            path.display()
-        )),
+    if crate::cmd::debugger::DebugMode::from_config(mode).is_none() {
+        errors.push(format!(
+            "{}: {field} must be one of {}",
+            path.display(),
+            crate::cmd::debugger::DebugMode::allowed_values()
+        ));
     }
 }
 
@@ -507,4 +507,27 @@ fn looks_like_package(value: &str) -> bool {
         && value
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_mode_validation_follows_the_value_enum() {
+        let path = Path::new(".shadowdroid.json");
+        let mut errors = Vec::new();
+        for ok in ["auto", "JAVA", " mixed "] {
+            validate_debug_mode(path, "debug_mode", ok, &mut errors);
+        }
+        assert!(errors.is_empty(), "{errors:?}");
+
+        validate_debug_mode(path, "debug_mode", "jdwp", &mut errors);
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("auto, java, native, mixed"),
+            "{}",
+            errors[0]
+        );
+    }
 }

@@ -199,7 +199,7 @@ pub async fn run_init(args: &InitArgs) -> Result<()> {
     if install_studio {
         if let Err(err) = install(args.studio.as_deref(), args.plugin.as_deref(), args.json).await {
             if args.json {
-                print_json(&serde_json::json!({
+                crate::events::emit(&serde_json::json!({
                     "type": "init_step",
                     "step": "studio_plugin",
                     "ok": false,
@@ -220,7 +220,7 @@ pub async fn run_init(args: &InitArgs) -> Result<()> {
     if !args.no_skills {
         let skills = skill::install_default_skills();
         if args.json {
-            println!("{}", serde_json::to_string(&skills)?);
+            crate::events::emit(&skills);
         } else {
             print_skill_install_human(&skills);
         }
@@ -235,7 +235,7 @@ pub async fn run_init(args: &InitArgs) -> Result<()> {
 async fn status(explicit_studio: Option<&Path>, json: bool) -> Result<()> {
     let report = status_report(explicit_studio)?;
     if json {
-        print_json(&report);
+        crate::events::emit(&report);
     } else {
         print_status_human(&report);
     }
@@ -314,7 +314,7 @@ async fn install(
     };
 
     if json {
-        print_json(&report);
+        crate::events::emit(&report);
     } else {
         print_install_human(&report);
     }
@@ -950,10 +950,6 @@ fn print_skill_install_human(value: &serde_json::Value) {
             println!("  - failed {agent}: {error}");
         }
     }
-}
-
-fn print_json<T: Serialize>(value: &T) {
-    println!("{}", serde_json::to_string(value).unwrap());
 }
 
 #[cfg(test)]

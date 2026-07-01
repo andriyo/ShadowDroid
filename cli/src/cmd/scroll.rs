@@ -144,18 +144,16 @@ fn swipe_within(x1: i32, y1: i32, x2: i32, y2: i32, finger_dir: &str) -> (i32, i
 
 /// Emit the result of the fast on-device path (coords only, no element detail).
 fn emit_server(selector: &Selector, resp: &ScrollResp, tap: bool) -> Result<()> {
-    println!(
-        "{}",
-        serde_json::json!({
-            "type": "action",
-            "cmd": "scroll_to",
+    crate::events::emit_action(
+        "scroll_to",
+        &serde_json::json!({
             "selector": selector.label(),
             "matched": resp.matched,
             "swipes": resp.swipes,
             "reason": "server",
             "tapped": tap && resp.matched,
             "element": resp.matched.then(|| serde_json::json!({ "tap": [resp.x, resp.y] })),
-        })
+        }),
     );
     Ok(())
 }

@@ -166,9 +166,7 @@ pub async fn run(serial: &Serial, args: &AppInstallArgs, reinstall: bool) -> Res
             }
         };
         match launch {
-            Ok(out) if !out.contains("Error") && !out.contains("Exception") => {
-                steps.push(Step::ok("launch", package.clone()))
-            }
+            Ok(out) if !launch_failed(&out) => steps.push(Step::ok("launch", package.clone())),
             Ok(out) => steps.push(Step::fail("launch", out.trim().to_string())),
             Err(e) => steps.push(Step::fail("launch", e.to_string())),
         }
@@ -334,9 +332,49 @@ fn sdk_roots() -> Vec<PathBuf> {
     roots
 }
 
+/// Classify `am start`/`monkey` output. Both print unlocalized AOSP English;
+/// failures announce themselves with an `Error…` line ("Error:", "Error type
+/// 3", monkey's "** Error: …"), an exception ("java.lang.SecurityException:
+/// …"), or monkey's "… monkey aborted" epitaph. Matching must be line-anchored
+/// (not a bare substring test) so the echoed component in
+/// "Starting: Intent { cmp=com.x/.ErrorDemoActivity }" doesn't read as a
+/// failure.
+fn launch_failed(out: &str) -> bool {
+    out.lines().any(|line| {
+        let l = line.trim_start().trim_start_matches("** ").trim_start();
+        l.starts_with("Error") || l.contains("Exception:") || l.contains("monkey aborted")
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_badging;
+    use super::{launch_failed, parse_badging};
+
+    #[test]
+    fn launch_failure_is_line_anchored() {
+        // Component names containing "Error" are not failures.
+        assert!(!launch_failed(
+            "Starting: Intent { cmp=com.example/.ErrorDemoActivity }\n"
+        ));
+        // Benign warnings are not failures.
+        assert!(!launch_failed(
+            "Warning: Activity not started, its current task has already been brought to the front\n"
+        ));
+        assert!(launch_failed(
+            "Starting: Intent { cmp=com.example/.Main }\nError type 3\nError: Activity class {com.example/.Main} does not exist.\n"
+        ));
+        assert!(launch_failed(
+            "java.lang.SecurityException: Permission Denial: starting Intent\n"
+        ));
+        // Monkey's no-launcher failure has no Error/Exception wording at all.
+        assert!(launch_failed(
+            "** No activities found to run, monkey aborted.\n"
+        ));
+        assert!(launch_failed("** Error: Unable to launch\n"));
+        assert!(!launch_failed(
+            "Events injected: 1\n## Network stats: elapsed time=32ms\n"
+        ));
+    }
 
     #[test]
     fn parses_badging_fields() {
