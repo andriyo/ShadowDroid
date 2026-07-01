@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::device::adb;
+use crate::hostenv::home_dir;
 
 pub const USER_CONFIG_REL: &str = ".shadowdroid/config.json";
 pub const PROJECT_CONFIG_FILE: &str = ".shadowdroid.json";
@@ -282,12 +283,6 @@ fn config_paths() -> Result<Vec<PathBuf>> {
     project_paths.reverse();
     paths.extend(project_paths);
     Ok(paths)
-}
-
-fn home_dir() -> Result<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("$HOME not set"))
 }
 
 fn looks_like_package(value: &str) -> bool {

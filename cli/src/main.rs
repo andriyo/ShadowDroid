@@ -8,6 +8,8 @@
 //!   proto       — wire types for the on-device HTTP API
 //!   selector    — canonical text-selector normalization + matching
 //!   events      — JSON event emission (stdout) + types
+//!   release     — GitHub release asset download + SHA-256 verification
+//!   hostenv     — host home/data directories + env-var toggles
 //!
 //! Each module is documented in the file header. See README.md for the public
 //! command surface.
@@ -17,9 +19,11 @@ mod cmd;
 mod config;
 mod device;
 mod events;
+mod hostenv;
 mod ids;
 mod net;
 mod proto;
+mod release;
 mod selector;
 mod update;
 mod watch;

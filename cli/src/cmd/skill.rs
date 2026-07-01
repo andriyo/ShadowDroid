@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 use crate::cli::Cli;
+use crate::hostenv::home_dir;
 
 #[derive(clap::Args)]
 pub struct SkillArgs {
@@ -175,20 +176,26 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
 
 fn install_note(agent: &str, path: &Path, install: bool) -> Option<&'static str> {
     match agent {
-        "claude-code" => Some("Claude Code skills are global; restart or reload Claude Code if it was already running."),
-        "cursor" if install || is_cursor_skill_path(path) => Some("Cursor personal skills are global. Restart or reload Cursor if it was already running. For a project rule instead, pass --out <project>/.cursor/rules/shadowdroid.mdc."),
-        "cursor" => Some("Cursor project rules are workspace-scoped. Open the matching project folder in Cursor, or use --install for a global personal skill."),
-        "codex" => Some("Codex AGENTS.md instructions are project-scoped; place the file at the repo root opened by Codex."),
-        "gemini" => Some("Gemini CLI skills are global (~/.gemini/skills). Restart Gemini CLI if it was already running."),
-        "antigravity" => Some("Antigravity skills are global (~/.gemini/antigravity*). Restart Antigravity if it was already running."),
+        "claude-code" => Some(
+            "Claude Code skills are global; restart or reload Claude Code if it was already running.",
+        ),
+        "cursor" if install || is_cursor_skill_path(path) => Some(
+            "Cursor personal skills are global. Restart or reload Cursor if it was already running. For a project rule instead, pass --out <project>/.cursor/rules/shadowdroid.mdc.",
+        ),
+        "cursor" => Some(
+            "Cursor project rules are workspace-scoped. Open the matching project folder in Cursor, or use --install for a global personal skill.",
+        ),
+        "codex" => Some(
+            "Codex AGENTS.md instructions are project-scoped; place the file at the repo root opened by Codex.",
+        ),
+        "gemini" => Some(
+            "Gemini CLI skills are global (~/.gemini/skills). Restart Gemini CLI if it was already running.",
+        ),
+        "antigravity" => Some(
+            "Antigravity skills are global (~/.gemini/antigravity*). Restart Antigravity if it was already running.",
+        ),
         _ => None,
     }
-}
-
-fn home_dir() -> Result<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("$HOME not set"))
 }
 
 /// The agent's conventional integration location (relative to $HOME or $CWD).
@@ -264,7 +271,7 @@ fn wrap_for_agent(agent: &str, body: &str) -> Result<String> {
         other => {
             return Err(anyhow!(
                 "unknown agent '{other}' (claude-code|cursor|codex|gemini|antigravity)"
-            ))
+            ));
         }
     })
 }

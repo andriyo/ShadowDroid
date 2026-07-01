@@ -19,12 +19,16 @@
 
 use crate::ids::Serial;
 use anyhow::{anyhow, bail, Context, Result};
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 use crate::device::{adb, client::ServerClient, portmap};
+use crate::hostenv::{env_truthy, shadowdroid_home};
+use crate::release::{
+    download_file, download_text, expected_sha, release_asset_url, release_base_url, sha256_file,
+    verify_sha256, CHECKSUMS_ASSET,
+};
 
 pub const EXPECTED_APK_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const APP_PACKAGE: &str = "io.github.andriyo.shadowdroid";
@@ -39,7 +43,6 @@ pub const SERVER_TEST_CLASS: &str = "io.github.andriyo.shadowdroid.ShadowDroidSe
 pub const DEFAULT_PORT: u16 = 7912;
 const RELEASE_MAIN_APK_ASSET: &str = "shadowdroid-server-main.apk";
 const RELEASE_TEST_APK_ASSET: &str = "shadowdroid-server-test.apk";
-const RELEASE_CHECKSUMS_ASSET: &str = "SHA256SUMS";
 pub const INSTRUMENT_LOG_PATH: &str = "/sdcard/shadowdroid-instr.log";
 
 /// Where each APK pair came from. Used for logging + to decide whether to
@@ -204,14 +207,14 @@ async fn download_github_release() -> Result<ApkPair> {
     }
     fs::create_dir_all(&staging_dir).context(format!("create {}", staging_dir.display()))?;
 
-    let base = release_base_url();
+    let base = release_base_url(EXPECTED_APK_VERSION);
     let main_url = release_asset_url(&base, RELEASE_MAIN_APK_ASSET);
     let test_url = release_asset_url(&base, RELEASE_TEST_APK_ASSET);
-    let sums_url = release_asset_url(&base, RELEASE_CHECKSUMS_ASSET);
+    let sums_url = release_asset_url(&base, CHECKSUMS_ASSET);
     info!("downloading ShadowDroid server APKs from {base}");
 
     let checksums = download_text(&sums_url).await.with_context(|| {
-        format!("download {RELEASE_CHECKSUMS_ASSET} from GitHub release v{EXPECTED_APK_VERSION}")
+        format!("download {CHECKSUMS_ASSET} from GitHub release v{EXPECTED_APK_VERSION}")
     })?;
     let main_sha = expected_sha(
         option_env!("SHADOWDROID_RELEASE_MAIN_APK_SHA256"),
@@ -255,115 +258,8 @@ async fn download_github_release() -> Result<ApkPair> {
     })
 }
 
-async fn download_text(url: &str) -> Result<String> {
-    let resp = reqwest::Client::new()
-        .get(url)
-        .header(reqwest::header::USER_AGENT, "shadowdroid")
-        .send()
-        .await?
-        .error_for_status()?;
-    Ok(resp.text().await?)
-}
-
-async fn download_file(url: &str, path: &Path) -> Result<()> {
-    let resp = reqwest::Client::new()
-        .get(url)
-        .header(reqwest::header::USER_AGENT, "shadowdroid")
-        .send()
-        .await?
-        .error_for_status()?;
-    let bytes = resp.bytes().await?;
-    tokio::fs::write(path, bytes).await?;
-    Ok(())
-}
-
-fn expected_sha(embedded: Option<&str>, checksums: &str, asset: &str) -> Result<String> {
-    if let Some(value) = embedded.map(str::trim).filter(|s| !s.is_empty()) {
-        return normalize_sha256(value);
-    }
-    checksum_for(checksums, asset)
-        .ok_or_else(|| anyhow!("no checksum found for {asset} in {RELEASE_CHECKSUMS_ASSET}"))
-}
-
-fn checksum_for(checksums: &str, asset: &str) -> Option<String> {
-    checksums.lines().find_map(|line| {
-        let mut parts = line.split_whitespace();
-        let sha = parts.next()?;
-        let name = parts.next()?.trim_start_matches('*');
-        if name == asset {
-            normalize_sha256(sha).ok()
-        } else {
-            None
-        }
-    })
-}
-
-fn normalize_sha256(value: &str) -> Result<String> {
-    let lower = value.trim().to_ascii_lowercase();
-    if lower.len() == 64 && lower.bytes().all(|b| b.is_ascii_hexdigit()) {
-        Ok(lower)
-    } else {
-        bail!("invalid SHA-256 digest: {value}")
-    }
-}
-
-fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
-    let actual = sha256_file(path)?;
-    if actual != expected {
-        bail!(
-            "checksum mismatch for {}: expected {expected}, got {actual}",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-fn sha256_file(path: &Path) -> Result<String> {
-    let bytes = fs::read(path).context(format!("read {}", path.display()))?;
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let digest = hasher.finalize();
-    Ok(hex_lower(&digest))
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        use std::fmt::Write;
-        let _ = write!(&mut out, "{b:02x}");
-    }
-    out
-}
-
-fn release_base_url() -> String {
-    let template = option_env!("SHADOWDROID_RELEASE_BASE_URL")
-        .unwrap_or("https://github.com/andriyo/ShadowDroid/releases/download/v{version}");
-    template
-        .replace("{version}", EXPECTED_APK_VERSION)
-        .trim_end_matches('/')
-        .to_string()
-}
-
-fn release_asset_url(base: &str, asset: &str) -> String {
-    format!("{}/{asset}", base.trim_end_matches('/'))
-}
-
 fn versioned_cache_dir() -> Result<PathBuf> {
     Ok(shadowdroid_home()?.join("apks").join(EXPECTED_APK_VERSION))
-}
-
-/// Truthy-env check shared across the CLI. Accepts `1`/`true`/`yes`/`on`
-/// (case-insensitive, trimmed); unset or anything else (including `0`/`no`/`off`)
-/// is false. Used for `SHADOWDROID_ANY_APK_VERSION` and the dev-source toggle.
-pub fn env_truthy(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
 }
 
 /// Given a path that's either the test APK or a directory containing both,
@@ -440,17 +336,6 @@ fn first_apk_matching(dir: &Path, suffix: &str) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-fn shadowdroid_home() -> Result<PathBuf> {
-    let dirs = directories::ProjectDirs::from("io.github", "andriyo", "ShadowDroid")
-        .ok_or_else(|| anyhow!("cannot determine home directory"))?;
-    let p = dirs.config_dir().to_path_buf();
-    // Fall back to the simpler ~/.shadowdroid for parity with the docs.
-    let home_dot = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|h| h.join(".shadowdroid"));
-    Ok(home_dot.unwrap_or(p))
-}
-
 // ── full lifecycle: resolve → install → forward → instrument → poll ──────
 
 /// Set up `adb forward <host_port> -> tcp:7912` for `serial`, returning the
@@ -511,7 +396,9 @@ pub async fn ensure_ready(
     }
     // First start failed — most likely the UiAutomation slot is still owned
     // by a prior instrumentation/app_process. Heavier cleanup + retry.
-    warn!("first start attempt failed; cooling down 10s and retrying (UiAutomation slot may need time to release)");
+    warn!(
+        "first start attempt failed; cooling down 10s and retrying (UiAutomation slot may need time to release)"
+    );
     long_cooldown(serial).await?;
     start_instrumentation(serial).await?;
     wait_for_server(serial, &client, any_apk_version).await?;
@@ -826,48 +713,6 @@ async fn ui_automation_failure_hint(serial: &Serial) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_sha256sums_lines() {
-        let sums = "\
-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  shadowdroid-server-main.apk
-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa *shadowdroid-server-test.apk
-";
-        assert_eq!(
-            checksum_for(sums, RELEASE_MAIN_APK_ASSET).as_deref(),
-            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
-        );
-        assert_eq!(
-            checksum_for(sums, RELEASE_TEST_APK_ASSET).as_deref(),
-            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-        );
-        assert!(checksum_for(sums, "missing.apk").is_none());
-    }
-
-    #[test]
-    fn rejects_invalid_sha256() {
-        assert!(normalize_sha256("abc").is_err());
-        assert!(normalize_sha256(
-            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn env_truthy_accepts_common_spellings() {
-        // Unique var name keeps this independent of other (parallel) tests.
-        let key = "SHADOWDROID_TEST_ENV_TRUTHY";
-        for v in ["1", "true", "TRUE", "yes", " on ", "On"] {
-            std::env::set_var(key, v);
-            assert!(env_truthy(key), "{v:?} should be truthy");
-        }
-        for v in ["0", "false", "no", "off", "", "banana"] {
-            std::env::set_var(key, v);
-            assert!(!env_truthy(key), "{v:?} should be falsy");
-        }
-        std::env::remove_var(key);
-        assert!(!env_truthy(key), "unset should be falsy");
-    }
 
     #[test]
     fn mislabeled_apk_error_names_the_bypass() {

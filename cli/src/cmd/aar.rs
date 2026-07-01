@@ -16,14 +16,17 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::hostenv::{env_truthy, shadowdroid_home};
+use crate::release::{
+    checksum_for, download_file, download_text, release_base_url, verify_sha256, CHECKSUMS_ASSET,
+};
+
 /// Release asset name (matches the `release.yml` staging step).
 const AAR_ASSET: &str = "shadowdroid-agent.aar";
-const CHECKSUMS_ASSET: &str = "SHA256SUMS";
 const EXPECTED_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Where the AAR is placed inside the target app, relative to the Gradle root.
@@ -200,12 +203,20 @@ pub async fn run(cmd: &AarCmd, project: Option<&Path>, device: Option<&str>) -> 
             let body = match (&a.body, &a.body_file) {
                 (Some(b), _) => Some(b.clone()),
                 (None, Some(f)) => Some(
-                    fs::read_to_string(f).with_context(|| format!("read --body-file {}", f.display()))?,
+                    fs::read_to_string(f)
+                        .with_context(|| format!("read --body-file {}", f.display()))?,
                 ),
                 (None, None) => None,
             };
-            return agent::resume(&serial, &a.id, a.set_status, body, a.content_type.as_deref(), a.json)
-                .await;
+            return agent::resume(
+                &serial,
+                &a.id,
+                a.set_status,
+                body,
+                a.content_type.as_deref(),
+                a.json,
+            )
+            .await;
         }
         AarCmd::Drop(a) => {
             let serial = crate::cli::resolve_serial(device).await?;
@@ -255,8 +266,7 @@ async fn install(args: &InstallArgs, root: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    fs::copy(&resolved.path, &dest)
-        .with_context(|| format!("copy AAR to {}", dest.display()))?;
+    fs::copy(&resolved.path, &dest).with_context(|| format!("copy AAR to {}", dest.display()))?;
 
     let added = wire_dependency(&module_gradle)?;
 
@@ -287,7 +297,10 @@ async fn install(args: &InstallArgs, root: &Path) -> Result<()> {
             "✓ ShadowDroid agent AAR installed into `{}` (module :{})",
             report.app, report.module
         );
-        println!("  source:     {} (version {})", report.aar_source, report.aar_version);
+        println!(
+            "  source:     {} (version {})",
+            report.aar_source, report.aar_version
+        );
         println!("  aar:        {}", report.aar_path);
         println!(
             "  dependency: {}",
@@ -299,7 +312,10 @@ async fn install(args: &InstallArgs, root: &Path) -> Result<()> {
         );
         match build_result {
             "ok" => println!("  build:      :{}:assembleDebug succeeded", report.module),
-            "failed" => println!("  build:      :{}:assembleDebug FAILED (see output above)", report.module),
+            "failed" => println!(
+                "  build:      :{}:assembleDebug FAILED (see output above)",
+                report.module
+            ),
             _ => println!("  build:      skipped (pass --build to verify)"),
         }
         println!(
@@ -353,12 +369,21 @@ fn status(args: &TargetArgs, root: &Path) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else if report.installed {
-        println!("✓ agent AAR installed in `{}` (module :{})", report.app, report.module);
+        println!(
+            "✓ agent AAR installed in `{}` (module :{})",
+            report.app, report.module
+        );
     } else {
-        println!("✗ agent AAR not fully installed in `{}` (module :{})", report.app, report.module);
+        println!(
+            "✗ agent AAR not fully installed in `{}` (module :{})",
+            report.app, report.module
+        );
         println!("  dependency line: {}", yes_no(report.dependency_present));
         println!("  aar file:        {}", yes_no(report.aar_present));
-        println!("  install with: shadowdroid aar install --project-root {}", report.app);
+        println!(
+            "  install with: shadowdroid aar install --project-root {}",
+            report.app
+        );
     }
     Ok(())
 }
@@ -395,9 +420,19 @@ fn remove(args: &TargetArgs, root: &Path) -> Result<()> {
             }))?
         );
     } else {
-        println!("✓ removed agent AAR from `{}` (module :{})", root.display(), module);
-        println!("  dependency line: {}", if removed_dep { "removed" } else { "was absent" });
-        println!("  aar file:        {}", if removed_aar { "removed" } else { "was absent" });
+        println!(
+            "✓ removed agent AAR from `{}` (module :{})",
+            root.display(),
+            module
+        );
+        println!(
+            "  dependency line: {}",
+            if removed_dep { "removed" } else { "was absent" }
+        );
+        println!(
+            "  aar file:        {}",
+            if removed_aar { "removed" } else { "was absent" }
+        );
     }
     Ok(())
 }
@@ -432,7 +467,8 @@ fn settings_file(root: &Path) -> Option<PathBuf> {
 /// each module's build script.
 fn detect_app_module(root: &Path) -> Result<String> {
     let settings = settings_file(root).ok_or_else(|| anyhow!("no settings file"))?;
-    let text = fs::read_to_string(&settings).with_context(|| format!("read {}", settings.display()))?;
+    let text =
+        fs::read_to_string(&settings).with_context(|| format!("read {}", settings.display()))?;
 
     let mut candidates = Vec::new();
     for line in text.lines() {
@@ -455,7 +491,9 @@ fn detect_app_module(root: &Path) -> Result<String> {
             if let Ok(content) = fs::read_to_string(&gradle) {
                 // Match the Android application plugin specifically — not the
                 // bare Gradle `application` plugin used by JVM modules.
-                if content.contains("com.android.application") || content.contains("androidApplication") {
+                if content.contains("com.android.application")
+                    || content.contains("androidApplication")
+                {
                     return Ok(module.clone());
                 }
             }
@@ -483,7 +521,11 @@ fn module_build_gradle(root: &Path, module: &str) -> Result<PathBuf> {
             return Ok(p);
         }
     }
-    bail!("module `{}` has no build.gradle[.kts] under {}", module, dir.display())
+    bail!(
+        "module `{}` has no build.gradle[.kts] under {}",
+        module,
+        dir.display()
+    )
 }
 
 // ── gradle file editing ───────────────────────────────────────────────────────
@@ -491,7 +533,10 @@ fn module_build_gradle(root: &Path, module: &str) -> Result<PathBuf> {
 fn managed_lines() -> [String; 2] {
     [
         format!("    // {DEP_MARKER} — debug-only in-app debug agent"),
-        format!("    debugImplementation(files(rootProject.file(\"{}\")))", APP_AAR_RELPATH),
+        format!(
+            "    debugImplementation(files(rootProject.file(\"{}\")))",
+            APP_AAR_RELPATH
+        ),
     ]
 }
 
@@ -565,9 +610,16 @@ fn unwire_dependency(build_gradle: &Path) -> Result<bool> {
 }
 
 fn gradle_assemble_debug(root: &Path, module: &str) -> Result<bool> {
-    let gradlew = root.join(if cfg!(windows) { "gradlew.bat" } else { "gradlew" });
+    let gradlew = root.join(if cfg!(windows) {
+        "gradlew.bat"
+    } else {
+        "gradlew"
+    });
     if !gradlew.is_file() {
-        bail!("no Gradle wrapper at {} — cannot --build", gradlew.display());
+        bail!(
+            "no Gradle wrapper at {} — cannot --build",
+            gradlew.display()
+        );
     }
     let task = format!(":{module}:assembleDebug");
     eprintln!("→ {} {}", gradlew.display(), task);
@@ -605,12 +657,20 @@ async fn resolve_aar(explicit: Option<&Path>) -> Result<ResolvedAar> {
     if !disable_dev {
         // 2. repo auto-discovery: a freshly-built AAR in the ShadowDroid checkout.
         if let Some(p) = resolve_repo_build()? {
-            return Ok(ResolvedAar { path: p, source: "repo build".into(), version: "dev".into() });
+            return Ok(ResolvedAar {
+                path: p,
+                source: "repo build".into(),
+                version: "dev".into(),
+            });
         }
         // 3. local drop-in
         let dropin = shadowdroid_home()?.join("agent/local").join(AAR_ASSET);
         if dropin.is_file() {
-            return Ok(ResolvedAar { path: dropin, source: "local drop-in".into(), version: "dev".into() });
+            return Ok(ResolvedAar {
+                path: dropin,
+                source: "local drop-in".into(),
+                version: "dev".into(),
+            });
         }
     }
 
@@ -653,7 +713,7 @@ async fn download_release_aar() -> Result<PathBuf> {
     let cache_dir = versioned_cache_dir()?;
     fs::create_dir_all(&cache_dir).with_context(|| format!("create {}", cache_dir.display()))?;
 
-    let base = release_base_url();
+    let base = release_base_url(EXPECTED_VERSION);
     let aar_url = format!("{base}/{AAR_ASSET}");
     let sums_url = format!("{base}/{CHECKSUMS_ASSET}");
 
@@ -671,91 +731,8 @@ async fn download_release_aar() -> Result<PathBuf> {
     Ok(dest)
 }
 
-// ── small self-contained helpers (repo convention: per-module duplication) ────
-
-fn release_base_url() -> String {
-    let template = option_env!("SHADOWDROID_RELEASE_BASE_URL")
-        .unwrap_or("https://github.com/andriyo/ShadowDroid/releases/download/v{version}");
-    template
-        .replace("{version}", EXPECTED_VERSION)
-        .trim_end_matches('/')
-        .to_string()
-}
-
-async fn download_text(url: &str) -> Result<String> {
-    Ok(reqwest::Client::new()
-        .get(url)
-        .header(reqwest::header::USER_AGENT, "shadowdroid")
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?)
-}
-
-async fn download_file(url: &str, path: &Path) -> Result<()> {
-    let bytes = reqwest::Client::new()
-        .get(url)
-        .header(reqwest::header::USER_AGENT, "shadowdroid")
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
-    tokio::fs::write(path, bytes).await?;
-    Ok(())
-}
-
-fn checksum_for(checksums: &str, asset: &str) -> Option<String> {
-    checksums.lines().find_map(|line| {
-        let mut parts = line.split_whitespace();
-        let sha = parts.next()?;
-        let name = parts.next()?.trim_start_matches('*');
-        if name == asset {
-            normalize_sha256(sha).ok()
-        } else {
-            None
-        }
-    })
-}
-
-fn normalize_sha256(value: &str) -> Result<String> {
-    let lower = value.trim().to_ascii_lowercase();
-    if lower.len() == 64 && lower.bytes().all(|b| b.is_ascii_hexdigit()) {
-        Ok(lower)
-    } else {
-        bail!("invalid SHA-256 digest: {value}")
-    }
-}
-
-fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
-    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let actual: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    if actual != expected {
-        bail!("checksum mismatch for {}: expected {expected}, got {actual}", path.display());
-    }
-    Ok(())
-}
-
 fn versioned_cache_dir() -> Result<PathBuf> {
     Ok(shadowdroid_home()?.join("agent").join(EXPECTED_VERSION))
-}
-
-fn shadowdroid_home() -> Result<PathBuf> {
-    let dirs = directories::ProjectDirs::from("io.github", "andriyo", "ShadowDroid")
-        .ok_or_else(|| anyhow!("cannot determine home directory"))?;
-    let home_dot = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|h| h.join(".shadowdroid"));
-    Ok(home_dot.unwrap_or_else(|| dirs.config_dir().to_path_buf()))
-}
-
-fn env_truthy(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
 }
 
 fn yes_no(b: bool) -> &'static str {

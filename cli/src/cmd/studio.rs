@@ -12,7 +12,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read};
@@ -24,10 +23,14 @@ use zip::ZipArchive;
 
 use crate::cmd::skill;
 use crate::cmd::studio_contract;
+use crate::hostenv::{env_truthy, home_dir, shadowdroid_home};
+use crate::release::{
+    download_file, download_text, expected_sha, release_asset_url, release_base_url, sha256_file,
+    verify_sha256, CHECKSUMS_ASSET,
+};
 
 const EXPECTED_PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RELEASE_PLUGIN_ASSET: &str = "shadowdroid-studio-plugin.zip";
-const RELEASE_CHECKSUMS_ASSET: &str = "SHA256SUMS";
 const PLUGIN_DIR_NAME: &str = "shadowdroid-plugin";
 
 #[derive(Args, Debug)]
@@ -281,7 +284,9 @@ async fn install(
             .map(|s| format!("  - {}", s.path))
             .collect::<Vec<_>>()
             .join("\n");
-        bail!("multiple Android Studio installations were detected; choose one with --studio:\n{choices}");
+        bail!(
+            "multiple Android Studio installations were detected; choose one with --studio:\n{choices}"
+        );
     }
 
     let plugin = resolve_plugin(explicit_plugin, true).await?;
@@ -436,7 +441,7 @@ fn default_studio_candidates() -> Vec<PathBuf> {
     {
         candidates.push(PathBuf::from("/Applications/Android Studio.app"));
         candidates.push(PathBuf::from("/Applications/Android Studio Preview.app"));
-        if let Some(home) = home_dir() {
+        if let Ok(home) = home_dir() {
             candidates.push(home.join("Applications/Android Studio.app"));
             candidates.push(home.join("Applications/Android Studio Preview.app"));
             collect_named_dirs(
@@ -452,7 +457,7 @@ fn default_studio_candidates() -> Vec<PathBuf> {
     {
         candidates.push(PathBuf::from("/opt/android-studio"));
         candidates.push(PathBuf::from("/usr/local/android-studio"));
-        if let Some(home) = home_dir() {
+        if let Ok(home) = home_dir() {
             candidates.push(home.join("android-studio"));
             collect_named_dirs(
                 &home.join(".local/share/JetBrains/Toolbox/apps"),
@@ -508,7 +513,7 @@ fn collect_named_dirs(base: &Path, name: &str, max_depth: usize, out: &mut Vec<P
 fn plugins_dir(data_directory_name: &str) -> Result<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        let home = home_dir().ok_or_else(|| anyhow!("cannot determine home directory"))?;
+        let home = home_dir()?;
         Ok(home
             .join("Library/Application Support/Google")
             .join(data_directory_name)
@@ -526,7 +531,7 @@ fn plugins_dir(data_directory_name: &str) -> Result<PathBuf> {
     }
     #[cfg(target_os = "linux")]
     {
-        let home = home_dir().ok_or_else(|| anyhow!("cannot determine home directory"))?;
+        let home = home_dir()?;
         Ok(home.join(".local/share/Google").join(data_directory_name))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
@@ -637,14 +642,14 @@ async fn download_github_release() -> Result<PluginZip> {
     fs::create_dir_all(&staging_dir)
         .with_context(|| format!("create {}", staging_dir.display()))?;
 
-    let base = release_base_url();
+    let base = release_base_url(EXPECTED_PLUGIN_VERSION);
     let plugin_url = release_asset_url(&base, RELEASE_PLUGIN_ASSET);
-    let sums_url = release_asset_url(&base, RELEASE_CHECKSUMS_ASSET);
+    let sums_url = release_asset_url(&base, CHECKSUMS_ASSET);
     info!("downloading ShadowDroid Android Studio plugin from {base}");
 
     let checksums = download_text(&sums_url)
         .await
-        .with_context(|| format!("download {RELEASE_CHECKSUMS_ASSET} from GitHub release"))?;
+        .with_context(|| format!("download {CHECKSUMS_ASSET} from GitHub release"))?;
     let expected = expected_sha(
         option_env!("SHADOWDROID_RELEASE_STUDIO_PLUGIN_SHA256"),
         &checksums,
@@ -797,99 +802,6 @@ fn bridge_status() -> Result<BridgeInfo> {
     })
 }
 
-async fn download_text(url: &str) -> Result<String> {
-    let resp = reqwest::Client::new()
-        .get(url)
-        .header(reqwest::header::USER_AGENT, "shadowdroid")
-        .send()
-        .await?
-        .error_for_status()?;
-    Ok(resp.text().await?)
-}
-
-async fn download_file(url: &str, path: &Path) -> Result<()> {
-    let resp = reqwest::Client::new()
-        .get(url)
-        .header(reqwest::header::USER_AGENT, "shadowdroid")
-        .send()
-        .await?
-        .error_for_status()?;
-    let bytes = resp.bytes().await?;
-    tokio::fs::write(path, bytes).await?;
-    Ok(())
-}
-
-fn expected_sha(embedded: Option<&str>, checksums: &str, asset: &str) -> Result<String> {
-    if let Some(value) = embedded.map(str::trim).filter(|s| !s.is_empty()) {
-        return normalize_sha256(value);
-    }
-    checksum_for(checksums, asset)
-        .ok_or_else(|| anyhow!("no checksum found for {asset} in {RELEASE_CHECKSUMS_ASSET}"))
-}
-
-fn checksum_for(checksums: &str, asset: &str) -> Option<String> {
-    checksums.lines().find_map(|line| {
-        let mut parts = line.split_whitespace();
-        let sha = parts.next()?;
-        let name = parts.next()?.trim_start_matches('*');
-        if name == asset {
-            normalize_sha256(sha).ok()
-        } else {
-            None
-        }
-    })
-}
-
-fn normalize_sha256(value: &str) -> Result<String> {
-    let lower = value.trim().to_ascii_lowercase();
-    if lower.len() == 64 && lower.bytes().all(|b| b.is_ascii_hexdigit()) {
-        Ok(lower)
-    } else {
-        bail!("invalid SHA-256 digest: {value}")
-    }
-}
-
-fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
-    let actual = sha256_file(path)?;
-    if actual != expected {
-        bail!(
-            "checksum mismatch for {}: expected {expected}, got {actual}",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-fn sha256_file(path: &Path) -> Result<String> {
-    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let digest = hasher.finalize();
-    Ok(hex_lower(&digest))
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        use std::fmt::Write;
-        let _ = write!(&mut out, "{b:02x}");
-    }
-    out
-}
-
-fn release_base_url() -> String {
-    let template = option_env!("SHADOWDROID_RELEASE_BASE_URL")
-        .unwrap_or("https://github.com/andriyo/ShadowDroid/releases/download/v{version}");
-    template
-        .replace("{version}", EXPECTED_PLUGIN_VERSION)
-        .trim_end_matches('/')
-        .to_string()
-}
-
-fn release_asset_url(base: &str, asset: &str) -> String {
-    format!("{}/{asset}", base.trim_end_matches('/'))
-}
-
 fn versioned_plugin_cache_file() -> Result<PathBuf> {
     Ok(shadowdroid_home()?
         .join("plugins")
@@ -897,44 +809,19 @@ fn versioned_plugin_cache_file() -> Result<PathBuf> {
         .join(RELEASE_PLUGIN_ASSET))
 }
 
-fn shadowdroid_home() -> Result<PathBuf> {
-    let dirs = directories::ProjectDirs::from("io.github", "andriyo", "ShadowDroid")
-        .ok_or_else(|| anyhow!("cannot determine home directory"))?;
-    let p = dirs.config_dir().to_path_buf();
-    let home_dot = home_dir().map(|h| h.join(".shadowdroid"));
-    Ok(home_dot.unwrap_or(p))
-}
-
 fn expand_home(path: &Path) -> PathBuf {
     let Some(raw) = path.to_str() else {
         return path.to_path_buf();
     };
     if raw == "~" {
-        return home_dir().unwrap_or_else(|| path.to_path_buf());
+        return home_dir().unwrap_or_else(|_| path.to_path_buf());
     }
     if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = home_dir() {
+        if let Ok(home) = home_dir() {
             return home.join(rest);
         }
     }
     path.to_path_buf()
-}
-
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
-}
-
-fn env_truthy(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
 }
 
 fn process_running(pid: u64) -> bool {
@@ -1074,20 +961,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_plugin_checksum() {
-        let sums = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  shadowdroid-studio-plugin.zip\n";
-        assert_eq!(
-            checksum_for(sums, RELEASE_PLUGIN_ASSET).as_deref(),
-            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-        );
-    }
-
-    #[test]
-    fn rejects_bad_plugin_checksum() {
-        assert!(normalize_sha256("not-a-sha").is_err());
-    }
-
-    #[test]
     fn install_plugin_zip_extracts_nested_entries() {
         use std::io::Write;
         use zip::write::{SimpleFileOptions, ZipWriter};
@@ -1098,11 +971,14 @@ mod tests {
         {
             let file = fs::File::create(&zip_path).unwrap();
             let mut zw = ZipWriter::new(file);
-            let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            let deflated =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
             let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
-            zw.start_file("shadowdroid-plugin/lib/plugin.jar", deflated).unwrap();
+            zw.start_file("shadowdroid-plugin/lib/plugin.jar", deflated)
+                .unwrap();
             zw.write_all(b"JARBYTES-deflated").unwrap();
-            zw.start_file("shadowdroid-plugin/META-INF/plugin.xml", stored).unwrap();
+            zw.start_file("shadowdroid-plugin/META-INF/plugin.xml", stored)
+                .unwrap();
             zw.write_all(b"<idea-plugin/>").unwrap();
             zw.finish().unwrap();
         }

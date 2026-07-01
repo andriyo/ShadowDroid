@@ -991,7 +991,7 @@ pub async fn run() -> Result<()> {
     // parsing rejects `1`/`yes` and errors with `[possible values: true, false]`).
     // `env_truthy` accepts 1/true/yes/on; anything else (including 0/no/off) is false.
     let any_apk_version =
-        cli.any_apk_version || installer::env_truthy("SHADOWDROID_ANY_APK_VERSION");
+        cli.any_apk_version || crate::hostenv::env_truthy("SHADOWDROID_ANY_APK_VERSION");
     let mut cmd = cli.cmd;
     apply_config_defaults(&mut cmd, &config);
 
@@ -1018,7 +1018,7 @@ pub async fn run() -> Result<()> {
             return crate::cmd::debug::run_host_only(args, device.as_deref()).await;
         }
         Cmd::Connect => {
-            return cmd_connect(device.as_deref(), apk.as_deref(), any_apk_version).await
+            return cmd_connect(device.as_deref(), apk.as_deref(), any_apk_version).await;
         }
         Cmd::Disconnect => return cmd_disconnect(device.as_deref()).await,
         Cmd::Test {
@@ -1032,7 +1032,7 @@ pub async fn run() -> Result<()> {
                 !*no_reconnect,
                 command.clone(),
             )
-            .await
+            .await;
         }
         Cmd::Doctor {
             app,
@@ -1048,7 +1048,7 @@ pub async fn run() -> Result<()> {
                 app.as_deref(),
                 project.as_deref(),
             )
-            .await
+            .await;
         }
         Cmd::Collect {
             app,
@@ -2832,7 +2832,9 @@ pub(crate) async fn resolve_serial(explicit: Option<&str>) -> Result<Serial> {
     }
     let devices = adb::list_devices().await.context("listing devices")?;
     match devices.len() {
-        0 => Err(anyhow!("no Android devices attached. Run `shadowdroid devices` to check.")),
+        0 => Err(anyhow!(
+            "no Android devices attached. Run `shadowdroid devices` to check."
+        )),
         1 => Ok(Serial::from(devices.into_iter().next().unwrap())),
         _ => Err(anyhow!(
             "multiple devices attached ({}). Pass --device <serial> or set $SHADOWDROID_DEVICE.\nattached: {}",
