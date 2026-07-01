@@ -19,6 +19,9 @@ internal object BridgeProtocol {
         Response(HttpURLConnection.HTTP_BAD_REQUEST, obj("ok", false, "error", message))
 
     @JvmStatic
+    fun bad(t: Throwable): Response = bad(t.message ?: t.javaClass.simpleName)
+
+    @JvmStatic
     fun send(exchange: HttpExchange, status: Int, body: String) {
         try {
             val bytes = body.toByteArray(StandardCharsets.UTF_8)

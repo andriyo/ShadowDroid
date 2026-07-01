@@ -22,6 +22,11 @@ import com.intellij.openapi.project.Project
 import org.jetbrains.android.sdk.AndroidSdkUtils
 
 internal object AndroidAttachBridge {
+    private const val DEBUGGER_ID_JAVA = "Java"
+    private const val DEBUGGER_ID_NATIVE = "Native"
+    private const val DEBUGGER_ID_HYBRID = "Hybrid"
+    private const val MAX_CANDIDATES_IN_ERROR = 6
+
     @JvmStatic
     fun clients(project: Project?, query: Map<String, String>): Response {
         if (project == null) return BridgeProtocol.bad("no project")
@@ -31,7 +36,7 @@ internal object AndroidAttachBridge {
                 BridgeProtocol.ok("ok", true, "project", projectInfo(project), "clients", payload)
             }
         } catch (t: Throwable) {
-            BridgeProtocol.bad(t.message)
+            BridgeProtocol.bad(t)
         }
     }
 
@@ -64,7 +69,7 @@ internal object AndroidAttachBridge {
                 )
             }
         } catch (t: Throwable) {
-            BridgeProtocol.bad(t.message)
+            BridgeProtocol.bad(t)
         }
     }
 
@@ -97,10 +102,26 @@ internal object AndroidAttachBridge {
         if (candidates.isEmpty()) {
             throw IllegalArgumentException("no matching Android process; use debugger clients to inspect attachable processes")
         }
-        if (candidates.size > 1) {
-            throw IllegalArgumentException("multiple matching Android processes; pass package, pid, or device")
+        if (candidates.size == 1) return candidates.single()
+        // A package filter also matches the app's ":subprocess" clients; an
+        // exact process-name hit is unambiguously the requested process.
+        val requestedPackage = query[BridgeQuery.PACKAGE]
+        if (!requestedPackage.isNullOrBlank()) {
+            val exact = candidates.filter { it.client.clientData.processName == requestedPackage }
+            if (exact.size == 1) return exact.single()
         }
-        return candidates.single()
+        throw IllegalArgumentException(
+            "multiple matching Android processes: ${describeCandidates(candidates)}; pass pid, device, or the exact process name",
+        )
+    }
+
+    private fun describeCandidates(candidates: List<AttachClient>): String {
+        val listed = candidates.take(MAX_CANDIDATES_IN_ERROR).joinToString(", ") { candidate ->
+            val data = candidate.client.clientData
+            "${data.processName ?: data.packageName ?: "?"} (pid ${data.pid}, ${candidate.device.serialNumber})"
+        }
+        val more = candidates.size - MAX_CANDIDATES_IN_ERROR
+        return if (more > 0) "$listed, and $more more" else listed
     }
 
     private fun matchingClients(project: Project, query: Map<String, String>): List<AttachClient> {
@@ -166,6 +187,7 @@ internal object AndroidAttachBridge {
         var fallback: AndroidDebugger<*>? = null
         var defaultDebugger: AndroidDebugger<*>? = null
         var modeMatch: AndroidDebugger<*>? = null
+        var modeMatchRank = 0
         for (debugger in AndroidDebugger.EP_NAME.extensionList) {
             if (!debugger.supportsProject(project)) continue
             if (fallback == null) fallback = debugger
@@ -173,24 +195,49 @@ internal object AndroidAttachBridge {
             if (!requested.isNullOrBlank() && (requested == debugger.id || requested == debugger.displayName)) {
                 return debugger
             }
-            if (modeMatch == null && debuggerMatchesMode(debugger, mode)) {
+            val rank = debuggerModeRank(debugger, mode)
+            if (rank > modeMatchRank) {
                 modeMatch = debugger
+                modeMatchRank = rank
             }
         }
         if (!requested.isNullOrBlank()) {
             throw IllegalArgumentException("Android debugger not found: $requested")
         }
+        if (modeMatch == null && (mode == "native" || mode == "mixed")) {
+            throw IllegalStateException("no $mode-capable Android debugger supports this project; use --mode java or --mode auto")
+        }
         return modeMatch ?: defaultDebugger ?: fallback
     }
 
-    private fun debuggerMatchesMode(debugger: AndroidDebugger<*>, mode: String): Boolean {
-        if (mode == "auto") return false
+    // Ranks a debugger's fit for the requested mode; 0 = no fit. Exact Studio
+    // ids outrank display-name heuristics (kept for third-party debuggers) so
+    // that "Native Only" cannot shadow "Dual (Java + Native)" for mixed, and
+    // native/hybrid debuggers never satisfy a java request.
+    private fun debuggerModeRank(debugger: AndroidDebugger<*>, mode: String): Int {
         val text = "${debugger.id} ${debugger.displayName}".lowercase()
+        val nativeText = text.contains("native") || text.contains("lldb")
+        val mixedText = text.contains("dual") || text.contains("hybrid")
         return when (mode) {
-            "java" -> debugger.shouldBeDefault() || text.contains("java")
-            "native" -> text.contains("native") || text.contains("lldb")
-            "mixed" -> text.contains("native") || text.contains("lldb") || text.contains("dual")
-            else -> false
+            "java" -> when {
+                debugger.id == DEBUGGER_ID_JAVA -> 3
+                nativeText || mixedText -> 0
+                text.contains("java") -> 2
+                else -> 0
+            }
+            "native" -> when {
+                debugger.id == DEBUGGER_ID_NATIVE -> 3
+                mixedText -> 1
+                nativeText -> 2
+                else -> 0
+            }
+            "mixed" -> when {
+                debugger.id == DEBUGGER_ID_HYBRID -> 3
+                mixedText -> 2
+                nativeText -> 1
+                else -> 0
+            }
+            else -> 0
         }
     }
 

@@ -27,8 +27,9 @@ import kotlin.math.min
 internal object LayoutInspectorBridge {
     private const val DEFAULT_LAYOUT_WAIT_MS = 5_000
     private const val LAYOUT_POLL_MS = 100L
+    private const val SOURCE_RESOLVER_TTL_MS = 30_000L
 
-    private val sourceResolvers = ConcurrentHashMap<String, SourceResolver>()
+    private val sourceResolvers = ConcurrentHashMap<String, CachedSourceResolver>()
 
     @JvmStatic
     fun snapshot(project: Project?, query: Map<String, String>): Response {
@@ -70,7 +71,7 @@ internal object LayoutInspectorBridge {
                 )
             }
         } catch (t: Throwable) {
-            BridgeProtocol.bad(t.message)
+            BridgeProtocol.bad(t)
         }
     }
 
@@ -96,9 +97,6 @@ internal object LayoutInspectorBridge {
                 }
                 state.model?.recompositionModel?.observeAll()
                 (state.client as? AppInspectionInspectorClient)?.updateRecompositionCountSettings()
-                if (reset) {
-                    state.model?.resetRecompositionCounts()
-                }
                 val nodes = mutableListOf<Any>()
                 var count = 0
                 var skips = 0
@@ -116,6 +114,11 @@ internal object LayoutInspectorBridge {
                     skips += data.skips
                     childCount += data.childCount
                 }
+                // Reset only after the snapshot is built: a reset request
+                // reports the counts it reset, not the zeroed state.
+                if (reset) {
+                    state.model?.resetRecompositionCounts()
+                }
                 BridgeProtocol.ok(
                     "ok", true,
                     "type", BridgeValues.LAYOUT_RECOMPOSITIONS,
@@ -128,7 +131,7 @@ internal object LayoutInspectorBridge {
                 )
             }
         } catch (t: Throwable) {
-            BridgeProtocol.bad(t.message)
+            BridgeProtocol.bad(t)
         }
     }
 
@@ -173,7 +176,7 @@ internal object LayoutInspectorBridge {
                 )
             }
         } catch (t: Throwable) {
-            BridgeProtocol.bad(t.message)
+            BridgeProtocol.bad(t)
         }
     }
 
@@ -231,8 +234,14 @@ internal object LayoutInspectorBridge {
         }
 
         if (!target.device.isNullOrBlank()) {
-            inspector.deviceModel?.forcedDeviceSerialNumber = target.device
-            inspector.foregroundProcessDetection?.start(target.device)
+            // The query's device may be a serial or a model name (deviceMatches
+            // accepts both); the forced-serial API needs the actual serial.
+            val serial = processModel.processes
+                .map { it.device }
+                .firstOrNull { target.device == it.serial || target.device == it.model }
+                ?.serial ?: target.device
+            inspector.deviceModel?.forcedDeviceSerialNumber = serial
+            inspector.foregroundProcessDetection?.start(serial)
         }
         launcher.enabled = true
         inspector.inspectorClientSettings.inLiveMode = true
@@ -246,9 +255,13 @@ internal object LayoutInspectorBridge {
         }
 
         val visibleProcesses = processModel.processes
+        // Exact process-name match outranks package match: an app's
+        // ":subprocess" shares the package, and picking it yields an empty
+        // UI-less layout model.
         val candidates = visibleProcesses
             .filter { target.matches(it) }
             .sortedWith(compareByDescending<ProcessDescriptor> { it.isRunning }
+                .thenByDescending { target.exactProcessNameMatch(it) }
                 .thenByDescending { target.exactPackageMatch(it) }
                 .thenBy { it.pid })
 
@@ -528,6 +541,11 @@ internal object LayoutInspectorBridge {
             return packageName == process.packageName || packageName == process.name
         }
 
+        fun exactProcessNameMatch(process: ProcessDescriptor): Boolean {
+            if (packageName.isNullOrBlank()) return false
+            return packageName == process.name
+        }
+
         fun info(): Map<String, Any?> =
             BridgeProtocol.map(
                 "device", device,
@@ -591,17 +609,20 @@ internal object LayoutInspectorBridge {
         nodes: List<ViewNode>,
         query: Map<String, String>,
         sourceResolver: SourceResolver,
-    ): ViewNode? =
-        nodes.mapNotNull { node ->
-            layoutNodeScore(project, node, query, sourceResolver)?.let { score ->
+    ): ViewNode? {
+        val requestedBounds = Bounds.parse(query[BridgeQuery.BOUNDS])
+        return nodes.mapNotNull { node ->
+            layoutNodeScore(project, node, query, requestedBounds, sourceResolver)?.let { score ->
                 ScoredLayoutNode(score, nodeArea(node), node)
             }
         }.minWithOrNull(compareBy<ScoredLayoutNode> { it.score }.thenBy { it.area })?.node
+    }
 
     private fun layoutNodeScore(
         project: Project,
         node: ViewNode,
         query: Map<String, String>,
+        requestedBounds: Bounds?,
         sourceResolver: SourceResolver,
     ): Double? {
         val drawId = optionalLong(query[BridgeQuery.DRAW_ID])
@@ -613,9 +634,8 @@ internal object LayoutInspectorBridge {
             if (sourceFile == null || !sourceFile.endsWith(file)) return null
         }
 
-        val requestedBounds = Bounds.parse(query[BridgeQuery.BOUNDS])
         if (requestedBounds != null) {
-            val nodeBounds = nodeBounds(node) ?: return null
+            val nodeBounds = nodeBounds(node)
             val coverage = requestedBounds.coverageBy(nodeBounds)
             val centerDistance = requestedBounds.centerDistance(nodeBounds)
             if (coverage <= 0.0 && centerDistance > 96.0) return null
@@ -686,13 +706,12 @@ internal object LayoutInspectorBridge {
         }
     }
 
-    private fun nodeBounds(node: ViewNode): Bounds? {
+    private fun nodeBounds(node: ViewNode): Bounds {
         val rect = node.renderBounds.bounds
         return Bounds(rect.x, rect.y, rect.x + rect.width, rect.y + rect.height)
     }
 
-    private fun nodeArea(node: ViewNode): Int =
-        nodeBounds(node)?.area ?: Int.MAX_VALUE
+    private fun nodeArea(node: ViewNode): Int = nodeBounds(node).area
 
     private fun resourceSearchText(ref: ResourceReference?): String? {
         if (ref == null) return null
@@ -707,17 +726,32 @@ internal object LayoutInspectorBridge {
         return value.toLongOrNull() ?: throw IllegalArgumentException("invalid integer: $value")
     }
 
+    // ViewNode.readAccess is the supported way to read tree structure; the
+    // previous reflection on the Kotlin synthetic accessor silently returns
+    // null on current Studio builds (the accessor is no longer generated).
     private fun parentNode(node: ViewNode): ViewNode? =
         try {
-            val method = ViewNode::class.java.getDeclaredMethod("access\$getParent\$p", ViewNode::class.java)
-            method.isAccessible = true
-            method.invoke(null, node) as? ViewNode
+            ViewNode.readAccess { node.parent }
         } catch (_: Throwable) {
             null
         }
 
-    private fun sourceResolver(project: Project): SourceResolver =
-        sourceResolvers.computeIfAbsent(projectKey(project)) { SourceResolver.build(project.basePath) }
+    // Rebuilt after a short TTL so files created since the last walk resolve;
+    // the walk prunes build/VCS/dependency directories, so rebuilds stay cheap.
+    private fun sourceResolver(project: Project): SourceResolver {
+        val key = projectKey(project)
+        val now = BridgeProtocol.nowMs()
+        val cached = sourceResolvers[key]
+        if (cached != null && now - cached.builtAtMs < SOURCE_RESOLVER_TTL_MS) return cached.resolver
+        val resolver = SourceResolver.build(project.basePath)
+        sourceResolvers[key] = CachedSourceResolver(now, resolver)
+        return resolver
+    }
+
+    private data class CachedSourceResolver(
+        val builtAtMs: Long,
+        val resolver: SourceResolver,
+    )
 
     private fun projectKey(project: Project): String = project.basePath ?: project.name
 

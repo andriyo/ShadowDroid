@@ -1,8 +1,12 @@
 package io.github.andriyo.shadowdroid.studio
 
 import com.intellij.openapi.diagnostic.Logger
+import java.io.IOException
+import java.nio.file.FileVisitResult
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.SimpleFileVisitor
+import java.nio.file.attribute.BasicFileAttributes
 
 internal data class SourceResolver(
     private val byName: Map<String, List<String>>,
@@ -19,6 +23,7 @@ internal data class SourceResolver(
 
     companion object {
         private val LOG = Logger.getInstance(SourceResolver::class.java)
+        private val SKIPPED_DIRECTORIES = setOf("build", ".gradle", ".idea", ".git", "node_modules")
 
         @JvmStatic
         fun build(basePath: String?): SourceResolver {
@@ -26,17 +31,24 @@ internal data class SourceResolver(
             val byName = linkedMapOf<String, MutableList<String>>()
             val root = Path.of(basePath)
             try {
-                Files.walk(root).use { paths ->
-                    paths
-                        .filter(Files::isRegularFile)
-                        .forEach { path ->
-                            val normalized = path.toAbsolutePath().toString().replace('\\', '/')
-                            if (!isSourcePath(normalized)) return@forEach
-                            val name = path.fileName?.toString().orEmpty()
-                            if (name.isBlank()) return@forEach
-                            byName.getOrPut(name) { mutableListOf() }.add(path.toAbsolutePath().toString())
+                Files.walkFileTree(root, object : SimpleFileVisitor<Path>() {
+                    override fun preVisitDirectory(dir: Path, attrs: BasicFileAttributes): FileVisitResult =
+                        if (dir.fileName?.toString() in SKIPPED_DIRECTORIES) FileVisitResult.SKIP_SUBTREE
+                        else FileVisitResult.CONTINUE
+
+                    override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
+                        if (attrs.isRegularFile) {
+                            val name = file.fileName?.toString().orEmpty()
+                            if (name.isNotBlank() && isSourceFile(name)) {
+                                byName.getOrPut(name) { mutableListOf() }.add(file.toAbsolutePath().toString())
+                            }
                         }
-                }
+                        return FileVisitResult.CONTINUE
+                    }
+
+                    override fun visitFileFailed(file: Path, exc: IOException): FileVisitResult =
+                        FileVisitResult.CONTINUE
+                })
             } catch (t: Throwable) {
                 LOG.debug("Unable to build source resolver for $basePath", t)
             }
@@ -44,9 +56,7 @@ internal data class SourceResolver(
             return SourceResolver(byName)
         }
 
-        private fun isSourcePath(path: String): Boolean {
-            if (path.contains("/build/") || path.contains("/.gradle/") || path.contains("/.idea/")) return false
-            return path.endsWith(".kt") || path.endsWith(".java") || path.endsWith(".xml")
-        }
+        private fun isSourceFile(name: String): Boolean =
+            name.endsWith(".kt") || name.endsWith(".java") || name.endsWith(".xml")
     }
 }

@@ -23,12 +23,15 @@ internal object StudioThreading {
         val app = ApplicationManager.getApplication()
         if (app.isDispatchThread) return supplier.get()
         val value = AtomicReference<T>()
-        val error = AtomicReference<Exception>()
+        // Capture Throwable, not just Exception: an Error escaping into the
+        // EDT event handler would leave value null and surface to the caller
+        // as an unrelated NPE instead of the real failure.
+        val error = AtomicReference<Throwable>()
         app.invokeAndWait {
             try {
                 value.set(supplier.get())
-            } catch (e: Exception) {
-                error.set(e)
+            } catch (t: Throwable) {
+                error.set(t)
             }
         }
         error.get()?.let { throw it }

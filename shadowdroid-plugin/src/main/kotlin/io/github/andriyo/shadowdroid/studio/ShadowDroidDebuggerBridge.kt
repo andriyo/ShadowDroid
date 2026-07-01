@@ -1,19 +1,24 @@
 package io.github.andriyo.shadowdroid.studio
 
+import com.android.ddmlib.AndroidDebugBridge
 import com.android.ddmlib.IDevice
 import com.intellij.debugger.engine.JavaDebugProcess
 import com.intellij.debugger.engine.JavaStackFrame
 import com.intellij.debugger.jdi.LocalVariableProxyImpl
 import com.intellij.debugger.jdi.StackFrameProxyImpl
+import com.intellij.openapi.Disposable
+import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.startup.ProjectActivity
+import com.intellij.openapi.util.Disposer
 import com.intellij.xdebugger.XDebugProcess
 import com.intellij.xdebugger.XDebugSession
 import com.intellij.xdebugger.XDebugSessionListener
 import com.intellij.xdebugger.XDebuggerManager
 import com.intellij.xdebugger.XDebuggerManagerListener
 import com.intellij.xdebugger.XSourcePosition
+import com.intellij.xdebugger.breakpoints.SuspendPolicy
 import com.intellij.xdebugger.breakpoints.XBreakpoint
 import com.intellij.xdebugger.breakpoints.XBreakpointListener
 import com.intellij.xdebugger.breakpoints.XLineBreakpoint
@@ -30,13 +35,14 @@ import java.net.HttpURLConnection
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.nio.charset.StandardCharsets
+import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.time.Instant
 import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
-import org.jetbrains.android.sdk.AndroidSdkUtils
 
 class ShadowDroidDebuggerBridge : ProjectActivity {
     override suspend fun execute(project: Project) {
@@ -77,21 +83,34 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
         private fun installProjectListeners(project: Project) {
             val key = projectKey(project)
             if (!listenedProjects.add(key)) return
+            // The message-bus connections below die with the project; forget the
+            // key on dispose so a reopened project gets listeners installed again.
+            Disposer.register(project, Disposable { listenedProjects.remove(key) })
             project.messageBus.connect(project).subscribe(XDebuggerManager.TOPIC, object : XDebuggerManagerListener {
                 override fun processStarted(debugProcess: XDebugProcess) {
                     installSessionListeners(project)
                 }
 
                 override fun currentSessionChanged(previousSession: XDebugSession?, currentSession: XDebugSession?) {
+                    // No recordSessionPause here: a suspended session is either
+                    // newly discovered (installSessionListeners records it) or
+                    // already listened (its sessionPaused recorded it). Recording
+                    // again double-counts hits when focus bounces between
+                    // concurrent sessions.
                     installSessionListeners(project)
-                    if (currentSession != null && currentSession.isSuspended) {
-                        recordSessionPause(currentSession)
-                    }
                 }
             })
             project.messageBus.connect(project).subscribe(XBreakpointListener.TOPIC, object : XBreakpointListener<XBreakpoint<*>> {
                 override fun breakpointLogMessage(breakpoint: XBreakpoint<*>, session: XDebugSession, message: String) {
-                    recordBreakpointHit(project, breakpoint)
+                    // Suspending breakpoints are counted by the sessionPaused
+                    // path; counting both would double-record suspend+log ones.
+                    if (breakpoint.suspendPolicy == SuspendPolicy.NONE) {
+                        recordBreakpointHit(project, breakpoint)
+                    }
+                }
+
+                override fun breakpointRemoved(breakpoint: XBreakpoint<*>) {
+                    BreakpointBridge.forget(project, breakpoint)
                 }
             })
         }
@@ -106,15 +125,17 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                     }
 
                     override fun stackFrameChanged() {
+                        // No epoch bump here: JDI object references stay valid
+                        // across frame switches within one suspend, and the
+                        // advertised handle contract is valid_until=resume.
                         if (session.isSuspended) {
-                            advanceHandleEpoch(session)
                             refreshWatchesForSession(session)
                         }
                     }
 
                     override fun sessionStopped() {
                         listenedSessions.remove(key)
-                        advanceHandleEpoch(session)
+                        clearSessionHandles(session)
                     }
                 }, project)
                 if (session.isSuspended) {
@@ -151,7 +172,10 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
             val fileUrl = pos.file.url
             val line = pos.line
             val project = session.project
-            StudioThreading.onIdeaThread {
+            // Runs on whichever thread fired the pause — often the debugger
+            // manager thread, which must never block on the EDT. Breakpoint
+            // state only needs read access, so take it on this thread.
+            ReadAction.compute<Unit, RuntimeException> {
                 for (breakpoint in XDebuggerManager.getInstance(project).breakpointManager.allBreakpoints) {
                     if (breakpoint is XLineBreakpoint<*> &&
                         fileUrl == breakpoint.fileUrl &&
@@ -160,7 +184,6 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                         recordBreakpointHit(project, breakpoint)
                     }
                 }
-                null
             }
         }
 
@@ -331,7 +354,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                 }
                 BridgeProtocol.ok("ok", true, "action", action, "session", sessionInfo(sessionIndex(session), session))
             } catch (t: Throwable) {
-                BridgeProtocol.bad(t.message)
+                BridgeProtocol.bad(t)
             }
         }
 
@@ -369,24 +392,33 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
             }
             val limit = BridgeProtocol.intParam(query, BridgeQuery.LIMIT, 32, 1, 128)
             val timeoutMs = BridgeProtocol.debuggerTimeoutMs(query)
-            val stacks = session.suspendContext?.executionStacks ?: XExecutionStack.EMPTY_ARRAY
-            val payload = mutableListOf<Any>()
-            for (index in stacks.indices) {
-                val top: XStackFrame? = stacks[index].topFrame
-                val frames = mutableListOf<Any>()
-                if (top is JavaStackFrame) {
-                    frames.addAll(DebuggerValues.javaFrames(session, top, limit, timeoutMs))
-                } else if (top != null) {
-                    frames += DebuggerValues.frameInfo(top, 0)
+            // Execution stacks and top frames are async debugger state; read
+            // them on the debugger thread (as coroutineThreadsPayload does) so
+            // a request right after a pause doesn't see missing frames.
+            return try {
+                StudioThreading.onDebuggerThread(session, timeoutMs) {
+                    val stacks = session.suspendContext?.executionStacks ?: XExecutionStack.EMPTY_ARRAY
+                    val payload = mutableListOf<Any>()
+                    for (index in stacks.indices) {
+                        val top: XStackFrame? = stacks[index].topFrame
+                        val frames = mutableListOf<Any>()
+                        if (top is JavaStackFrame) {
+                            frames.addAll(DebuggerValues.javaFrames(session, top, limit, timeoutMs))
+                        } else if (top != null) {
+                            frames += DebuggerValues.frameInfo(top, 0)
+                        }
+                        payload += BridgeProtocol.map(
+                            "index", index,
+                            "name", stacks[index].displayName,
+                            "top_frame", top?.let { DebuggerValues.frameInfo(it, 0) },
+                            "frames", frames,
+                        )
+                    }
+                    BridgeProtocol.ok("ok", true, "session", sessionInfo(sessionIndex(session), session), "threads", payload)
                 }
-                payload += BridgeProtocol.map(
-                    "index", index,
-                    "name", stacks[index].displayName,
-                    "top_frame", top?.let { DebuggerValues.frameInfo(it, 0) },
-                    "frames", frames,
-                )
+            } catch (t: Throwable) {
+                BridgeProtocol.bad(t)
             }
-            return BridgeProtocol.ok("ok", true, "session", sessionInfo(sessionIndex(session), session), "threads", payload)
         }
 
         private fun variables(query: Map<String, String>): Response {
@@ -433,7 +465,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                     )
                 }
             } catch (t: Throwable) {
-                BridgeProtocol.bad(t.message)
+                BridgeProtocol.bad(t)
             }
         }
 
@@ -470,7 +502,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                     )
                 }
             } catch (t: Throwable) {
-                BridgeProtocol.bad(t.message)
+                BridgeProtocol.bad(t)
             }
         }
 
@@ -534,7 +566,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                     )
                 }
             } catch (t: Throwable) {
-                BridgeProtocol.bad(t.message)
+                BridgeProtocol.bad(t)
             }
         }
 
@@ -577,7 +609,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                     )
                 }
             } catch (t: Throwable) {
-                BridgeProtocol.bad(t.message)
+                BridgeProtocol.bad(t)
             }
         }
 
@@ -597,7 +629,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                     )
                 }
             } catch (t: Throwable) {
-                BridgeProtocol.bad(t.message)
+                BridgeProtocol.bad(t)
             }
         }
 
@@ -627,7 +659,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                     )
                 }
             } catch (t: Throwable) {
-                BridgeProtocol.bad(t.message)
+                BridgeProtocol.bad(t)
             }
         }
 
@@ -664,15 +696,24 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                     )
                 }
             } catch (t: Throwable) {
-                BridgeProtocol.bad(t.message)
+                BridgeProtocol.bad(t)
             }
         }
 
         private fun addWatch(query: Map<String, String>): Response {
             val expression = query[BridgeQuery.EXPRESSION]
             if (expression.isNullOrBlank()) return BridgeProtocol.bad("missing expression")
-            val project = selectProject(query, null)
-            val projectKey = project?.let(::projectKey)
+            // Scope to a project only when requested explicitly; an unscoped
+            // watch is global. Defaulting to the first open project would make
+            // the background refresher skip every other project's sessions.
+            val requestedProject = query[BridgeQuery.PROJECT]?.takeUnless { it.isBlank() }
+            val projectKey = if (requestedProject == null) {
+                null
+            } else {
+                liveProjects().firstOrNull { requestedProject == it.name || requestedProject == it.basePath }
+                    ?.let(::projectKey)
+                    ?: return BridgeProtocol.bad("project not found: $requestedProject")
+            }
             val name = query[BridgeQuery.NAME]?.takeUnless { it.isBlank() } ?: expression
             val watch = WatchSpec(watchId(projectKey, name, expression), projectKey, name, expression, true)
             watches.removeIf { it.id == watch.id }
@@ -709,7 +750,11 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
             for (watch in watches) {
                 var value: Any? = null
                 val frame = session?.currentStackFrame
-                if (session != null && session.isSuspended && frame is JavaStackFrame) {
+                // Honor the watch's project scope like the background refresher
+                // does; a scoped watch keeps its cached value here instead of
+                // being evaluated against a foreign project's session.
+                val inScope = watch.project == null || session == null || watch.project == projectKey(session.project)
+                if (inScope && session != null && session.isSuspended && frame is JavaStackFrame) {
                     try {
                         value = StudioThreading.onDebuggerThread(session, timeoutMs) {
                             val result = DebuggerValues.evaluatePath(frame.stackFrameProxy, watch.expression)
@@ -784,12 +829,21 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
         private fun resolveObjectHandle(session: XDebugSession, handle: String): ObjectHandleEntry? {
             val entry = objectHandles[handle] ?: return null
             val key = sessionKey(session)
+            // A handle from a different session is not ours to invalidate here —
+            // it may still be valid in its own session; just report no match.
+            if (entry.sessionKey != key) return null
             val epoch = sessionHandleEpochs[key] ?: 0
-            if (entry.sessionKey != key || entry.epoch != epoch) {
+            if (entry.epoch != epoch) {
                 objectHandles.remove(handle)
                 return null
             }
             return entry
+        }
+
+        private fun clearSessionHandles(session: XDebugSession) {
+            val key = sessionKey(session)
+            objectHandles.entries.removeIf { it.value.sessionKey == key }
+            sessionHandleEpochs.remove(key)
         }
 
         private fun advanceHandleEpoch(session: XDebugSession) {
@@ -973,11 +1027,12 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
 
         // The device a debug session is attached to, resolved by matching the
         // session's JDWP connection port to a ddmlib client's debugger port.
-        // ddmlib (`AndroidSdkUtils.getDebugBridge`) must be touched on the IDEA
-        // thread — the HTTP handler runs on the HttpServer thread — so the match
-        // is hopped onto the EDT (mirroring AndroidAttachBridge.clients). Best-
-        // effort: null for non-Java sessions or when ddmlib isn't reachable, so
-        // the rest of the session payload still renders.
+        // Uses the static AndroidDebugBridge.getBridge() accessor: it is safe
+        // from any thread, unlike AndroidSdkUtils.getDebugBridge which asserts
+        // the EDT — and this runs inside onDebuggerThread suppliers, where
+        // waiting on the EDT is a deadlock vector. Best-effort: null for
+        // non-Java sessions or before ADB is initialized, so the rest of the
+        // session payload still renders.
         private fun sessionDevice(session: XDebugSession): IDevice? {
             val java = session.debugProcess as? JavaDebugProcess ?: return null
             val ports = try {
@@ -992,10 +1047,8 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
             }
             if (ports.isEmpty()) return null
             return try {
-                StudioThreading.onIdeaThread {
-                    AndroidSdkUtils.getDebugBridge(session.project)?.devices?.firstOrNull { device ->
-                        device.clients.any { it.isValid && it.debuggerListenPort in ports }
-                    }
+                AndroidDebugBridge.getBridge()?.devices?.firstOrNull { device ->
+                    device.clients.any { it.isValid && it.debuggerListenPort in ports }
                 }
             } catch (t: Throwable) {
                 null
@@ -1112,7 +1165,20 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                     "updated_at", Instant.now().toString(),
                     "projects", projectPayload(),
                 )
-                Files.writeString(File(dir, BridgeConfig.REGISTRY_FILE).toPath(), body, StandardCharsets.UTF_8)
+                // Write-then-move so a CLI reading the registry mid-update
+                // never sees a torn file.
+                val target = File(dir, BridgeConfig.REGISTRY_FILE).toPath()
+                val temp = Files.createTempFile(dir.toPath(), BridgeConfig.REGISTRY_FILE, ".tmp")
+                try {
+                    Files.writeString(temp, body, StandardCharsets.UTF_8)
+                    try {
+                        Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+                    } catch (_: AtomicMoveNotSupportedException) {
+                        Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING)
+                    }
+                } finally {
+                    Files.deleteIfExists(temp)
+                }
             } catch (_: Throwable) {
             }
         }

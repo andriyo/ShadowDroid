@@ -23,14 +23,34 @@ import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
 
 internal object BreakpointBridge {
+    // One physical hit can surface through more than one listener (pause
+    // position match, log-message callback — observed duplicated with
+    // concurrent sessions); collapse records landing within this window.
+    // hit_count is documented as observed/approximate, so a burst of real
+    // hits inside the window under-counts rather than double-counting.
+    private const val HIT_DEDUPE_WINDOW_MS = 250L
+
     private val breakpointHits = ConcurrentHashMap<String, Int>()
     private val breakpointLastHit = ConcurrentHashMap<String, Long>()
 
     @JvmStatic
     fun recordHit(project: Project, breakpoint: XBreakpoint<*>) {
         val id = breakpointId(project, breakpoint)
+        val now = System.currentTimeMillis()
+        val last = breakpointLastHit.put(id, now)
+        if (last != null && now - last < HIT_DEDUPE_WINDOW_MS) return
         breakpointHits.merge(id, 1, Int::plus)
-        breakpointLastHit[id] = System.currentTimeMillis()
+    }
+
+    @JvmStatic
+    fun forget(project: Project, breakpoint: XBreakpoint<*>) {
+        val id = try {
+            breakpointId(project, breakpoint)
+        } catch (_: Throwable) {
+            return
+        }
+        breakpointHits.remove(id)
+        breakpointLastHit.remove(id)
     }
 
     @JvmStatic
@@ -57,6 +77,7 @@ internal object BreakpointBridge {
                         .addLineBreakpoint(type, virtualFile.url, line - 1, props, temporary)
                 }
                 target.setEnabled(enabled)
+                target.setTemporary(temporary)
                 if (clearCondition) {
                     target.setCondition(null)
                 } else if (condition != null) {
@@ -66,7 +87,7 @@ internal object BreakpointBridge {
             }
             BridgeProtocol.ok("ok", true, "breakpoint", breakpointInfo(project, breakpoint))
         } catch (t: Throwable) {
-            BridgeProtocol.bad(t.message)
+            BridgeProtocol.bad(t)
         }
     }
 
@@ -80,17 +101,24 @@ internal object BreakpointBridge {
             val breakpoint = StudioThreading.onIdeaThread {
                 val type = breakpointType(JavaExceptionBreakpointType::class.java)
                     ?: throw IllegalStateException("Java exception breakpoint type is not available")
-                val props = JavaExceptionBreakpointProperties(exception)
-                props.NOTIFY_CAUGHT = BridgeProtocol.booleanParam(query, BridgeQuery.CAUGHT, true)
-                props.NOTIFY_UNCAUGHT = BridgeProtocol.booleanParam(query, BridgeQuery.UNCAUGHT, true)
-                val created = XDebuggerManager.getInstance(project).breakpointManager
-                    .addBreakpoint(type as XBreakpointType<XBreakpoint<JavaExceptionBreakpointProperties>, JavaExceptionBreakpointProperties>, props)
-                created.setEnabled(BridgeProtocol.booleanParam(query, BridgeQuery.ENABLED, true))
-                created
+                // Idempotent: re-adding the same exception updates the existing
+                // breakpoint instead of piling up duplicates on agent retries.
+                val target = findExceptionBreakpoint(project, type.id, exception)
+                    ?: XDebuggerManager.getInstance(project).breakpointManager
+                        .addBreakpoint(
+                            type as XBreakpointType<XBreakpoint<JavaExceptionBreakpointProperties>, JavaExceptionBreakpointProperties>,
+                            JavaExceptionBreakpointProperties(exception),
+                        )
+                (target.properties as? JavaExceptionBreakpointProperties)?.let { props ->
+                    props.NOTIFY_CAUGHT = BridgeProtocol.booleanParam(query, BridgeQuery.CAUGHT, true)
+                    props.NOTIFY_UNCAUGHT = BridgeProtocol.booleanParam(query, BridgeQuery.UNCAUGHT, true)
+                }
+                target.setEnabled(BridgeProtocol.booleanParam(query, BridgeQuery.ENABLED, true))
+                target
             }
             BridgeProtocol.ok("ok", true, "breakpoint", breakpointInfo(project, breakpoint))
         } catch (t: Throwable) {
-            BridgeProtocol.bad(t.message)
+            BridgeProtocol.bad(t)
         }
     }
 
@@ -106,17 +134,24 @@ internal object BreakpointBridge {
             val breakpoint = StudioThreading.onIdeaThread {
                 val type = breakpointType(JavaWildcardMethodBreakpointType::class.java)
                     ?: throw IllegalStateException("Java wildcard method breakpoint type is not available")
-                val props = JavaMethodBreakpointProperties(classPattern, method)
-                props.WATCH_ENTRY = BridgeProtocol.booleanParam(query, BridgeQuery.ENTRY, true)
-                props.WATCH_EXIT = BridgeProtocol.booleanParam(query, BridgeQuery.EXIT, false)
-                val created = XDebuggerManager.getInstance(project).breakpointManager
-                    .addBreakpoint(type as XBreakpointType<XBreakpoint<JavaMethodBreakpointProperties>, JavaMethodBreakpointProperties>, props)
-                created.setEnabled(BridgeProtocol.booleanParam(query, BridgeQuery.ENABLED, true))
-                created
+                // Idempotent: re-adding the same class#method updates the
+                // existing breakpoint instead of duplicating it.
+                val target = findMethodBreakpoint(project, type.id, classPattern, method)
+                    ?: XDebuggerManager.getInstance(project).breakpointManager
+                        .addBreakpoint(
+                            type as XBreakpointType<XBreakpoint<JavaMethodBreakpointProperties>, JavaMethodBreakpointProperties>,
+                            JavaMethodBreakpointProperties(classPattern, method),
+                        )
+                (target.properties as? JavaMethodBreakpointProperties)?.let { props ->
+                    props.WATCH_ENTRY = BridgeProtocol.booleanParam(query, BridgeQuery.ENTRY, true)
+                    props.WATCH_EXIT = BridgeProtocol.booleanParam(query, BridgeQuery.EXIT, false)
+                }
+                target.setEnabled(BridgeProtocol.booleanParam(query, BridgeQuery.ENABLED, true))
+                target
             }
             BridgeProtocol.ok("ok", true, "breakpoint", breakpointInfo(project, breakpoint))
         } catch (t: Throwable) {
-            BridgeProtocol.bad(t.message)
+            BridgeProtocol.bad(t)
         }
     }
 
@@ -138,13 +173,23 @@ internal object BreakpointBridge {
                     ?: throw IllegalStateException("Java field breakpoint type is not available")
                 val virtualFile = LocalFileSystem.getInstance().refreshAndFindFileByIoFile(File(file))
                     ?: throw IllegalArgumentException("file not found in IDE VFS: $file")
-                val props = JavaFieldBreakpointProperties(className, field)
+                // Constructor order is (fieldName, className) — passing them
+                // swapped stores the class in myFieldName and the watchpoint
+                // never matches a real field.
+                val props = JavaFieldBreakpointProperties(field, className)
                 props.WATCH_ACCESS = BridgeProtocol.booleanParam(query, BridgeQuery.ACCESS, false)
                 props.WATCH_MODIFICATION = BridgeProtocol.booleanParam(query, BridgeQuery.MODIFICATION, true)
-                var breakpoint = findLineBreakpoint(project, virtualFile.url, line - 1, type.id)
+                // Match on the field name too -- reusing any field breakpoint on
+                // the same line would silently return one for a different field.
+                var breakpoint = findFieldBreakpoint(project, virtualFile.url, line - 1, type.id, field)
                 if (breakpoint == null) {
                     breakpoint = XDebuggerManager.getInstance(project).breakpointManager
                         .addLineBreakpoint(type, virtualFile.url, line - 1, props, temporary)
+                } else {
+                    (breakpoint.properties as? JavaFieldBreakpointProperties)?.let { existing ->
+                        existing.WATCH_ACCESS = props.WATCH_ACCESS
+                        existing.WATCH_MODIFICATION = props.WATCH_MODIFICATION
+                    }
                 }
                 breakpoint.setEnabled(BridgeProtocol.booleanParam(query, BridgeQuery.ENABLED, true))
                 breakpoint.setTemporary(temporary)
@@ -152,7 +197,7 @@ internal object BreakpointBridge {
             }
             BridgeProtocol.ok("ok", true, "breakpoint", breakpointInfo(project, target))
         } catch (t: Throwable) {
-            BridgeProtocol.bad(t.message)
+            BridgeProtocol.bad(t)
         }
     }
 
@@ -191,7 +236,12 @@ internal object BreakpointBridge {
                 }
                 if (query.containsKey(BridgeQuery.LOG_MESSAGE)) breakpoint.setLogMessage(BridgeProtocol.booleanParam(query, BridgeQuery.LOG_MESSAGE, breakpoint.isLogMessage))
                 if (query.containsKey(BridgeQuery.LOG_STACK)) breakpoint.setLogStack(BridgeProtocol.booleanParam(query, BridgeQuery.LOG_STACK, breakpoint.isLogStack))
-                if (query.containsKey(BridgeQuery.SUSPEND)) breakpoint.setSuspendPolicy(SuspendPolicy.valueOf(query.getValue(BridgeQuery.SUSPEND)))
+                if (query.containsKey(BridgeQuery.SUSPEND)) {
+                    val raw = query.getValue(BridgeQuery.SUSPEND)
+                    val policy = SuspendPolicy.values().firstOrNull { it.name.equals(raw, ignoreCase = true) }
+                        ?: throw IllegalArgumentException("invalid suspend policy: $raw (use all, thread, or none)")
+                    breakpoint.setSuspendPolicy(policy)
+                }
                 val props = breakpoint.properties
                 if (query.containsKey(BridgeQuery.PASS_COUNT) && props is JavaBreakpointProperties<*>) {
                     val count = BridgeProtocol.intParam(query, BridgeQuery.PASS_COUNT, 0, 0, Int.MAX_VALUE)
@@ -202,7 +252,7 @@ internal object BreakpointBridge {
             }
             BridgeProtocol.ok("ok", true, "breakpoint", breakpointInfo(selected.project, breakpoint))
         } catch (t: Throwable) {
-            BridgeProtocol.bad(t.message)
+            BridgeProtocol.bad(t)
         }
     }
 
@@ -211,12 +261,15 @@ internal object BreakpointBridge {
         val selected = findBreakpoint(query, projects, requestedProject) ?: return BridgeProtocol.bad("breakpoint not found")
         return try {
             StudioThreading.onIdeaThread {
+                // Prune hit stats first: the id derives from the source position,
+                // which may no longer resolve once the breakpoint is removed.
+                forget(selected.project, selected.breakpoint)
                 XDebuggerManager.getInstance(selected.project).breakpointManager.removeBreakpoint(selected.breakpoint)
                 null
             }
             BridgeProtocol.ok("ok", true, "removed", true, "id", query[BridgeQuery.ID])
         } catch (t: Throwable) {
-            BridgeProtocol.bad(t.message)
+            BridgeProtocol.bad(t)
         }
     }
 
@@ -237,6 +290,33 @@ internal object BreakpointBridge {
             .asSequence()
             .filterIsInstance<XLineBreakpoint<*>>()
             .firstOrNull { it.fileUrl == fileUrl && it.line == zeroBasedLine && it.type.id == typeId }
+
+    private fun findFieldBreakpoint(
+        project: Project,
+        fileUrl: String,
+        zeroBasedLine: Int,
+        typeId: String,
+        field: String,
+    ): XLineBreakpoint<*>? =
+        XDebuggerManager.getInstance(project).breakpointManager.allBreakpoints
+            .asSequence()
+            .filterIsInstance<XLineBreakpoint<*>>()
+            .firstOrNull {
+                it.fileUrl == fileUrl && it.line == zeroBasedLine && it.type.id == typeId &&
+                    (it.properties as? JavaFieldBreakpointProperties)?.myFieldName == field
+            }
+
+    private fun findExceptionBreakpoint(project: Project, typeId: String, exception: String): XBreakpoint<*>? =
+        XDebuggerManager.getInstance(project).breakpointManager.allBreakpoints.firstOrNull {
+            it.type.id == typeId &&
+                (it.properties as? JavaExceptionBreakpointProperties)?.myQualifiedName == exception
+        }
+
+    private fun findMethodBreakpoint(project: Project, typeId: String, classPattern: String, method: String): XBreakpoint<*>? =
+        XDebuggerManager.getInstance(project).breakpointManager.allBreakpoints.firstOrNull {
+            val props = it.properties as? JavaMethodBreakpointProperties
+            it.type.id == typeId && props != null && props.myClassPattern == classPattern && props.myMethodName == method
+        }
 
     private fun <T : Any> breakpointType(klass: Class<T>): T? =
         XBreakpointType.EXTENSION_POINT_NAME.extensionList.firstNotNullOfOrNull { klass.castOrNull(it) }
