@@ -135,6 +135,18 @@ fn is_true(b: &bool) -> bool {
 // ── /v1/app/* ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct AppStartResp {
+    #[serde(default = "_true")]
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
+    #[serde(default)]
+    pub launcher_activities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct AppInfo {
     pub version_name: Option<String>,
     pub version_code: i32,

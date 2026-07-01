@@ -345,11 +345,12 @@ impl ServerClient {
 
     // ── app lifecycle ──────────────────────────────────────────
 
-    pub async fn app_start(&self, package: &str) -> Result<()> {
-        let _: OkResponse = self
-            .post("/app/start", &serde_json::json!({"package": package}))
-            .await?;
-        Ok(())
+    pub async fn app_start(&self, package: &str, activity: Option<&str>) -> Result<AppStartResp> {
+        let mut body = serde_json::json!({"package": package});
+        if let Some(activity) = activity {
+            body["activity"] = serde_json::json!(activity);
+        }
+        self.post("/app/start", &body).await
     }
     pub async fn app_stop(&self, package: &str) -> Result<()> {
         let _: OkResponse = self

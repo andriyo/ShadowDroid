@@ -690,10 +690,11 @@ fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "next_commands": ["app start <pkg>", "ui wait --pkg <pkg>", "ui dump"]
         })),
         "app start" => Some(serde_json::json!({
-            "use_when": ["Need to launch a package's default activity or recover after the foreground app drifted."],
-            "output": "app start action JSON",
+            "use_when": ["Need to launch a package's default activity, or a specific launcher/activity with --activity when Android exposes several choices."],
+            "output": "app start action JSON including launched activity, launcher candidates, and ambiguity warnings",
             "side_effects": ["launches the app"],
-            "next_commands": ["app wait <pkg> --front", "ui dump", "debug snapshot --app <pkg>"]
+            "next_commands": ["app wait <pkg> --front", "ui dump", "debug snapshot --app <pkg>"],
+            "examples": ["app start com.example.app --activity .MainActivity"]
         })),
         "app stop" => Some(serde_json::json!({
             "use_when": ["Need to force-stop an app before a clean launch, reinstall, or state reset."],
@@ -901,14 +902,14 @@ fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "net check" => Some(serde_json::json!({
             "use_when": ["Need to know whether a package is likely interceptable before relying on HTTP(S) events."],
-            "output": "interceptability verdict JSON",
+            "output": "interceptability verdict JSON with device image, CA store evidence, and recommended trust command",
             "side_effects": ["none"],
             "next_commands": ["net trust", "net start", "watch"]
         })),
         "net trust" => Some(serde_json::json!({
             "use_when": ["Need the device/app to trust ShadowDroid's CA before expecting decrypted HTTPS traffic."],
             "output": "certificate trust/install JSON",
-            "side_effects": ["pushes or installs a CA certificate; --system may require emulator/root; --ui drives Settings UI"],
+            "side_effects": ["pushes or installs a CA certificate; --auto chooses the best available path; --system may require emulator/root; --ui drives Settings UI"],
             "next_commands": ["net check <pkg>", "net start", "watch"]
         })),
         "net start" => Some(serde_json::json!({
@@ -931,13 +932,13 @@ fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "net log" => Some(serde_json::json!({
             "use_when": ["Need recent HTTP flows from the session log without watching live UI."],
-            "output": "http events followed by net_log summary",
+            "output": "line-delimited JSON: one http event per line followed by a net_log summary object",
             "side_effects": ["none"],
             "next_commands": ["net show <id>", "net export har <id>", "watch"]
         })),
         "net show" => Some(serde_json::json!({
             "use_when": ["Need headers, bodies, or full detail for a flow id seen in watch or net log."],
-            "output": "flow detail JSON",
+            "output": "flow detail JSON; --body-file writes the captured response body to a file for large responses",
             "side_effects": ["none"],
             "next_commands": ["net resume <id>", "net respond <id>", "net export har <id>"]
         })),
@@ -987,7 +988,19 @@ fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "use_when": ["Need to add one response/request mutation rule such as map-local, set-status, replace, block, or delay."],
             "output": "rule add JSON with rule id",
             "side_effects": ["mutates active proxy rules"],
-            "next_commands": ["net rule list", "watch", "net rule rm <id>"]
+            "next_commands": ["net rule list", "watch", "net rule rm <id>"],
+            "examples": [
+                "net rule add map-local response.json --host api.example.com --path /v1/dict",
+                "net rule add set-status 503 --host api.example.com"
+            ]
+        })),
+        "net override" => Some(serde_json::json!({
+            "use_when": ["Need the shortest path to serve one local file for a matching URL without remembering the map-local positional form."],
+            "output": "net_override action JSON with created rule id",
+            "side_effects": ["adds an active map-local proxy rule"],
+            "prerequisites": ["net start must be running"],
+            "next_commands": ["watch", "net rule list", "net rule rm <id>"],
+            "examples": ["net override --url 'https://api.example.com/v1/dict*' --file response.json"]
         })),
         "net rule list" => Some(serde_json::json!({
             "use_when": ["Need to inspect currently active proxy mutation rules."],

@@ -281,21 +281,42 @@ pub enum Cmd {
 
 #[derive(Subcommand)]
 pub enum AppCmd {
-    /// Launch the app's default activity.
-    Start { package: String },
+    /// Launch the app's default activity, or an explicit activity with --activity.
+    Start {
+        /// App package, app alias from config, or installed package name.
+        #[arg(value_name = "PACKAGE")]
+        package: Option<String>,
+        /// Explicit activity class to launch, e.g. .MainActivity or com.example.MainActivity.
+        #[arg(long, value_name = "ACTIVITY")]
+        activity: Option<String>,
+    },
     /// Force-stop the app.
-    Stop { package: String },
+    Stop {
+        /// App package, app alias from config, or installed package name.
+        #[arg(value_name = "PACKAGE")]
+        package: Option<String>,
+    },
     /// Install an APK and run the app-under-test setup ritual (clear/grant/launch/wait).
     Install(AppInstallArgs),
     /// Like `install`, but uninstall any existing copy first.
     Reinstall(AppInstallArgs),
     /// Clear the app's data.
-    Clear { package: String },
+    Clear {
+        /// App package, app alias from config, or installed package name.
+        #[arg(value_name = "PACKAGE")]
+        package: Option<String>,
+    },
     /// Version name/code + label.
-    Info { package: String },
+    Info {
+        /// App package, app alias from config, or installed package name.
+        #[arg(value_name = "PACKAGE")]
+        package: Option<String>,
+    },
     /// Wait for the app to launch (or, with --front, reach the foreground).
     Wait {
-        package: String,
+        /// App package, app alias from config, or installed package name.
+        #[arg(value_name = "PACKAGE")]
+        package: Option<String>,
         /// Give up after this many milliseconds.
         #[arg(long, default_value_t = 20000)]
         timeout_ms: u32,
@@ -652,9 +673,16 @@ pub enum UiCmd {
 #[derive(Subcommand)]
 pub enum NetCmd {
     /// Verdict: is this app interceptable (debuggable, NSC trusts user CA, engine proxy-aware)?
-    Check { package: String },
+    Check {
+        /// App package, app alias from config, or installed package name.
+        #[arg(value_name = "PACKAGE")]
+        package: Option<String>,
+    },
     /// Install / trust the ShadowDroid CA on the device.
     Trust {
+        /// Choose the best available install path for this device (default).
+        #[arg(long)]
+        auto: bool,
         /// Push into the system trust store (emulator/root).
         #[arg(long)]
         system: bool,
@@ -812,6 +840,15 @@ pub enum NetCmd {
     /// Declarative response/request rules.
     #[command(subcommand)]
     Rule(NetRuleCmd),
+    /// Convenience: map URL-matching requests to a local response file.
+    Override {
+        /// URL glob to match, e.g. https://api.example.com/v1/dict*.
+        #[arg(long, value_name = "GLOB")]
+        url: String,
+        /// Local file to serve as the response body.
+        #[arg(long, value_name = "PATH")]
+        file: PathBuf,
+    },
     /// Apply a bulk rules file (JSON array of rules).
     Rules { file: PathBuf },
     /// Serve saved responses without a backend.
@@ -859,9 +896,10 @@ pub struct NetRuleAddArgs {
     /// Match flows with this response content-type (substring).
     #[arg(long)]
     pub content_type: Option<String>,
-    /// Kind-specific positional args (e.g. set-status <code>,
-    /// set-request-header / set-response-header <name> <value>, map-remote
-    /// <host:port>).
+    /// Kind-specific positionals: block [status], delay <ms>, map-local <file>,
+    /// map-remote <host:port>, set-request-header <name> <value>,
+    /// set-response-header <name> <value>, set-status <code>, replace <regex> <repl>.
+    #[arg(value_name = "ARGS")]
     pub args: Vec<String>,
 }
 
@@ -977,7 +1015,7 @@ pub async fn run() -> Result<()> {
         Cmd::Debug(args) if args.is_host_only() => {
             // Host-only debugger commands skip device resolution / ensure_ready,
             // but still honor an explicit --device to pick the matching session.
-            return crate::cmd::debug::run_host_only(args, device.as_deref()).await
+            return crate::cmd::debug::run_host_only(args, device.as_deref()).await;
         }
         Cmd::Connect => {
             return cmd_connect(device.as_deref(), apk.as_deref(), any_apk_version).await
@@ -1049,17 +1087,18 @@ pub async fn run() -> Result<()> {
             if matches!(c, NetCmd::Daemon(_)) {
                 // The daemon ignores this arg (it reads its serial from the
                 // deserialized DaemonConfig); pass an empty sentinel.
-                return dispatch_net(c, &Serial::new("")).await;
+                return dispatch_net(c, &Serial::new(""), &config).await;
             }
             let serial = resolve_serial(device.as_deref()).await?;
-            return dispatch_net(c, &serial).await;
+            return dispatch_net(c, &serial, &config).await;
         }
         _ => {}
     }
 
     // ── Phase 2: server-backed commands share one bring-up ──
     let serial = resolve_serial(device.as_deref()).await?;
-    let client = installer::ensure_ready(&serial, apk.as_deref(), any_apk_version).await?;
+    let client =
+        installer::ensure_ready_for_command(&serial, apk.as_deref(), any_apk_version).await?;
 
     match cmd {
         // handled in phase 1
@@ -1082,7 +1121,7 @@ pub async fn run() -> Result<()> {
         | Cmd::Aar(_) => unreachable!("handled before ensure_ready"),
 
         // ── namespaces ─────────────────────────────────────────
-        Cmd::App(app_cmd) => dispatch_app(app_cmd, &client).await?,
+        Cmd::App(app_cmd) => dispatch_app(app_cmd, &client, &config, &serial).await?,
         Cmd::Device(device_cmd) => dispatch_device(device_cmd, &client, &serial).await?,
         Cmd::Files(files_cmd) => dispatch_files(files_cmd, &client, &serial).await?,
         Cmd::Debug(args) => crate::cmd::debug::run(&serial, &client, args).await?,
@@ -1372,9 +1411,28 @@ fn apply_config_defaults(cmd: &mut Cmd, config: &ShadowDroidConfig) {
         Cmd::Studio(args) => apply_studio_config(args, config),
         Cmd::Collect { app, .. } => fill_app(app, config),
         Cmd::Doctor { app, .. } => fill_app(app, config),
+        Cmd::App(args) => apply_app_config(args, config),
+        Cmd::Net(args) => apply_net_config(args, config),
         Cmd::Debug(args) => apply_debug_config(args, config),
         Cmd::Layout(args) => apply_layout_config(args, config),
         _ => {}
+    }
+}
+
+fn apply_app_config(args: &mut AppCmd, config: &ShadowDroidConfig) {
+    match args {
+        AppCmd::Start { package, .. }
+        | AppCmd::Stop { package }
+        | AppCmd::Clear { package }
+        | AppCmd::Info { package }
+        | AppCmd::Wait { package, .. } => fill_app(package, config),
+        AppCmd::Install(_) | AppCmd::Reinstall(_) | AppCmd::Current { .. } => {}
+    }
+}
+
+fn apply_net_config(args: &mut NetCmd, config: &ShadowDroidConfig) {
+    if let NetCmd::Check { package } = args {
+        fill_app(package, config);
     }
 }
 
@@ -1615,10 +1673,46 @@ async fn dispatch_profile(c: &ProfileCmd, serial: &Serial) -> Result<()> {
     }
 }
 
+async fn resolve_net_check_package(
+    serial: &Serial,
+    config: &ShadowDroidConfig,
+    package: Option<String>,
+) -> Result<String> {
+    let requested = package
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let resolved = config
+        .resolve_app(Some(serial.as_str()), requested.as_deref())
+        .await?;
+    if let Some(package) = resolved.package {
+        return Ok(package);
+    }
+    if let Some(input) = resolved.input {
+        bail!(
+            "`{input}` did not resolve to one installed package for `shadowdroid net check` \
+             (resolution source: {}). Pass a package explicitly or add an alias with \
+             `shadowdroid config init --project --app <name> --package <pkg>`.",
+            resolved.source
+        );
+    }
+    if let Some(component) = adb::foreground_activity(serial).await {
+        if let Some((package, _)) = component.split_once('/') {
+            if !package.is_empty() {
+                return Ok(package.to_string());
+            }
+        }
+    }
+    bail!(
+        "`shadowdroid net check` needs a package, and no default app is configured. \
+         Run `shadowdroid app current` to inspect the foreground app, pass `shadowdroid net check <pkg>`, \
+         or create a default with `shadowdroid config init --project --app <name> --package <pkg>`."
+    )
+}
+
 /// Route a parsed `net` command to its host-side handler. `net` owns its own
 /// daemon + adb wiring, so (unlike server-backed namespaces) this never touches
 /// `ensure_ready`. Clap types stay here; the handlers speak plain structs.
-async fn dispatch_net(c: &NetCmd, serial: &Serial) -> Result<()> {
+async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -> Result<()> {
     use crate::net::commands as nc;
     use crate::net::{DaemonConfig, Matcher, RuleSpec};
 
@@ -1633,8 +1727,11 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial) -> Result<()> {
     };
 
     match c {
-        NetCmd::Check { package } => nc::check(serial, package).await,
-        NetCmd::Trust { system, ui } => nc::trust(serial, *system, *ui).await,
+        NetCmd::Check { package } => {
+            let package = resolve_net_check_package(serial, config, package.clone()).await?;
+            nc::check(serial, &package).await
+        }
+        NetCmd::Trust { auto, system, ui } => nc::trust(serial, *auto, *system, *ui).await,
         NetCmd::Start {
             port,
             host,
@@ -1751,6 +1848,7 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial) -> Result<()> {
             NetRuleCmd::Rm { id } => nc::rule_rm(serial, id).await,
             NetRuleCmd::Clear => nc::rule_clear(serial).await,
         },
+        NetCmd::Override { url, file } => nc::override_local(serial, url, file).await,
         NetCmd::Rules { file } => nc::rules_apply(serial, file).await,
         NetCmd::Replay { from, host } => nc::replay(serial, from, host.clone()).await,
         NetCmd::Daemon(a) => {
@@ -1793,24 +1891,42 @@ fn read_body_arg(inline: &Option<String>, file: &Option<PathBuf>) -> Result<Opti
 
 /// Server-backed `app` verbs. `Install`/`Reinstall` are handled host-side in
 /// phase 1, so they're unreachable here.
-async fn dispatch_app(c: AppCmd, client: &ServerClient) -> Result<()> {
+async fn dispatch_app(
+    c: AppCmd,
+    client: &ServerClient,
+    config: &ShadowDroidConfig,
+    serial: &Serial,
+) -> Result<()> {
     match c {
         AppCmd::Install(_) | AppCmd::Reinstall(_) => {
             unreachable!("app install/reinstall handled host-side")
         }
-        AppCmd::Start { package } => {
-            client.app_start(&package).await?;
-            emit_action("app_start", &json!({"package":package}));
+        AppCmd::Start { package, activity } => {
+            let package = require_app_package(client, config, serial, package, "app start").await?;
+            let r = client.app_start(&package, activity.as_deref()).await?;
+            let mut body = json!({
+                "package": package,
+                "activity": r.activity,
+                "launcher_activities": r.launcher_activities,
+                "ok": r.ok,
+            });
+            if let Some(warning) = r.warning {
+                body["warning"] = json!(warning);
+            }
+            emit_action("app_start", &body);
         }
         AppCmd::Stop { package } => {
+            let package = require_app_package(client, config, serial, package, "app stop").await?;
             client.app_stop(&package).await?;
             emit_action("app_stop", &json!({"package":package}));
         }
         AppCmd::Clear { package } => {
+            let package = require_app_package(client, config, serial, package, "app clear").await?;
             client.app_clear(&package).await?;
             emit_action("app_clear", &json!({"package":package}));
         }
         AppCmd::Info { package } => {
+            let package = require_app_package(client, config, serial, package, "app info").await?;
             let info = client.app_info(&package).await?;
             emit_action(
                 "app_info",
@@ -1827,6 +1943,7 @@ async fn dispatch_app(c: AppCmd, client: &ServerClient) -> Result<()> {
             timeout_ms,
             front,
         } => {
+            let package = require_app_package(client, config, serial, package, "app wait").await?;
             let r = client.app_wait(&package, timeout_ms, front).await?;
             emit_action(
                 "app_wait",
@@ -1842,6 +1959,48 @@ async fn dispatch_app(c: AppCmd, client: &ServerClient) -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn require_app_package(
+    client: &ServerClient,
+    config: &ShadowDroidConfig,
+    serial: &Serial,
+    package: Option<String>,
+    command: &str,
+) -> Result<String> {
+    let requested = package
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let resolved = config
+        .resolve_app(Some(serial.as_str()), requested.as_deref())
+        .await?;
+    if let Some(package) = resolved.package {
+        return Ok(package);
+    }
+    if let Some(input) = resolved.input {
+        bail!(
+            "`{input}` did not resolve to one installed package for `shadowdroid {command}` \
+             (resolution source: {}). Pass a package explicitly or add an alias with \
+             `shadowdroid config init --project --app <name> --package <pkg>`.",
+            resolved.source
+        );
+    }
+    let foreground = client
+        .app_current()
+        .await
+        .ok()
+        .and_then(|current| current.package);
+    let mut msg =
+        format!("`shadowdroid {command}` needs a package, and no default app is configured.");
+    if let Some(package) = foreground {
+        msg.push_str(&format!(
+            " Foreground package is `{package}`; rerun `shadowdroid {command} {package}` if that is the target."
+        ));
+    }
+    msg.push_str(
+        " Or create a default with `shadowdroid config init --project --app <name> --package <pkg>`.",
+    );
+    bail!("{msg}")
 }
 
 async fn dispatch_device(c: DeviceCmd, client: &ServerClient, serial: &Serial) -> Result<()> {
@@ -2396,7 +2555,7 @@ async fn reconnect_after_screen_error(
     any_apk_version: bool,
     err: &anyhow::Error,
 ) -> Result<ServerClient> {
-    installer::ensure_ready(serial, apk, any_apk_version)
+    installer::ensure_ready_for_command(serial, apk, any_apk_version)
         .await
         .with_context(|| format!("screen request failed ({err}); reconnect failed"))
 }
@@ -2542,6 +2701,10 @@ async fn cmd_connect(
     any_apk_version: bool,
 ) -> Result<()> {
     let serial = resolve_serial(device).await?;
+    let before_version = installer::running_server_version(&serial)
+        .await
+        .ok()
+        .flatten();
     let client = installer::ensure_ready(&serial, apk, any_apk_version).await?;
     // Device prep: disable the Android 14+ stylus-handwriting tutorial that
     // otherwise hijacks the first text-field focus and breaks `text` input.
@@ -2552,7 +2715,7 @@ async fn cmd_connect(
     let mut out = json!({
         "type": "connected",
         "device": serial,
-        "server_version": state.server_version,
+        "server_version": state.server_version.clone(),
         "api_version": state.api_version,
         "ui_automator_version": state.ui_automator_version,
         "android_sdk": state.android_sdk,
@@ -2562,6 +2725,13 @@ async fn cmd_connect(
         "device_prep": {"stylus_tutorial_disabled": stylus_tutorial_disabled},
         "ui_automation": ui_automation_advisory(),
     });
+    if let Some(previous) = before_version.filter(|previous| previous != &state.server_version) {
+        out["server_reconciled"] = json!({
+            "previous_version": previous,
+            "current_version": state.server_version,
+            "hint": "server version was reconciled by this explicit connect; implicit UI/app commands fail fast on stale live servers",
+        });
+    }
     // Surface the UiAutomation-slot implication once, up front, so a later
     // instrumentation-test failure isn't a mystery. Muted by `--quiet`.
     tracing::info!(

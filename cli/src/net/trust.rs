@@ -16,6 +16,7 @@
 
 use crate::ids::Serial;
 use anyhow::{bail, Result};
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::device::adb;
@@ -27,7 +28,11 @@ const USER_CACERTS: &str = "/data/misc/user/0/cacerts-added";
 const TMP_CA: &str = "/data/local/tmp/shadowdroid-ca.pem";
 
 /// `net trust [--system|--ui]`.
-pub async fn run(serial: &Serial, system: bool, ui: bool) -> Result<()> {
+pub async fn run(serial: &Serial, auto: bool, system: bool, ui: bool) -> Result<()> {
+    let selected = [auto, system, ui].into_iter().filter(|v| *v).count();
+    if selected > 1 {
+        bail!("choose only one trust mode: --auto, --system, or --ui");
+    }
     let _ = CertAuthority::load_or_generate()?;
     if ui {
         return ui_install(serial).await;
@@ -76,6 +81,58 @@ pub async fn run(serial: &Serial, system: bool, ui: bool) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct TrustEvidence {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+    pub adbd_root: bool,
+    pub ca_generated: bool,
+    pub system_store: bool,
+    pub user_store: bool,
+    pub recommended_command: String,
+    pub recommendation_reason: String,
+}
+
+/// Read-only CA/trust-store evidence for `net check` and diagnostics.
+pub async fn evidence(serial: &Serial, play_store_image: bool) -> TrustEvidence {
+    let ca_generated = CertAuthority::load_or_generate().is_ok();
+    let hash = ca_subject_hash().ok();
+    let adbd_root = adb::shell(serial, "id -u")
+        .await
+        .map(|out| out.trim() == "0")
+        .unwrap_or(false);
+    let (system_store, user_store) = if let Some(hash) = &hash {
+        let sys = format!("{SYSTEM_CACERTS}/{hash}.0");
+        let usr = format!("{USER_CACERTS}/{hash}.0");
+        (
+            cert_present(serial, &sys).await,
+            cert_present(serial, &usr).await,
+        )
+    } else {
+        (false, false)
+    };
+    let (recommended_command, recommendation_reason) = if play_store_image || !adbd_root {
+        (
+            "shadowdroid net trust --ui".to_string(),
+            "device does not expose root adbd (common on Play Store/locked images), so install the CA through Android Settings".to_string(),
+        )
+    } else {
+        (
+            "shadowdroid net trust --auto".to_string(),
+            "root adbd is available, so ShadowDroid can push the CA directly and fall back between stores".to_string(),
+        )
+    };
+    TrustEvidence {
+        hash,
+        adbd_root,
+        ca_generated,
+        system_store,
+        user_store,
+        recommended_command,
+        recommendation_reason,
+    }
+}
+
 async fn try_system_store(serial: &Serial, hash: &str) -> (bool, Vec<Value>) {
     let dest = format!("{SYSTEM_CACERTS}/{hash}.0");
     let mut steps = Vec::new();
@@ -111,7 +168,7 @@ async fn try_user_store(serial: &Serial, hash: &str) -> bool {
 
 /// Verify-by-readback that avoids the false positive where `ls:`'s *error*
 /// message echoes the path (so a plain `contains(hash)` wrongly matches).
-async fn cert_present(serial: &Serial, dest: &str) -> bool {
+pub(crate) async fn cert_present(serial: &Serial, dest: &str) -> bool {
     let out = adb::shell(serial, format!("ls {dest} 2>&1"))
         .await
         .unwrap_or_default();
@@ -155,7 +212,7 @@ pub async fn remove(serial: &Serial) -> Result<bool> {
 }
 
 /// The OpenSSL `subject_hash_old` of our CA cert. Requires `openssl` on PATH.
-fn ca_subject_hash() -> Result<String> {
+pub(crate) fn ca_subject_hash() -> Result<String> {
     let ca = paths::ca_cert_path()?;
     let out = std::process::Command::new("openssl")
         .args([

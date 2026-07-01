@@ -256,12 +256,7 @@ pub async fn show(
 /// inlining a large body in the JSON. The body is whatever was stored (up to
 /// [`crate::net::flow::BODY_CAP`]); `truncated` is surfaced so the caller knows
 /// if the response exceeded the capture cap.
-fn write_body_file(
-    id: &str,
-    resp_body: Option<&str>,
-    truncated: bool,
-    path: &Path,
-) -> Result<()> {
+fn write_body_file(id: &str, resp_body: Option<&str>, truncated: bool, path: &Path) -> Result<()> {
     let Some(b) = resp_body else {
         bail!("flow `{id}` has no captured response body (binary, empty, or non-textual content-type)");
     };
@@ -284,8 +279,8 @@ pub async fn check(serial: &Serial, package: &str) -> Result<()> {
     crate::net::check::run(serial, package).await
 }
 
-pub async fn trust(serial: &Serial, system: bool, ui: bool) -> Result<()> {
-    crate::net::trust::run(serial, system, ui).await
+pub async fn trust(serial: &Serial, auto: bool, system: bool, ui: bool) -> Result<()> {
+    crate::net::trust::run(serial, auto, system, ui).await
 }
 
 pub async fn export(
@@ -381,6 +376,56 @@ pub async fn rule_add(serial: &Serial, spec: RuleSpec) -> Result<()> {
     }
     emit("net_rule_add", reply);
     Ok(())
+}
+
+pub async fn override_local(serial: &Serial, url_glob: &str, file: &Path) -> Result<()> {
+    if !file.is_file() {
+        bail!(
+            "override file does not exist or is not a file: {}",
+            file.display()
+        );
+    }
+    let matcher = matcher_from_url_glob(url_glob);
+    let spec = RuleSpec {
+        kind: "map-local".into(),
+        matcher,
+        content_type: None,
+        args: vec![file.display().to_string()],
+    };
+    let reply = control::request(serial, json!({"op": "rule_add", "spec": spec})).await?;
+    emit(
+        "net_override",
+        json!({
+            "url": url_glob,
+            "file": file.display().to_string(),
+            "rule": reply,
+            "hint": "equivalent to `net rule add map-local <file> --host <host> --path <path>`",
+        }),
+    );
+    Ok(())
+}
+
+fn matcher_from_url_glob(url_glob: &str) -> Matcher {
+    let mut raw = url_glob
+        .trim()
+        .trim_start_matches('*')
+        .trim_end_matches('*')
+        .to_string();
+    if let Some((_, rest)) = raw.split_once("://") {
+        raw = rest.to_string();
+    }
+    let (host, path) = match raw.split_once('/') {
+        Some((host, path)) => (
+            host.trim_matches('*'),
+            format!("/{}", path.trim_matches('*')),
+        ),
+        None => (raw.trim_matches('*'), String::new()),
+    };
+    Matcher {
+        host: (!host.is_empty()).then(|| host.to_string()),
+        path: (!path.is_empty() && path != "/").then_some(path),
+        ..Default::default()
+    }
 }
 
 /// `map-remote` rewrites scheme+host only and keeps the original request path. If
@@ -502,5 +547,16 @@ mod tests {
 
         // Other rule kinds never warn.
         assert!(map_remote_path_warning(&spec("set-request-header", "x-debug")).is_none());
+    }
+
+    #[test]
+    fn url_glob_to_matcher_extracts_host_and_path() {
+        let m = matcher_from_url_glob("https://api.example.com/v1/dict*");
+        assert_eq!(m.host.as_deref(), Some("api.example.com"));
+        assert_eq!(m.path.as_deref(), Some("/v1/dict"));
+
+        let m = matcher_from_url_glob("*.example.com");
+        assert_eq!(m.host.as_deref(), Some(".example.com"));
+        assert_eq!(m.path, None);
     }
 }

@@ -518,6 +518,38 @@ pub async fn ensure_ready(
     Ok(client)
 }
 
+/// Like [`ensure_ready`], but refuses to repair a live server that is merely
+/// stale. This keeps an unrelated UI/read command from unexpectedly spending
+/// seconds reinstalling the server after a CLI upgrade; `connect` and
+/// `doctor --fix` remain the explicit reconciliation paths.
+pub async fn ensure_ready_for_command(
+    serial: &Serial,
+    explicit_apk: Option<&Path>,
+    any_apk_version: bool,
+) -> Result<ServerClient> {
+    let host_port = ensure_forward(serial).await?;
+    let client = ServerClient::new(host_port)?;
+    match probe(&client, any_apk_version).await {
+        ProbeResult::Ready => Ok(client),
+        ProbeResult::VersionMismatch { found } => {
+            bail!(
+                "ShadowDroid server is running version {found}, but this CLI expects \
+                 {EXPECTED_APK_VERSION}. Run `shadowdroid connect` or \
+                 `shadowdroid doctor --fix` once to upgrade/restart the server, then retry."
+            )
+        }
+        ProbeResult::Down => ensure_ready(serial, explicit_apk, any_apk_version).await,
+    }
+}
+
+/// Best-effort version probe used by `connect` to report when it reconciled a
+/// stale live server. Returns `Ok(None)` when no server is answering.
+pub async fn running_server_version(serial: &Serial) -> Result<Option<String>> {
+    let host_port = ensure_forward(serial).await?;
+    let client = ServerClient::new(host_port)?;
+    Ok(client.state().await.ok().map(|state| state.server_version))
+}
+
 /// Heavy-handed cleanup for the case where system_server is holding a stale
 /// `UiAutomationService` registration. Force-stop everything, then wait long
 /// enough for system_server to actually release the slot (~5-10s observed).

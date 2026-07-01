@@ -153,7 +153,7 @@ pub fn spawn(cfg: &DaemonConfig) -> Result<u32> {
         .arg("--host-port")
         .arg(cfg.host_port.to_string());
     for app in &cfg.app_filters {
-        cmd.arg("--app").arg(app);
+        cmd.arg("--host").arg(app);
     }
     if cfg.anticache {
         cmd.arg("--anticache");

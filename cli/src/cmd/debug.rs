@@ -312,7 +312,9 @@ pub async fn run(serial: &Serial, client: &ServerClient, args: DebugArgs) -> Res
         DebugCmd::Snapshot(args) => snapshot_cmd(serial, client, args, studio_url.as_deref()).await,
         DebugCmd::Record(args) => record_cmd(serial, client, args, studio_url.as_deref()).await,
         DebugCmd::Replay(args) => replay_cmd(client, args).await,
-        DebugCmd::Studio(cmd) => debugger::run(&cmd, Some(serial.as_str()), studio_url.as_deref()).await,
+        DebugCmd::Studio(cmd) => {
+            debugger::run(&cmd, Some(serial.as_str()), studio_url.as_deref()).await
+        }
         DebugCmd::StepUntilScreenChange(args) => {
             step_until_screen_change(serial, client, args, studio_url.as_deref()).await
         }
@@ -361,8 +363,8 @@ async fn debug_auto(
                 "package": package,
             }));
         } else {
-            match client.app_start(package).await {
-                Ok(()) => steps.push(json!({
+            match client.app_start(package, None).await {
+                Ok(_) => steps.push(json!({
                     "step": "app_start",
                     "ok": true,
                     "package": package,
@@ -1929,7 +1931,7 @@ async fn perform_action(client: &ServerClient, value: &Value) -> Result<()> {
                 .get("package")
                 .and_then(Value::as_str)
                 .context("app_start event needs package")?;
-            client.app_start(package).await
+            client.app_start(package, None).await.map(|_| ())
         }
         other => anyhow::bail!("unsupported replay action: {other}"),
     }

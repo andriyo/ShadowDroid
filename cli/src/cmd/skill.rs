@@ -783,6 +783,33 @@ shadowdroid watch --app com.example.app | jq -c .
 default, warns when the net proxy is unavailable, and accepts `--no-net` only
 when you intentionally want UI/crash-only events.
 
+## Network capture notes
+
+Use `net check <pkg>` before relying on HTTPS capture. It reports the device
+image kind (Play Store vs Google APIs/AOSP), CA store evidence, and the
+recommended trust command (`net trust --auto` for rootable images, `net trust
+--ui` for locked/Play images). For targetSdk 24+ apps, user-store CA trust can
+still be conditional on the app's Network Security Config; prove the final loop
+by running `net start`, exercising the app, and observing a decrypted `http`
+event.
+
+```bash
+shadowdroid net check com.example.app | jq
+shadowdroid net trust --auto       # or use the command recommended by net check
+shadowdroid net start
+shadowdroid net log | jq -c 'select(.type=="http")'
+shadowdroid net show f1 --body --body-file /tmp/response.json
+shadowdroid net override --url 'https://api.example.com/v1/dict*' --file fixtures/dict.json
+```
+
+`net log` is line-delimited JSON: one `http` object per line, followed by one
+`{"cmd":"net_log","count":...}` summary object. Do not use `jq '.flows[]'`.
+Filter events with `jq -c 'select(.type=="http")'`.
+
+Large response bodies are capped inline. When `resp_truncated` is true, or when
+the body is just too large for the conversation, use `net show <id> --body-file
+<path>` so the body is written to disk instead of pasted into stdout.
+
 ## Debugging for agents
 
 Use a bounded snapshot when you need causality, not just the screen:

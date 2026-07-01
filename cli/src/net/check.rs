@@ -15,6 +15,7 @@
 use crate::ids::Serial;
 use anyhow::{bail, Result};
 use serde::Serialize;
+use serde_json::json;
 
 use crate::device::adb;
 
@@ -29,10 +30,26 @@ pub struct CheckReport {
     pub min_sdk: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version_name: Option<String>,
+    pub device_image: DeviceImage,
+    pub trust: crate::net::trust::TrustEvidence,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ca_trusted_by_app: Option<bool>,
+    pub ca_trust_basis: String,
     /// interceptable | conditional | blocked
     pub verdict: String,
     pub reason: String,
     pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceImage {
+    pub kind: String,
+    pub play_store_image: bool,
+    pub google_apis: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub product: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub characteristics: Option<String>,
 }
 
 /// Inspect an installed package and produce a verdict. Errors only if the
@@ -46,8 +63,12 @@ pub async fn inspect(serial: &Serial, package: &str) -> Result<CheckReport> {
     let target_sdk = parse_kv_int(&dump, "targetSdk");
     let min_sdk = parse_kv_int(&dump, "minSdk");
     let version_name = adb::pm_version(serial, package).await.ok().flatten();
+    let device_image = inspect_device_image(serial).await;
+    let trust = crate::net::trust::evidence(serial, device_image.play_store_image).await;
 
     let (verdict, reason) = verdict(debuggable, target_sdk);
+    let (ca_trusted_by_app, ca_trust_basis) =
+        app_ca_trust_expectation(&trust, debuggable, target_sdk);
 
     let mut notes = Vec::new();
     notes.push(
@@ -64,6 +85,20 @@ pub async fn inspect(serial: &Serial, package: &str) -> Result<CheckReport> {
                 .to_string(),
         );
     }
+    if ca_trusted_by_app.is_none() {
+        notes.push(
+            "Actual per-app CA trust was not proven by `net check`: Android does not expose that \
+             for arbitrary targetSdk ≥ 24 apps. Close the loop by running `net start`, exercising \
+             a known HTTPS request, then reading `net log` for a decrypted `http` event."
+                .to_string(),
+        );
+    }
+    if !trust.system_store && !trust.user_store {
+        notes.push(format!(
+            "ShadowDroid CA was not found in the device trust stores. Recommended setup: `{}`.",
+            trust.recommended_command
+        ));
+    }
 
     Ok(CheckReport {
         package: package.to_string(),
@@ -72,6 +107,10 @@ pub async fn inspect(serial: &Serial, package: &str) -> Result<CheckReport> {
         target_sdk,
         min_sdk,
         version_name,
+        device_image,
+        trust,
+        ca_trusted_by_app,
+        ca_trust_basis,
         verdict,
         reason,
         notes,
@@ -83,11 +122,85 @@ pub async fn run(serial: &Serial, package: &str) -> Result<()> {
     let report = inspect(serial, package).await?;
     let mut v = serde_json::to_value(&report).unwrap_or_default();
     if let serde_json::Value::Object(map) = &mut v {
-        map.insert("type".into(), serde_json::json!("action"));
-        map.insert("cmd".into(), serde_json::json!("net_check"));
+        map.insert("type".into(), json!("action"));
+        map.insert("cmd".into(), json!("net_check"));
     }
     println!("{}", serde_json::to_string(&v).unwrap());
     Ok(())
+}
+
+async fn inspect_device_image(serial: &Serial) -> DeviceImage {
+    let play_store_image = adb::pm_path(serial, "com.android.vending")
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    let google_apis = adb::pm_path(serial, "com.google.android.gms")
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    let product = getprop(serial, "ro.product.name").await;
+    let characteristics = getprop(serial, "ro.build.characteristics").await;
+    let kind = if play_store_image {
+        "play_store"
+    } else if google_apis {
+        "google_apis"
+    } else {
+        "aosp_or_generic"
+    }
+    .to_string();
+    DeviceImage {
+        kind,
+        play_store_image,
+        google_apis,
+        product,
+        characteristics,
+    }
+}
+
+async fn getprop(serial: &Serial, key: &str) -> Option<String> {
+    adb::shell(serial, format!("getprop {key}"))
+        .await
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn app_ca_trust_expectation(
+    trust: &crate::net::trust::TrustEvidence,
+    debuggable: bool,
+    target_sdk: Option<u32>,
+) -> (Option<bool>, String) {
+    if trust.system_store {
+        return (
+            Some(true),
+            "ShadowDroid CA is in the system store, which Android exposes to apps unless the client pins or bypasses the platform trust manager.".into(),
+        );
+    }
+    if !trust.user_store {
+        return (
+            Some(false),
+            "ShadowDroid CA is not installed in either the system or user trust store.".into(),
+        );
+    }
+    if target_sdk.is_some_and(|sdk| sdk <= 23) {
+        return (
+            Some(true),
+            "ShadowDroid CA is in the user store and targetSdk <= 23 trusts user CAs by default."
+                .into(),
+        );
+    }
+    if debuggable {
+        return (
+            None,
+            "ShadowDroid CA is in the user store; targetSdk >= 24 debuggable apps trust it only when their Network Security Config opts into user CAs.".into(),
+        );
+    }
+    (
+        Some(false),
+        "ShadowDroid CA is only in the user store; targetSdk >= 24 release apps do not trust user CAs unless their Network Security Config explicitly opts in.".into(),
+    )
 }
 
 fn verdict(debuggable: bool, target_sdk: Option<u32>) -> (String, String) {
@@ -145,5 +258,32 @@ mod tests {
         assert_eq!(verdict(true, Some(34)).0, "conditional");
         assert_eq!(verdict(false, Some(34)).0, "blocked");
         assert_eq!(verdict(false, Some(21)).0, "interceptable");
+    }
+
+    #[test]
+    fn app_ca_trust_expectation_distinguishes_actual_and_conditional() {
+        let mut trust = crate::net::trust::TrustEvidence {
+            hash: Some("abcd".into()),
+            adbd_root: true,
+            ca_generated: true,
+            system_store: false,
+            user_store: true,
+            recommended_command: "shadowdroid net trust --auto".into(),
+            recommendation_reason: "root".into(),
+        };
+        assert_eq!(app_ca_trust_expectation(&trust, true, Some(34)).0, None);
+        assert_eq!(
+            app_ca_trust_expectation(&trust, false, Some(34)).0,
+            Some(false)
+        );
+        assert_eq!(
+            app_ca_trust_expectation(&trust, false, Some(23)).0,
+            Some(true)
+        );
+        trust.system_store = true;
+        assert_eq!(
+            app_ca_trust_expectation(&trust, false, Some(34)).0,
+            Some(true)
+        );
     }
 }

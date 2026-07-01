@@ -1,0 +1,44 @@
+<resources>
+    <item name="sample_root" type="id" />
+    <item name="status_text" type="id" />
+    <item name="name_input" type="id" />
+    <item name="url_input" type="id" />
+    <item name="body_input" type="id" />
+    <item name="counter_button" type="id" />
+    <item name="counter_value" type="id" />
+    <item name="duplicate_one_button" type="id" />
+    <item name="duplicate_two_button" type="id" />
+    <item name="disabled_button" type="id" />
+    <item name="dialog_button" type="id" />
+    <item name="popup_button" type="id" />
+    <item name="toast_button" type="id" />
+    <item name="camera_permission_button" type="id" />
+    <item name="notification_button" type="id" />
+    <item name="detail_button" type="id" />
+    <item name="deep_link_button" type="id" />
+    <item name="clipboard_button" type="id" />
+    <item name="file_button" type="id" />
+    <item name="log_button" type="id" />
+    <item name="crash_button" type="id" />
+    <item name="anr_button" type="id" />
+    <item name="https_get_button" type="id" />
+    <item name="http_get_button" type="id" />
+    <item name="json_post_button" type="id" />
+    <item name="graphql_post_button" type="id" />
+    <item name="status_418_button" type="id" />
+    <item name="slow_request_button" type="id" />
+    <item name="large_body_button" type="id" />
+    <item name="webview_button" type="id" />
+    <item name="network_progress" type="id" />
+    <item name="webview_container" type="id" />
+    <item name="web_view" type="id" />
+    <item name="detail_root" type="id" />
+    <item name="detail_message" type="id" />
+    <item name="detail_finish_button" type="id" />
+    <item name="deep_link_root" type="id" />
+    <item name="deep_link_message" type="id" />
+    <item name="deep_link_finish_button" type="id" />
+    <item name="alt_root" type="id" />
+    <item name="alt_open_main_button" type="id" />
+</resources>
+

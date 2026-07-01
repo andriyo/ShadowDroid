@@ -463,7 +463,7 @@ async fn dispatch_command(
         }
         "launch" => {
             let package = req_str(cmd, "package")?;
-            cfg.client.app_start(package).await?;
+            cfg.client.app_start(package, None).await?;
             emit_action("launch", &json!({"package":package}));
         }
         "stop" => {

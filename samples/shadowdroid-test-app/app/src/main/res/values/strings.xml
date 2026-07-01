@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">ShadowDroid Test App</string>
+    <string name="main_activity_name">ShadowDroid Test</string>
+    <string name="alt_launcher_activity_name">ShadowDroid Alt Launcher</string>
+    <string name="detail_activity_name">ShadowDroid Detail</string>
+    <string name="deep_link_activity_name">ShadowDroid Deep Link</string>
+    <string name="notification_channel_name">Sample events</string>
+</resources>
+
