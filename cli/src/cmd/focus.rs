@@ -17,10 +17,11 @@
 
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 
 use crate::device::client::ServerClient;
 use crate::proto::Element;
+use crate::selector::{Selector, SelectorArgs};
 
 /// Pause after a D-pad press so the (often animated) focus move lands before we
 /// re-dump. Compose-TV focus transitions both animate and drop key events sent
@@ -33,15 +34,8 @@ const MAX_STALLS: u32 = 4;
 
 #[derive(clap::Args)]
 pub struct FocusArgs {
-    /// Match an element whose text contains this (substring, case-insensitive).
-    #[arg(long)]
-    pub text: Option<String>,
-    /// Match by resource-id substring.
-    #[arg(long)]
-    pub rid: Option<String>,
-    /// Match by content-description substring.
-    #[arg(long)]
-    pub desc: Option<String>,
+    #[command(flatten)]
+    pub selector: SelectorArgs,
     /// Press DPAD_CENTER once the target is focused (activate it).
     #[arg(long)]
     pub center: bool,
@@ -52,49 +46,6 @@ pub struct FocusArgs {
     /// Maximum D-pad presses before giving up.
     #[arg(long, default_value_t = 30)]
     pub max_steps: u32,
-}
-
-enum Selector {
-    Text(String),
-    Rid(String),
-    Desc(String),
-}
-
-impl Selector {
-    fn from_args(a: &FocusArgs) -> Result<Self> {
-        match (&a.text, &a.rid, &a.desc) {
-            (Some(t), None, None) => Ok(Selector::Text(t.clone())),
-            (None, Some(r), None) => Ok(Selector::Rid(r.clone())),
-            (None, None, Some(d)) => Ok(Selector::Desc(d.clone())),
-            (None, None, None) => bail!("pass exactly one of --text / --rid / --desc"),
-            _ => bail!("pass only one of --text / --rid / --desc"),
-        }
-    }
-
-    fn matches(&self, el: &Element, exact: bool) -> bool {
-        let (field, query) = match self {
-            Selector::Text(q) => (&el.text, q),
-            Selector::Rid(q) => (&el.rid, q),
-            Selector::Desc(q) => (&el.desc, q),
-        };
-        crate::selector::text_matches(field.as_deref(), Some(query), exact)
-    }
-
-    fn label(&self) -> serde_json::Value {
-        match self {
-            Selector::Text(q) => serde_json::json!({ "text": q }),
-            Selector::Rid(q) => serde_json::json!({ "rid": q }),
-            Selector::Desc(q) => serde_json::json!({ "desc": q }),
-        }
-    }
-
-    fn describe(&self) -> String {
-        match self {
-            Selector::Text(q) => format!("--text {q:?}"),
-            Selector::Rid(q) => format!("--rid {q:?}"),
-            Selector::Desc(q) => format!("--desc {q:?}"),
-        }
-    }
 }
 
 /// Resolve the selector to the single element to drive focus toward. Sole match
@@ -134,7 +85,7 @@ fn candidate_json(e: &Element) -> serde_json::Value {
 }
 
 pub async fn run(client: &ServerClient, args: &FocusArgs) -> Result<()> {
-    let selector = Selector::from_args(args)?;
+    let selector = args.selector.exactly_one()?;
 
     let mut steps = 0u32;
     let mut stalls = 0u32;

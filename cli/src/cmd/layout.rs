@@ -100,15 +100,8 @@ pub struct LayoutSourceArgs {
     /// Android Studio Layout Inspector draw id from `layout snapshot`.
     #[arg(long)]
     pub draw_id: Option<i64>,
-    /// Match text substring.
-    #[arg(long)]
-    pub text: Option<String>,
-    /// Match resource-id substring.
-    #[arg(long)]
-    pub rid: Option<String>,
-    /// Match content-description substring.
-    #[arg(long)]
-    pub desc: Option<String>,
+    #[command(flatten)]
+    pub selector: crate::selector::SelectorArgs,
     /// Android Studio plugin bridge URL.
     #[arg(long, env = "SHADOWDROID_STUDIO_DEBUGGER_URL")]
     pub studio_url: Option<String>,
@@ -285,15 +278,17 @@ async fn recompositions_cmd(
 async fn source_cmd(serial: &Serial, client: &ServerClient, args: LayoutSourceArgs) -> Result<()> {
     if args.id.is_none()
         && args.draw_id.is_none()
-        && args.text.is_none()
-        && args.rid.is_none()
-        && args.desc.is_none()
+        && args.selector.text.is_none()
+        && args.selector.rid.is_none()
+        && args.selector.desc.is_none()
     {
         anyhow::bail!("layout source needs --id, --draw-id, --text, --rid, or --desc");
     }
     let screen = client.screen().await.context("reading screen tree")?;
-    let needs_element_match =
-        args.id.is_some() || args.text.is_some() || args.rid.is_some() || args.desc.is_some();
+    let needs_element_match = args.id.is_some()
+        || args.selector.text.is_some()
+        || args.selector.rid.is_some()
+        || args.selector.desc.is_some();
     let element = if needs_element_match {
         screen
             .elements
@@ -365,10 +360,12 @@ async fn studio_layout_source(
         Err(err) => return json!({"available": false, "error": err.to_string()}),
     };
     let text = args
+        .selector
         .text
         .as_deref()
         .or_else(|| element.and_then(|element| element.text.as_deref()));
     let rid = args
+        .selector
         .rid
         .as_deref()
         .or_else(|| element.and_then(|element| element.rid.as_deref()));
@@ -384,7 +381,7 @@ async fn studio_layout_source(
         (query::TEXT, text),
         (query::RID, rid),
         (query::CLASS, class),
-        (query::DESC, args.desc.as_deref()),
+        (query::DESC, args.selector.desc.as_deref()),
         (query::BOUNDS, bounds.as_deref()),
     ];
     let params = target.params_with(&params);
@@ -616,9 +613,16 @@ fn element_matches(element: &Element, args: &LayoutSourceArgs) -> bool {
     if let Some(id) = args.id {
         return element.id == id;
     }
-    crate::selector::text_matches(element.text.as_deref(), args.text.as_deref(), false)
-        && crate::selector::text_matches(element.rid.as_deref(), args.rid.as_deref(), false)
-        && crate::selector::text_matches(element.desc.as_deref(), args.desc.as_deref(), false)
+    crate::selector::text_matches(
+        element.text.as_deref(),
+        args.selector.text.as_deref(),
+        false,
+    ) && crate::selector::text_matches(element.rid.as_deref(), args.selector.rid.as_deref(), false)
+        && crate::selector::text_matches(
+            element.desc.as_deref(),
+            args.selector.desc.as_deref(),
+            false,
+        )
 }
 
 fn read_snapshot(path: &Path) -> Result<Vec<Element>> {

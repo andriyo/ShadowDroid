@@ -92,6 +92,92 @@ pub struct AmbiguousMatch {
     pub candidates: Vec<serde_json::Value>,
 }
 
+/// The `--text/--rid/--desc` selector flags, flattened into every verb that
+/// targets an element by field. Verbs that require a single selector (`ui
+/// focus`, `ui scroll-to`) validate with [`SelectorArgs::exactly_one`]; verbs
+/// where the fields are independent optional filters (`layout source`) read
+/// them directly.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct SelectorArgs {
+    /// Match an element whose text contains this (substring, case-insensitive).
+    #[arg(long)]
+    pub text: Option<String>,
+    /// Match by resource-id substring.
+    #[arg(long)]
+    pub rid: Option<String>,
+    /// Match by content-description substring.
+    #[arg(long)]
+    pub desc: Option<String>,
+}
+
+impl SelectorArgs {
+    pub fn exactly_one(&self) -> anyhow::Result<Selector> {
+        match (&self.text, &self.rid, &self.desc) {
+            (Some(t), None, None) => Ok(Selector::Text(t.clone())),
+            (None, Some(r), None) => Ok(Selector::Rid(r.clone())),
+            (None, None, Some(d)) => Ok(Selector::Desc(d.clone())),
+            (None, None, None) => anyhow::bail!("pass exactly one of --text / --rid / --desc"),
+            _ => anyhow::bail!("pass only one of --text / --rid / --desc"),
+        }
+    }
+}
+
+/// One concrete field selector — the validated exactly-one form of
+/// [`SelectorArgs`].
+pub enum Selector {
+    Text(String),
+    Rid(String),
+    Desc(String),
+}
+
+impl Selector {
+    pub fn matches(&self, el: &crate::proto::Element, exact: bool) -> bool {
+        let (field, query) = match self {
+            Selector::Text(q) => (&el.text, q),
+            Selector::Rid(q) => (&el.rid, q),
+            Selector::Desc(q) => (&el.desc, q),
+        };
+        text_matches(field.as_deref(), Some(query), exact)
+    }
+
+    /// The `{"text": …}`-style object used in action output.
+    pub fn label(&self) -> serde_json::Value {
+        match self {
+            Selector::Text(q) => serde_json::json!({ "text": q }),
+            Selector::Rid(q) => serde_json::json!({ "rid": q }),
+            Selector::Desc(q) => serde_json::json!({ "desc": q }),
+        }
+    }
+
+    /// The equivalent on-device query for server-side find/tap routes.
+    pub fn query(&self) -> crate::proto::SelectorQuery {
+        match self {
+            Selector::Text(q) => crate::proto::SelectorQuery {
+                text: Some(q.clone()),
+                ..Default::default()
+            },
+            Selector::Rid(q) => crate::proto::SelectorQuery {
+                rid: Some(q.clone()),
+                ..Default::default()
+            },
+            Selector::Desc(q) => crate::proto::SelectorQuery {
+                desc: Some(q.clone()),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// How to spell this selector back on the command line (for hint text and
+    /// `ambiguous_match` queries).
+    pub fn describe(&self) -> String {
+        match self {
+            Selector::Text(q) => format!("--text {q:?}"),
+            Selector::Rid(q) => format!("--rid {q:?}"),
+            Selector::Desc(q) => format!("--desc {q:?}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

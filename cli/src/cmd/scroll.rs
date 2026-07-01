@@ -11,22 +11,16 @@
 //! `down` (default) reveals items further down a vertical list. The finger
 //! gesture is the opposite, handled internally.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 
 use crate::device::client::ServerClient;
-use crate::proto::{Element, ScrollResp, SelectorQuery};
+use crate::proto::{Element, ScrollResp};
+use crate::selector::{Selector, SelectorArgs};
 
 #[derive(clap::Args)]
 pub struct ScrollArgs {
-    /// Match an element whose text contains this (substring, case-insensitive).
-    #[arg(long)]
-    pub text: Option<String>,
-    /// Match by resource-id substring.
-    #[arg(long)]
-    pub rid: Option<String>,
-    /// Match by content-description substring.
-    #[arg(long)]
-    pub desc: Option<String>,
+    #[command(flatten)]
+    pub selector: SelectorArgs,
     /// Content scroll direction: down (default) reveals items further down.
     #[arg(long, default_value = "down", value_parser = ["up", "down", "left", "right"])]
     pub direction: String,
@@ -44,60 +38,8 @@ pub struct ScrollArgs {
     pub duration_ms: u32,
 }
 
-enum Selector {
-    Text(String),
-    Rid(String),
-    Desc(String),
-}
-
-impl Selector {
-    fn from_args(a: &ScrollArgs) -> Result<Self> {
-        match (&a.text, &a.rid, &a.desc) {
-            (Some(t), None, None) => Ok(Selector::Text(t.clone())),
-            (None, Some(r), None) => Ok(Selector::Rid(r.clone())),
-            (None, None, Some(d)) => Ok(Selector::Desc(d.clone())),
-            (None, None, None) => bail!("pass exactly one of --text / --rid / --desc"),
-            _ => bail!("pass only one of --text / --rid / --desc"),
-        }
-    }
-
-    fn matches(&self, el: &Element) -> bool {
-        let (field, query) = match self {
-            Selector::Text(q) => (&el.text, q),
-            Selector::Rid(q) => (&el.rid, q),
-            Selector::Desc(q) => (&el.desc, q),
-        };
-        crate::selector::text_matches(field.as_deref(), Some(query), false)
-    }
-
-    fn label(&self) -> serde_json::Value {
-        match self {
-            Selector::Text(q) => serde_json::json!({ "text": q }),
-            Selector::Rid(q) => serde_json::json!({ "rid": q }),
-            Selector::Desc(q) => serde_json::json!({ "desc": q }),
-        }
-    }
-
-    fn query(&self) -> SelectorQuery {
-        match self {
-            Selector::Text(q) => SelectorQuery {
-                text: Some(q.clone()),
-                ..Default::default()
-            },
-            Selector::Rid(q) => SelectorQuery {
-                rid: Some(q.clone()),
-                ..Default::default()
-            },
-            Selector::Desc(q) => SelectorQuery {
-                desc: Some(q.clone()),
-                ..Default::default()
-            },
-        }
-    }
-}
-
 pub async fn run(client: &ServerClient, args: &ScrollArgs) -> Result<()> {
-    let selector = Selector::from_args(args)?;
+    let selector = args.selector.exactly_one()?;
 
     // Fast path: drive a scrollable on-device. On any error (older server with
     // no /v1/scroll route, or no scrollable container) fall back to the host
@@ -105,9 +47,9 @@ pub async fn run(client: &ServerClient, args: &ScrollArgs) -> Result<()> {
     // container exists but the item simply isn't there.
     let server = client
         .scroll(
-            args.rid.as_deref(),
-            args.text.as_deref(),
-            args.desc.as_deref(),
+            args.selector.rid.as_deref(),
+            args.selector.text.as_deref(),
+            args.selector.desc.as_deref(),
             &args.direction,
             args.container_rid.as_deref(),
             args.max_swipes,
@@ -124,7 +66,7 @@ pub async fn run(client: &ServerClient, args: &ScrollArgs) -> Result<()> {
     let mut last_hash = String::new();
     loop {
         let screen = client.screen().await?;
-        if let Some(el) = screen.elements.iter().find(|e| selector.matches(e)) {
+        if let Some(el) = screen.elements.iter().find(|e| selector.matches(e, false)) {
             let mut el = el.clone();
             if args.tap {
                 el = client.find_tap(&selector.query()).await?.matched;
