@@ -54,6 +54,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         createNotificationChannel()
+        startService(Intent(this, RemoteEchoService::class.java))
         render()
         setStatus("Ready: ${intentSummary(intent)}")
         Log.i(TAG, "MainActivity created")
