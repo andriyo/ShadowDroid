@@ -161,7 +161,7 @@ pub fn header_get<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a
 /// JS, form-encoded, and `+json`/`+xml` structured-suffix types.
 pub fn is_textual(content_type: Option<&str>) -> bool {
     match content_type {
-        None => true, // unknown — small bodies are usually text; the cap protects us
+        None => true, // unknown — give it a chance; body_to_text sniffs for binary
         Some(ct) => {
             ct.starts_with("text/")
                 || ct.contains("json")
@@ -174,13 +174,21 @@ pub fn is_textual(content_type: Option<&str>) -> bool {
 }
 
 /// Reduce a raw body to a capped textual string for storage. Returns
-/// `(text, truncated)`; `text` is `None` for binary or empty bodies.
+/// `(text, truncated)`; `text` is `None` for binary or empty bodies. A body
+/// with no declared content-type is sniffed: a NUL among the first bytes
+/// means binary. Declared-text bodies that aren't valid UTF-8 (e.g. Latin-1)
+/// are still stored, lossily — mangled text beats nothing when debugging.
 pub fn body_to_text(
     content_type: Option<&str>,
     bytes: &[u8],
     cap: usize,
 ) -> (Option<String>, bool) {
     if bytes.is_empty() || !is_textual(content_type) {
+        return (None, false);
+    }
+    // `is_textual(None)` is benefit-of-the-doubt; don't let an undeclared
+    // binary body become a megabyte of U+FFFD in the session log.
+    if content_type.is_none() && bytes.iter().take(512).any(|&b| b == 0) {
         return (None, false);
     }
     let truncated = bytes.len() > cap;
@@ -192,12 +200,31 @@ pub fn body_to_text(
     }
 }
 
+/// Headers as a JSON object. A header that appears once maps to a string; a
+/// repeated header (case-insensitive — think multiple `Set-Cookie`) collects
+/// every value into an array under the first-seen key casing.
 fn headers_to_map(headers: &[(String, String)]) -> serde_json::Value {
+    use serde_json::Value;
     let mut m = serde_json::Map::new();
     for (k, v) in headers {
-        m.insert(k.clone(), serde_json::Value::String(v.clone()));
+        let key = m
+            .keys()
+            .find(|existing| existing.eq_ignore_ascii_case(k))
+            .cloned()
+            .unwrap_or_else(|| k.clone());
+        let val = Value::String(v.clone());
+        match m.get_mut(&key) {
+            None => {
+                m.insert(key, val);
+            }
+            Some(Value::Array(arr)) => arr.push(val),
+            Some(prev) => {
+                let first = prev.take();
+                *prev = Value::Array(vec![first, val]);
+            }
+        }
     }
-    serde_json::Value::Object(m)
+    Value::Object(m)
 }
 
 fn is_false(b: &bool) -> bool {
@@ -230,6 +257,35 @@ mod tests {
 
         let (t, _) = body_to_text(Some("image/png"), &[0u8, 1, 2], 1024);
         assert!(t.is_none());
+    }
+
+    #[test]
+    fn unknown_type_sniffs_binary() {
+        // No content-type + NUL in the head = binary, not stored.
+        let (t, trunc) = body_to_text(None, b"\x00\x01\x02garbage", 1024);
+        assert!(t.is_none());
+        assert!(!trunc);
+        // No content-type but clean text is still captured.
+        let (t, _) = body_to_text(None, b"plain text", 1024);
+        assert_eq!(t.as_deref(), Some("plain text"));
+        // A declared-text body keeps the benefit of the doubt (lossy path).
+        let (t, _) = body_to_text(Some("text/html"), b"caf\xe9", 1024);
+        assert_eq!(t.as_deref(), Some("caf\u{fffd}"));
+    }
+
+    #[test]
+    fn repeated_headers_collect_into_array() {
+        let headers = vec![
+            ("Content-Type".to_string(), "text/html".to_string()),
+            ("Set-Cookie".to_string(), "a=1".to_string()),
+            ("set-cookie".to_string(), "b=2".to_string()),
+            ("Set-Cookie".to_string(), "c=3".to_string()),
+        ];
+        let m = headers_to_map(&headers);
+        assert_eq!(m["Content-Type"], serde_json::json!("text/html"));
+        // Case-insensitive merge under the first-seen casing, values in order.
+        assert_eq!(m["Set-Cookie"], serde_json::json!(["a=1", "b=2", "c=3"]));
+        assert!(m.get("set-cookie").is_none());
     }
 
     #[test]
