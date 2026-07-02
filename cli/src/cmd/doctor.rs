@@ -70,24 +70,39 @@ enum OwnerClass {
 pub struct DoctorReport {
     pub target: Option<Serial>,
     pub checks: Vec<Check>,
-    /// Every non-advisory check is `ok`. The Studio / debugger-bridge checks are
-    /// advisory (they describe an optional capability, not the driving pipe) and
-    /// do not gate this flag — see `from_checks`.
+    /// Every non-advisory check is `ok`. Advisory checks (see [`ADVISORY_CODES`])
+    /// describe optional capabilities, not the driving pipe, and do not gate this
+    /// flag — see [`is_healthy`].
     pub healthy: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fixed: Option<bool>,
 }
 
+/// Checks whose status must NOT gate `healthy`: they describe optional
+/// capabilities layered on top of the host↔device pipe, not the pipe itself.
+/// A missing Android Studio debugger, an app that can't be MITM'd, or an
+/// un-wired in-app agent shouldn't read as "device pipe broken" to an agent.
+const ADVISORY_CODES: &[&str] = &[
+    "studio",
+    "studio_plugin",
+    "debugger_bridge",
+    "net_app",
+    "agent",
+];
+
+/// `healthy` iff every non-advisory check is `ok`. Single source of truth so the
+/// checks appended after `gather` (net_app, agent) recompute health the same way
+/// — previously each re-derived it as `all(ok)`, which dropped the advisory
+/// exemption and let an advisory warning flip `healthy` to false.
+fn is_healthy(checks: &[Check]) -> bool {
+    checks
+        .iter()
+        .all(|c| c.status == Status::Ok || ADVISORY_CODES.contains(&c.code))
+}
+
 impl DoctorReport {
     fn from_checks(target: Option<Serial>, checks: Vec<Check>) -> Self {
-        // The Studio / debugger-bridge checks describe an OPTIONAL capability (the
-        // Android Studio debugger), not the host↔device pipe needed to drive the
-        // UI. A missing or idle bridge shouldn't flip `healthy` to false and read
-        // as "device pipe broken" to an agent — gate health on the core checks.
-        const ADVISORY_CODES: &[&str] = &["studio", "studio_plugin", "debugger_bridge"];
-        let healthy = checks
-            .iter()
-            .all(|c| c.status == Status::Ok || ADVISORY_CODES.contains(&c.code));
+        let healthy = is_healthy(&checks);
         Self {
             target,
             checks,
@@ -434,6 +449,7 @@ pub async fn run(
     json: bool,
     app: Option<&str>,
     project: Option<&std::path::Path>,
+    config: &crate::config::ShadowDroidConfig,
 ) -> Result<()> {
     let mut report = gather(device).await;
 
@@ -446,7 +462,16 @@ pub async fn run(
     // `doctor --app <pkg>`: append the per-app interceptability verdict (`net
     // check`). Read-only, so it sits outside the fix flow.
     if let (Some(app), Some(serial)) = (app, report.target.clone()) {
-        let check = match crate::net::check::inspect(&serial, app).await {
+        // Resolve a config alias (e.g. `Sample`) to its package before checking,
+        // like every other app-taking command — otherwise `net check` looks up a
+        // package literally named `Sample` and reports it "not installed".
+        let package = config
+            .resolve_app(Some(serial.as_str()), Some(app))
+            .await
+            .ok()
+            .and_then(|r| r.package)
+            .unwrap_or_else(|| app.to_string());
+        let check = match crate::net::check::inspect(&serial, &package).await {
             Ok(rep) => {
                 let status = match rep.verdict.as_str() {
                     "interceptable" => Status::Ok,
@@ -463,12 +488,12 @@ pub async fn run(
             Err(e) => Check {
                 code: "net_app",
                 status: Status::Warn,
-                detail: format!("net check {app}: {e}"),
+                detail: format!("net check {package}: {e}"),
                 remedy: None,
             },
         };
         report.checks.push(check);
-        report.healthy = report.checks.iter().all(|c| c.status == Status::Ok);
+        report.healthy = is_healthy(&report.checks);
     }
 
     // `--project-root <path>` (or config `project`): append the in-app debug-agent
@@ -503,7 +528,7 @@ pub async fn run(
                 },
             };
         report.checks.push(check);
-        report.healthy = report.checks.iter().all(|c| c.status == Status::Ok);
+        report.healthy = is_healthy(&report.checks);
     }
 
     if json {
@@ -758,6 +783,42 @@ fn print_human(report: &DoctorReport, fix: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn check(code: &'static str, status: Status) -> Check {
+        Check {
+            code,
+            status,
+            detail: String::new(),
+            remedy: None,
+        }
+    }
+
+    #[test]
+    fn advisory_warnings_do_not_flip_healthy() {
+        // A core check failing → unhealthy.
+        assert!(!is_healthy(&[
+            check("server", Status::Ok),
+            check("owners", Status::Fail),
+        ]));
+        // Advisory checks (net_app conditional, agent not-installed, idle bridge)
+        // warning/failing while the core pipe is ok → still healthy. This is the
+        // regression: configuring a project used to flip healthy to false purely
+        // because the optional AAR wasn't installed.
+        assert!(is_healthy(&[
+            check("device", Status::Ok),
+            check("apk", Status::Ok),
+            check("server", Status::Ok),
+            check("owners", Status::Ok),
+            check("net_app", Status::Warn),
+            check("agent", Status::Warn),
+            check("debugger_bridge", Status::Warn),
+        ]));
+        // Even a hard net_app fail (app not interceptable) is advisory.
+        assert!(is_healthy(&[
+            check("server", Status::Ok),
+            check("net_app", Status::Fail),
+        ]));
+    }
 
     #[test]
     fn classifies_owners() {

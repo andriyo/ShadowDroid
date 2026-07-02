@@ -1047,6 +1047,7 @@ pub async fn run() -> Result<()> {
                 *json,
                 app.as_deref(),
                 project.as_deref(),
+                &config,
             )
             .await;
         }
