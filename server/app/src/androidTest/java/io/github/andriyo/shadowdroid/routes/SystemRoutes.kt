@@ -1,6 +1,7 @@
 package io.github.andriyo.shadowdroid.routes
 
 import android.app.Instrumentation
+import android.app.UiAutomation
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -8,6 +9,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.view.Surface
 import androidx.test.uiautomator.UiDevice
 import io.github.andriyo.shadowdroid.BadRequest
 import io.github.andriyo.shadowdroid.proto.OkResponse
@@ -47,14 +49,16 @@ object SystemRoutes {
         }
 
         route.get("/orientation") {
+            // Report the display rotation in the SAME vocabulary `set` accepts, so
+            // a get→set round-trip works. (Previously get returned
+            // natural|landscape|other, which `set` rejects.)
             val v =
-                when {
-                    uiDevice.isNaturalOrientation -> "natural"
-                    else ->
-                        when (instr.targetContext.resources.configuration.orientation) {
-                            android.content.res.Configuration.ORIENTATION_LANDSCAPE -> "landscape"
-                            else -> "other"
-                        }
+                when (uiDevice.displayRotation) {
+                    Surface.ROTATION_0 -> "natural"
+                    Surface.ROTATION_90 -> "left"
+                    Surface.ROTATION_180 -> "upsidedown"
+                    Surface.ROTATION_270 -> "right"
+                    else -> "natural"
                 }
             call.respond(OrientationResp(v))
         }
@@ -64,12 +68,13 @@ object SystemRoutes {
                 "natural", "n" -> uiDevice.setOrientationNatural()
                 "left", "l" -> uiDevice.setOrientationLeft()
                 "right", "r" -> uiDevice.setOrientationRight()
-                "upsidedown", "upside_down", "u" ->
-                    uiDevice.setOrientationLeft().also {
-                        // No direct setOrientationUpsideDown; left twice ≈ upside-down on
-                        // most devices. For strict 180° rotation, callers should use
-                        // settings put system user_rotation 2 via /v1/shell.
-                    }
+                "upsidedown", "upside_down", "u" -> {
+                    // UiDevice has no setOrientationUpsideDown; freeze at 180°
+                    // directly (the same UiAutomation call the left/right helpers
+                    // use for 90°/270°), then wait for the rotation to settle.
+                    instr.uiAutomation.setRotation(UiAutomation.ROTATION_FREEZE_180)
+                    uiDevice.waitForIdle()
+                }
                 else -> throw BadRequest(
                     "bad_orientation",
                     "value must be natural|left|right|upsidedown, got '${r.value}'",
