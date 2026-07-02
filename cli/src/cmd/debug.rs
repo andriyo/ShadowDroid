@@ -14,7 +14,7 @@ use crate::device::client::ServerClient;
 use crate::events::CrashEvent;
 use crate::ids::Serial;
 use crate::watch::logcat;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1225,7 +1225,14 @@ async fn step_until_log(
                         return Ok(());
                     }
                 }
-                Ok(None) | Err(_) => {}
+                // Channel closed (logcat exited): recv resolves instantly, so
+                // continuing would hot-spin to the deadline. Bail like
+                // run_until_crash does. Err(_) is the 25ms poll timeout — expected.
+                Ok(None) => bail!(
+                    "logcat for step-until-log stopped before {:?} matched",
+                    args.pattern
+                ),
+                Err(_) => {}
             }
         }
     }
@@ -1329,7 +1336,8 @@ async fn run_until_crash(
                 emit_or_write_json(args.out.as_deref(), &result)?;
                 return Ok(());
             }
-            Ok(None) | Err(_) => {}
+            Ok(None) => bail!("crash logcat stopped before a crash was detected"),
+            Err(_) => {}
         }
     }
 }
@@ -1609,7 +1617,9 @@ async fn device_file_list(serial: &Serial, list_cmd: &str) -> Result<Vec<String>
 
 fn spawn_crash_logcat(serial: Serial, app_filter: Option<String>, out: mpsc::Sender<CrashEvent>) {
     tokio::spawn(async move {
-        let _ = logcat::run_crashes(serial, app_filter, out).await;
+        if let Err(err) = logcat::run_crashes(serial, app_filter, out).await {
+            tracing::warn!("crash logcat stopped: {err}");
+        }
     });
 }
 

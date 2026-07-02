@@ -11,7 +11,7 @@
 use crate::device::adb;
 use crate::events::{now_ts, CausedBy, CrashEvent, Event};
 use crate::ids::Serial;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use regex::Regex;
 use std::process::Stdio;
 use std::sync::OnceLock;
@@ -29,13 +29,25 @@ pub async fn run(
     out: mpsc::Sender<Event>,
 ) -> Result<()> {
     let (crash_tx, mut crash_rx) = mpsc::channel(256);
-    tokio::spawn(async move {
-        let _ = run_crashes(serial, app_filter, crash_tx).await;
-    });
-    while let Some(evt) = crash_rx.recv().await {
-        let _ = out.send(Event::Crash(evt)).await;
+    let mut worker = tokio::spawn(run_crashes(serial, app_filter, crash_tx));
+    loop {
+        tokio::select! {
+            evt = crash_rx.recv() => {
+                if let Some(evt) = evt {
+                    let _ = out.send(Event::Crash(evt)).await;
+                } else {
+                    return worker.await.context("crash detector task panicked")?;
+                }
+            }
+            result = &mut worker => {
+                let run_result = result.context("crash detector task panicked")?;
+                while let Ok(evt) = crash_rx.try_recv() {
+                    let _ = out.send(Event::Crash(evt)).await;
+                }
+                return run_result;
+            }
+        }
     }
-    Ok(())
 }
 
 pub async fn run_crashes(
@@ -76,7 +88,10 @@ pub async fn run_crashes(
         tokio::select! {
             line = lines.next_line() => {
                 let Some(line) = line? else {
-                    break;
+                    if let Some(evt) = collector.finalize_now() {
+                        emit_if_matches(&serial, &app_filter, &out, evt).await;
+                    }
+                    bail!("adb logcat for crash detection exited");
                 };
                 for evt in collector.handle_line(&line) {
                     emit_if_matches(&serial, &app_filter, &out, evt).await;
@@ -89,11 +104,6 @@ pub async fn run_crashes(
             }
         }
     }
-
-    if let Some(evt) = collector.finalize_now() {
-        emit_if_matches(&serial, &app_filter, &out, evt).await;
-    }
-    Ok(())
 }
 
 async fn emit_if_matches(
@@ -236,7 +246,7 @@ fn build_anr_event(line: &LogLine) -> CrashEvent {
         kind: "anr".to_string(),
         ts: now_ts(),
         package,
-        pid: Some(line.pid),
+        pid: None,
         thread: None,
         exception: None,
         message: Some(line.msg.clone()),
@@ -502,7 +512,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "anr");
         assert_eq!(events[0].package.as_deref(), Some("com.example"));
-        assert_eq!(events[0].pid, Some(1234));
+        assert_eq!(events[0].pid, None);
         assert!(events[0]
             .message
             .as_deref()

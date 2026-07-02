@@ -418,7 +418,7 @@ pub enum FilesCmd {
         local: String,
         remote: String,
         /// Unix permission bits for the pushed file (octal, e.g. 644).
-        #[arg(long, default_value_t = 0o644)]
+        #[arg(long, default_value = "644", value_parser = parse_octal_mode)]
         mode: u32,
     },
     /// Pull a device file to the host.
@@ -2090,19 +2090,22 @@ async fn dispatch_files(c: FilesCmd, client: &ServerClient, serial: &Serial) -> 
             let bytes_len = bytes.len() as u64;
             // Server first (app-accessible storage); fall back to `adb push` for
             // paths the instrumentation uid can't write (e.g. /sdcard under
-            // scoped storage).
-            match client.push_file(&remote, bytes).await {
+            // scoped storage). A structured client error (4xx, e.g. bad_mode) is
+            // a contract violation adb can't fix, so surface it instead.
+            match client.push_file(&remote, bytes, Some(mode)).await {
                 Ok(r) => emit_action(
                     "push",
                     &json!({"local":local,"remote":remote,"path":r.path,"bytes":r.bytes,"mode":r.mode,"requested_mode":mode,"via":"server"}),
                 ),
-                Err(_) => {
+                Err(err) if should_fall_back_to_adb(&err) => {
                     adb::push(serial, std::path::PathBuf::from(&local), remote.clone()).await?;
+                    let mode_applied = chmod_via_adb(serial, mode, &remote).await;
                     emit_action(
                         "push",
-                        &json!({"local":local,"remote":remote,"bytes":bytes_len,"via":"adb"}),
+                        &json!({"local":local,"remote":remote,"bytes":bytes_len,"requested_mode":mode,"mode_applied":mode_applied,"via":"adb"}),
                     );
                 }
+                Err(err) => return Err(err),
             }
         }
         FilesCmd::Pull { remote, local } => {
@@ -2118,6 +2121,53 @@ async fn dispatch_files(c: FilesCmd, client: &ServerClient, serial: &Serial) -> 
         }
     }
     Ok(())
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Parse an octal permission string (e.g. `644`, `755`) into its bit value.
+/// `files push --mode` documents octal, but clap's stock `u32` parser reads
+/// base-10 — so `--mode 644` would mean 644 decimal, overflowing the server's
+/// `0..=0o777` range and getting chmod'd as `0o1204` on the adb fallback. This
+/// mirrors the octal parse the `watch` stdin `push` grammar already uses.
+fn parse_octal_mode(s: &str) -> Result<u32, String> {
+    let mode = u32::from_str_radix(s.trim(), 8)
+        .map_err(|_| format!("mode must be octal permission bits, e.g. 644 (got {s:?})"))?;
+    if mode > 0o777 {
+        return Err(format!("mode must be in the range 0..=777 octal (got {s})"));
+    }
+    Ok(mode)
+}
+
+/// Whether a failed server push should fall back to `adb push`. Transport
+/// failures and server-side (5xx) errors — e.g. an unwritable scoped-storage
+/// path — fall back; structured client errors (4xx, e.g. `bad_mode`) are
+/// surfaced, since adb can't fix a rejected request.
+fn should_fall_back_to_adb(err: &anyhow::Error) -> bool {
+    match err.downcast_ref::<crate::device::client::ServerError>() {
+        Some(server) => !server.status.is_client_error(),
+        None => true,
+    }
+}
+
+const CHMOD_OK_MARKER: &str = "__shadowdroid_chmod_ok__";
+
+/// Apply `mode` to `remote` via `adb shell chmod`, reporting whether it
+/// actually took. `adb::shell` returns `Ok` whenever the transport succeeds and
+/// discards the on-device exit code, so the command self-reports success with a
+/// marker that only prints when `chmod` returns 0.
+async fn chmod_via_adb(serial: &Serial, mode: u32, remote: &str) -> bool {
+    let cmd = format!(
+        "chmod {:o} {} && echo {CHMOD_OK_MARKER}",
+        mode,
+        shell_single_quote(remote)
+    );
+    match adb::shell(serial, cmd).await {
+        Ok(out) => out.contains(CHMOD_OK_MARKER),
+        Err(_) => false,
+    }
 }
 
 // ── emit helpers ────────────────────────────────────────────
@@ -2848,6 +2898,56 @@ pub(crate) async fn resolve_serial(explicit: Option<&str>) -> Result<Serial> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn push_mode_parses_as_octal() {
+        // `--mode 644` must mean 0o644 (rw-r--r-- = 420), matching the help text
+        // and the `watch` stdin `push` grammar — not 644 decimal.
+        assert_eq!(parse_octal_mode("644").unwrap(), 0o644);
+        assert_eq!(parse_octal_mode("755").unwrap(), 0o755);
+        assert_eq!(parse_octal_mode(" 600 ").unwrap(), 0o600);
+        // Out of the server's 0..=0o777 range, and non-octal digits, are rejected.
+        assert!(parse_octal_mode("999").is_err());
+        assert!(parse_octal_mode("1644").is_err());
+        assert!(parse_octal_mode("rwx").is_err());
+    }
+
+    #[test]
+    fn push_mode_default_is_0o644() {
+        let cli =
+            Cli::try_parse_from(["shadowdroid", "files", "push", "a.txt", "/data/local/tmp/a"])
+                .unwrap();
+        match cli.cmd {
+            Cmd::Files(FilesCmd::Push { mode, .. }) => assert_eq!(mode, 0o644),
+            _ => panic!("expected files push"),
+        }
+    }
+
+    #[test]
+    fn adb_fallback_skips_client_errors_but_takes_server_and_transport() {
+        use crate::device::client::ServerError;
+        // A 4xx (e.g. bad_mode) is a contract error adb can't fix → surface it.
+        let client_err = anyhow::Error::new(ServerError {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            code: "bad_mode".into(),
+            message: "mode must be between 0 and 511".into(),
+            detail: None,
+        });
+        assert!(!should_fall_back_to_adb(&client_err));
+        // A 5xx (e.g. unwritable scoped-storage path) → fall back, the reason the
+        // adb path exists.
+        let server_err = anyhow::Error::new(ServerError {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            code: "internal".into(),
+            message: "EACCES".into(),
+            detail: None,
+        });
+        assert!(should_fall_back_to_adb(&server_err));
+        // A non-structured (transport) error → fall back (server unreachable).
+        assert!(should_fall_back_to_adb(&anyhow::anyhow!(
+            "connection refused"
+        )));
+    }
 
     #[test]
     fn cli_defines_global_quiet_flag() {

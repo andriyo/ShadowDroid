@@ -466,10 +466,19 @@ impl ServerClient {
             .await
     }
 
-    pub async fn push_file(&self, remote: &str, bytes: Vec<u8>) -> Result<FileWriteResp> {
+    pub async fn push_file(
+        &self,
+        remote: &str,
+        bytes: Vec<u8>,
+        mode: Option<u32>,
+    ) -> Result<FileWriteResp> {
+        let mut path = file_path(remote);
+        if let Some(mode) = mode {
+            path.push_str(&format!("?mode={mode}"));
+        }
         let resp = self
             .http
-            .put(format!("{}{}", self.base, file_path(remote)))
+            .put(format!("{}{}", self.base, path))
             .body(bytes)
             .send()
             .await?;

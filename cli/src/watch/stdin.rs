@@ -28,10 +28,7 @@ pub fn parse_command(line: &str) -> Result<Value> {
     match cmd.as_str() {
         "tap" | "tap_and_wait" => {
             if args.len() == 1 {
-                return Ok(json_obj(
-                    &[("cmd", cmd), ("id", args[0])],
-                    &[("id", parse_i32(args[0])?)],
-                ));
+                return Ok(serde_json::json!({"cmd": cmd, "id": parse_i32(args[0])?}));
             }
             if args.len() == 2 {
                 return Ok(serde_json::json!({
@@ -120,7 +117,7 @@ pub fn parse_command(line: &str) -> Result<Value> {
         "xpath" | "xpath_tap" => Ok(serde_json::json!({"cmd":cmd,"query":args.join(" ")})),
         "toast" => Ok(serde_json::json!({
             "cmd": "toast",
-            "wait": parse_f64_opt(args.first(), 5.0)?,
+            "timeout": parse_f64_opt(args.first(), 5.0)?,
         })),
         "swipe_ext" => {
             require_len_at_least(cmd, &args, 1)?;
@@ -224,17 +221,6 @@ fn parse_f64_opt(value: Option<&&str>, default: f64) -> Result<f64> {
         .unwrap_or(Ok(default))
 }
 
-fn json_obj(strs: &[(&str, &str)], nums: &[(&str, i32)]) -> Value {
-    let mut map = serde_json::Map::new();
-    for (k, v) in strs {
-        map.insert((*k).to_string(), Value::String((*v).to_string()));
-    }
-    for (k, v) in nums {
-        map.insert((*k).to_string(), Value::Number((*v).into()));
-    }
-    Value::Object(map)
-}
-
 #[cfg(test)]
 mod tests {
     use super::parse_command;
@@ -272,6 +258,20 @@ mod tests {
         let v = parse_command("tap_and_wait 12").unwrap();
         assert_eq!(v["cmd"], "tap_and_wait");
         assert_eq!(v["id"], 12);
+    }
+
+    #[test]
+    fn parses_toast_timeout() {
+        let v = parse_command("toast 30").unwrap();
+        assert_eq!(v["cmd"], "toast");
+        assert_eq!(v["timeout"], 30.0);
+    }
+
+    #[test]
+    fn parses_push_mode_as_octal() {
+        let v = parse_command("push local.txt /data/local/tmp/remote.txt 755").unwrap();
+        assert_eq!(v["cmd"], "push");
+        assert_eq!(v["mode"], 0o755);
     }
 
     #[test]

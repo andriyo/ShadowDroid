@@ -1,9 +1,10 @@
 //! Steady-state watch loop. One emit per real screen change.
 //!
-//! Wake sources (all feed a single `tokio::sync::mpsc::Sender<Wake>`):
-//!   - logcat tail (low-latency event signal on Window/Activity transitions)
+//! Wake sources:
+//!   - logcat tail (low-latency event signal on Window/Activity transitions,
+//!     feeding a dedicated wake channel)
 //!   - safety-net poll (default 1s) — catches in-screen mutations
-//!   - command nudge (after every dispatched action, force a fresh dump)
+//!   - command nudge (after every dispatched action, direct forced refresh)
 //!
 //! On wake:
 //!   - sleep `debounce_ms` to coalesce a storm
@@ -12,6 +13,9 @@
 //!   - hash compare → emit on change
 //!   - run watcher rules → dispatch actions, emit `watcher_fired` events
 //!   - update `last_hash`
+//!
+//! Stdin commands use a separate channel so a wake storm cannot force commands
+//! to wait behind every queued wake.
 
 use crate::device::client::ServerClient;
 use crate::events::{self, emit_action, now_ts, Event, ScreenFormat};
@@ -51,11 +55,6 @@ pub struct WatchConfig {
     pub net: bool,
 }
 
-enum WatchMsg {
-    Wake(Wake),
-    Command(String),
-}
-
 #[derive(Default)]
 struct WatchState {
     last_hash: Option<String>,
@@ -64,8 +63,9 @@ struct WatchState {
 pub async fn run(cfg: WatchConfig) -> Result<()> {
     let watchers = WatcherSet::from_files(&cfg.watcher_files)?;
     watchers.set_permission_dialog_policy(cfg.permission_dialog_policy);
-    let (watch_tx, mut watch_rx) = mpsc::channel::<WatchMsg>(128);
-    let (event_tx, mut event_rx) = mpsc::channel::<Event>(64);
+    let (wake_tx, mut wake_rx) = mpsc::channel::<Wake>(128);
+    let (command_tx, mut command_rx) = mpsc::channel::<String>(128);
+    let (event_tx, event_rx) = mpsc::channel::<Event>(64);
     let state = cfg
         .client
         .state()
@@ -85,18 +85,19 @@ pub async fn run(cfg: WatchConfig) -> Result<()> {
     // it is not running, emit a structured warning so an agent can decide whether
     // to run `net start` or continue UI-only.
     // println! locks stdout per line, so http/screen lines interleave cleanly.
+    spawn_event_emitter(event_rx);
     if cfg.net {
         spawn_net_events(cfg.serial.clone(), event_tx.clone());
     }
 
-    spawn_wake_logcat(cfg.serial.clone(), watch_tx.clone(), event_tx.clone());
+    spawn_wake_logcat(cfg.serial.clone(), wake_tx.clone(), event_tx.clone());
     if cfg.detect_crashes {
         spawn_crash_detector(cfg.serial.clone(), cfg.app_filter.clone(), event_tx.clone());
     }
     if cfg.accept_stdin {
-        spawn_stdin(watch_tx.clone());
+        spawn_stdin(command_tx.clone());
     }
-    let _ = watch_tx.send(WatchMsg::Wake(Wake::Init)).await;
+    let _ = wake_tx.send(Wake::Init).await;
 
     let mut poll = interval(Duration::from_millis(cfg.poll_ms as u64));
     poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -111,29 +112,36 @@ pub async fn run(cfg: WatchConfig) -> Result<()> {
                 break;
             }
             _ = poll.tick() => {
-                handle_screen_wake(&cfg, &watchers, &mut state, Wake::Poll, false).await;
+                if handle_screen_wake(&cfg, &watchers, &mut state, Wake::Poll, false, None).await {
+                    break;
+                }
             }
-            Some(evt) = event_rx.recv() => {
-                events::emit(&evt);
+            Some(wake) = wake_rx.recv() => {
+                // Logcat Event and startup Init wakes respect the --app filter
+                // and screen-hash de-dup; only an explicit `screen` stdin command
+                // forces a filtered-out emit (via command_rx → ScreenOnly).
+                if handle_screen_wake(&cfg, &watchers, &mut state, wake, false, Some(&mut wake_rx)).await {
+                    break;
+                }
             }
-            Some(msg) = watch_rx.recv() => {
-                match msg {
-                    WatchMsg::Wake(wake) => {
-                        let force = matches!(wake, Wake::Init | Wake::Command);
-                        handle_screen_wake(&cfg, &watchers, &mut state, wake, force).await;
-                    }
-                    WatchMsg::Command(line) => {
-                        let should_quit = handle_command(&cfg, &watchers, &mut state, &line).await;
-                        if should_quit {
-                            break;
-                        }
-                    }
+            Some(line) = command_rx.recv() => {
+                let should_quit = handle_command(&cfg, &watchers, &mut state, &line).await;
+                if should_quit {
+                    break;
                 }
             }
         }
     }
 
     Ok(())
+}
+
+fn spawn_event_emitter(mut event_rx: mpsc::Receiver<Event>) {
+    tokio::spawn(async move {
+        while let Some(evt) = event_rx.recv().await {
+            events::emit(&evt);
+        }
+    });
 }
 
 fn spawn_net_events(serial: Serial, event_tx: mpsc::Sender<Event>) {
@@ -171,13 +179,9 @@ fn spawn_crash_detector(serial: Serial, app_filter: Option<String>, event_tx: mp
     });
 }
 
-fn spawn_wake_logcat(
-    serial: Serial,
-    watch_tx: mpsc::Sender<WatchMsg>,
-    event_tx: mpsc::Sender<Event>,
-) {
+fn spawn_wake_logcat(serial: Serial, wake_tx: mpsc::Sender<Wake>, event_tx: mpsc::Sender<Event>) {
     tokio::spawn(async move {
-        if let Err(err) = run_wake_logcat(serial, watch_tx).await {
+        if let Err(err) = run_wake_logcat(serial, wake_tx).await {
             let _ = event_tx
                 .send(Event::Error {
                     stage: "logcat_wake".to_string(),
@@ -190,7 +194,7 @@ fn spawn_wake_logcat(
     });
 }
 
-async fn run_wake_logcat(serial: Serial, watch_tx: mpsc::Sender<WatchMsg>) -> Result<()> {
+async fn run_wake_logcat(serial: Serial, wake_tx: mpsc::Sender<Wake>) -> Result<()> {
     let mut child = Command::new("adb")
         .args([
             "-s",
@@ -220,10 +224,10 @@ async fn run_wake_logcat(serial: Serial, watch_tx: mpsc::Sender<WatchMsg>) -> Re
     let mut lines = BufReader::new(stdout).lines();
     while let Some(line) = lines.next_line().await? {
         if is_ui_wake_line(&line) {
-            let _ = watch_tx.send(WatchMsg::Wake(Wake::Event)).await;
+            let _ = wake_tx.send(Wake::Event).await;
         }
     }
-    Ok(())
+    bail!("adb logcat for UI wake events exited")
 }
 
 fn is_ui_wake_line(line: &str) -> bool {
@@ -241,11 +245,11 @@ fn is_ui_wake_line(line: &str) -> bool {
     .any(|key| line.contains(key))
 }
 
-fn spawn_stdin(watch_tx: mpsc::Sender<WatchMsg>) {
+fn spawn_stdin(command_tx: mpsc::Sender<String>) {
     tokio::spawn(async move {
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            if watch_tx.send(WatchMsg::Command(line)).await.is_err() {
+            if command_tx.send(line).await.is_err() {
                 break;
             }
         }
@@ -258,23 +262,29 @@ async fn handle_screen_wake(
     state: &mut WatchState,
     wake: Wake,
     force: bool,
-) {
+    drain_wakes: Option<&mut mpsc::Receiver<Wake>>,
+) -> bool {
     let debounce_ms = debounce_delay_ms(wake, cfg.debounce_ms);
     if debounce_ms > 0 {
         sleep(Duration::from_millis(debounce_ms as u64)).await;
     }
+    // Coalesce any wakes that queued during the debounce window into this one
+    // screen fetch. The channel only carries Event/Init wakes, neither of which
+    // forces a filtered-out emit, so draining them can't change `force`.
+    if let Some(wake_rx) = drain_wakes {
+        while wake_rx.try_recv().is_ok() {}
+    }
     match cfg.client.screen().await {
         Ok(screen) => {
-            if let Some(filter) = &cfg.app_filter {
-                if !should_emit_package(
-                    Some(filter.as_str()),
-                    screen.current_app.package.as_deref(),
-                ) {
-                    return;
-                }
+            if !should_emit_screen(
+                cfg.app_filter.as_deref(),
+                screen.current_app.package.as_deref(),
+                force,
+            ) {
+                return false;
             }
             if !force && state.last_hash.as_deref() == Some(screen.screen_hash.as_str()) {
-                return;
+                return false;
             }
             state.last_hash = Some(screen.screen_hash.clone());
             let hits = watchers.matches(&screen.screen_hash, &screen.elements);
@@ -295,7 +305,7 @@ async fn handle_screen_wake(
                         Ok(DispatchOutcome::Handled) => {}
                         Ok(DispatchOutcome::Continue) => {}
                         Ok(DispatchOutcome::ScreenOnly) => {}
-                        Ok(DispatchOutcome::Quit) => return,
+                        Ok(DispatchOutcome::Quit) => return true,
                         Err(err) => events::emit(&Event::Error {
                             stage: "watcher".to_string(),
                             msg: err.to_string(),
@@ -313,6 +323,7 @@ async fn handle_screen_wake(
             ts: now_ts(),
         }),
     }
+    false
 }
 
 async fn handle_command(
@@ -338,12 +349,10 @@ async fn handle_command(
     match dispatch_command(cfg, watchers, state, &cmd).await {
         Ok(DispatchOutcome::Handled) => false,
         Ok(DispatchOutcome::Continue) => {
-            handle_screen_wake(cfg, watchers, state, Wake::Command, false).await;
-            false
+            handle_screen_wake(cfg, watchers, state, Wake::Command, false, None).await
         }
         Ok(DispatchOutcome::ScreenOnly) => {
-            handle_screen_wake(cfg, watchers, state, Wake::Command, true).await;
-            false
+            handle_screen_wake(cfg, watchers, state, Wake::Command, true, None).await
         }
         Ok(DispatchOutcome::Quit) => true,
         Err(err) => {
@@ -620,7 +629,7 @@ async fn dispatch_command(
             );
         }
         "toast" => {
-            let wait = timeout_ms(cmd, 5_000)?;
+            let wait = toast_timeout_ms(cmd)?;
             let start = unix_ms();
             cfg.client.toast_start(50).await?;
             let deadline = std::time::Instant::now() + Duration::from_millis(wait as u64);
@@ -636,18 +645,24 @@ async fn dispatch_command(
         "push" => {
             let local = req_str(cmd, "local")?;
             let remote = req_str(cmd, "remote")?;
-            let bytes = std::fs::read(local).with_context(|| format!("reading {local}"))?;
-            let r = cfg.client.push_file(remote, bytes).await?;
-            emit_action(
-                "push",
-                &json!({"local":local, "remote":remote, "path":r.path, "bytes":r.bytes}),
-            );
+            let mode = opt_u32(cmd, "mode")?;
+            let bytes = tokio::fs::read(local)
+                .await
+                .with_context(|| format!("reading {local}"))?;
+            let r = cfg.client.push_file(remote, bytes, mode).await?;
+            let mut payload = json!({"local":local, "remote":remote, "path":r.path, "bytes":r.bytes, "mode":r.mode});
+            if let Some(mode) = mode {
+                payload["requested_mode"] = json!(mode);
+            }
+            emit_action("push", &payload);
         }
         "pull" => {
             let remote = req_str(cmd, "remote")?;
             let local = req_str(cmd, "local")?;
             let bytes = cfg.client.pull_file(remote).await?;
-            std::fs::write(local, &bytes).with_context(|| format!("writing {local}"))?;
+            tokio::fs::write(local, &bytes)
+                .await
+                .with_context(|| format!("writing {local}"))?;
             emit_action(
                 "pull",
                 &json!({"remote":remote, "local":local, "bytes":bytes.len() as u64}),
@@ -891,12 +906,7 @@ fn wait_query_matches(cmd: &Value, app: &AppRef, elements: &[Element]) -> bool {
 }
 
 fn selector_string_matches(actual: Option<&str>, expected: Option<&str>) -> bool {
-    let Some(expected) = expected else {
-        return true;
-    };
-    actual
-        .map(|actual| actual.to_lowercase().contains(&expected.to_lowercase()))
-        .unwrap_or(false)
+    crate::selector::text_matches(actual, expected, false)
 }
 
 fn selector_query_from_cmd(cmd: &Value) -> Result<Option<SelectorQuery>> {
@@ -939,7 +949,9 @@ async fn write_screenshot(client: &ServerClient, path: Option<String>) -> Result
             std::env::temp_dir().join(format!("shadowdroid-screenshot-{ts}.png"))
         }
     };
-    std::fs::write(&path, &bytes).with_context(|| format!("writing {}", path.display()))?;
+    tokio::fs::write(&path, &bytes)
+        .await
+        .with_context(|| format!("writing {}", path.display()))?;
     Ok((path.display().to_string(), bytes.len() as u64))
 }
 
@@ -1039,6 +1051,20 @@ fn timeout_ms(cmd: &Value, default_ms: u32) -> Result<u32> {
     Ok(default_ms)
 }
 
+fn toast_timeout_ms(cmd: &Value) -> Result<u32> {
+    if cmd.get("timeout_ms").is_some() || cmd.get("timeout").is_some() {
+        return timeout_ms(cmd, 5_000);
+    }
+    if let Some(v) = cmd.get("wait") {
+        let secs = v
+            .as_f64()
+            .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+            .ok_or_else(|| anyhow!("field `wait` must be a number"))?;
+        return Ok((secs * 1000.0).round().max(0.0) as u32);
+    }
+    Ok(5_000)
+}
+
 fn as_i32(v: &Value) -> Option<i32> {
     as_i64(v).and_then(|n| i32::try_from(n).ok())
 }
@@ -1062,6 +1088,10 @@ fn should_emit_package(app_filter: Option<&str>, package: Option<&str>) -> bool 
     package == filter || is_system_interruption(package)
 }
 
+fn should_emit_screen(app_filter: Option<&str>, package: Option<&str>, force: bool) -> bool {
+    force || should_emit_package(app_filter, package)
+}
+
 fn is_system_interruption(package: &str) -> bool {
     matches!(
         package,
@@ -1075,7 +1105,11 @@ fn is_system_interruption(package: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{debounce_delay_ms, should_emit_package, Wake};
+    use super::{
+        debounce_delay_ms, selector_string_matches, should_emit_package, should_emit_screen,
+        toast_timeout_ms, Wake,
+    };
+    use serde_json::json;
 
     #[test]
     fn app_filter_allows_target_package() {
@@ -1099,10 +1133,48 @@ mod tests {
     }
 
     #[test]
+    fn forced_screen_bypasses_app_filter() {
+        assert!(!should_emit_screen(
+            Some("com.livd"),
+            Some("com.google.android.apps.nexuslauncher"),
+            false
+        ));
+        assert!(should_emit_screen(
+            Some("com.livd"),
+            Some("com.google.android.apps.nexuslauncher"),
+            true
+        ));
+    }
+
+    #[test]
     fn command_wakes_do_not_pay_debounce_delay() {
         assert_eq!(debounce_delay_ms(Wake::Command, 80), 0);
         assert_eq!(debounce_delay_ms(Wake::Poll, 80), 0);
         assert_eq!(debounce_delay_ms(Wake::Event, 80), 80);
         assert_eq!(debounce_delay_ms(Wake::Init, 80), 80);
+    }
+
+    #[test]
+    fn wait_selector_matching_uses_canonical_normalization() {
+        assert!(selector_string_matches(
+            Some("Sign\u{00A0}\u{200B}in"),
+            Some("sign in")
+        ));
+        assert!(selector_string_matches(
+            Some("Don\u{2019}t allow"),
+            Some("don't")
+        ));
+    }
+
+    #[test]
+    fn toast_timeout_accepts_legacy_wait_alias() {
+        assert_eq!(
+            toast_timeout_ms(&json!({"cmd":"toast","wait":30})).unwrap(),
+            30_000
+        );
+        assert_eq!(
+            toast_timeout_ms(&json!({"cmd":"toast","timeout":1.5})).unwrap(),
+            1_500
+        );
     }
 }

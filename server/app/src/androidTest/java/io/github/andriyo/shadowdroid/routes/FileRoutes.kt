@@ -1,6 +1,8 @@
 package io.github.andriyo.shadowdroid.routes
 
 import android.app.Instrumentation
+import android.system.ErrnoException
+import android.system.Os
 import io.github.andriyo.shadowdroid.BadRequest
 import io.github.andriyo.shadowdroid.NotFound
 import io.ktor.http.ContentType
@@ -23,11 +25,13 @@ object FileRoutes {
     ) {
         route.put("/files/{path...}") {
             val file = resolveRequestedFile(call.parameters.getAll("path"), instr)
+            val requestedMode = parseMode(call.request.queryParameters["mode"])
             file.parentFile?.mkdirs()
             @Suppress("DEPRECATION")
             val bytes = call.receiveChannel().readRemaining().readBytes()
             file.writeBytes(bytes)
-            call.respond(FileWriteResp(path = file.path, bytes = bytes.size.toLong(), mode = 420))
+            applyMode(file, requestedMode)
+            call.respond(FileWriteResp(path = file.path, bytes = bytes.size.toLong(), mode = fileMode(file, requestedMode)))
         }
 
         route.get("/files/{path...}") {
@@ -76,6 +80,39 @@ private fun resolveRequestedFile(
         }
     }
 }
+
+private fun parseMode(value: String?): Int {
+    if (value == null) return 420
+    val mode =
+        value.toIntOrNull()
+            ?: throw BadRequest("bad_mode", "mode must be an integer permission bitmask")
+    if (mode !in 0..0x1FF) {
+        throw BadRequest("bad_mode", "mode must be between 0 and 511")
+    }
+    return mode
+}
+
+private fun applyMode(
+    file: File,
+    mode: Int,
+) {
+    try {
+        Os.chmod(file.path, mode)
+    } catch (_: ErrnoException) {
+        // Shared/external storage may reject chmod. The response reports the
+        // actual mode when stat is available, so callers can tell what happened.
+    }
+}
+
+private fun fileMode(
+    file: File,
+    fallback: Int,
+): Int =
+    try {
+        Os.stat(file.path).st_mode and 0x1FF
+    } catch (_: ErrnoException) {
+        fallback
+    }
 
 @Serializable
 private data class FileWriteResp(
