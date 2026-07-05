@@ -103,4 +103,12 @@ pub struct DaemonConfig {
     pub app_filters: Vec<String>,
     pub anticache: bool,
     pub anticomp: bool,
+    /// Validate the upstream server's TLS cert (default off: dev/staging backends
+    /// are often self-signed, and this is a debugging proxy).
+    #[serde(default)]
+    pub verify_upstream: bool,
+    /// Redact sensitive headers (authorization/cookie/…) from captured flows
+    /// before they hit the session log or `net show`.
+    #[serde(default)]
+    pub redact: bool,
 }

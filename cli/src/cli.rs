@@ -711,6 +711,15 @@ pub enum NetCmd {
         /// Strip Accept-Encoding (force uncompressed responses).
         #[arg(long)]
         anticomp: bool,
+        /// Validate the upstream server's TLS certificate. Off by default so
+        /// self-signed dev/staging backends work; enable to catch a tampered
+        /// upstream (note: it will also surface the app's own pinning failures).
+        #[arg(long)]
+        verify_upstream: bool,
+        /// Redact sensitive headers (authorization, cookie, set-cookie,
+        /// proxy-authorization) from captured flows before they're logged.
+        #[arg(long)]
+        redact: bool,
     },
     /// Stop the proxy and tear down device wiring.
     Stop {
@@ -950,6 +959,12 @@ pub struct NetDaemonArgs {
     /// Strip Accept-Encoding to force uncompressed responses.
     #[arg(long)]
     pub anticomp: bool,
+    /// Validate the upstream server's TLS certificate.
+    #[arg(long)]
+    pub verify_upstream: bool,
+    /// Redact sensitive headers from captured flows.
+    #[arg(long)]
+    pub redact: bool,
 }
 
 /// Parse argv, converting clap's plaintext usage errors into the same
@@ -1782,14 +1797,20 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
             foreground,
             anticache,
             anticomp,
+            verify_upstream,
+            redact,
         } => {
             nc::start(
                 serial,
-                *port,
-                host.clone(),
-                *foreground,
-                *anticache,
-                *anticomp,
+                nc::StartOpts {
+                    port: *port,
+                    apps: host.clone(),
+                    foreground: *foreground,
+                    anticache: *anticache,
+                    anticomp: *anticomp,
+                    verify_upstream: *verify_upstream,
+                    redact: *redact,
+                },
             )
             .await
         }
@@ -1903,6 +1924,8 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
                 app_filters: a.host.clone(),
                 anticache: a.anticache,
                 anticomp: a.anticomp,
+                verify_upstream: a.verify_upstream,
+                redact: a.redact,
             })
             .await
         }

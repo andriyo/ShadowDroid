@@ -58,6 +58,11 @@ pub struct FlowRecord {
     pub modified: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The response body was streamed through (SSE / oversized), not buffered, so
+    /// it isn't captured and response rules/intercept didn't run. `resp_len` is
+    /// the `content-length` hint when the server sent one, else 0.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub streamed: bool,
 }
 
 impl FlowRecord {
@@ -99,6 +104,7 @@ impl FlowRecord {
             matched: self.matched.clone(),
             modified: self.modified,
             error: self.error.clone(),
+            streamed: self.streamed,
         }
     }
 
@@ -315,6 +321,7 @@ mod tests {
             matched: None,
             modified: false,
             error: None,
+            streamed: false,
         };
         assert_eq!(
             content_type(&rec.req_headers).as_deref(),

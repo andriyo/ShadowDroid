@@ -331,6 +331,7 @@ mod tests {
             matched: None,
             modified: false,
             error: None,
+            streamed: false,
         }
     }
 }

@@ -33,14 +33,28 @@ fn kill_pid(pid: u32) {
 
 // ── lifecycle ─────────────────────────────────────────────────
 
-pub async fn start(
-    serial: &Serial,
-    port: u16,
-    apps: Vec<String>,
-    foreground: bool,
-    anticache: bool,
-    anticomp: bool,
-) -> Result<()> {
+/// Options for [`start`] — grouped into a struct so the knob set can grow
+/// (anticache/anticomp/verify-upstream/redact/…) without a widening arg list.
+pub struct StartOpts {
+    pub port: u16,
+    pub apps: Vec<String>,
+    pub foreground: bool,
+    pub anticache: bool,
+    pub anticomp: bool,
+    pub verify_upstream: bool,
+    pub redact: bool,
+}
+
+pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
+    let StartOpts {
+        port,
+        apps,
+        foreground,
+        anticache,
+        anticomp,
+        verify_upstream,
+        redact,
+    } = opts;
     // Host loopback port is per-serial so concurrent daemons for different
     // devices don't fight over one port; the device-facing `port` stays stable.
     let host_port = crate::device::portmap::free_loopback_port()?;
@@ -51,6 +65,8 @@ pub async fn start(
         app_filters: apps.clone(),
         anticache,
         anticomp,
+        verify_upstream,
+        redact,
     };
 
     if foreground {
@@ -90,6 +106,8 @@ pub async fn start(
             "apps": apps,
             "anticache": anticache,
             "anticomp": anticomp,
+            "verify_upstream": verify_upstream,
+            "redact": redact,
             "ca": paths::ca_cert_path()?.display().to_string(),
             "hint": "next: `net check <pkg>` to confirm trust; `watch` streams HTTP events alongside screen/crash events",
         }),

@@ -35,6 +35,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
     let shared = Arc::new(SharedState {
         anticache: cfg.anticache,
         anticomp: cfg.anticomp,
+        redact: cfg.redact,
         host_filters: cfg.app_filters.clone(),
         intercept: RwLock::new(None),
         held: Mutex::new(HashMap::new()),
@@ -46,7 +47,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
 
     let ctx = Arc::new(ProxyContext {
         ca,
-        client: proxy::build_upstream_client(),
+        client: proxy::build_upstream_client(cfg.verify_upstream),
         flow_tx,
         shared: shared.clone(),
         serial: cfg.serial.clone(),
@@ -162,6 +163,12 @@ pub fn spawn(cfg: &DaemonConfig) -> Result<u32> {
     }
     if cfg.anticomp {
         cmd.arg("--anticomp");
+    }
+    if cfg.verify_upstream {
+        cmd.arg("--verify-upstream");
+    }
+    if cfg.redact {
+        cmd.arg("--redact");
     }
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log_file))

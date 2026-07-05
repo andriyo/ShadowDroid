@@ -26,9 +26,18 @@ pub fn append_event(serial: &Serial, ev: &Event) -> Result<()> {
 fn append_line(serial: &Serial, line: &str) -> Result<()> {
     paths::ensure_net_dir()?;
     let path = paths::session_log_path(serial)?;
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
+    // 0600 on creation: the log holds full captured headers + bodies (live auth
+    // tokens, cookies), so — like the CA key — it must not be world-readable.
+    // `net start` clears the log each session, so a fresh file always gets these
+    // perms; `--redact` additionally strips sensitive headers before capture.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
         .open(&path)
         .with_context(|| format!("open {}", path.display()))?;
     writeln!(f, "{line}").with_context(|| format!("append {}", path.display()))?;

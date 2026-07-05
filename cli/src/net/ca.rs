@@ -106,9 +106,11 @@ impl CertAuthority {
             .with_no_client_auth()
             .with_single_cert(vec![leaf], self.leaf_key.clone_key())
             .map_err(|e| anyhow!("rustls server config for {host}: {e}"))?;
-        // http/1.1 ONLY on the inner leg — we serve hyper http1, so advertising
-        // h2 here would break any client that selects it.
-        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        // Advertise h2 + http/1.1 on the inner leg: the proxy serves the decrypted
+        // connection with hyper's version-negotiating `auto` builder, so an app
+        // that speaks HTTP/2 (most modern OkHttp/Cronet stacks) isn't downgraded.
+        // Order matters — clients pick the first mutually-supported protocol.
+        cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let cfg = Arc::new(cfg);
         self.cache
             .lock()
@@ -636,7 +638,10 @@ mod tests {
         let ca = CertAuthority::build(&cert.pem(), key).unwrap();
 
         let cfg1 = ca.server_config("api.example.com").unwrap();
-        assert_eq!(cfg1.alpn_protocols, vec![b"http/1.1".to_vec()]);
+        assert_eq!(
+            cfg1.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
         // Second call for the same host is served from cache (same Arc).
         let cfg2 = ca.server_config("api.example.com").unwrap();
         assert!(Arc::ptr_eq(&cfg1, &cfg2));

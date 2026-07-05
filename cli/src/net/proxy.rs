@@ -21,9 +21,10 @@
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
+use futures::StreamExt;
 use http::uri::{Authority, Scheme};
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Empty, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, Uri};
@@ -35,7 +36,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context as TaskCtx, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use tokio::io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_rustls::TlsAcceptor;
@@ -44,6 +45,24 @@ use crate::events::{self, Event};
 use crate::net::ca::CertAuthority;
 use crate::net::flow::{self, FlowRecord};
 use crate::net::{Matcher, Mutation, RuleSpec};
+
+/// The response body we hand the device: either a buffered `Full` (the common
+/// case) or a live `StreamBody` for streamed responses — unified as one boxed
+/// type. `Unsync` because the streamed variant wraps reqwest's `Send`-but-not-
+/// `Sync` byte stream (hyper only needs the response body to be `Send`).
+type ProxyBody = UnsyncBoxBody<Bytes, std::io::Error>;
+
+/// Buffer bodies up to this size, then spill to a streamed pass-through. Bounds
+/// per-response memory and, with the `text/event-stream` short-circuit, stops an
+/// infinite/large response from hanging or OOMing the daemon (issue: #1/#6).
+const BUFFER_CAP: usize = 8 * 1024 * 1024;
+
+/// A fully-buffered body from `bytes`.
+fn full_body(bytes: Bytes) -> ProxyBody {
+    Full::new(bytes)
+        .map_err(|never: Infallible| match never {})
+        .boxed_unsync()
+}
 
 /// Everything a proxy connection needs. Cloned (Arc) per connection.
 pub struct ProxyContext {
@@ -61,6 +80,8 @@ pub struct ProxyContext {
 pub struct SharedState {
     pub anticache: bool,
     pub anticomp: bool,
+    /// Redact sensitive headers from captured flows before store/broadcast.
+    pub redact: bool,
     /// Host globs to MITM + capture. Empty = all hosts.
     pub host_filters: Vec<String>,
     /// Active interception config (`net intercept`), or `None`.
@@ -117,12 +138,13 @@ pub enum HoldDecision {
 }
 
 /// Build the upstream reqwest client. Doesn't follow redirects (we pass them to
-/// the app) and accepts invalid upstream certs — this is a debugging proxy and
-/// dev/staging backends are often self-signed.
-pub fn build_upstream_client() -> reqwest::Client {
+/// the app). By default it accepts invalid upstream certs — this is a debugging
+/// proxy and dev/staging backends are often self-signed; `verify_upstream`
+/// (`net start --verify-upstream`) turns validation back on.
+pub fn build_upstream_client(verify_upstream: bool) -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_certs(!verify_upstream)
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .expect("build upstream reqwest client")
@@ -176,9 +198,15 @@ async fn handle(
     ctx: Arc<ProxyContext>,
     req: Request<Incoming>,
     tunnel: Option<(Scheme, Authority)>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
+) -> Result<Response<ProxyBody>, Infallible> {
     if req.method() == Method::CONNECT {
         return Ok(process_connect(ctx, req));
+    }
+    // A WebSocket upgrade can't go through the buffered request path (the body is
+    // a bidirectional frame stream that never "completes"). Relay the handshake
+    // and raw-tunnel the two upgraded connections instead.
+    if is_websocket_upgrade(req.headers()) {
+        return Ok(proxy_websocket(ctx, req, tunnel).await);
     }
     match proxy_request(ctx, req, tunnel).await {
         Ok(resp) => Ok(resp),
@@ -191,7 +219,7 @@ async fn handle(
 
 /// Establish a CONNECT tunnel: return 200 immediately, then on a detached task
 /// peek the first bytes — TLS ClientHello → MITM, else blind TCP tunnel.
-fn process_connect(ctx: Arc<ProxyContext>, req: Request<Incoming>) -> Response<Full<Bytes>> {
+fn process_connect(ctx: Arc<ProxyContext>, req: Request<Incoming>) -> Response<ProxyBody> {
     let authority = match req.uri().authority().cloned() {
         Some(a) => a,
         None => return error_response(StatusCode::BAD_REQUEST, "CONNECT requires an authority"),
@@ -240,10 +268,14 @@ fn process_connect(ctx: Arc<ProxyContext>, req: Request<Incoming>) -> Response<F
                 let tunnel = Some((Scheme::HTTPS, authority.clone()));
                 async move { handle(ctx, r, tunnel).await }
             });
-            if let Err(e) = http1::Builder::new()
-                .serve_connection(io, svc)
-                .with_upgrades()
-                .await
+            // `auto` negotiates HTTP/1.1 vs HTTP/2 from the ALPN the leaf offered,
+            // so an h2 app is served h2 (not downgraded); `with_upgrades` keeps the
+            // HTTP/1.1 WebSocket path working.
+            if let Err(e) = hyper_util::server::conn::auto::Builder::new(
+                hyper_util::rt::TokioExecutor::new(),
+            )
+            .serve_connection_with_upgrades(io, svc)
+            .await
             {
                 tracing::debug!("inner serve {host}: {e}");
             }
@@ -260,7 +292,7 @@ fn process_connect(ctx: Arc<ProxyContext>, req: Request<Incoming>) -> Response<F
     });
 
     // 200 OK (empty body) == "tunnel established".
-    Response::new(Full::new(Bytes::new()))
+    Response::new(full_body(Bytes::new()))
 }
 
 /// Report a failed inner TLS handshake (issue #5): persist a `tls_error` to the
@@ -299,13 +331,264 @@ fn tls_failure_reason(err: &std::io::Error) -> String {
     }
 }
 
+// ── WebSocket tunneling (issue: in-scope wss broke) ───────────────────────────
+
+/// A request carrying `Connection: upgrade` + `Upgrade: websocket`.
+fn is_websocket_upgrade(headers: &http::HeaderMap) -> bool {
+    let contains = |name: http::header::HeaderName, needle: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.to_lowercase().contains(needle))
+    };
+    contains(http::header::CONNECTION, "upgrade") && contains(http::header::UPGRADE, "websocket")
+}
+
+/// Any stream hyper's client can drive, boxed so TLS and plaintext upstreams
+/// share one type.
+trait IoStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> IoStream for T {}
+
+/// Relay a WebSocket handshake to the real server and, on `101`, raw-tunnel the
+/// two upgraded connections until either side closes. In-scope handshakes are
+/// captured as a flow (frames aren't decoded) — the goal is that wss *works*
+/// while the proxy is scoped to the host instead of silently breaking.
+async fn proxy_websocket(
+    ctx: Arc<ProxyContext>,
+    mut req: Request<Incoming>,
+    tunnel: Option<(Scheme, Authority)>,
+) -> Response<ProxyBody> {
+    let (scheme, host, path, _url) = match resolve_target(req.uri(), &tunnel) {
+        Ok(t) => t,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    let port = ws_target_port(req.uri(), &tunnel, &scheme);
+    let req_headers = header_pairs(req.headers());
+    let id = flow::new_id();
+    let in_scope = ctx.shared.host_in_scope(&host);
+
+    let (status, resp_headers, upstream_resp) =
+        match ws_handshake_upstream(&scheme, &host, port, &path, &req_headers).await {
+            Ok(v) => v,
+            Err(e) => {
+                if in_scope {
+                    capture(
+                        &ctx,
+                        error_flow(&id, req.method(), &scheme, &host, &path, &req_headers, &[], None, &[], 0, e.to_string(), Some("websocket".into()), false),
+                    );
+                }
+                return error_response(StatusCode::BAD_GATEWAY, &e.to_string());
+            }
+        };
+
+    if in_scope {
+        // The handshake itself is a capturable flow; frames aren't decoded.
+        capture(
+            &ctx,
+            FlowParts {
+                id: &id,
+                method: req.method().as_str(),
+                scheme: &scheme,
+                host: &host,
+                path: &path,
+                req_headers: &req_headers,
+                req_bytes: &[],
+                status: Some(status),
+                resp_headers: &resp_headers,
+                resp_bytes: &[],
+                dur_ms: 0,
+                error: None,
+                matched: Some("websocket".into()),
+                modified: false,
+            },
+        );
+    }
+
+    if status != 101 {
+        // Server declined the upgrade — pass its response straight back.
+        let bytes = collect_incoming(upstream_resp).await.unwrap_or_default();
+        return build_client_response(status, &resp_headers, bytes);
+    }
+
+    let upstream_io = match hyper::upgrade::on(upstream_resp).await {
+        Ok(u) => u,
+        Err(e) => {
+            return error_response(StatusCode::BAD_GATEWAY, &format!("upstream ws upgrade: {e}"))
+        }
+    };
+    // Once the device sees our 101 it upgrades; copy bytes both ways until close.
+    tokio::spawn(async move {
+        match hyper::upgrade::on(&mut req).await {
+            Ok(device_io) => {
+                let mut a = TokioIo::new(device_io);
+                let mut b = TokioIo::new(upstream_io);
+                let _ = copy_bidirectional(&mut a, &mut b).await;
+            }
+            Err(e) => tracing::debug!("device ws upgrade: {e}"),
+        }
+    });
+    ws_switching_response(&resp_headers)
+}
+
+fn ws_target_port(uri: &Uri, tunnel: &Option<(Scheme, Authority)>, scheme: &str) -> u16 {
+    if let Some((_, authority)) = tunnel {
+        if let Some(p) = authority.port_u16() {
+            return p;
+        }
+    } else if let Some(p) = uri.port_u16() {
+        return p;
+    }
+    if scheme == "https" {
+        443
+    } else {
+        80
+    }
+}
+
+/// Open a client connection to `host:port` (TLS for https), send the handshake,
+/// and return `(status, headers, response)` un-upgraded so the caller can upgrade
+/// (101) or read the reject body.
+async fn ws_handshake_upstream(
+    scheme: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+    req_headers: &[(String, String)],
+) -> Result<(u16, Vec<(String, String)>, Response<Incoming>)> {
+    let tcp = TcpStream::connect((host, port))
+        .await
+        .map_err(|e| anyhow!("connect {host}:{port}: {e}"))?;
+    let stream: Box<dyn IoStream> = if scheme == "https" {
+        let sni = rustls::pki_types::ServerName::try_from(host.to_string())
+            .map_err(|e| anyhow!("bad SNI {host}: {e}"))?;
+        Box::new(
+            ws_tls_connector()
+                .connect(sni, tcp)
+                .await
+                .map_err(|e| anyhow!("upstream TLS {host}: {e}"))?,
+        )
+    } else {
+        Box::new(tcp)
+    };
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .map_err(|e| anyhow!("upstream handshake: {e}"))?;
+    tokio::spawn(conn.with_upgrades());
+
+    let mut builder = Request::builder().method(Method::GET).uri(path);
+    for (name, value) in req_headers {
+        if name.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        if let (Ok(hn), Ok(hv)) = (
+            http::HeaderName::from_bytes(name.as_bytes()),
+            http::HeaderValue::from_str(value),
+        ) {
+            builder = builder.header(hn, hv);
+        }
+    }
+    if flow::header_get(req_headers, "host").is_none() {
+        builder = builder.header(http::header::HOST, host);
+    }
+    let upstream_req = builder
+        .body(Empty::<Bytes>::new())
+        .map_err(|e| anyhow!("build ws request: {e}"))?;
+    let resp = sender
+        .send_request(upstream_req)
+        .await
+        .map_err(|e| anyhow!("upstream ws request: {e}"))?;
+    let status = resp.status().as_u16();
+    let headers = header_pairs(resp.headers());
+    Ok((status, headers, resp))
+}
+
+async fn collect_incoming(resp: Response<Incoming>) -> Result<Bytes> {
+    Ok(resp
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| anyhow!("read ws-reject body: {e}"))?
+        .to_bytes())
+}
+
+/// The `101 Switching Protocols` handed to the device — the upstream's upgrade
+/// headers (`Upgrade`, `Connection`, `Sec-WebSocket-Accept`) verbatim.
+fn ws_switching_response(headers: &[(String, String)]) -> Response<ProxyBody> {
+    let mut builder = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
+    for (name, value) in headers {
+        let lname = name.to_lowercase();
+        if lname == "content-length" || lname == "transfer-encoding" {
+            continue;
+        }
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(full_body(Bytes::new()))
+        .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
+}
+
+/// A permissive TLS client connector for the upstream WebSocket leg — matches the
+/// proxy's default upstream posture (accepts self-signed dev backends). Built once.
+fn ws_tls_connector() -> tokio_rustls::TlsConnector {
+    static CONNECTOR: std::sync::OnceLock<tokio_rustls::TlsConnector> = std::sync::OnceLock::new();
+    CONNECTOR
+        .get_or_init(|| {
+            let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+            let cfg = rustls::ClientConfig::builder_with_provider(provider.clone())
+                .with_safe_default_protocol_versions()
+                .expect("rustls client versions")
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
+                .with_no_client_auth();
+            tokio_rustls::TlsConnector::from(Arc::new(cfg))
+        })
+        .clone()
+}
+
+/// Accept-any server-cert verifier (upstream WebSocket leg only; signature math
+/// is still checked so the handshake is well-formed — only cert-chain/name
+/// validation is skipped).
+#[derive(Debug)]
+struct NoVerify(Arc<rustls::crypto::CryptoProvider>);
+impl rustls::client::danger::ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
 /// Forward one (decrypted or plaintext) request upstream, applying any active
 /// interception at the request and/or response phase, and capture the flow.
 async fn proxy_request(
     ctx: Arc<ProxyContext>,
     req: Request<Incoming>,
     tunnel: Option<(Scheme, Authority)>,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<ProxyBody>> {
     let (parts, body) = req.into_parts();
     let method = parts.method.clone();
     let (scheme, host, path, mut url) = resolve_target(&parts.uri, &tunnel)?;
@@ -456,7 +739,7 @@ async fn proxy_request(
 
     // ── forward upstream ──
     let started = std::time::Instant::now();
-    let outcome = forward_upstream(
+    let resp = match send_upstream(
         &ctx.client,
         &method,
         &url,
@@ -464,13 +747,69 @@ async fn proxy_request(
         req_bytes.clone(),
         &ctx.shared,
     )
-    .await;
-    let dur_ms = started.elapsed().as_millis() as u64;
-
-    let (mut status, mut resp_headers, mut resp_bytes, error) = match outcome {
-        Ok((status, headers, bytes)) => (Some(status), headers, bytes, None),
-        Err(e) => (None, Vec::new(), Bytes::new(), Some(e.to_string())),
+    .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            // Never reached the server (DNS / connect / upstream TLS).
+            let dur_ms = started.elapsed().as_millis() as u64;
+            if in_scope {
+                capture(&ctx, error_flow(&id, &method, &scheme, &host, &path, &req_headers, &req_bytes, None, &[], dur_ms, e.to_string(), matched.clone(), modified));
+            }
+            return Ok(error_response(StatusCode::BAD_GATEWAY, &e.to_string()));
+        }
     };
+
+    let status_code = resp.status().as_u16();
+    let mut resp_headers = header_pairs(resp.headers());
+
+    // Stream long-lived / oversized bodies instead of buffering (SSE would hang;
+    // a huge download would OOM). A streamed flow skips response rules/intercept
+    // (nothing buffered to mutate) and is captured as a note (`streamed:true`).
+    let mut resp_bytes = match read_body_capped(resp, &resp_headers).await {
+        BodyRead::Buffered(bytes) => bytes,
+        BodyRead::Streamed {
+            prefix,
+            rest,
+            len_hint,
+        } => {
+            let dur_ms = started.elapsed().as_millis() as u64;
+            if in_scope {
+                let parts = FlowParts {
+                    id: &id,
+                    method: method.as_str(),
+                    scheme: &scheme,
+                    host: &host,
+                    path: &path,
+                    req_headers: &req_headers,
+                    req_bytes: &req_bytes,
+                    status: Some(status_code),
+                    resp_headers: &resp_headers,
+                    resp_bytes: &[],
+                    dur_ms,
+                    error: None,
+                    matched: matched.clone(),
+                    modified,
+                };
+                capture_streamed(&ctx, parts, len_hint);
+            }
+            return Ok(response_with_body(
+                status_code,
+                &resp_headers,
+                streamed_body(prefix, rest),
+            ));
+        }
+        BodyRead::Error(e) => {
+            let dur_ms = started.elapsed().as_millis() as u64;
+            if in_scope {
+                capture(&ctx, error_flow(&id, &method, &scheme, &host, &path, &req_headers, &req_bytes, Some(status_code), &resp_headers, dur_ms, e.clone(), matched.clone(), modified));
+            }
+            return Ok(error_response(StatusCode::BAD_GATEWAY, &e));
+        }
+    };
+    let dur_ms = started.elapsed().as_millis() as u64;
+    let mut status = Some(status_code);
+    let error: Option<String> = None;
 
     // Decompress in-scope responses so capture, rules, and intercept all see
     // plain text — and strip `content-encoding` so the (decompressed) body we
@@ -614,14 +953,17 @@ fn resolve_target(
     }
 }
 
-async fn forward_upstream(
+/// Send the (possibly mutated) request upstream and return the response with its
+/// headers available — the body is read separately by [`read_body_capped`] so we
+/// can decide buffer-vs-stream.
+async fn send_upstream(
     client: &reqwest::Client,
     method: &Method,
     url: &str,
     req_headers: &[(String, String)],
     body: Bytes,
     shared: &SharedState,
-) -> Result<(u16, Vec<(String, String)>, Bytes)> {
+) -> Result<reqwest::Response> {
     let mut headers = http::HeaderMap::new();
     for (name, value) in req_headers {
         let lname = name.to_lowercase();
@@ -652,21 +994,119 @@ async fn forward_upstream(
     if !body.is_empty() {
         rb = rb.body(body.to_vec());
     }
-    let resp = rb.send().await.map_err(|e| anyhow!("upstream: {e}"))?;
-    let status = resp.status().as_u16();
-    let headers = header_pairs(resp.headers());
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| anyhow!("upstream body: {e}"))?;
-    Ok((status, headers, bytes))
+    rb.send().await.map_err(|e| anyhow!("upstream: {e}"))
 }
 
-fn build_client_response(
+/// A byte stream normalised to `io::Result` (reqwest's error mapped away) so the
+/// cap loop is decoupled from reqwest and unit-testable.
+type ByteStream = Pin<Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + Send>>;
+
+/// The outcome of reading an upstream response body.
+enum BodyRead {
+    /// Finished under the cap — fully captured, mutable.
+    Buffered(Bytes),
+    /// Streamed pass-through: the prefix already pulled, plus the rest of the
+    /// live stream. Not captured/mutated (SSE or oversized).
+    Streamed {
+        prefix: Vec<Bytes>,
+        rest: ByteStream,
+        len_hint: Option<u64>,
+    },
+    /// The upstream body errored mid-read.
+    Error(String),
+}
+
+/// Force streaming (never buffer) for content-types that are long-lived by
+/// design — buffering them would hang the device waiting on a body that never
+/// ends. Everything else is buffered up to [`BUFFER_CAP`], then spilled.
+fn is_streaming_content_type(headers: &[(String, String)]) -> bool {
+    flow::content_type(headers).is_some_and(|ct| {
+        ct == "text/event-stream"
+            || ct == "multipart/x-mixed-replace"
+            || ct.starts_with("application/grpc")
+    })
+}
+
+fn content_length(headers: &[(String, String)]) -> Option<u64> {
+    flow::header_get(headers, "content-length").and_then(|v| v.trim().parse().ok())
+}
+
+/// Read the upstream body, buffering up to [`BUFFER_CAP`] then spilling to a
+/// streamed pass-through; known-streaming content-types stream immediately so
+/// the device gets headers without waiting on the body.
+async fn read_body_capped(resp: reqwest::Response, headers: &[(String, String)]) -> BodyRead {
+    let len_hint = content_length(headers);
+    let force = is_streaming_content_type(headers);
+    let stream: ByteStream = Box::pin(resp.bytes_stream().map(|r| r.map_err(std::io::Error::other)));
+    read_stream_capped(stream, force, len_hint, BUFFER_CAP).await
+}
+
+/// Core of [`read_body_capped`], decoupled from reqwest: buffer chunks until the
+/// stream ends (→ `Buffered`) or `cap` is exceeded (→ `Streamed`, prefix + rest);
+/// `force_stream` spills immediately with an empty prefix (SSE et al.).
+async fn read_stream_capped(
+    mut rest: ByteStream,
+    force_stream: bool,
+    len_hint: Option<u64>,
+    cap: usize,
+) -> BodyRead {
+    if force_stream {
+        return BodyRead::Streamed {
+            prefix: Vec::new(),
+            rest,
+            len_hint,
+        };
+    }
+    let mut prefix: Vec<Bytes> = Vec::new();
+    let mut total = 0usize;
+    loop {
+        match rest.next().await {
+            None => return BodyRead::Buffered(concat_chunks(&prefix)),
+            Some(Err(e)) => return BodyRead::Error(e.to_string()),
+            Some(Ok(chunk)) => {
+                total += chunk.len();
+                prefix.push(chunk);
+                if total > cap {
+                    return BodyRead::Streamed {
+                        prefix,
+                        rest,
+                        len_hint,
+                    };
+                }
+            }
+        }
+    }
+}
+
+fn concat_chunks(chunks: &[Bytes]) -> Bytes {
+    match chunks {
+        [] => Bytes::new(),
+        [one] => one.clone(),
+        many => {
+            let mut buf = Vec::with_capacity(many.iter().map(|c| c.len()).sum());
+            for c in many {
+                buf.extend_from_slice(c);
+            }
+            Bytes::from(buf)
+        }
+    }
+}
+
+/// A streaming `ProxyBody` that emits the already-pulled `prefix` chunks, then
+/// the rest of the live upstream stream.
+fn streamed_body(prefix: Vec<Bytes>, rest: ByteStream) -> ProxyBody {
+    let head = futures::stream::iter(prefix.into_iter().map(Ok::<Bytes, std::io::Error>));
+    let frames = head.chain(rest).map(|r| r.map(Frame::data));
+    BodyExt::boxed_unsync(StreamBody::new(frames))
+}
+
+/// Assemble a response with the given (already-decided) body, copying headers
+/// except the framing ones hyper derives from the body itself.
+fn response_with_body(
     status: u16,
     headers: &[(String, String)],
-    body: Bytes,
-) -> Response<Full<Bytes>> {
+    body: ProxyBody,
+) -> Response<ProxyBody> {
     let mut builder = Response::builder().status(status);
     for (name, value) in headers {
         let lname = name.to_lowercase();
@@ -677,16 +1117,24 @@ fn build_client_response(
         builder = builder.header(name, value);
     }
     builder
-        .body(Full::new(body))
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
+        .body(body)
+        .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
 }
 
-fn error_response(status: StatusCode, msg: &str) -> Response<Full<Bytes>> {
+fn build_client_response(
+    status: u16,
+    headers: &[(String, String)],
+    body: Bytes,
+) -> Response<ProxyBody> {
+    response_with_body(status, headers, full_body(body))
+}
+
+fn error_response(status: StatusCode, msg: &str) -> Response<ProxyBody> {
     Response::builder()
         .status(status)
         .header("content-type", "text/plain; charset=utf-8")
-        .body(Full::new(Bytes::from(format!("shadowdroid proxy: {msg}"))))
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
+        .body(full_body(Bytes::from(format!("shadowdroid proxy: {msg}"))))
+        .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
 }
 
 struct FlowParts<'a> {
@@ -735,15 +1183,96 @@ fn make_flow(p: FlowParts<'_>) -> FlowRecord {
         matched: p.matched,
         modified: p.modified,
         error: p.error,
+        streamed: false,
+    }
+}
+
+/// [`FlowParts`] for a request that errored before/while reading the body — a
+/// small constructor so the two upstream-error sites don't repeat the literal.
+#[allow(clippy::too_many_arguments)]
+fn error_flow<'a>(
+    id: &'a str,
+    method: &'a Method,
+    scheme: &'a str,
+    host: &'a str,
+    path: &'a str,
+    req_headers: &'a [(String, String)],
+    req_bytes: &'a [u8],
+    status: Option<u16>,
+    resp_headers: &'a [(String, String)],
+    dur_ms: u64,
+    error: String,
+    matched: Option<String>,
+    modified: bool,
+) -> FlowParts<'a> {
+    FlowParts {
+        id,
+        method: method.as_str(),
+        scheme,
+        host,
+        path,
+        req_headers,
+        req_bytes,
+        status,
+        resp_headers,
+        resp_bytes: &[],
+        dur_ms,
+        error: Some(error),
+        matched,
+        modified,
     }
 }
 
 /// Build the final flow record and push it to the daemon (store + broadcast).
 fn capture(ctx: &ProxyContext, parts: FlowParts<'_>) {
-    let _ = ctx.flow_tx.send(make_flow(parts));
+    let mut rec = make_flow(parts);
+    if ctx.shared.redact {
+        redact_headers(&mut rec.req_headers);
+        redact_headers(&mut rec.resp_headers);
+    }
+    let _ = ctx.flow_tx.send(rec);
+}
+
+/// Capture a streamed (pass-through) flow: same metadata as [`capture`] but with
+/// no body, `streamed:true`, and `resp_len` set from the `content-length` hint
+/// (the real streamed length isn't known when the flow is recorded).
+fn capture_streamed(ctx: &ProxyContext, parts: FlowParts<'_>, len_hint: Option<u64>) {
+    let mut rec = make_flow(parts);
+    rec.streamed = true;
+    rec.resp_body = None;
+    rec.resp_len = len_hint.unwrap_or(rec.resp_len);
+    if ctx.shared.redact {
+        redact_headers(&mut rec.req_headers);
+        redact_headers(&mut rec.resp_headers);
+    }
+    let _ = ctx.flow_tx.send(rec);
+}
+
+/// Headers whose values are replaced with a placeholder when `--redact` is on.
+const SENSITIVE_HEADERS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+];
+
+/// Replace the values of [`SENSITIVE_HEADERS`] in place (bodies are not touched —
+/// redaction is a best-effort guard, not a guarantee that no secret is logged).
+fn redact_headers(headers: &mut [(String, String)]) {
+    for (name, value) in headers.iter_mut() {
+        if SENSITIVE_HEADERS
+            .iter()
+            .any(|h| name.eq_ignore_ascii_case(h))
+        {
+            *value = "<redacted>".to_string();
+        }
+    }
 }
 
 // ── interception ──────────────────────────────────────────────
+
+/// Max concurrently-held flows before `hold` fails open (see [`hold`]).
+const MAX_HELD_FLOWS: usize = 128;
 
 /// If interception is active and `snap` matches at this `phase`, register the
 /// flow as held, emit an `http_intercept` event, and await the agent's decision
@@ -761,13 +1290,26 @@ async fn hold(ctx: &ProxyContext, snap: FlowRecord, phase: &'static str) -> Opti
 
     let (tx, rx) = oneshot::channel();
     let id = snap.id.clone();
-    ctx.shared.held.lock().unwrap().insert(
-        id.clone(),
-        HeldFlow {
-            tx,
-            meta: snap.clone(),
-        },
-    );
+    {
+        // Cap concurrent holds: each pins a FlowRecord (with bodies) until acted
+        // on or its deadline. An app hammering a matched endpoint faster than the
+        // agent can resume would otherwise grow this map without bound, so past
+        // the cap we fail open — let the flow through unheld rather than OOM.
+        let mut held = ctx.shared.held.lock().unwrap();
+        if held.len() >= MAX_HELD_FLOWS {
+            tracing::warn!(
+                "net intercept: {MAX_HELD_FLOWS} flows already held; letting {id} through unheld"
+            );
+            return None;
+        }
+        held.insert(
+            id.clone(),
+            HeldFlow {
+                tx,
+                meta: snap.clone(),
+            },
+        );
+    }
     let _ = ctx
         .shared
         .events
@@ -928,7 +1470,7 @@ fn apply_body_mutation(body: &mut Bytes, m: &Mutation) {
     }
 }
 
-fn drop_response(status: Option<u16>) -> Response<Full<Bytes>> {
+fn drop_response(status: Option<u16>) -> Response<ProxyBody> {
     match status {
         Some(s) => build_client_response(s, &[], Bytes::new()),
         None => error_response(StatusCode::BAD_GATEWAY, "dropped by net intercept"),
@@ -1148,9 +1690,12 @@ fn set_header_vec(headers: &mut Vec<(String, String)>, name: &str, value: &str) 
     }
 }
 
-/// Decompress a gzip/deflate body. Returns `None` if not encoded (or on error,
-/// leaving the original bytes untouched). `br` (brotli) isn't handled — use
-/// `--anticomp` for those servers.
+/// Decompress a `content-encoding` body so capture, rules, and intercept all see
+/// plain bytes. Handles gzip, deflate, `br` (brotli), and `zstd` — the encodings
+/// clients actually negotiate (OkHttp → gzip; WebViews/Cronet/CDNs → br/zstd).
+/// Returns `None` if not encoded or on decode error, leaving the original bytes
+/// untouched (the client still gets a consistent compressed body since
+/// `content-encoding` is only stripped when this returns `Some`).
 fn decompress(headers: &[(String, String)], body: &[u8]) -> Option<Vec<u8>> {
     use std::io::Read;
     let enc = headers
@@ -1171,6 +1716,13 @@ fn decompress(headers: &[(String, String)], body: &[u8]) -> Option<Vec<u8>> {
                     .ok()?
             }
         },
+        "br" => brotli::Decompressor::new(body, 4096)
+            .read_to_end(&mut out)
+            .ok()?,
+        "zstd" => ruzstd::decoding::StreamingDecoder::new(body)
+            .ok()?
+            .read_to_end(&mut out)
+            .ok()?,
         _ => return None,
     };
     Some(out)
@@ -1201,15 +1753,24 @@ fn is_hop_by_hop(name_lower: &str) -> bool {
     )
 }
 
-/// Glob host match: `*.example.com` matches the domain + any subdomain; an
-/// exact/plain pattern is an exact-or-substring match.
+/// Glob host match used to scope which hosts the proxy MITMs (`net start --host`).
+/// `*.example.com` matches the apex + any subdomain. A **domain-shaped** pattern
+/// (contains a dot) matches that domain and its subdomains at a label boundary —
+/// so `example.com` matches `api.example.com` but NOT `example.com.evil.com`. A
+/// bare fragment with no dot (`livd`) keeps the substring convenience.
+///
+/// (This is stricter than [`FlowRecord::matches`], which stays a plain substring
+/// match — that only filters flows already captured, so looseness is harmless
+/// there; scoping decides what to intercept, so it must not over-capture.)
 fn host_glob_match(pattern: &str, host: &str) -> bool {
     let p = pattern.to_lowercase();
     let h = host.to_lowercase();
     if let Some(suffix) = p.strip_prefix("*.") {
         h == suffix || h.ends_with(&format!(".{suffix}"))
+    } else if p.contains('.') {
+        h == p || h.ends_with(&format!(".{p}"))
     } else {
-        h == p || h.contains(&p)
+        h.contains(&p)
     }
 }
 
@@ -1267,7 +1828,10 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Rewind<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{host_glob_match, release_held, resolve_held, tls_failure_reason, HeldFlow, HoldDecision};
+    use super::{
+        decompress, host_glob_match, release_held, resolve_held, tls_failure_reason, HeldFlow,
+        HoldDecision,
+    };
     use crate::net::flow::FlowRecord;
     use crate::net::Mutation;
     use std::collections::HashMap;
@@ -1275,6 +1839,121 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
     use tokio::sync::oneshot;
+
+    #[test]
+    fn decompress_round_trips_every_supported_encoding() {
+        use std::io::Write;
+        let plain = b"{\"hello\":\"world\",\"items\":[1,2,3]}".repeat(20);
+        let ce = |v: &str| vec![("Content-Encoding".to_string(), v.to_string())];
+
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&plain).unwrap();
+        assert_eq!(decompress(&ce("gzip"), &gz.finish().unwrap()).unwrap(), plain);
+
+        let mut br = Vec::new();
+        {
+            let mut w = brotli::CompressorWriter::new(&mut br, 4096, 5, 22);
+            w.write_all(&plain).unwrap();
+        }
+        assert_eq!(decompress(&ce("br"), &br).unwrap(), plain);
+
+        let zs = ruzstd::encoding::compress_to_vec(
+            &plain[..],
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        assert_eq!(decompress(&ce("zstd"), &zs).unwrap(), plain);
+
+        // No / unknown / identity encoding → leave bytes untouched.
+        assert!(decompress(&[], &plain).is_none());
+        assert!(decompress(&ce("identity"), &plain).is_none());
+        // Corrupt br payload → None (fall back to passthrough), never a panic.
+        assert!(decompress(&ce("br"), b"not really brotli").is_none());
+    }
+
+    #[test]
+    fn streaming_content_types_and_length() {
+        use super::{content_length, is_streaming_content_type};
+        let h = |ct: &str| vec![("content-type".to_string(), ct.to_string())];
+        assert!(is_streaming_content_type(&h("text/event-stream")));
+        assert!(is_streaming_content_type(&h("application/grpc+proto")));
+        assert!(!is_streaming_content_type(&h("application/json")));
+        assert!(!is_streaming_content_type(&[]));
+        assert_eq!(
+            content_length(&[("Content-Length".into(), "42".into())]),
+            Some(42)
+        );
+        assert_eq!(content_length(&[]), None);
+    }
+
+    #[tokio::test]
+    async fn stream_cap_buffers_small_and_spills_large() {
+        use super::{read_stream_capped, BodyRead, ByteStream};
+        use bytes::Bytes;
+        let chunks = |parts: Vec<&'static [u8]>| -> ByteStream {
+            Box::pin(futures::stream::iter(
+                parts.into_iter().map(|b| Ok(Bytes::from_static(b))),
+            ))
+        };
+
+        // Finishes under the cap → one buffered blob (fully captured).
+        match read_stream_capped(chunks(vec![b"hel", b"lo"]), false, None, 64).await {
+            BodyRead::Buffered(b) => assert_eq!(&b[..], b"hello"),
+            _ => panic!("expected Buffered"),
+        }
+
+        // Exceeds the cap → spill to Streamed, keeping the pulled prefix.
+        match read_stream_capped(chunks(vec![b"aaaa", b"bbbb", b"cccc"]), false, Some(12), 6).await {
+            BodyRead::Streamed { prefix, len_hint, .. } => {
+                assert_eq!(len_hint, Some(12));
+                assert!(prefix.iter().map(|c| c.len()).sum::<usize>() > 6);
+            }
+            _ => panic!("expected Streamed"),
+        }
+
+        // force_stream → immediate Streamed with an empty prefix (SSE).
+        match read_stream_capped(chunks(vec![b"data: 1\n\n"]), true, None, 999).await {
+            BodyRead::Streamed { prefix, .. } => assert!(prefix.is_empty()),
+            _ => panic!("expected Streamed"),
+        }
+
+        // A stream error surfaces as Error, not a panic.
+        let erroring: ByteStream = Box::pin(futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"x")),
+            Err(std::io::Error::other("boom")),
+        ]));
+        match read_stream_capped(erroring, false, None, 64).await {
+            BodyRead::Error(e) => assert!(e.contains("boom")),
+            _ => panic!("expected Error"),
+        }
+    }
+
+    #[test]
+    fn detects_websocket_upgrade() {
+        use super::is_websocket_upgrade;
+        let mut h = http::HeaderMap::new();
+        assert!(!is_websocket_upgrade(&h));
+        h.insert(http::header::CONNECTION, "Upgrade".parse().unwrap());
+        h.insert(http::header::UPGRADE, "websocket".parse().unwrap());
+        assert!(is_websocket_upgrade(&h));
+        // A keep-alive upgrade to something else is not a websocket.
+        h.insert(http::header::UPGRADE, "h2c".parse().unwrap());
+        assert!(!is_websocket_upgrade(&h));
+    }
+
+    #[test]
+    fn redact_headers_masks_only_sensitive() {
+        let mut headers = vec![
+            ("Authorization".to_string(), "Bearer secret-token".to_string()),
+            ("Content-Type".to_string(), "application/json".to_string()),
+            ("set-cookie".to_string(), "session=abc".to_string()),
+            ("X-Trace".to_string(), "keep-me".to_string()),
+        ];
+        super::redact_headers(&mut headers);
+        assert_eq!(headers[0].1, "<redacted>"); // Authorization (case-insensitive)
+        assert_eq!(headers[1].1, "application/json"); // untouched
+        assert_eq!(headers[2].1, "<redacted>"); // set-cookie
+        assert_eq!(headers[3].1, "keep-me"); // untouched
+    }
 
     #[test]
     fn tls_failure_reason_flags_cert_rejection_vs_lower_level() {
@@ -1353,5 +2032,12 @@ mod tests {
         assert!(host_glob_match("api.livd.app", "api.livd.app"));
         assert!(host_glob_match("livd", "api.livd.app"));
         assert!(!host_glob_match("segment.io", "api.livd.app"));
+
+        // A domain-shaped pattern matches its subdomains at a label boundary…
+        assert!(host_glob_match("livd.app", "api.livd.app"));
+        assert!(host_glob_match("example.com", "example.com"));
+        // …but NOT a longer domain that merely contains it (the over-capture bug).
+        assert!(!host_glob_match("example.com", "example.com.evil.com"));
+        assert!(!host_glob_match("livd.app", "notlivd.app"));
     }
 }

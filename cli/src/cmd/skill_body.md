@@ -138,6 +138,14 @@ shadowdroid net ca info | jq        # source (generated|imported), validity, has
 shadowdroid net ca reset            # go back to a generated CA
 ```
 
+The proxy serves HTTP/2 and HTTP/1.1, decodes gzip/deflate/br/zstd, and streams
+SSE / large responses through (those flows carry `"streamed":true` and have no
+captured body — re-request with a narrower scope or inspect on-device if you need
+the payload). WebSocket upgrades are tunnelled (handshake captured as a
+`matched:"websocket"` flow, frames not decoded). Add `--redact` to `net start` to
+mask auth/cookie headers in captured flows, or `--verify-upstream` to validate the
+real server's TLS cert (off by default for self-signed dev backends).
+
 `net log` is line-delimited JSON: one `http` object per line, followed by one
 `{"cmd":"net_log","count":...}` summary object. Do not use `jq '.flows[]'`.
 Filter events with `jq -c 'select(.type=="http")'`.

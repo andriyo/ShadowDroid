@@ -58,8 +58,8 @@ zip = { version = "8.6", default-features = false, features = ["deflate"] }
 # ── MITM proxy (`net` namespace) ────────────────────────────────────────
 # All already present transitively (verified in Cargo.lock); promoting to
 # direct deps adds no build cost. aws-lc-rs is the active rustls provider.
-hyper = { version = "1.9", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper = { version = "1.9", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
 http = "1.4"
 http-body-util = "0.1"
 bytes = "1"
@@ -68,6 +68,8 @@ rustls = "0.23"
 rcgen = { version = "0.14", features = ["x509-parser"] }
 x509-parser = "0.18"     # inspect a user-provided CA cert (SPKI match, CA flag, validity) on `net ca import`; already in lock via rcgen
 flate2 = "1"             # decompress captured gzip/deflate response bodies (already in lock via zip)
+brotli = "8"             # decompress captured `br` response bodies (pure Rust; keeps the single binary)
+ruzstd = "0.8"           # decompress captured `zstd` response bodies (pure Rust decoder, no libzstd C dep)
 
 [dev-dependencies]
 tempfile = "3.27"
