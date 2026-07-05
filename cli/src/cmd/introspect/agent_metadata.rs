@@ -129,7 +129,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
                 "Need to correlate UI state with network responses, app crashes, or watcher automation during a flow."
             ],
             "avoid_when": ["Need one immediate actionable element list; use ui dump instead.", "Need a saved layout/source artifact; use layout snapshot instead."],
-            "output": "jsonl event stream: ready, screen_compact/screen, crash, watcher_fired, http/http_intercept, warning, error",
+            "output": "jsonl event stream: ready, screen_compact/screen, crash, watcher_fired, http/http_intercept, tls_error, warning, error",
             "side_effects": ["polls the screen", "tails logcat", "may run watcher actions", "auto-attaches to a running net proxy unless --no-net is passed"],
             "prerequisites": ["shadowdroid connect", "shadowdroid net start for HTTP(S) events"],
             "next_commands": ["ui tap", "ui text", "ui wait", "net start", "net show <id>", "debug snapshot"],
@@ -905,7 +905,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "net log" => Some(serde_json::json!({
             "use_when": ["Need recent HTTP flows from the session log without watching live UI."],
-            "output": "line-delimited JSON: one http event per line followed by a net_log summary object",
+            "output": "line-delimited JSON: http (and tls_error, when an app rejected the CA) events in ts order, followed by a net_log summary object",
             "side_effects": ["none"],
             "next_commands": ["net show <id>", "net export har <id>", "watch"]
         })),

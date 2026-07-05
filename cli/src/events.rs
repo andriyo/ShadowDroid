@@ -123,6 +123,16 @@ pub enum Event {
         #[serde(skip_serializing_if = "Option::is_none")]
         resp_preview: Option<String>,
     },
+    /// A TLS handshake the proxy could not complete after presenting a minted
+    /// leaf for `host` — almost always the app rejecting the MITM CA (untrusted),
+    /// but also cert pinning or a version/cipher mismatch. Emitted so a silent
+    /// "no flows captured" turns into a visible, actionable one-liner. Deduped
+    /// per host within a session so a retrying client doesn't flood the timeline.
+    TlsError {
+        ts: f64,
+        host: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]

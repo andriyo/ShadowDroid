@@ -356,9 +356,11 @@ optionally activates it) — the TV analog of `ui tap` / `ui scroll-to`. Prefer 
 
 `watch` is the streaming workhorse — it emits debounced, hash-diffed `screen`
 events plus `crash`, `toast`, `watcher_fired`, and `http` events when a `net`
-proxy is running. If network capture is not available, `watch` emits a structured
-`warning` event with the suggested recovery command, so an agent can decide
-whether to run `net start` or continue UI/crash-only (`watch --no-net`).
+proxy is running (plus a `tls_error` when an app rejects the proxy CA, so a
+failed interception is visible instead of just missing). If network capture is
+not available, `watch` emits a structured `warning` event with the suggested
+recovery command, so an agent can decide whether to run `net start` or continue
+UI/crash-only (`watch --no-net`).
 
 `net` is a host-side MITM proxy built into the single binary — no Python, no
 external mitmproxy. `net start` spawns the proxy, wires the device through

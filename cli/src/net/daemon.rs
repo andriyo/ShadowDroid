@@ -4,7 +4,7 @@
 
 use crate::ids::Serial;
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -41,6 +41,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         events: event_tx.clone(),
         rules: RwLock::new(Vec::new()),
         replay: RwLock::new(None),
+        tls_errors_seen: Mutex::new(HashSet::new()),
     });
 
     let ctx = Arc::new(ProxyContext {
@@ -48,6 +49,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         client: proxy::build_upstream_client(),
         flow_tx,
         shared: shared.clone(),
+        serial: cfg.serial.clone(),
     });
 
     let state = Arc::new(DaemonState {

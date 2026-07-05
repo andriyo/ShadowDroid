@@ -291,7 +291,14 @@ fn event_matches(ev: &Event, m: &Matcher) -> bool {
                 && sub(method, &m.method)
                 && m.status.map(|s| *status == Some(s)).unwrap_or(true)
         }
-        // Only HTTP events flow over network stream clients.
+        // A handshake failure only carries a host — apply just the host filter
+        // (path/method/status don't apply to a connection that never spoke HTTP).
+        Event::TlsError { host, .. } => m
+            .host
+            .as_deref()
+            .map(|x| host.to_lowercase().contains(&x.to_lowercase()))
+            .unwrap_or(true),
+        // Only HTTP + TLS-error events flow over network stream clients.
         _ => false,
     }
 }
@@ -442,5 +449,31 @@ mod tests {
         // The old umbrella `set-header` is gone — it now reads as unknown so a
         // stale rule fails loudly instead of silently applying to the wrong phase.
         assert!(validate_rule(&spec("set-header", &["a", "b"])).is_err());
+    }
+
+    #[test]
+    fn tls_error_events_reach_watch_and_respect_host_filter() {
+        let ev = Event::TlsError {
+            ts: 1.0,
+            host: "appconfigs.disney-plus.net".into(),
+            reason: "rejected".into(),
+        };
+        // Relayed to watch (previously the catch-all dropped everything non-HTTP).
+        assert!(event_matches(&ev, &Matcher::default()));
+        // Host filter applies (case-insensitive substring); path/method/status don't.
+        assert!(event_matches(
+            &ev,
+            &Matcher {
+                host: Some("DISNEY".into()),
+                ..Default::default()
+            }
+        ));
+        assert!(!event_matches(
+            &ev,
+            &Matcher {
+                host: Some("example.com".into()),
+                ..Default::default()
+            }
+        ));
     }
 }

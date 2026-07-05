@@ -202,11 +202,37 @@ async fn teardown_wiring(serial: &Serial, port: u16) -> Result<()> {
 
 pub async fn log(serial: &Serial, matcher: Matcher, limit: usize) -> Result<()> {
     let flows = store::read_filtered(serial, &matcher, limit)?;
-    for f in &flows {
-        events::emit(&f.http_event());
+    let tls_errors = store::read_tls_errors(serial, matcher.host.as_deref())?;
+    // Interleave completed flows with any TLS-handshake failures (issue #5) so a
+    // "why is nothing captured?" moment shows the rejected host inline.
+    let items = merge_timeline(&flows, tls_errors, limit);
+    for v in &items {
+        events::emit(v);
     }
-    emit("net_log", json!({"count": flows.len(), "limit": limit}));
+    emit("net_log", json!({"count": items.len(), "limit": limit}));
     Ok(())
+}
+
+/// Merge completed flows (as `http` events) with `tls_error` markers into one
+/// list ordered by `ts`, keeping the most recent `limit` events overall.
+fn merge_timeline(
+    flows: &[crate::net::flow::FlowRecord],
+    tls_errors: Vec<serde_json::Value>,
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    let mut items: Vec<(f64, serde_json::Value)> = Vec::with_capacity(flows.len() + tls_errors.len());
+    for f in flows {
+        if let Ok(v) = serde_json::to_value(f.http_event()) {
+            items.push((f.ts, v));
+        }
+    }
+    for v in tls_errors {
+        let ts = v.get("ts").and_then(|t| t.as_f64()).unwrap_or(0.0);
+        items.push((ts, v));
+    }
+    items.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let start = items.len().saturating_sub(limit);
+    items.split_off(start).into_iter().map(|(_, v)| v).collect()
 }
 
 pub async fn show(
@@ -588,7 +614,34 @@ pub async fn replay(serial: &Serial, from: &Path, host: Option<String>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::flow::FlowRecord;
     use crate::net::Matcher;
+
+    #[test]
+    fn merge_timeline_orders_by_ts_and_keeps_last_n() {
+        let flow = |id: &str, ts: f64| FlowRecord {
+            id: id.into(),
+            ts,
+            method: "GET".into(),
+            scheme: "https".into(),
+            host: "api.example.com".into(),
+            path: "/x".into(),
+            ..Default::default()
+        };
+        let flows = vec![flow("f1", 1.0), flow("f3", 3.0)];
+        let tls = vec![serde_json::json!({"type":"tls_error","ts":2.0,"host":"api.example.com","reason":"r"})];
+
+        // All three, chronological.
+        let all = merge_timeline(&flows, tls.clone(), 10);
+        let ts: Vec<f64> = all.iter().map(|v| v["ts"].as_f64().unwrap()).collect();
+        assert_eq!(ts, [1.0, 2.0, 3.0]);
+        assert_eq!(all[1]["type"], "tls_error");
+
+        // limit keeps the most recent N across both kinds.
+        let last2 = merge_timeline(&flows, tls, 2);
+        let ts: Vec<f64> = last2.iter().map(|v| v["ts"].as_f64().unwrap()).collect();
+        assert_eq!(ts, [2.0, 3.0]);
+    }
 
     fn spec(kind: &str, arg: &str) -> RuleSpec {
         RuleSpec {

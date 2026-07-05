@@ -28,7 +28,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -52,6 +52,9 @@ pub struct ProxyContext {
     /// Completed flows are pushed here; the daemon drains → store + broadcast.
     pub flow_tx: mpsc::UnboundedSender<FlowRecord>,
     pub shared: Arc<SharedState>,
+    /// This daemon's device serial — used to persist a `tls_error` to the
+    /// session log so `net log` can recall handshake failures.
+    pub serial: crate::ids::Serial,
 }
 
 /// Runtime-mutable proxy knobs. (Rules land here in P3.)
@@ -70,6 +73,9 @@ pub struct SharedState {
     pub rules: RwLock<Vec<(String, RuleSpec)>>,
     /// Saved flows served as canned responses (`net replay`), or `None`.
     pub replay: RwLock<Option<Vec<FlowRecord>>>,
+    /// Hosts we've already reported a `tls_error` for, so a client that keeps
+    /// retrying a rejected handshake produces one signal, not a flood.
+    pub tls_errors_seen: Mutex<HashSet<String>>,
 }
 
 impl SharedState {
@@ -224,6 +230,7 @@ fn process_connect(ctx: Arc<ProxyContext>, req: Request<Incoming>) -> Response<F
                 Ok(s) => s,
                 Err(e) => {
                     tracing::debug!("TLS accept {host}: {e}");
+                    report_tls_error(&ctx, &host, &e);
                     return;
                 }
             };
@@ -254,6 +261,42 @@ fn process_connect(ctx: Arc<ProxyContext>, req: Request<Incoming>) -> Response<F
 
     // 200 OK (empty body) == "tunnel established".
     Response::new(Full::new(Bytes::new()))
+}
+
+/// Report a failed inner TLS handshake (issue #5): persist a `tls_error` to the
+/// session log (so `net log` recalls it) and broadcast it (so `watch` shows it
+/// live). Deduped per host so a retrying client yields one signal, not a flood.
+fn report_tls_error(ctx: &ProxyContext, host: &str, err: &std::io::Error) {
+    {
+        let mut seen = ctx.shared.tls_errors_seen.lock().unwrap();
+        if !seen.insert(host.to_string()) {
+            return; // already reported this host this session
+        }
+    }
+    let ev = Event::TlsError {
+        ts: events::now_ts(),
+        host: host.to_string(),
+        reason: tls_failure_reason(err),
+    };
+    let _ = crate::net::store::append_event(&ctx.serial, &ev);
+    let _ = ctx.shared.events.send(Arc::new(ev));
+}
+
+/// Turn a `TlsAcceptor::accept` error into an agent-actionable reason. A fatal
+/// alert from the peer during the handshake is, in a MITM, overwhelmingly "I
+/// don't trust your certificate"; everything else is a lower-level failure.
+fn tls_failure_reason(err: &std::io::Error) -> String {
+    let raw = err.to_string();
+    if raw.to_lowercase().contains("alert") {
+        format!(
+            "the app rejected the proxy's TLS certificate ({raw}) — it does not trust the MITM CA \
+             (or the connection is certificate-pinned). Verify with `net check <pkg>`, install \
+             trust with `net trust`, confirm the app's Network Security Config allows user CAs, \
+             and see `net ca info` for the active CA."
+        )
+    } else {
+        format!("TLS handshake with the app failed before any request: {raw}")
+    }
 }
 
 /// Forward one (decrypted or plaintext) request upstream, applying any active
@@ -1224,13 +1267,30 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Rewind<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{host_glob_match, release_held, resolve_held, HeldFlow, HoldDecision};
+    use super::{host_glob_match, release_held, resolve_held, tls_failure_reason, HeldFlow, HoldDecision};
     use crate::net::flow::FlowRecord;
     use crate::net::Mutation;
     use std::collections::HashMap;
+    use std::io;
     use std::sync::Mutex;
     use std::time::Duration;
     use tokio::sync::oneshot;
+
+    #[test]
+    fn tls_failure_reason_flags_cert_rejection_vs_lower_level() {
+        // A peer alert during the handshake reads as "app doesn't trust the CA".
+        let alert = io::Error::other("received fatal alert: UnknownCA");
+        let reason = tls_failure_reason(&alert);
+        assert!(reason.contains("rejected the proxy's TLS certificate"), "{reason}");
+        assert!(reason.contains("net trust"), "{reason}");
+        assert!(reason.contains("UnknownCA"), "raw error preserved: {reason}");
+
+        // Anything else is reported as a lower-level handshake failure.
+        let reset = io::Error::other("connection reset by peer");
+        let reason = tls_failure_reason(&reset);
+        assert!(reason.contains("failed before any request"), "{reason}");
+        assert!(!reason.contains("net trust"), "{reason}");
+    }
 
     fn insert_held(
         held: &Mutex<HashMap<String, HeldFlow>>,

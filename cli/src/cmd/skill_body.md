@@ -112,6 +112,12 @@ still be conditional on the app's Network Security Config; prove the final loop
 by running `net start`, exercising the app, and observing a decrypted `http`
 event.
 
+If `net log`/`watch` show no flows after exercising the app, look for a
+`tls_error` event: it means the app rejected the proxy CA (untrusted or pinned),
+and its `reason` names the fix (`net check`/`net trust`, NSC user-CA opt-in, or
+cert pinning). No `tls_error` and no flows usually means the app bypassed the
+proxy (Cronet/QUIC) — see `net check`.
+
 ```bash
 shadowdroid net check com.example.app | jq
 shadowdroid net trust --auto       # or use the command recommended by net check
