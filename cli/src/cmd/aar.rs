@@ -35,6 +35,17 @@ const APP_AAR_RELPATH: &str = "shadowdroid/shadowdroid-agent.aar";
 /// Tags the managed dependency line so install is idempotent and remove is exact.
 const DEP_MARKER: &str = "shadowdroid-agent (managed by `shadowdroid aar`)";
 
+/// Delimits the managed coroutine-probes block inside the module build file
+/// (the full BEGIN/END lines live in the template; this substring is shared).
+const PROBES_MARKER: &str = "shadowdroid coroutine probes (managed by `shadowdroid aar`)";
+
+/// The coroutine-probes block: an AGP ASM visitor that swaps kotlin-stdlib's
+/// no-op `DebugProbesKt` for the delegating variant in debug builds, activating
+/// kotlinx-coroutines DebugProbes so `aar coroutines` sees live coroutines.
+/// Inlined into the module's build.gradle.kts (an `apply(from = …)` script gets
+/// its own classloader without AGP/ASM, so a separate file cannot work).
+const PROBES_BLOCK: &str = include_str!("coroutine_probes.gradle.kts");
+
 #[derive(Subcommand)]
 pub enum AarCmd {
     /// Install the debug AAR into an app and wire one debug-only dependency.
@@ -55,6 +66,27 @@ pub enum AarCmd {
     Drop(IdArgs),
     /// Show the running agent: info, armed matcher, held flows, capture count.
     Agent(JsonArg),
+    /// Dump every live coroutine (state, job tree, stacks) via DebugProbes.
+    Coroutines(CoroutinesArgs),
+}
+
+#[derive(Args)]
+pub struct CoroutinesArgs {
+    /// Include the full DebugProbes text dump (job hierarchy + stack traces).
+    #[arg(long)]
+    pub dump: bool,
+    /// Stack frames to show per coroutine in the structured list (0 = none).
+    #[arg(long, default_value_t = 6)]
+    pub frames: u32,
+    /// Cap the structured coroutine list (state counts are always complete).
+    #[arg(long, default_value_t = 200)]
+    pub limit: u32,
+    /// Write the full text dump to this file (implies the dump is collected).
+    #[arg(short = 'o', long)]
+    pub out: Option<PathBuf>,
+    /// Emit a single JSON object instead of human-readable text.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]
@@ -146,6 +178,10 @@ pub struct InstallArgs {
     /// Use this local AAR file instead of resolving one (dev / testing).
     #[arg(long)]
     pub from: Option<PathBuf>,
+    /// Also activate kotlinx-coroutines DebugProbes in debug builds (build-time
+    /// bytecode swap of the stdlib probe stub), enabling `aar coroutines`.
+    #[arg(long)]
+    pub coroutine_probes: bool,
     /// After wiring, run `:<module>:assembleDebug` to verify the app compiles.
     #[arg(long)]
     pub build: bool,
@@ -226,6 +262,18 @@ pub async fn run(cmd: &AarCmd, project: Option<&Path>, device: Option<&str>) -> 
             let serial = crate::cli::resolve_serial(device).await?;
             return agent::status(&serial, a.json).await;
         }
+        AarCmd::Coroutines(a) => {
+            let serial = crate::cli::resolve_serial(device).await?;
+            return agent::coroutines(
+                &serial,
+                a.dump || a.out.is_some(),
+                a.frames,
+                a.limit,
+                a.out.as_ref(),
+                a.json,
+            )
+            .await;
+        }
         _ => {}
     }
 
@@ -250,6 +298,7 @@ struct InstallReport {
     aar_version: String,
     aar_path: String,
     dependency_added: bool,
+    coroutine_probes: bool,
     build: &'static str,
 }
 
@@ -270,6 +319,10 @@ async fn install(args: &InstallArgs, root: &Path) -> Result<()> {
 
     let added = wire_dependency(&module_gradle)?;
 
+    if args.coroutine_probes {
+        wire_probes_block(&module_gradle)?;
+    }
+
     let mut build_result = "skipped";
     if args.build {
         build_result = if gradle_assemble_debug(root, &module)? {
@@ -287,6 +340,7 @@ async fn install(args: &InstallArgs, root: &Path) -> Result<()> {
         aar_version: resolved.version.clone(),
         aar_path: APP_AAR_RELPATH.to_string(),
         dependency_added: added,
+        coroutine_probes: args.coroutine_probes,
         build: build_result,
     };
 
@@ -310,6 +364,12 @@ async fn install(args: &InstallArgs, root: &Path) -> Result<()> {
                 "already present (idempotent)"
             }
         );
+        if args.coroutine_probes {
+            println!(
+                "  coroutines: probes activation wired (managed block in the module \
+                 build file); rebuild + relaunch, then `shadowdroid aar coroutines`"
+            );
+        }
         match build_result {
             "ok" => println!("  build:      :{}:assembleDebug succeeded", report.module),
             "failed" => println!(
@@ -339,6 +399,7 @@ pub struct StatusReport {
     pub dependency_present: bool,
     pub aar_present: bool,
     pub aar_path: String,
+    pub coroutine_probes: bool,
     pub installed: bool,
 }
 
@@ -350,16 +411,17 @@ pub fn inspect(root: &Path, module: Option<&str>) -> Result<StatusReport> {
         None => detect_app_module(root)?,
     };
     let module_gradle = module_build_gradle(root, &module)?;
-    let dependency_present = fs::read_to_string(&module_gradle)
-        .map(|c| c.contains(DEP_MARKER))
-        .unwrap_or(false);
+    let gradle_text = fs::read_to_string(&module_gradle).unwrap_or_default();
+    let dependency_present = gradle_text.contains(DEP_MARKER);
     let aar_present = root.join(APP_AAR_RELPATH).is_file();
+    let coroutine_probes = gradle_text.contains(PROBES_MARKER);
     Ok(StatusReport {
         app: root.display().to_string(),
         module,
         dependency_present,
         aar_present,
         aar_path: APP_AAR_RELPATH.to_string(),
+        coroutine_probes,
         installed: dependency_present && aar_present,
     })
 }
@@ -372,6 +434,14 @@ fn status(args: &TargetArgs, root: &Path) -> Result<()> {
         println!(
             "✓ agent AAR installed in `{}` (module :{})",
             report.app, report.module
+        );
+        println!(
+            "  coroutine probes: {}",
+            if report.coroutine_probes {
+                "wired (debug builds activate DebugProbes)"
+            } else {
+                "not wired (add with `aar install --coroutine-probes`)"
+            }
         );
     } else {
         println!(
@@ -397,6 +467,7 @@ fn remove(args: &TargetArgs, root: &Path) -> Result<()> {
     };
     let module_gradle = module_build_gradle(root, &module)?;
     let removed_dep = unwire_dependency(&module_gradle)?;
+    let removed_probes = unwire_probes(&module_gradle)?;
 
     let aar_path = root.join(APP_AAR_RELPATH);
     let removed_aar = aar_path.is_file();
@@ -416,6 +487,7 @@ fn remove(args: &TargetArgs, root: &Path) -> Result<()> {
                 "app": root.display().to_string(),
                 "module": module,
                 "dependency_removed": removed_dep,
+                "coroutine_probes_removed": removed_probes,
                 "aar_removed": removed_aar,
             }))?
         );
@@ -433,6 +505,9 @@ fn remove(args: &TargetArgs, root: &Path) -> Result<()> {
             "  aar file:        {}",
             if removed_aar { "removed" } else { "was absent" }
         );
+        if removed_probes {
+            println!("  coroutine probes: removed (apply line + script)");
+        }
     }
     Ok(())
 }
@@ -574,6 +649,68 @@ fn wire_dependency(build_gradle: &Path) -> Result<bool> {
     let mut out = lines.join("\n");
     out.push('\n');
     fs::write(build_gradle, out).with_context(|| format!("write {}", build_gradle.display()))?;
+    Ok(true)
+}
+
+/// Append the managed coroutine-probes block to the module build file.
+/// Idempotent. Kotlin DSL only: the block declares a Kotlin class against
+/// AGP/ASM APIs, which a Groovy build file cannot host.
+fn wire_probes_block(build_gradle: &Path) -> Result<bool> {
+    if !build_gradle
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("kts"))
+    {
+        bail!(
+            "--coroutine-probes requires a Kotlin DSL build file (build.gradle.kts); \
+             `{}` is Groovy. Convert the module or wire the probes manually.",
+            build_gradle.display()
+        );
+    }
+    let content = fs::read_to_string(build_gradle)
+        .with_context(|| format!("read {}", build_gradle.display()))?;
+    if content.contains(PROBES_MARKER) {
+        return Ok(false);
+    }
+    let mut out = content;
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str(PROBES_BLOCK);
+    fs::write(build_gradle, out).with_context(|| format!("write {}", build_gradle.display()))?;
+    Ok(true)
+}
+
+/// Remove the managed coroutine-probes block (BEGIN through END marker line).
+fn unwire_probes(build_gradle: &Path) -> Result<bool> {
+    let content = match fs::read_to_string(build_gradle) {
+        Ok(c) => c,
+        Err(_) => return Ok(false),
+    };
+    if !content.contains(PROBES_MARKER) {
+        return Ok(false);
+    }
+    let mut out: Vec<&str> = Vec::new();
+    let mut in_block = false;
+    for line in content.lines() {
+        if !in_block && line.contains(">>>") && line.contains(PROBES_MARKER) {
+            in_block = true;
+            continue;
+        }
+        if in_block {
+            if line.contains("<<<") && line.contains(PROBES_MARKER) {
+                in_block = false;
+            }
+            continue;
+        }
+        out.push(line);
+    }
+    while out.last().is_some_and(|l| l.trim().is_empty()) {
+        out.pop();
+    }
+    let mut text = out.join("\n");
+    text.push('\n');
+    fs::write(build_gradle, text).with_context(|| format!("write {}", build_gradle.display()))?;
     Ok(true)
 }
 
@@ -740,5 +877,68 @@ fn yes_no(b: bool) -> &'static str {
         "present"
     } else {
         "missing"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kts(dir: &tempfile::TempDir) -> PathBuf {
+        let p = dir.path().join("build.gradle.kts");
+        fs::write(
+            &p,
+            "plugins {\n    id(\"com.android.application\")\n}\n\ndependencies {\n}\n",
+        )
+        .unwrap();
+        p
+    }
+
+    #[test]
+    fn probes_block_wires_once_and_unwires_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let gradle = kts(&dir);
+        let before = fs::read_to_string(&gradle).unwrap();
+
+        assert!(wire_probes_block(&gradle).unwrap());
+        let wired = fs::read_to_string(&gradle).unwrap();
+        assert!(wired.contains(PROBES_MARKER));
+        assert!(wired.contains("ShadowDroidCoroutineProbesFactory"));
+        // Idempotent: second wire is a no-op.
+        assert!(!wire_probes_block(&gradle).unwrap());
+        assert_eq!(fs::read_to_string(&gradle).unwrap(), wired);
+
+        assert!(unwire_probes(&gradle).unwrap());
+        let after = fs::read_to_string(&gradle).unwrap();
+        assert!(!after.contains(PROBES_MARKER));
+        assert!(!after.contains("ShadowDroidCoroutineProbesFactory"));
+        assert_eq!(after.trim_end(), before.trim_end());
+        // Nothing left to unwire.
+        assert!(!unwire_probes(&gradle).unwrap());
+    }
+
+    #[test]
+    fn probes_block_rejects_groovy_build_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("build.gradle");
+        fs::write(&p, "dependencies {\n}\n").unwrap();
+        let err = wire_probes_block(&p).unwrap_err().to_string();
+        assert!(err.contains("build.gradle.kts"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn probes_block_survives_content_between_markers_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let gradle = kts(&dir);
+        wire_probes_block(&gradle).unwrap();
+        // A user line added after the block must survive removal.
+        let mut text = fs::read_to_string(&gradle).unwrap();
+        text.push_str("\n// user note: keep me\n");
+        fs::write(&gradle, text).unwrap();
+
+        unwire_probes(&gradle).unwrap();
+        let after = fs::read_to_string(&gradle).unwrap();
+        assert!(after.contains("keep me"));
+        assert!(!after.contains(PROBES_MARKER));
     }
 }

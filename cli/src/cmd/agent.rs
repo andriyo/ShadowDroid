@@ -288,6 +288,115 @@ pub async fn drop_flow(serial: &Serial, id: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// `aar coroutines` — dump live coroutines via the in-app DebugProbes.
+///
+/// The heavy lifting is in the app process; this just frames the request,
+/// optionally persists the text dump, and renders a summary.
+pub async fn coroutines(
+    serial: &Serial,
+    dump: bool,
+    frames: u32,
+    limit: u32,
+    out: Option<&PathBuf>,
+    json: bool,
+) -> Result<()> {
+    let mut cmd = format!("coroutines --frames {frames} --limit {limit}");
+    if dump {
+        cmd.push_str(" --dump");
+    }
+    let resp = send(serial, cmd).await?;
+
+    // Persist the full text dump if requested, in either output mode.
+    if let Some(path) = out {
+        match resp.get("dump").and_then(Value::as_str) {
+            Some(text) => std::fs::write(path, text)
+                .with_context(|| format!("write coroutine dump to {}", path.display()))?,
+            None => bail!(
+                "no dump returned to write to {}: {}",
+                path.display(),
+                resp.get("error").and_then(Value::as_str).unwrap_or("agent")
+            ),
+        }
+    }
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&resp)?);
+    } else {
+        print!("{}", render_coroutines(&resp, out));
+    }
+    Ok(())
+}
+
+/// Human-readable rendering of a `coroutines` agent response. Pure so it can be
+/// unit-tested without a device.
+fn render_coroutines(resp: &Value, out: Option<&PathBuf>) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+
+    if !resp.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        let err = resp.get("error").and_then(Value::as_str).unwrap_or("unknown");
+        let _ = writeln!(s, "✗ coroutine dump unavailable: {err}");
+        if let Some(hint) = resp.get("hint").and_then(Value::as_str) {
+            let _ = writeln!(s, "  hint: {hint}");
+        }
+        return s;
+    }
+
+    let total = resp.get("total").and_then(Value::as_i64).unwrap_or(0);
+    let active = resp.get("active").and_then(Value::as_bool).unwrap_or(true);
+    if !active {
+        let _ = writeln!(s, "⚠ probes installed but INERT — coroutines are not being tracked");
+        if let Some(hint) = resp.get("hint").and_then(Value::as_str) {
+            let _ = writeln!(s, "  {hint}");
+        }
+    }
+    let _ = writeln!(s, "live coroutines: {total}");
+    if let Some(states) = resp.get("byState").and_then(Value::as_object) {
+        let mut pairs: Vec<(&String, i64)> = states
+            .iter()
+            .map(|(k, v)| (k, v.as_i64().unwrap_or(0)))
+            .collect();
+        pairs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        for (state, count) in pairs {
+            let _ = writeln!(s, "  {state:<10} {count}");
+        }
+    }
+
+    if let Some(list) = resp.get("coroutines").and_then(Value::as_array) {
+        for c in list {
+            let seq = c.get("seq").and_then(Value::as_i64);
+            let state = c.get("state").and_then(Value::as_str).unwrap_or("?");
+            let thread = c.get("thread").and_then(Value::as_str);
+            let ctx = c.get("context").and_then(Value::as_str);
+            let _ = write!(s, "\n#{} [{state}]", seq.unwrap_or(-1));
+            if let Some(t) = thread {
+                let _ = write!(s, " on {t}");
+            }
+            let _ = writeln!(s);
+            if let Some(ctx) = ctx {
+                let _ = writeln!(s, "  context: {ctx}");
+            }
+            if let Some(stack) = c.get("stack").and_then(Value::as_array) {
+                for frame in stack {
+                    if let Some(f) = frame.as_str() {
+                        let _ = writeln!(s, "    at {f}");
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(path) = out {
+        let _ = writeln!(s, "\nfull dump written to {}", path.display());
+    } else if resp.get("dump").is_some() {
+        let _ = writeln!(s, "\n--- DebugProbes dump ---");
+        if let Some(text) = resp.get("dump").and_then(Value::as_str) {
+            let _ = write!(s, "{text}");
+        }
+    }
+    s
+}
+
 // ── helpers ────────────────────────────────────────────────────────────────
 
 fn write_jsonl(path: &PathBuf, flows: &[FlowRecord]) -> Result<()> {
@@ -349,5 +458,42 @@ mod tests {
     #[test]
     fn parse_agent_port_none_without_marker() {
         assert_eq!(parse_agent_port("nothing here"), None);
+    }
+
+    #[test]
+    fn render_coroutines_summarises_states_and_frames() {
+        let resp = serde_json::json!({
+            "ok": true,
+            "installed": true,
+            "total": 3,
+            "byState": { "SUSPENDED": 2, "RUNNING": 1 },
+            "coroutines": [
+                {
+                    "seq": 7,
+                    "state": "SUSPENDED",
+                    "thread": "DefaultDispatcher-worker-1",
+                    "context": "[StandaloneCoroutine{Suspended}@abc, CoroutineName(leak)]",
+                    "stack": ["com.app.Leak.loop(Leak.kt:12)"]
+                }
+            ]
+        });
+        let out = render_coroutines(&resp, None);
+        assert!(out.contains("live coroutines: 3"));
+        assert!(out.contains("SUSPENDED  2"));
+        assert!(out.contains("#7 [SUSPENDED] on DefaultDispatcher-worker-1"));
+        assert!(out.contains("at com.app.Leak.loop(Leak.kt:12)"));
+        assert!(out.contains("CoroutineName(leak)"));
+    }
+
+    #[test]
+    fn render_coroutines_reports_unavailable_with_hint() {
+        let resp = serde_json::json!({
+            "ok": false,
+            "error": "kotlinx-coroutines DebugProbes unavailable: ClassNotFoundException",
+            "hint": "the host app must depend on kotlinx-coroutines-core (1.6+)"
+        });
+        let out = render_coroutines(&resp, None);
+        assert!(out.contains("✗ coroutine dump unavailable"));
+        assert!(out.contains("hint: the host app must depend"));
     }
 }

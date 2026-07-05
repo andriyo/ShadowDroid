@@ -40,5 +40,9 @@
     <item name="deep_link_finish_button" type="id" />
     <item name="alt_root" type="id" />
     <item name="alt_open_main_button" type="id" />
+    <item name="coroutines_button" type="id" />
+    <item name="coroutines_root" type="id" />
+    <item name="coroutines_status" type="id" />
+    <item name="coroutines_spawn_button" type="id" />
 </resources>
 

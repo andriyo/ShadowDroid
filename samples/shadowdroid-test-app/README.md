@@ -52,6 +52,12 @@ io.github.andriyo.shadowdroid.sample
 | Logs/crashes/ANR | Log spam, deliberate crash, deliberate main-thread block | `watch`, `collect`, `debug run-until-crash`, `doctor` |
 | Network MITM | HTTP GET, HTTPS GET, JSON POST, GraphQL-shaped POST, error status, slow response, large body | `net check`, `net trust`, `net start`, `net log`, `net show`, `net export fixtures`, `net rule`, `net override` |
 | WebView | Loads the configured URL into a platform WebView | `net log`, `ui dump`, `watch` |
+| Coroutine dumps | `CoroutinesActivity` starts a misbehaving coroutine zoo: a leaked heartbeat, parked channel workers, a clogged no-buffer `SharedFlow` (slow collector + suspended emitter), plus a button that grows the pool | `aar coroutines`, `aar agent` |
+
+The coroutine zoo needs the agent AAR with probes activation
+(`shadowdroid aar install --coroutine-probes`, already wired in this sample);
+open the "Open coroutine workload" screen (or `am start …/.CoroutinesActivity`)
+and every coroutine shows up named in `shadowdroid aar coroutines`.
 
 The debug build uses a Network Security Config with `debug-overrides` that trusts
 user-installed CAs, so it is suitable for `shadowdroid net trust --auto` on

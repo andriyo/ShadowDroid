@@ -1001,10 +1001,10 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "next_commands": ["net rule list", "watch", "ui dump"]
         })),
         "aar" => Some(serde_json::json!({
-            "use_when": ["Need the in-app debug agent path for apps you can build, especially above-TLS capture/intercept or pinned/Cronet traffic."],
-            "output": "AAR install/status/capture/intercept JSON or human setup reports",
+            "use_when": ["Need the in-app debug agent path for apps you can build: above-TLS capture/intercept (pinned/Cronet traffic) or in-process coroutine dumps."],
+            "output": "AAR install/status/capture/intercept/coroutines JSON or human setup reports",
             "side_effects": ["install/remove mutate project files; intercept/resume/drop affect in-app flows"],
-            "next_commands": ["aar status", "aar install", "aar agent", "aar capture"]
+            "next_commands": ["aar status", "aar install", "aar agent", "aar capture", "aar coroutines"]
         })),
         "aar install" => Some(serde_json::json!({
             "use_when": ["Need to wire the debug-only ShadowDroid in-app agent AAR into a Gradle app project."],
@@ -1057,6 +1057,13 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "output": "drop result JSON",
             "side_effects": ["unblocks a held in-app flow with failure behavior"],
             "next_commands": ["aar agent", "ui dump"]
+        })),
+        "aar coroutines" => Some(serde_json::json!({
+            "use_when": ["Need to find a leaked coroutine, a stuck job, or a clogged SharedFlow: dump every live coroutine (state, context, stacks) from the running app without attaching a debugger."],
+            "output": "state counts + per-coroutine context/stacks JSON or human summary; --dump/-o adds the full DebugProbes text dump",
+            "side_effects": ["none"],
+            "prerequisites": ["debug build with AAR installed must be running", "probes activation wired via `aar install --coroutine-probes` (otherwise the dump reports installed-but-inert)"],
+            "next_commands": ["aar agent", "debug attach", "watch"]
         })),
         _ => None,
     }

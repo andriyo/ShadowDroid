@@ -155,6 +155,9 @@ class MainActivity : Activity() {
         })
         root.addView(button(R.id.clipboard_button, "Copy clipboard value", "Copy clipboard button") { copyClipboard() })
         root.addView(button(R.id.file_button, "Write sample files", "Write sample files button") { writeSampleFiles() })
+        root.addView(button(R.id.coroutines_button, "Open coroutine workload", "Open coroutine workload button") {
+            startActivity(Intent(this, CoroutinesActivity::class.java))
+        })
 
         addSection(root, "Logs And Failure Modes")
         root.addView(button(R.id.log_button, "Emit log messages", "Emit log messages button") { emitLogs() })

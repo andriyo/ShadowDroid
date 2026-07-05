@@ -141,7 +141,9 @@ Optional integrations extend the same command surface:
   HTTP(S) traffic.
 - The debug-only in-app AAR auto-installs through a merged `ContentProvider` in
   apps you can build, giving `shadowdroid aar ...` above-TLS capture and
-  interception for pinned, Cronet, and QUIC traffic.
+  interception for pinned, Cronet, and QUIC traffic — plus in-process coroutine
+  dumps (`aar coroutines`) for leaked-coroutine / clogged-flow hunting without
+  attaching a debugger.
 
 On the first `connect`, the CLI auto-installs a **version-matched APK pair**
 (downloaded from the matching GitHub Release, SHA-256 verified, cached under
@@ -351,7 +353,7 @@ optionally activates it) — the TV analog of `ui tap` / `ui scroll-to`. Prefer 
 | **Display profile** | `profile snapshot`, `apply`, `reset` (animations, font, density, size, rotation) |
 | **Files** | `files ls`, `push`, `pull` |
 | **Network MITM** | `net check`, `trust`, `ca import/info/reset`, `start`, `stop`, `status`, `log`, `show`, `export`, `intercept`, `resume`, `drop`, `respond`, `rule`, `rules`, `replay` |
-| **In-app AAR agent** | `aar install`, `status`, `remove`, `capture`, `intercept`, `resume`, `drop`, `agent` |
+| **In-app AAR agent** | `aar install` (`--coroutine-probes`), `status`, `remove`, `capture`, `intercept`, `resume`, `drop`, `agent`, `coroutines` |
 | **Authoring/testing helpers** | `ui audit` (selector gaps), `ui gen` (Screen Object scaffold), `net export fixtures` (replayable response set + `manifest.json`, GraphQL keyed by operationName), `test` (instrumentation command with the slot freed), `debug replay --repeat --diff` (flake hunting) |
 
 `watch` is the streaming workhorse — it emits debounced, hash-diffed `screen`
@@ -424,7 +426,8 @@ Backed by an optional Android Studio plugin:
   crash waits emit parsed Java/native/ANR events and can write local bundles.
 - **`debug native` / `debug tombstones` / `debug coroutines`** — native/mixed
   readiness, tombstone artifacts, and conservative suspended-state coroutine
-  insight without arbitrary code execution.
+  insight without arbitrary code execution. (For whole-process coroutine dumps
+  from a *running* app with no debugger attached, see `aar coroutines`.)
 - **`layout`** — UI-tree snapshots and diffs, enriched (when Studio's Layout
   Inspector is live) with Compose source locations, semantics, and recomposition
   counters.

@@ -26,5 +26,8 @@ release-keystore.jks
 # ---- ShadowDroid local state ----
 ~/.shadowdroid/
 
+# AAR copied into the sample by `shadowdroid aar install` (regenerated; not source)
+samples/shadowdroid-test-app/shadowdroid/
+
 # Per-machine paths
 local.properties

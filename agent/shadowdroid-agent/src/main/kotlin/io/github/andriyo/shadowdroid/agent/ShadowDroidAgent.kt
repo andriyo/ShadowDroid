@@ -43,6 +43,15 @@ object ShadowDroidAgent {
     fun start(context: Context) {
         if (!started.compareAndSet(false, true)) return
         packageName = context.packageName
+        // Install coroutine DebugProbes as early as possible — this runs before
+        // Application.onCreate (merged ContentProvider) — so probes observe
+        // coroutines from process start. Best-effort: a no-op in apps without
+        // kotlinx-coroutines. See [Coroutines].
+        try {
+            Coroutines.installBestEffort()
+        } catch (t: Throwable) {
+            Log.w(TAG, "coroutine probes install skipped", t)
+        }
         port = AgentServer(::handle).also { server = it }.startBestEffort()
         Log.i(
             TAG,
@@ -63,6 +72,7 @@ object ShadowDroidAgent {
      * - `status`                       → armed matcher + held flows + counts
      * - `resume <id> [{status,body,contentType}]`
      * - `drop <id>`
+     * - `coroutines [--dump] [--frames n] [--limit n]` → live coroutine dump
      */
     private fun handle(line: String): String {
         val trimmed = line.trim()
@@ -78,6 +88,7 @@ object ShadowDroidAgent {
                 "status" -> statusJson()
                 "resume" -> resolve(rest, drop = false)
                 "drop" -> resolve(rest, drop = true)
+                "coroutines" -> Coroutines.dump(rest)
                 else -> jsonError("unknown command: $cmd")
             }
         } catch (t: Throwable) {
@@ -105,6 +116,12 @@ object ShadowDroidAgent {
             put("package", packageName)
             put("captured", Capture.size())
             put("intercept", Intercept.status())
+            put(
+                "coroutines",
+                JSONObject()
+                    .put("installed", Coroutines.available())
+                    .put("active", Coroutines.probesActive()),
+            )
         }.toString()
 
     private fun resolve(rest: String, drop: Boolean): String {
@@ -128,7 +145,8 @@ object ShadowDroidAgent {
     fun info(): String =
         """{"ok":true,"agent":"shadowdroid","version":"${BuildInfo.VERSION}",""" +
             """"package":"$packageName","sdk":${Build.VERSION.SDK_INT},""" +
-            """"pid":${Process.myPid()},"port":$port}"""
+            """"pid":${Process.myPid()},"port":$port,""" +
+            """"coroutines":${Coroutines.available()}}"""
 
     private fun jsonError(message: String): String =
         """{"ok":false,"error":"${message.replace("\"", "'")}"}"""
