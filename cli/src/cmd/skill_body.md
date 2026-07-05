@@ -139,10 +139,11 @@ shadowdroid net ca reset            # go back to a generated CA
 ```
 
 The proxy serves HTTP/2 and HTTP/1.1, decodes gzip/deflate/br/zstd, and streams
-SSE / large responses through (those flows carry `"streamed":true` and have no
-captured body — re-request with a narrower scope or inspect on-device if you need
-the payload). WebSocket upgrades are tunnelled (handshake captured as a
-`matched:"websocket"` flow, frames not decoded). Add `--redact` to `net start` to
+SSE / large responses (and large request uploads) through instead of buffering.
+Streamed flows carry `"streamed":true` (response) or `"req_streamed":true`
+(request) and have no captured body — re-request with a narrower scope or inspect
+on-device if you need the payload. WebSocket upgrades are tunnelled (handshake
+captured as a `matched:"websocket"` flow, frames not decoded). Add `--redact` to `net start` to
 mask auth/cookie headers in captured flows, or `--verify-upstream` to validate the
 real server's TLS cert (off by default for self-signed dev backends).
 

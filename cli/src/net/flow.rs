@@ -63,6 +63,11 @@ pub struct FlowRecord {
     /// the `content-length` hint when the server sent one, else 0.
     #[serde(default, skip_serializing_if = "is_false")]
     pub streamed: bool,
+    /// The request body was streamed upstream (oversized upload), not buffered, so
+    /// it isn't captured and request intercept was skipped. `req_len` is the
+    /// `content-length` hint when the client sent one, else 0.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub req_streamed: bool,
 }
 
 impl FlowRecord {
@@ -105,6 +110,7 @@ impl FlowRecord {
             modified: self.modified,
             error: self.error.clone(),
             streamed: self.streamed,
+            req_streamed: self.req_streamed,
         }
     }
 
@@ -131,6 +137,8 @@ impl FlowRecord {
             "matched": self.matched,
             "modified": self.modified,
             "error": self.error,
+            "streamed": self.streamed,
+            "req_streamed": self.req_streamed,
         });
         if body {
             v["req_body"] = serde_json::json!(self.req_body);
@@ -322,6 +330,7 @@ mod tests {
             modified: false,
             error: None,
             streamed: false,
+            req_streamed: false,
         };
         assert_eq!(
             content_type(&rec.req_headers).as_deref(),

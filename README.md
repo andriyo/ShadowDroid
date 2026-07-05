@@ -376,9 +376,10 @@ from a saved session with `net replay`. `net check <app>` reports whether a buil
 is interceptable; `net export har|curl|fixtures` hands flows to other tools.
 
 The decrypted leg negotiates **HTTP/2 or HTTP/1.1** (h2 apps aren't downgraded),
-streams **SSE / large bodies** through instead of buffering them (marked
-`streamed` in the flow), decodes `gzip`/`deflate`/`br`/`zstd`, and raw-tunnels
-**WebSocket** upgrades. `net start --verify-upstream` validates the real server's
+streams **SSE / large bodies** through instead of buffering them — both response
+and request (a big upload streams chunked; marked `streamed`/`req_streamed` in the
+flow) — decodes `gzip`/`deflate`/`br`/`zstd`, and raw-tunnels **WebSocket**
+upgrades. `net start --verify-upstream` validates the real server's
 cert (off by default for self-signed dev backends); `net start --redact` masks
 `authorization`/`cookie` in captured flows (the session log is written `0600`
 either way).

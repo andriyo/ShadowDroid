@@ -97,9 +97,12 @@ pub enum Event {
         modified: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
-        /// Body was streamed (SSE/oversized), not captured; `resp_len` is a hint.
+        /// Response body was streamed (SSE/oversized), not captured; `resp_len` is a hint.
         #[serde(default, skip_serializing_if = "is_false")]
         streamed: bool,
+        /// Request body was streamed upstream (oversized upload), not captured.
+        #[serde(default, skip_serializing_if = "is_false")]
+        req_streamed: bool,
     },
     /// A flow paused by `net intercept`, awaiting the agent's `net
     /// resume`/`drop`/`respond`. Held until acted on or `hold_deadline_ms`.

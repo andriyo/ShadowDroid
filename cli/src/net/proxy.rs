@@ -23,7 +23,7 @@ use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use futures::StreamExt;
 use http::uri::{Authority, Scheme};
-use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Empty, Full, StreamBody};
+use http_body_util::{combinators::UnsyncBoxBody, BodyExt, BodyStream, Empty, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -374,7 +374,7 @@ async fn proxy_websocket(
                 if in_scope {
                     capture(
                         &ctx,
-                        error_flow(&id, req.method(), &scheme, &host, &path, &req_headers, &[], None, &[], 0, e.to_string(), Some("websocket".into()), false),
+                        error_flow(&id, req.method(), &scheme, &host, &path, &req_headers, &[], false, None, &[], 0, e.to_string(), Some("websocket".into()), false),
                     );
                 }
                 return error_response(StatusCode::BAD_GATEWAY, &e.to_string());
@@ -393,6 +393,7 @@ async fn proxy_websocket(
                 path: &path,
                 req_headers: &req_headers,
                 req_bytes: &[],
+                req_streamed: false,
                 status: Some(status),
                 resp_headers: &resp_headers,
                 resp_bytes: &[],
@@ -593,11 +594,34 @@ async fn proxy_request(
     let method = parts.method.clone();
     let (scheme, host, path, mut url) = resolve_target(&parts.uri, &tunnel)?;
     let mut req_headers = header_pairs(&parts.headers);
-    let mut req_bytes = body
-        .collect()
-        .await
-        .map_err(|e| anyhow!("read request body: {e}"))?
-        .to_bytes();
+
+    // Read the request body, buffering up to the cap then streaming it upstream —
+    // a large upload would otherwise buffer whole in RAM. A streamed request, like
+    // a streamed response, skips request-phase interception and body capture.
+    let req_len_hint = content_length(&req_headers);
+    let force_req_stream = req_len_hint.is_some_and(|n| n as usize > BUFFER_CAP);
+    let req_body_stream: ByteStream = Box::pin(BodyStream::new(body).filter_map(|f| async move {
+        match f {
+            Ok(frame) => frame.into_data().ok().map(Ok),
+            Err(e) => Some(Err(std::io::Error::other(e))),
+        }
+    }));
+    let mut req_bytes = Bytes::new();
+    let mut req_streaming = false;
+    let mut req_stream: Option<(Vec<Bytes>, ByteStream)> = None;
+    match read_stream_capped(req_body_stream, force_req_stream, req_len_hint, BUFFER_CAP).await {
+        BodyRead::Buffered(b) => req_bytes = b,
+        BodyRead::Streamed { prefix, rest, .. } => {
+            req_streaming = true;
+            req_stream = Some((prefix, rest));
+        }
+        BodyRead::Error(e) => {
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("read request body: {e}"),
+            ))
+        }
+    }
 
     let id = flow::new_id();
     let in_scope = ctx.shared.host_in_scope(&host);
@@ -619,6 +643,7 @@ async fn proxy_request(
                     path: &path,
                     req_headers: &req_headers,
                     req_bytes: &req_bytes,
+                    req_streamed: req_streaming,
                     status: Some(status),
                     resp_headers: &headers,
                     resp_bytes: &body,
@@ -662,6 +687,7 @@ async fn proxy_request(
                     path: &path,
                     req_headers: &req_headers,
                     req_bytes: &req_bytes,
+                    req_streamed: req_streaming,
                     status: Some(status),
                     resp_headers: &headers,
                     resp_bytes: &body,
@@ -675,8 +701,9 @@ async fn proxy_request(
         }
     }
 
-    // ── request-phase interception ──
-    if in_scope {
+    // ── request-phase interception ── (skipped for streamed uploads: no buffered
+    //    body to preview or mutate, like a streamed response skips response intercept)
+    if in_scope && !req_streaming {
         let snap = make_flow(FlowParts {
             id: &id,
             method: method.as_str(),
@@ -685,6 +712,7 @@ async fn proxy_request(
             path: &path,
             req_headers: &req_headers,
             req_bytes: &req_bytes,
+            req_streamed: false,
             status: None,
             resp_headers: &[],
             resp_bytes: &[],
@@ -712,6 +740,7 @@ async fn proxy_request(
                             path: &path,
                             req_headers: &req_headers,
                             req_bytes: &req_bytes,
+                            req_streamed: false,
                             status: Some(status),
                             resp_headers: &headers,
                             resp_bytes: &resp_bytes,
@@ -738,23 +767,24 @@ async fn proxy_request(
     }
 
     // ── forward upstream ──
+    let up_body: Option<reqwest::Body> = if let Some((prefix, rest)) = req_stream.take() {
+        let s = futures::stream::iter(prefix.into_iter().map(Ok::<Bytes, std::io::Error>)).chain(rest);
+        Some(reqwest::Body::wrap_stream(s))
+    } else if req_bytes.is_empty() {
+        None
+    } else {
+        Some(reqwest::Body::from(req_bytes.clone()))
+    };
     let started = std::time::Instant::now();
-    let resp = match send_upstream(
-        &ctx.client,
-        &method,
-        &url,
-        &req_headers,
-        req_bytes.clone(),
-        &ctx.shared,
-    )
-    .await
+    let resp = match send_upstream(&ctx.client, &method, &url, &req_headers, up_body, &ctx.shared)
+        .await
     {
         Ok(resp) => resp,
         Err(e) => {
             // Never reached the server (DNS / connect / upstream TLS).
             let dur_ms = started.elapsed().as_millis() as u64;
             if in_scope {
-                capture(&ctx, error_flow(&id, &method, &scheme, &host, &path, &req_headers, &req_bytes, None, &[], dur_ms, e.to_string(), matched.clone(), modified));
+                capture(&ctx, error_flow(&id, &method, &scheme, &host, &path, &req_headers, &req_bytes, req_streaming, None, &[], dur_ms, e.to_string(), matched.clone(), modified));
             }
             return Ok(error_response(StatusCode::BAD_GATEWAY, &e.to_string()));
         }
@@ -783,6 +813,7 @@ async fn proxy_request(
                     path: &path,
                     req_headers: &req_headers,
                     req_bytes: &req_bytes,
+                    req_streamed: req_streaming,
                     status: Some(status_code),
                     resp_headers: &resp_headers,
                     resp_bytes: &[],
@@ -802,7 +833,7 @@ async fn proxy_request(
         BodyRead::Error(e) => {
             let dur_ms = started.elapsed().as_millis() as u64;
             if in_scope {
-                capture(&ctx, error_flow(&id, &method, &scheme, &host, &path, &req_headers, &req_bytes, Some(status_code), &resp_headers, dur_ms, e.clone(), matched.clone(), modified));
+                capture(&ctx, error_flow(&id, &method, &scheme, &host, &path, &req_headers, &req_bytes, req_streaming, Some(status_code), &resp_headers, dur_ms, e.clone(), matched.clone(), modified));
             }
             return Ok(error_response(StatusCode::BAD_GATEWAY, &e));
         }
@@ -851,6 +882,7 @@ async fn proxy_request(
             path: &path,
             req_headers: &req_headers,
             req_bytes: &req_bytes,
+            req_streamed: req_streaming,
             status,
             resp_headers: &resp_headers,
             resp_bytes: &resp_bytes,
@@ -904,6 +936,7 @@ async fn proxy_request(
                 path: &path,
                 req_headers: &req_headers,
                 req_bytes: &req_bytes,
+                req_streamed: req_streaming,
                 status,
                 resp_headers: &resp_headers,
                 resp_bytes: &resp_bytes,
@@ -961,7 +994,7 @@ async fn send_upstream(
     method: &Method,
     url: &str,
     req_headers: &[(String, String)],
-    body: Bytes,
+    body: Option<reqwest::Body>,
     shared: &SharedState,
 ) -> Result<reqwest::Response> {
     let mut headers = http::HeaderMap::new();
@@ -991,8 +1024,8 @@ async fn send_upstream(
     }
 
     let mut rb = client.request(method.clone(), url).headers(headers);
-    if !body.is_empty() {
-        rb = rb.body(body.to_vec());
+    if let Some(b) = body {
+        rb = rb.body(b);
     }
     rb.send().await.map_err(|e| anyhow!("upstream: {e}"))
 }
@@ -1145,6 +1178,10 @@ struct FlowParts<'a> {
     path: &'a str,
     req_headers: &'a [(String, String)],
     req_bytes: &'a [u8],
+    /// Set when the request body was streamed upstream: `req_bytes` is empty, the
+    /// captured `req_len` comes from the client's `content-length` instead, and no
+    /// request body is stored.
+    req_streamed: bool,
     status: Option<u16>,
     resp_headers: &'a [(String, String)],
     resp_bytes: &'a [u8],
@@ -1157,10 +1194,18 @@ struct FlowParts<'a> {
 fn make_flow(p: FlowParts<'_>) -> FlowRecord {
     let req_type = flow::content_type(p.req_headers);
     let resp_type = flow::content_type(p.resp_headers);
-    let (req_body, req_truncated) =
-        flow::body_to_text(req_type.as_deref(), p.req_bytes, flow::BODY_CAP);
+    let (req_body, req_truncated) = if p.req_streamed {
+        (None, false)
+    } else {
+        flow::body_to_text(req_type.as_deref(), p.req_bytes, flow::BODY_CAP)
+    };
     let (resp_body, resp_truncated) =
         flow::body_to_text(resp_type.as_deref(), p.resp_bytes, flow::BODY_CAP);
+    let req_len = if p.req_streamed {
+        content_length(p.req_headers).unwrap_or(0)
+    } else {
+        p.req_bytes.len() as u64
+    };
     FlowRecord {
         id: p.id.to_string(),
         ts: events::now_ts(),
@@ -1174,7 +1219,7 @@ fn make_flow(p: FlowParts<'_>) -> FlowRecord {
         resp_headers: p.resp_headers.to_vec(),
         req_type,
         resp_type,
-        req_len: p.req_bytes.len() as u64,
+        req_len,
         resp_len: p.resp_bytes.len() as u64,
         req_body,
         resp_body,
@@ -1184,6 +1229,7 @@ fn make_flow(p: FlowParts<'_>) -> FlowRecord {
         modified: p.modified,
         error: p.error,
         streamed: false,
+        req_streamed: p.req_streamed,
     }
 }
 
@@ -1198,6 +1244,7 @@ fn error_flow<'a>(
     path: &'a str,
     req_headers: &'a [(String, String)],
     req_bytes: &'a [u8],
+    req_streamed: bool,
     status: Option<u16>,
     resp_headers: &'a [(String, String)],
     dur_ms: u64,
@@ -1213,6 +1260,7 @@ fn error_flow<'a>(
         path,
         req_headers,
         req_bytes,
+        req_streamed,
         status,
         resp_headers,
         resp_bytes: &[],
@@ -1925,6 +1973,35 @@ mod tests {
             BodyRead::Error(e) => assert!(e.contains("boom")),
             _ => panic!("expected Error"),
         }
+    }
+
+    #[test]
+    fn make_flow_streamed_request_drops_body_and_uses_content_length() {
+        let headers = vec![
+            ("Content-Length".to_string(), "1048576".to_string()),
+            ("Content-Type".to_string(), "application/octet-stream".to_string()),
+        ];
+        let rec = super::make_flow(super::FlowParts {
+            id: "f1",
+            method: "POST",
+            scheme: "https",
+            host: "h",
+            path: "/upload",
+            req_headers: &headers,
+            req_bytes: &[], // streamed: no buffered body
+            req_streamed: true,
+            status: Some(200),
+            resp_headers: &[],
+            resp_bytes: b"ok",
+            dur_ms: 5,
+            error: None,
+            matched: None,
+            modified: false,
+        });
+        assert!(rec.req_streamed);
+        assert!(rec.req_body.is_none());
+        // req_len comes from content-length, not the (empty) buffer.
+        assert_eq!(rec.req_len, 1_048_576);
     }
 
     #[test]

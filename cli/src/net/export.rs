@@ -332,6 +332,7 @@ mod tests {
             modified: false,
             error: None,
             streamed: false,
+            req_streamed: false,
         }
     }
 }
