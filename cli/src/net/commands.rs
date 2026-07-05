@@ -283,6 +283,75 @@ pub async fn trust(serial: &Serial, auto: bool, system: bool, ui: bool) -> Resul
     crate::net::trust::run(serial, auto, system, ui).await
 }
 
+// ── CA management (`net ca`) ──────────────────────────────────
+
+/// Best-effort "is a proxy daemon live for this serial?" — used only to decide
+/// whether to tell the user to restart it. `net ca` may run with no device
+/// attached (empty sentinel serial), in which case there's nothing to check.
+async fn proxy_running(serial: &Serial) -> bool {
+    !serial.as_str().is_empty() && control::is_running(serial).await
+}
+
+/// `net ca import` — install a user-provided CA as the proxy's signing CA.
+pub async fn ca_import(serial: &Serial, cert: &Path, key: Option<&Path>) -> Result<()> {
+    let (info, warnings) = crate::net::ca::import_ca(cert, key)?;
+
+    // The device still trusts the *old* CA (or none), and a live daemon holds the
+    // old CA in memory — spell out both so leaves actually validate.
+    let mut next = vec![
+        "run `shadowdroid net trust` so the device trusts the imported CA".to_string(),
+    ];
+    if proxy_running(serial).await {
+        next.push(
+            "restart the proxy (`net stop` then `net start`) — the running daemon still holds \
+             the previous CA"
+                .to_string(),
+        );
+    }
+
+    emit(
+        "net_ca_import",
+        json!({
+            "imported": true,
+            "ca": info,
+            "warnings": warnings,
+            "backup": "the previous CA (if any) was saved alongside as ca.crt.bak / ca.key.bak",
+            "next": next,
+        }),
+    );
+    Ok(())
+}
+
+/// `net ca info` — describe the CA currently in use.
+pub async fn ca_info() -> Result<()> {
+    let info = crate::net::ca::ca_info()?;
+    emit("net_ca_info", serde_json::to_value(&info)?);
+    Ok(())
+}
+
+/// `net ca reset` — regenerate a fresh ShadowDroid CA (the current one is backed up).
+pub async fn ca_reset(serial: &Serial) -> Result<()> {
+    let info = crate::net::ca::reset_ca()?;
+    let mut next = vec![
+        "re-run `shadowdroid net trust` to install the regenerated CA".to_string(),
+    ];
+    if proxy_running(serial).await {
+        next.push(
+            "restart the proxy (`net stop` then `net start`) so it uses the new CA".to_string(),
+        );
+    }
+    emit(
+        "net_ca_reset",
+        json!({
+            "reset": true,
+            "ca": info,
+            "backup": "the previous CA was saved alongside as ca.crt.bak / ca.key.bak",
+            "next": next,
+        }),
+    );
+    Ok(())
+}
+
 pub async fn export(
     serial: &Serial,
     format: &str,

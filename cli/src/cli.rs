@@ -690,6 +690,9 @@ pub enum NetCmd {
         #[arg(long)]
         ui: bool,
     },
+    /// Manage the proxy's signing CA (use your own, inspect it, or regenerate).
+    #[command(subcommand)]
+    Ca(NetCaCmd),
     /// Start the MITM proxy: spawn the daemon, `adb reverse`, set `http_proxy`.
     Start {
         /// Proxy listen port (wired to the device via `adb reverse`).
@@ -863,6 +866,30 @@ pub enum NetCmd {
     /// Internal: run the proxy daemon in the foreground (spawned by `net start`).
     #[command(hide = true)]
     Daemon(NetDaemonArgs),
+}
+
+#[derive(Subcommand)]
+pub enum NetCaCmd {
+    /// Install a user-provided CA as the proxy's signing CA (replaces the
+    /// auto-generated one). Everything downstream — `net trust`, `net check`,
+    /// leaf signing — then uses your CA. Re-run `net trust` after importing so
+    /// the device trusts the new CA, and restart the proxy if it's running.
+    Import {
+        /// PEM certificate file (your root/intermediate CA). May also contain the
+        /// private key (a combined PEM like mitmproxy's `mitmproxy-ca.pem`).
+        #[arg(long, value_name = "PATH")]
+        cert: PathBuf,
+        /// PEM private key file. Omit if the key is in the --cert file. PKCS#1 /
+        /// SEC1 keys are converted to PKCS#8 via openssl automatically.
+        #[arg(long, value_name = "PATH")]
+        key: Option<PathBuf>,
+    },
+    /// Show the current signing CA: source, subject, validity, key type, and the
+    /// Android trust-store hash.
+    Info,
+    /// Discard the current CA (backed up to `.bak`) and generate a fresh
+    /// ShadowDroid CA — the way back after an import.
+    Reset,
 }
 
 #[derive(Subcommand)]
@@ -1089,6 +1116,15 @@ pub async fn run() -> Result<()> {
                 // The daemon ignores this arg (it reads its serial from the
                 // deserialized DaemonConfig); pass an empty sentinel.
                 return dispatch_net(c, &Serial::new(""), &config).await;
+            }
+            // `net ca` manages host-side CA files and needs no device attached;
+            // a serial is used only to enrich the "restart the running proxy"
+            // hint, so resolve it best-effort rather than failing without one.
+            if matches!(c, NetCmd::Ca(_)) {
+                let serial = resolve_serial(device.as_deref())
+                    .await
+                    .unwrap_or_else(|_| Serial::new(""));
+                return dispatch_net(c, &serial, &config).await;
             }
             let serial = resolve_serial(device.as_deref()).await?;
             return dispatch_net(c, &serial, &config).await;
@@ -1733,6 +1769,13 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
             nc::check(serial, &package).await
         }
         NetCmd::Trust { auto, system, ui } => nc::trust(serial, *auto, *system, *ui).await,
+        NetCmd::Ca(sub) => match sub {
+            NetCaCmd::Import { cert, key } => {
+                nc::ca_import(serial, cert, key.as_deref()).await
+            }
+            NetCaCmd::Info => nc::ca_info().await,
+            NetCaCmd::Reset => nc::ca_reset(serial).await,
+        },
         NetCmd::Start {
             port,
             host,

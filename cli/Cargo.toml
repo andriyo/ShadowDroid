@@ -66,6 +66,7 @@ bytes = "1"
 tokio-rustls = "0.26"
 rustls = "0.23"
 rcgen = { version = "0.14", features = ["x509-parser"] }
+x509-parser = "0.18"     # inspect a user-provided CA cert (SPKI match, CA flag, validity) on `net ca import`; already in lock via rcgen
 flate2 = "1"             # decompress captured gzip/deflate response bodies (already in lock via zip)
 
 [dev-dependencies]

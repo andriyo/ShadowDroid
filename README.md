@@ -350,7 +350,7 @@ optionally activates it) — the TV analog of `ui tap` / `ui scroll-to`. Prefer 
 | **Device/system** | `device info`, `shell`, `wake`, `sleep`, `unlock`, `orientation`, `clipboard`, `notifications`, `quick-settings`, `open-url` |
 | **Display profile** | `profile snapshot`, `apply`, `reset` (animations, font, density, size, rotation) |
 | **Files** | `files ls`, `push`, `pull` |
-| **Network MITM** | `net check`, `trust`, `start`, `stop`, `status`, `log`, `show`, `export`, `intercept`, `resume`, `drop`, `respond`, `rule`, `rules`, `replay` |
+| **Network MITM** | `net check`, `trust`, `ca import/info/reset`, `start`, `stop`, `status`, `log`, `show`, `export`, `intercept`, `resume`, `drop`, `respond`, `rule`, `rules`, `replay` |
 | **In-app AAR agent** | `aar install`, `status`, `remove`, `capture`, `intercept`, `resume`, `drop`, `agent` |
 | **Authoring/testing helpers** | `ui audit` (selector gaps), `ui gen` (Screen Object scaffold), `net export fixtures` (replayable response set + `manifest.json`, GraphQL keyed by operationName), `test` (instrumentation command with the slot freed), `debug replay --repeat --diff` (flake hunting) |
 
@@ -372,6 +372,13 @@ reply). Repeated edits can be promoted to declarative `net rule`s (map-local /
 map-remote / set-status / set-header / replace / block / delay) or served offline
 from a saved session with `net replay`. `net check <app>` reports whether a build
 is interceptable; `net export har|curl|fixtures` hands flows to other tools.
+
+By default the proxy signs with a CA it generates on first use. To reuse a CA the
+device already trusts — an existing mitmproxy/Charles/corporate CA — run
+`net ca import --cert <pem>` (the key can be a separate `--key`, or bundled in a
+combined PEM like mitmproxy's `mitmproxy-ca.pem`); every downstream step then
+signs and installs *your* CA. `net ca info` shows the active CA and `net ca reset`
+returns to a generated one.
 
 Run `shadowdroid commands` for the full command tree, or `shadowdroid --help` on
 any subcommand for its flags.

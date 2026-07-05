@@ -856,6 +856,35 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "side_effects": ["pushes or installs a CA certificate; --auto chooses the best available path; --system may require emulator/root; --ui drives Settings UI"],
             "next_commands": ["net check <pkg>", "net start", "watch"]
         })),
+        "net ca" => Some(serde_json::json!({
+            "use_when": ["Need to use your own CA (e.g. an existing mitmproxy/Charles/corporate CA the device already trusts) instead of ShadowDroid's generated one, or to inspect/regenerate the signing CA."],
+            "output": "CA management JSON (import/info/reset)",
+            "side_effects": ["import/reset replace ~/.shadowdroid/net/ca.{crt,key}"],
+            "next_commands": ["net ca info", "net trust", "net start"]
+        })),
+        "net ca import" => Some(serde_json::json!({
+            "use_when": ["Have a CA cert+key to reuse as the proxy's signing CA — e.g. a CA already installed on the device/emulator image, so you can skip re-installing trust."],
+            "output": "net_ca_import action JSON: resulting CA info, warnings, and next steps",
+            "side_effects": ["replaces the signing CA (previous one saved as ca.crt.bak/ca.key.bak); re-run net trust and restart a running proxy so the new CA takes effect"],
+            "prerequisites": ["a PEM CA certificate; its private key (in --cert as a combined PEM, or via --key). PKCS#1/SEC1 keys are converted to PKCS#8 via openssl"],
+            "next_commands": ["net ca info", "net trust", "net start"],
+            "examples": [
+                "net ca import --cert mitmproxy-ca.pem",
+                "net ca import --cert corp-ca.crt --key corp-ca.key"
+            ]
+        })),
+        "net ca info" => Some(serde_json::json!({
+            "use_when": ["Need to confirm which CA the proxy will sign with — its source (generated vs imported), subject, validity, key type, and Android trust-store hash."],
+            "output": "net_ca_info action JSON describing the current CA",
+            "side_effects": ["none"],
+            "next_commands": ["net ca import", "net trust", "net start"]
+        })),
+        "net ca reset" => Some(serde_json::json!({
+            "use_when": ["Need to go back to a freshly generated ShadowDroid CA after importing your own."],
+            "output": "net_ca_reset action JSON with the regenerated CA info",
+            "side_effects": ["replaces the signing CA with a new generated one (previous one saved as ca.crt.bak/ca.key.bak); re-run net trust afterwards"],
+            "next_commands": ["net trust", "net start"]
+        })),
         "net start" => Some(serde_json::json!({
             "use_when": ["Need watch to include HTTP(S) events or need to intercept/modify traffic."],
             "output": "action JSON with proxy/device wiring details",

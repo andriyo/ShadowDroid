@@ -213,7 +213,12 @@ pub async fn remove(serial: &Serial) -> Result<bool> {
 
 /// The OpenSSL `subject_hash_old` of our CA cert. Requires `openssl` on PATH.
 pub(crate) fn ca_subject_hash() -> Result<String> {
-    let ca = paths::ca_cert_path()?;
+    ca_subject_hash_of(&paths::ca_cert_path()?)
+}
+
+/// `subject_hash_old` of an arbitrary CA cert file — used by `net ca info` to
+/// hash the CA in a scratch dir, and by [`ca_subject_hash`] for the live one.
+pub(crate) fn ca_subject_hash_of(ca: &std::path::Path) -> Result<String> {
     let out = std::process::Command::new("openssl")
         .args([
             "x509",
@@ -223,7 +228,7 @@ pub(crate) fn ca_subject_hash() -> Result<String> {
             "-noout",
             "-in",
         ])
-        .arg(&ca)
+        .arg(ca)
         .output()
         .map_err(|e| anyhow::anyhow!("run openssl (is it on PATH?): {e}"))?;
     let hash = String::from_utf8_lossy(&out.stdout).trim().to_string();

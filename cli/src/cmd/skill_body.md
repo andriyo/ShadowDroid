@@ -121,6 +121,17 @@ shadowdroid net show f1 --body --body-file /tmp/response.json
 shadowdroid net override --url 'https://api.example.com/v1/dict*' --file fixtures/dict.json
 ```
 
+To reuse a CA the device already trusts (an existing mitmproxy/Charles/corporate
+CA) instead of ShadowDroid's generated one, import it before `net trust` — then
+the whole chain (`trust`, `check`, leaf signing) uses your CA:
+
+```bash
+shadowdroid net ca import --cert mitmproxy-ca.pem      # combined cert+key PEM
+shadowdroid net ca import --cert corp.crt --key corp.key
+shadowdroid net ca info | jq        # source (generated|imported), validity, hash
+shadowdroid net ca reset            # go back to a generated CA
+```
+
 `net log` is line-delimited JSON: one `http` object per line, followed by one
 `{"cmd":"net_log","count":...}` summary object. Do not use `jq '.flows[]'`.
 Filter events with `jq -c 'select(.type=="http")'`.
