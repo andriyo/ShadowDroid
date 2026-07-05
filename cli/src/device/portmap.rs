@@ -27,8 +27,7 @@ use std::path::PathBuf;
 /// or forwards the port; callers treat a later bind/forward failure as "the port
 /// got taken, pick another".
 pub fn free_loopback_port() -> Result<u16> {
-    let listener =
-        TcpListener::bind(("127.0.0.1", 0)).context("allocate a free loopback port")?;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).context("allocate a free loopback port")?;
     Ok(listener.local_addr()?.port())
 }
 

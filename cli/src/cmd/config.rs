@@ -278,6 +278,7 @@ fn schema_value() -> Value {
             "debugger": {"type": "string", "optional": true, "description": "Default Android debugger id/display name."},
             "debug_mode": {"type": "string", "optional": true, "enum": ["auto", "java", "native", "mixed"], "description": "Default semantic debugger mode."},
             "run_configuration": {"type": "string", "optional": true, "description": "Default Android Studio run configuration."},
+            "usage_log": {"type": "boolean", "optional": true, "description": "Opt-in local usage log (verb, duration, error code — never argument values) at ~/.shadowdroid/usage.jsonl; see `shadowdroid usage`."},
             "apps": {
                 "type": "object",
                 "optional": true,

@@ -238,7 +238,8 @@ fn merge_timeline(
     tls_errors: Vec<serde_json::Value>,
     limit: usize,
 ) -> Vec<serde_json::Value> {
-    let mut items: Vec<(f64, serde_json::Value)> = Vec::with_capacity(flows.len() + tls_errors.len());
+    let mut items: Vec<(f64, serde_json::Value)> =
+        Vec::with_capacity(flows.len() + tls_errors.len());
     for f in flows {
         if let Ok(v) = serde_json::to_value(f.http_event()) {
             items.push((f.ts, v));
@@ -342,9 +343,8 @@ pub async fn ca_import(serial: &Serial, cert: &Path, key: Option<&Path>) -> Resu
 
     // The device still trusts the *old* CA (or none), and a live daemon holds the
     // old CA in memory — spell out both so leaves actually validate.
-    let mut next = vec![
-        "run `shadowdroid net trust` so the device trusts the imported CA".to_string(),
-    ];
+    let mut next =
+        vec!["run `shadowdroid net trust` so the device trusts the imported CA".to_string()];
     if proxy_running(serial).await {
         next.push(
             "restart the proxy (`net stop` then `net start`) — the running daemon still holds \
@@ -376,9 +376,7 @@ pub async fn ca_info() -> Result<()> {
 /// `net ca reset` — regenerate a fresh ShadowDroid CA (the current one is backed up).
 pub async fn ca_reset(serial: &Serial) -> Result<()> {
     let info = crate::net::ca::reset_ca()?;
-    let mut next = vec![
-        "re-run `shadowdroid net trust` to install the regenerated CA".to_string(),
-    ];
+    let mut next = vec!["re-run `shadowdroid net trust` to install the regenerated CA".to_string()];
     if proxy_running(serial).await {
         next.push(
             "restart the proxy (`net stop` then `net start`) so it uses the new CA".to_string(),
@@ -647,7 +645,9 @@ mod tests {
             ..Default::default()
         };
         let flows = vec![flow("f1", 1.0), flow("f3", 3.0)];
-        let tls = vec![serde_json::json!({"type":"tls_error","ts":2.0,"host":"api.example.com","reason":"r"})];
+        let tls = vec![
+            serde_json::json!({"type":"tls_error","ts":2.0,"host":"api.example.com","reason":"r"}),
+        ];
 
         // All three, chronological.
         let all = merge_timeline(&flows, tls.clone(), 10);

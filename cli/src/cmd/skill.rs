@@ -534,6 +534,8 @@ fn command_reference() -> String {
         "disconnect",
         "doctor",
         "collect",
+        "log",
+        "why",
         "config",
         "ui",
         "watch",

@@ -443,7 +443,9 @@ mod tests {
     fn validate_rule_knows_request_and_response_header_kinds() {
         // Both header kinds need name + value.
         assert!(validate_rule(&spec("set-request-header", &["x-debug", "1"])).is_ok());
-        assert!(validate_rule(&spec("set-response-header", &["cache-control", "no-store"])).is_ok());
+        assert!(
+            validate_rule(&spec("set-response-header", &["cache-control", "no-store"])).is_ok()
+        );
         assert!(validate_rule(&spec("set-request-header", &["x-debug"])).is_err());
 
         // The old umbrella `set-header` is gone — it now reads as unknown so a

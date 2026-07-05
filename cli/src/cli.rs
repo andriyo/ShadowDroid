@@ -47,7 +47,8 @@ use crate::cmd::studio::{StudioArgs, StudioCmd};
 use crate::config::{expand_config_path, ShadowDroidConfig};
 use crate::device::client::{is_transient_transport_error, ServerClient};
 use crate::device::{adb, installer};
-use crate::events::{emit, emit_action, emit_error, CompactElement, ScreenFormat};
+use crate::events::{emit_action, emit_error, CompactElement, ScreenFormat};
+use crate::fusion::{top_screen_texts, Outcome};
 use crate::proto::{Element, SelectorQuery};
 use crate::watch::watcher::PermissionDialogPolicy;
 
@@ -192,6 +193,18 @@ pub enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Structured, bounded logcat: app-scoped JSON log lines with crash/ANR
+    /// blocks parsed out, windowed (`--last 60s`) and deduplicated. Works
+    /// without the on-device server.
+    Log(crate::cmd::log::LogArgs),
+    /// One bounded triage read: what just went wrong? Fuses the last
+    /// crash/ANR, recent error logs, the current screen, and network failures
+    /// into a verdict with evidence and next steps.
+    Why(crate::cmd::why::WhyArgs),
+    /// Opt-in local usage log (verb + duration + error code per invocation;
+    /// never argument values, never leaves this machine).
+    #[command(subcommand)]
+    Usage(crate::cmd::usage::UsageCmd),
     /// Inspect, generate, and validate user/project JSON config.
     Config(crate::cmd::config::ConfigArgs),
     /// Generate or refresh an agent-integration file (claude-code / cursor /
@@ -516,9 +529,16 @@ pub enum UiCmd {
         /// shares the target's text in favor of the actual button.
         #[arg(long)]
         clickable: bool,
+        #[command(flatten)]
+        fusion: crate::fusion::FusionArgs,
     },
     /// Double-tap at <x> <y> coordinates.
-    DoubleTap { x: i32, y: i32 },
+    DoubleTap {
+        x: i32,
+        y: i32,
+        #[command(flatten)]
+        fusion: crate::fusion::FusionArgs,
+    },
     /// Long-press at <x> <y> coordinates (hold for --duration-ms).
     LongTap {
         x: i32,
@@ -526,6 +546,8 @@ pub enum UiCmd {
         /// How long to hold the press, in milliseconds.
         #[arg(long, default_value_t = 600)]
         duration_ms: u32,
+        #[command(flatten)]
+        fusion: crate::fusion::FusionArgs,
     },
     /// Swipe from (x1,y1) to (x2,y2).
     Swipe {
@@ -536,6 +558,8 @@ pub enum UiCmd {
         /// Swipe duration in milliseconds (longer = slower, more deliberate).
         #[arg(long, default_value_t = 200)]
         duration_ms: u32,
+        #[command(flatten)]
+        fusion: crate::fusion::FusionArgs,
     },
     /// Drag from (x1,y1) to (x2,y2) — slower than swipe, for drag-and-drop / reorder.
     Drag {
@@ -546,6 +570,8 @@ pub enum UiCmd {
         /// Drag duration in milliseconds (longer = slower, for drag-and-drop).
         #[arg(long, default_value_t = 500)]
         duration_ms: u32,
+        #[command(flatten)]
+        fusion: crate::fusion::FusionArgs,
     },
     /// Swipe a fraction (--scale) of the screen in a direction (up/down/left/right).
     SwipeExt {
@@ -558,6 +584,8 @@ pub enum UiCmd {
         /// Swipe duration in milliseconds.
         #[arg(long, default_value_t = 200)]
         duration_ms: u32,
+        #[command(flatten)]
+        fusion: crate::fusion::FusionArgs,
     },
     /// Pinch in (zoom out) or out (zoom in) on the element matched by a selector.
     Pinch {
@@ -576,6 +604,8 @@ pub enum UiCmd {
         /// Pinch distance as a percent of the element's size (1–100).
         #[arg(long, default_value_t = 50)]
         percent: u32,
+        #[command(flatten)]
+        fusion: crate::fusion::FusionArgs,
     },
     /// Scroll a list until a selector is visible, then optionally tap it.
     ScrollTo(ScrollArgs),
@@ -605,15 +635,27 @@ pub enum UiCmd {
         /// Use exact selector matching instead of substring matching.
         #[arg(long)]
         exact: bool,
+        #[command(flatten)]
+        fusion: crate::fusion::FusionArgs,
     },
     /// Press a named key or keycode.
-    Key { name: String },
+    Key {
+        name: String,
+        #[command(flatten)]
+        fusion: crate::fusion::FusionArgs,
+    },
     /// Hide the soft keyboard if ShadowDroid sees it; no-op when already hidden.
     HideKeyboard,
     /// Press the Back button.
-    Back,
+    Back {
+        #[command(flatten)]
+        fusion: crate::fusion::FusionArgs,
+    },
     /// Press the Home button.
-    Home,
+    Home {
+        #[command(flatten)]
+        fusion: crate::fusion::FusionArgs,
+    },
     /// Wait for an element / activity / package to appear (or be --gone).
     ///
     /// Selector text matches as a case-insensitive substring by default; add
@@ -1021,7 +1063,17 @@ fn parse_cli() -> Cli {
     }
 }
 
+/// Entry point: run the command, then (if the user opted in) append one line
+/// to the local usage log — verb, duration, outcome. The log write can never
+/// fail the command.
 pub async fn run() -> Result<()> {
+    let started = std::time::Instant::now();
+    let result = run_inner().await;
+    crate::cmd::usage::record(started, &result);
+    result
+}
+
+async fn run_inner() -> Result<()> {
     let cli = parse_cli();
     let config = ShadowDroidConfig::load()?;
     let device = cli.device.or_else(|| config.device.clone());
@@ -1102,6 +1154,18 @@ pub async fn run() -> Result<()> {
             let app = resolve_app_package(&config, Some(&serial), app.clone()).await?;
             return crate::cmd::collect::run(&serial, app, out.clone(), !*no_screenshot).await;
         }
+        // `log` and `why` are host-side reads over adb (+ existing routes for
+        // `why`'s screen section) — they must work when the server is down,
+        // since "the server is down" is exactly when you need them.
+        Cmd::Log(args) => {
+            let serial = resolve_serial(device.as_deref()).await?;
+            return crate::cmd::log::run(&serial, &config, project.as_deref(), args).await;
+        }
+        Cmd::Why(args) => {
+            let serial = resolve_serial(device.as_deref()).await?;
+            return crate::cmd::why::run(&serial, &config, project.as_deref(), args).await;
+        }
+        Cmd::Usage(c) => return crate::cmd::usage::run(c),
         Cmd::Perm(c) => {
             let serial = resolve_serial(device.as_deref()).await?;
             return dispatch_perm(c, &serial).await;
@@ -1163,6 +1227,9 @@ pub async fn run() -> Result<()> {
         | Cmd::Doctor { .. }
         | Cmd::Collect { .. }
         | Cmd::Commands { .. }
+        | Cmd::Log(_)
+        | Cmd::Why(_)
+        | Cmd::Usage(_)
         | Cmd::Config(_)
         | Cmd::Skill(_)
         | Cmd::Studio(_)
@@ -1217,6 +1284,10 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+/// Every `ui` verb runs with the since-last-command events probe alongside it
+/// (one adb round-trip hidden behind the action), then emits exactly once from
+/// here — so crashes/ANRs that happened since the previous CLI command ride
+/// the same JSON object the agent was already reading, success or error.
 async fn dispatch_ui(
     c: UiCmd,
     client: &ServerClient,
@@ -1224,15 +1295,38 @@ async fn dispatch_ui(
     apk: Option<&std::path::Path>,
     any_apk_version: bool,
 ) -> Result<()> {
+    let probe = crate::crashscan::spawn_probe(serial);
+    let result = dispatch_ui_inner(c, client, serial, apk, any_apk_version).await;
+    let events = crate::crashscan::finish_probe(probe).await;
+    match result {
+        Ok(outcome) => {
+            outcome.emit(events);
+            Ok(())
+        }
+        Err(err) => {
+            // report_error (in main) drains the stash into the error envelope.
+            crate::events::stash_events(events);
+            Err(err)
+        }
+    }
+}
+
+async fn dispatch_ui_inner(
+    c: UiCmd,
+    client: &ServerClient,
+    serial: &Serial,
+    apk: Option<&std::path::Path>,
+    any_apk_version: bool,
+) -> Result<Outcome> {
     match c {
-        UiCmd::Dump { full } => cmd_screen(serial, apk, any_apk_version, client, full).await?,
+        UiCmd::Dump { full } => cmd_screen(serial, apk, any_apk_version, client, full).await,
         UiCmd::Audit => {
             let screen = read_screen_with_reconnect(serial, apk, any_apk_version, client).await?;
             let mut body = crate::cmd::authoring::audit_elements(&screen.elements);
             if let serde_json::Value::Object(m) = &mut body {
                 m.insert("screen_hash".into(), json!(screen.screen_hash));
             }
-            emit_action("ui_audit", &body);
+            Ok(Outcome::Action("ui_audit", body))
         }
         UiCmd::Gen { name } => {
             let screen = read_screen_with_reconnect(serial, apk, any_apk_version, client).await?;
@@ -1240,13 +1334,14 @@ async fn dispatch_ui(
                 "{}",
                 crate::cmd::authoring::generate_screen_object(&name, &screen.elements)
             );
+            Ok(Outcome::Done)
         }
         UiCmd::Screenshot {
             path,
             format,
             scale,
             quality,
-        } => cmd_screenshot(client, path, format, scale, quality).await?,
+        } => cmd_screenshot(client, path, format, scale, quality).await,
         UiCmd::Find {
             text,
             rid,
@@ -1268,22 +1363,17 @@ async fn dispatch_ui(
                 ..Default::default()
             };
             let r = client.find(&query).await?;
-            if full {
+            let body = if full {
                 let found = r.matched.is_some();
-                emit_action(
-                    "find",
-                    &json!({"matched":found,"element":r.matched,"elements":r.elements}),
-                );
+                json!({"matched":found,"element":r.matched,"elements":r.elements})
             } else {
                 let matched = r.matched.map(CompactElement::from);
                 let found = matched.is_some();
                 let elements: Vec<CompactElement> =
                     r.elements.into_iter().map(CompactElement::from).collect();
-                emit_action(
-                    "find",
-                    &json!({"matched":found,"element":matched,"elements":elements}),
-                );
-            }
+                json!({"matched":found,"element":matched,"elements":elements})
+            };
+            Ok(Outcome::Action("find", body))
         }
         UiCmd::Tap {
             id,
@@ -1295,14 +1385,39 @@ async fn dispatch_ui(
             xpath,
             exact,
             clickable,
-        } => cmd_tap(client, id, a, b, text, rid, desc, xpath, exact, clickable).await?,
-        UiCmd::DoubleTap { x, y } => {
-            client.double_tap(x, y).await?;
-            emit_action("double_tap", &json!({"x":x,"y":y}));
+            fusion,
+        } => {
+            let hint = crate::fusion::SelectorHint {
+                text: text.clone(),
+                rid: rid.clone(),
+                desc: desc.clone(),
+            };
+            crate::fusion::run_fused(
+                client,
+                &fusion,
+                Some(hint),
+                cmd_tap(client, id, a, b, text, rid, desc, xpath, exact, clickable),
+            )
+            .await
         }
-        UiCmd::LongTap { x, y, duration_ms } => {
-            client.long_tap(x, y, duration_ms).await?;
-            emit_action("long_tap", &json!({"x":x,"y":y,"duration_ms":duration_ms}));
+        UiCmd::DoubleTap { x, y, fusion } => {
+            crate::fusion::run_fused(client, &fusion, None, async {
+                client.double_tap(x, y).await?;
+                Ok(("double_tap", json!({"x":x,"y":y})))
+            })
+            .await
+        }
+        UiCmd::LongTap {
+            x,
+            y,
+            duration_ms,
+            fusion,
+        } => {
+            crate::fusion::run_fused(client, &fusion, None, async {
+                client.long_tap(x, y, duration_ms).await?;
+                Ok(("long_tap", json!({"x":x,"y":y,"duration_ms":duration_ms})))
+            })
+            .await
         }
         UiCmd::Swipe {
             x1,
@@ -1310,12 +1425,16 @@ async fn dispatch_ui(
             x2,
             y2,
             duration_ms,
+            fusion,
         } => {
-            client.swipe(x1, y1, x2, y2, duration_ms).await?;
-            emit_action(
-                "swipe",
-                &json!({"from":[x1,y1],"to":[x2,y2],"duration_ms":duration_ms}),
-            );
+            crate::fusion::run_fused(client, &fusion, None, async {
+                client.swipe(x1, y1, x2, y2, duration_ms).await?;
+                Ok((
+                    "swipe",
+                    json!({"from":[x1,y1],"to":[x2,y2],"duration_ms":duration_ms}),
+                ))
+            })
+            .await
         }
         UiCmd::Drag {
             x1,
@@ -1323,23 +1442,31 @@ async fn dispatch_ui(
             x2,
             y2,
             duration_ms,
+            fusion,
         } => {
-            client.drag(x1, y1, x2, y2, duration_ms).await?;
-            emit_action(
-                "drag",
-                &json!({"from":[x1,y1],"to":[x2,y2],"duration_ms":duration_ms}),
-            );
+            crate::fusion::run_fused(client, &fusion, None, async {
+                client.drag(x1, y1, x2, y2, duration_ms).await?;
+                Ok((
+                    "drag",
+                    json!({"from":[x1,y1],"to":[x2,y2],"duration_ms":duration_ms}),
+                ))
+            })
+            .await
         }
         UiCmd::SwipeExt {
             direction,
             scale,
             duration_ms,
+            fusion,
         } => {
-            client.swipe_ext(&direction, scale, duration_ms).await?;
-            emit_action(
-                "swipe_ext",
-                &json!({"direction":direction,"scale":scale,"duration_ms":duration_ms}),
-            );
+            crate::fusion::run_fused(client, &fusion, None, async {
+                client.swipe_ext(&direction, scale, duration_ms).await?;
+                Ok((
+                    "swipe_ext",
+                    json!({"direction":direction,"scale":scale,"duration_ms":duration_ms}),
+                ))
+            })
+            .await
         }
         UiCmd::Pinch {
             direction,
@@ -1347,23 +1474,32 @@ async fn dispatch_ui(
             text,
             desc,
             percent,
+            fusion,
         } => {
-            client
-                .pinch(
-                    rid.as_deref(),
-                    text.as_deref(),
-                    desc.as_deref(),
-                    &direction,
-                    percent,
-                )
-                .await?;
-            emit_action(
-                "pinch",
-                &json!({"direction":direction,"rid":rid,"text":text,"desc":desc,"percent":percent}),
-            );
+            let hint = crate::fusion::SelectorHint {
+                text: text.clone(),
+                rid: rid.clone(),
+                desc: desc.clone(),
+            };
+            crate::fusion::run_fused(client, &fusion, Some(hint), async {
+                client
+                    .pinch(
+                        rid.as_deref(),
+                        text.as_deref(),
+                        desc.as_deref(),
+                        &direction,
+                        percent,
+                    )
+                    .await?;
+                Ok((
+                    "pinch",
+                    json!({"direction":direction,"rid":rid,"text":text,"desc":desc,"percent":percent}),
+                ))
+            })
+            .await
         }
-        UiCmd::ScrollTo(args) => crate::cmd::scroll::run(client, &args).await?,
-        UiCmd::Focus(args) => crate::cmd::focus::run(client, &args).await?,
+        UiCmd::ScrollTo(args) => crate::cmd::scroll::run(client, &args).await,
+        UiCmd::Focus(args) => crate::cmd::focus::run(client, &args).await,
         UiCmd::Text {
             value,
             clear,
@@ -1373,19 +1509,28 @@ async fn dispatch_ui(
             desc,
             xpath,
             exact,
+            fusion,
         } => {
+            let hint = crate::fusion::SelectorHint {
+                text: text.clone(),
+                rid: rid.clone(),
+                desc: desc.clone(),
+            };
             let target = text_target_query(id, text, rid, desc, xpath, exact);
-            client
-                .text_with_target(&value, clear, target.as_ref())
-                .await?;
-            emit_action(
-                "text",
-                &json!({"value":value,"clear":clear,"target":target}),
-            );
+            crate::fusion::run_fused(client, &fusion, Some(hint), async {
+                client
+                    .text_with_target(&value, clear, target.as_ref())
+                    .await?;
+                Ok(("text", json!({"value":value,"clear":clear,"target":target})))
+            })
+            .await
         }
-        UiCmd::Key { name } => {
-            let injected = client.key(&name).await?;
-            emit_action("key", &json!({"name":name,"injected":injected}));
+        UiCmd::Key { name, fusion } => {
+            crate::fusion::run_fused(client, &fusion, None, async {
+                let injected = client.key(&name).await?;
+                Ok(("key", json!({"name":name,"injected":injected})))
+            })
+            .await
         }
         UiCmd::HideKeyboard => {
             let screen = read_screen_with_reconnect(serial, apk, any_apk_version, client).await?;
@@ -1394,22 +1539,28 @@ async fn dispatch_ui(
             } else {
                 false
             };
-            emit_action(
+            Ok(Outcome::Action(
                 "hide_keyboard",
-                &json!({
+                json!({
                     "keyboard_visible": screen.ime.keyboard_visible,
                     "injected": injected,
                     "ime": compact_ime(&screen.ime),
                 }),
-            );
+            ))
         }
-        UiCmd::Back => {
-            let injected = client.key("back").await?;
-            emit_action("key", &json!({"name":"back","injected":injected}));
+        UiCmd::Back { fusion } => {
+            crate::fusion::run_fused(client, &fusion, None, async {
+                let injected = client.key("back").await?;
+                Ok(("key", json!({"name":"back","injected":injected})))
+            })
+            .await
         }
-        UiCmd::Home => {
-            let injected = client.key("home").await?;
-            emit_action("key", &json!({"name":"home","injected":injected}));
+        UiCmd::Home { fusion } => {
+            crate::fusion::run_fused(client, &fusion, None, async {
+                let injected = client.key("home").await?;
+                Ok(("key", json!({"name":"home","injected":injected})))
+            })
+            .await
         }
         UiCmd::Wait {
             text,
@@ -1443,11 +1594,10 @@ async fn dispatch_ui(
                 apk,
                 any_apk_version,
             )
-            .await?;
+            .await
         }
-        UiCmd::Toast { wait_ms } => cmd_toast(client, wait_ms).await?,
+        UiCmd::Toast { wait_ms } => cmd_toast(client, wait_ms).await,
     }
-    Ok(())
 }
 
 fn apply_config_defaults(cmd: &mut Cmd, config: &ShadowDroidConfig) {
@@ -1785,9 +1935,7 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
         }
         NetCmd::Trust { auto, system, ui } => nc::trust(serial, *auto, *system, *ui).await,
         NetCmd::Ca(sub) => match sub {
-            NetCaCmd::Import { cert, key } => {
-                nc::ca_import(serial, cert, key.as_deref()).await
-            }
+            NetCaCmd::Import { cert, key } => nc::ca_import(serial, cert, key.as_deref()).await,
             NetCaCmd::Info => nc::ca_info().await,
             NetCaCmd::Reset => nc::ca_reset(serial).await,
         },
@@ -1958,12 +2106,36 @@ fn read_body_arg(inline: &Option<String>, file: &Option<PathBuf>) -> Result<Opti
 
 /// Server-backed `app` verbs. `Install`/`Reinstall` are handled host-side in
 /// phase 1, so they're unreachable here.
+/// Like [dispatch_ui], `app` verbs carry the since-last-command events probe:
+/// `app start` after a crash-loop, `app current` after an unexpected exit —
+/// these are exactly the moments the crash context matters.
 async fn dispatch_app(
     c: AppCmd,
     client: &ServerClient,
     config: &ShadowDroidConfig,
     serial: &Serial,
 ) -> Result<()> {
+    let probe = crate::crashscan::spawn_probe(serial);
+    let result = dispatch_app_inner(c, client, config, serial).await;
+    let events = crate::crashscan::finish_probe(probe).await;
+    match result {
+        Ok(outcome) => {
+            outcome.emit(events);
+            Ok(())
+        }
+        Err(err) => {
+            crate::events::stash_events(events);
+            Err(err)
+        }
+    }
+}
+
+async fn dispatch_app_inner(
+    c: AppCmd,
+    client: &ServerClient,
+    config: &ShadowDroidConfig,
+    serial: &Serial,
+) -> Result<Outcome> {
     match c {
         AppCmd::Install(_) | AppCmd::Reinstall(_) => {
             unreachable!("app install/reinstall handled host-side")
@@ -1980,30 +2152,30 @@ async fn dispatch_app(
             if let Some(warning) = r.warning {
                 body["warning"] = json!(warning);
             }
-            emit_action("app_start", &body);
+            Ok(Outcome::Action("app_start", body))
         }
         AppCmd::Stop { package } => {
             let package = require_app_package(client, config, serial, package, "app stop").await?;
             client.app_stop(&package).await?;
-            emit_action("app_stop", &json!({"package":package}));
+            Ok(Outcome::Action("app_stop", json!({"package":package})))
         }
         AppCmd::Clear { package } => {
             let package = require_app_package(client, config, serial, package, "app clear").await?;
             client.app_clear(&package).await?;
-            emit_action("app_clear", &json!({"package":package}));
+            Ok(Outcome::Action("app_clear", json!({"package":package})))
         }
         AppCmd::Info { package } => {
             let package = require_app_package(client, config, serial, package, "app info").await?;
             let info = client.app_info(&package).await?;
-            emit_action(
+            Ok(Outcome::Action(
                 "app_info",
-                &json!({
+                json!({
                     "package":package,
                     "version_name":info.version_name,
                     "version_code":info.version_code,
                     "label":info.label,
                 }),
-            );
+            ))
         }
         AppCmd::Wait {
             package,
@@ -2012,20 +2184,19 @@ async fn dispatch_app(
         } => {
             let package = require_app_package(client, config, serial, package, "app wait").await?;
             let r = client.app_wait(&package, timeout_ms, front).await?;
-            emit_action(
+            Ok(Outcome::Action(
                 "app_wait",
-                &json!({"package":package,"matched":r.matched,"current":r.current}),
-            );
+                json!({"package":package,"matched":r.matched,"current":r.current}),
+            ))
         }
         AppCmd::Current { json: _ } => {
             let cur = client.app_current().await?;
-            emit_action(
+            Ok(Outcome::Action(
                 "app_current",
-                &serde_json::to_value(&cur).unwrap_or_default(),
-            );
+                serde_json::to_value(&cur).unwrap_or_default(),
+            ))
         }
     }
-    Ok(())
 }
 
 async fn require_app_package(
@@ -2263,8 +2434,47 @@ pub fn report_error(err: &anyhow::Error) {
             &amb.to_string(),
             json!({ "detail": { "candidates": amb.candidates } }),
         );
+    } else if let Some(sc) = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<crate::fusion::ScreenChanged>())
+    {
+        // The failure carries the re-observe: `detail.screen` is the fresh
+        // compact dump, so the agent re-plans without another read.
+        emit_error(
+            "run",
+            "screen_changed",
+            &sc.to_string(),
+            json!({ "detail": {
+                "expected": sc.expected,
+                "actual": sc.actual,
+                "screen": sc.screen,
+            }}),
+        );
     } else {
         emit_error("run", "error", &err.to_string(), json!({}));
+    }
+}
+
+/// The machine error code `report_error` would assign — shared with the usage
+/// log so failure statistics use the same vocabulary the agent sees.
+pub fn error_code_of(err: &anyhow::Error) -> String {
+    if let Some(se) = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<crate::device::client::ServerError>())
+    {
+        se.code.clone()
+    } else if err.chain().any(|e| {
+        e.downcast_ref::<crate::selector::AmbiguousMatch>()
+            .is_some()
+    }) {
+        "ambiguous_match".into()
+    } else if err
+        .chain()
+        .any(|e| e.downcast_ref::<crate::fusion::ScreenChanged>().is_some())
+    {
+        "screen_changed".into()
+    } else {
+        "error".into()
     }
 }
 
@@ -2301,11 +2511,10 @@ async fn cmd_screen(
     any_apk_version: bool,
     client: &ServerClient,
     full: bool,
-) -> Result<()> {
+) -> Result<Outcome> {
     let screen = read_screen_with_reconnect(serial, apk, any_apk_version, client).await?;
     if full {
-        emit(&screen);
-        return Ok(());
+        return Ok(Outcome::Raw(serde_json::to_value(&screen)?));
     }
     let ime = compact_ime(&screen.ime);
     let elements: Vec<CompactElement> = screen
@@ -2313,15 +2522,14 @@ async fn cmd_screen(
         .into_iter()
         .map(CompactElement::from)
         .collect();
-    emit(&json!({
+    Ok(Outcome::Raw(json!({
         "screen_hash": screen.screen_hash,
         "viewport": screen.viewport,
         "current_app": screen.current_app,
         "element_count": screen.element_count,
         "ime": ime,
         "elements": elements,
-    }));
-    Ok(())
+    })))
 }
 
 fn compact_ime(ime: &crate::proto::ImeState) -> serde_json::Value {
@@ -2357,7 +2565,7 @@ async fn cmd_screenshot(
     format: Option<String>,
     scale: Option<f32>,
     quality: Option<u32>,
-) -> Result<()> {
+) -> Result<Outcome> {
     let bytes = client.screenshot(format.as_deref(), scale, quality).await?;
     let p: std::path::PathBuf = match path {
         Some(p) => p.into(),
@@ -2385,8 +2593,7 @@ async fn cmd_screenshot(
     if let Ok(screen) = client.screen().await {
         body["screen_hash"] = json!(screen.screen_hash);
     }
-    emit_action("screenshot", &body);
-    Ok(())
+    Ok(Outcome::Action("screenshot", body))
 }
 
 /// Parse pixel dimensions from a PNG or JPEG byte stream without pulling in an
@@ -2465,15 +2672,14 @@ async fn cmd_tap(
     xpath: Option<String>,
     exact: bool,
     clickable: bool,
-) -> Result<()> {
+) -> Result<(&'static str, serde_json::Value)> {
     // Selector modes take priority.
     if let Some(query) = xpath {
         let r = client.xpath_tap(&query).await?;
-        emit_action(
+        return Ok((
             "tap",
-            &json!({"via":"xpath","xpath":query,"x":r.x,"y":r.y,"action":r.action,"matched":true,"element":r.matched}),
-        );
-        return Ok(());
+            json!({"via":"xpath","xpath":query,"x":r.x,"y":r.y,"action":r.action,"matched":true,"element":r.matched}),
+        ));
     }
     if text.is_some() || rid.is_some() || desc.is_some() {
         let r = client
@@ -2486,50 +2692,48 @@ async fn cmd_tap(
                 ..Default::default()
             })
             .await?;
-        emit_action(
+        return Ok((
             "tap",
-            &json!({"via":"selector","x":r.x,"y":r.y,"action":r.action,"matched":true,"element":r.matched}),
-        );
-        return Ok(());
+            json!({"via":"selector","x":r.x,"y":r.y,"action":r.action,"matched":true,"element":r.matched}),
+        ));
     }
     // Coordinate / id modes.
     match (id, a, b) {
-        (Some(id), None, None) => {
-            tap_element_id(client, id).await?;
-        }
+        (Some(id), None, None) => tap_element_id(client, id).await,
         (Some(_), Some(_), _) | (Some(_), None, Some(_)) => {
             bail!("tap --id cannot be combined with positional coordinates or element id")
         }
         (None, Some(x), Some(y)) => {
             client.tap_xy(x, y).await?;
-            emit_action("tap", &json!({"via":"coords","x":x,"y":y}));
+            Ok(("tap", json!({"via":"coords","x":x,"y":y})))
         }
         (None, Some(a), None) => {
             let id = u32::try_from(a).map_err(|_| anyhow!("element id must be >= 0, got {a}"))?;
-            tap_element_id(client, id).await?;
+            tap_element_id(client, id).await
         }
         (None, None, _) => {
             bail!("tap needs a target: <id>, <x> <y>, or --text/--rid/--desc/--xpath <value>")
         }
     }
-    Ok(())
 }
 
-async fn tap_element_id(client: &ServerClient, id: u32) -> Result<()> {
+async fn tap_element_id(
+    client: &ServerClient,
+    id: u32,
+) -> Result<(&'static str, serde_json::Value)> {
     let r = client
         .find_tap(&SelectorQuery {
             id: Some(id),
             ..Default::default()
         })
         .await?;
-    emit_action(
+    Ok((
         "tap",
-        &json!({
+        json!({
             "via":"id","id": id, "x": r.x, "y": r.y, "action": r.action,
             "matched": true, "element": r.matched
         }),
-    );
-    Ok(())
+    ))
 }
 
 fn text_target_query(
@@ -2554,15 +2758,14 @@ fn text_target_query(
     })
 }
 
-async fn cmd_toast(client: &ServerClient, wait_ms: u32) -> Result<()> {
+async fn cmd_toast(client: &ServerClient, wait_ms: u32) -> Result<Outcome> {
     let start = unix_ms();
     client.toast_start(50).await?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms as u64);
     loop {
         let recent = client.toast_recent(start).await?;
         if !recent.toasts.is_empty() || std::time::Instant::now() >= deadline {
-            emit_action("toast", &json!({"toasts":recent.toasts}));
-            return Ok(());
+            return Ok(Outcome::Action("toast", json!({"toasts":recent.toasts})));
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
@@ -2596,7 +2799,7 @@ async fn cmd_wait(
     serial: &Serial,
     apk: Option<&std::path::Path>,
     any_apk_version: bool,
-) -> Result<()> {
+) -> Result<Outcome> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
     let mut client = client.clone();
     loop {
@@ -2627,8 +2830,7 @@ async fn cmd_wait(
             if let Some(el) = outcome.element {
                 body["element"] = json!(CompactElement::from(el));
             }
-            emit_action("wait", &body);
-            return Ok(());
+            return Ok(Outcome::Action("wait", body));
         }
         if std::time::Instant::now() >= deadline {
             let hint = if gone {
@@ -2640,11 +2842,10 @@ async fn cmd_wait(
             // something unexpected (e.g. an error page). Echo the visible texts
             // so the caller sees what the screen became without a second probe.
             let top_texts = top_screen_texts(&screen.elements, 12);
-            emit_action(
+            return Ok(Outcome::Action(
                 "wait",
-                &json!({"matched":matched,"gone":gone,"screen_hash":screen_hash,"current_app":current_app,"timeout":true,"hint":hint,"top_texts":top_texts}),
-            );
-            return Ok(());
+                json!({"matched":matched,"gone":gone,"screen_hash":screen_hash,"current_app":current_app,"timeout":true,"hint":hint,"top_texts":top_texts}),
+            ));
         }
         tokio::time::sleep(std::time::Duration::from_millis(poll_ms.max(1) as u64)).await;
     }
@@ -2675,24 +2876,6 @@ async fn reconnect_after_screen_error(
     installer::ensure_ready_for_command(serial, apk, any_apk_version)
         .await
         .with_context(|| format!("screen request failed ({err}); reconnect failed"))
-}
-
-/// Up to `n` distinct, non-empty visible texts in document order — returned on
-/// `ui wait` timeout so a caller that timed out because the screen changed (e.g.
-/// to an error page) sees *what* it shows now without issuing a second probe.
-fn top_screen_texts(elements: &[Element], n: usize) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for el in elements {
-        if let Some(t) = el.text.as_deref().map(str::trim) {
-            if !t.is_empty() && !out.iter().any(|x| x == t) {
-                out.push(t.to_string());
-                if out.len() >= n {
-                    break;
-                }
-            }
-        }
-    }
-    out
 }
 
 fn wait_query_matches(

@@ -122,7 +122,7 @@ async fn emit_if_matches(
     let _ = out.send(evt).await;
 }
 
-fn package_matches_filter(package: &str, filter: &str) -> bool {
+pub(crate) fn package_matches_filter(package: &str, filter: &str) -> bool {
     package == filter
         || package
             .strip_prefix(filter)
@@ -130,7 +130,7 @@ fn package_matches_filter(package: &str, filter: &str) -> bool {
 }
 
 #[derive(Default)]
-struct CrashCollector {
+pub(crate) struct CrashCollector {
     buffer: Vec<String>,
     kind: Option<CrashKind>,
     pid: Option<i32>,
@@ -144,7 +144,7 @@ enum CrashKind {
 }
 
 impl CrashCollector {
-    fn handle_line(&mut self, line: &str) -> Vec<CrashEvent> {
+    pub(crate) fn handle_line(&mut self, line: &str) -> Vec<CrashEvent> {
         let Some(parsed) = LogLine::parse(line) else {
             if !self.buffer.is_empty() {
                 self.buffer.push(line.to_string());
@@ -203,7 +203,7 @@ impl CrashCollector {
         }
     }
 
-    fn finalize_now(&mut self) -> Option<CrashEvent> {
+    pub(crate) fn finalize_now(&mut self) -> Option<CrashEvent> {
         if self.buffer.is_empty() {
             return None;
         }
@@ -218,19 +218,30 @@ impl CrashCollector {
     }
 }
 
-struct LogLine {
-    pid: i32,
-    tag: String,
-    msg: String,
-    raw: String,
+/// One parsed `threadtime` logcat line. Shared with the one-shot scanners
+/// (`log`, `why`, the events-since-last probe) via [crate::crashscan], so the
+/// single regex below stays the only logcat line grammar in the codebase.
+pub(crate) struct LogLine {
+    /// Device-clock timestamp as printed: `MM-DD HH:MM:SS.mmm` (no year).
+    pub(crate) ts: String,
+    pub(crate) pid: i32,
+    /// Single-letter priority: V D I W E F.
+    pub(crate) level: String,
+    pub(crate) tag: String,
+    pub(crate) msg: String,
+    pub(crate) raw: String,
 }
 
 impl LogLine {
-    fn parse(line: &str) -> Option<Self> {
+    pub(crate) fn parse(line: &str) -> Option<Self> {
         let caps = logcat_re().captures(line)?;
         Some(Self {
+            ts: caps.get(1)?.as_str().to_string(),
             pid: caps.get(2)?.as_str().parse().ok()?,
-            tag: caps.get(5)?.as_str().to_string(),
+            // caps[3] is tid — parsed by the regex but unused downstream.
+            level: caps.get(4)?.as_str().to_string(),
+            // threadtime pads short tags with trailing spaces before the colon.
+            tag: caps.get(5)?.as_str().trim_end().to_string(),
             msg: caps.get(6).map(|m| m.as_str()).unwrap_or("").to_string(),
             raw: line.to_string(),
         })

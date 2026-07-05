@@ -17,8 +17,10 @@
 mod cli;
 mod cmd;
 mod config;
+mod crashscan;
 mod device;
 mod events;
+mod fusion;
 mod hostenv;
 mod ids;
 mod net;

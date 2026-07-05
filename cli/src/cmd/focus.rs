@@ -20,6 +20,7 @@ use std::time::Duration;
 use anyhow::Result;
 
 use crate::device::client::ServerClient;
+use crate::fusion::Outcome;
 use crate::proto::Element;
 use crate::selector::{Selector, SelectorArgs};
 
@@ -84,7 +85,7 @@ fn candidate_json(e: &Element) -> serde_json::Value {
     serde_json::json!({ "id": e.id, "text": e.text, "rid": e.rid, "desc": e.desc, "tap": e.tap })
 }
 
-pub async fn run(client: &ServerClient, args: &FocusArgs) -> Result<()> {
+pub async fn run(client: &ServerClient, args: &FocusArgs) -> Result<Outcome> {
     let selector = args.selector.exactly_one()?;
 
     let mut steps = 0u32;
@@ -207,10 +208,10 @@ fn emit(
     reason: &str,
     element: Option<&Element>,
     activated: bool,
-) -> Result<()> {
-    crate::events::emit_action(
+) -> Result<Outcome> {
+    Ok(Outcome::Action(
         "focus",
-        &serde_json::json!({
+        serde_json::json!({
             "selector": selector.label(),
             "matched": matched,
             "steps": steps,
@@ -221,8 +222,7 @@ fn emit(
                 "focused": e.focused, "tap": e.tap,
             })),
         }),
-    );
-    Ok(())
+    ))
 }
 
 #[cfg(test)]

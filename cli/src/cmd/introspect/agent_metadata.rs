@@ -19,6 +19,61 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "side_effects": ["none"],
             "next_commands": ["connect", "doctor", "app current"]
         })),
+        "log" => Some(serde_json::json!({
+            "use_when": [
+                "Need to know what the app just logged — after a failed action, an unexpected screen, or a crash event on a previous response.",
+                "Need crash/ANR details: blocks are parsed into structured events with project_frames mapping the stack into your source tree."
+            ],
+            "output": "line-delimited JSON: {type:log} entries and {type:crash} events, then one {type:action,cmd:log} summary",
+            "side_effects": ["none"],
+            "prerequisites": ["works without the on-device server; scopes to the configured app by default (--all for everything)"],
+            "next_commands": ["why", "ui dump", "watch"]
+        })),
+        "why" => Some(serde_json::json!({
+            "use_when": [
+                "Something unexpected happened and you want one bounded read instead of a forensic sequence: was it a crash, an ANR, a network failure, or just a different screen?",
+                "An action failed or a wait timed out and the screen alone doesn't explain it."
+            ],
+            "output": "one action JSON: verdict + explanation, evidence (crash/anr/log_errors/screen/net), checked coverage list, and next-step hints",
+            "side_effects": ["none — read-only; uses the server only if it is already up"],
+            "next_commands": ["log", "ui dump", "net log", "collect"]
+        })),
+        "usage" => Some(serde_json::json!({
+            "use_when": ["Manage the opt-in local usage log (verb + duration + error code per invocation; no argument values, never uploaded)."],
+            "output": "action JSON per subcommand",
+            "side_effects": ["enable/disable write the user config; clear deletes the local log"],
+            "next_commands": ["usage status", "usage report"]
+        })),
+        "usage status" => Some(serde_json::json!({
+            "use_when": ["Check whether usage logging is enabled and where the log lives."],
+            "output": "usage_status action JSON",
+            "side_effects": ["none"],
+            "next_commands": ["usage enable", "usage report"]
+        })),
+        "usage enable" => Some(serde_json::json!({
+            "use_when": ["Opt in to the local usage log."],
+            "output": "usage_set action JSON",
+            "side_effects": ["writes usage_log:true to ~/.shadowdroid/config.json"],
+            "next_commands": ["usage status", "usage report"]
+        })),
+        "usage disable" => Some(serde_json::json!({
+            "use_when": ["Opt out of the local usage log."],
+            "output": "usage_set action JSON",
+            "side_effects": ["writes usage_log:false to ~/.shadowdroid/config.json"],
+            "next_commands": ["usage status"]
+        })),
+        "usage report" => Some(serde_json::json!({
+            "use_when": ["See which verbs run most, their error rates and durations, and the top error codes — the data-driven UX backlog."],
+            "output": "usage_report action JSON (per-verb count/errors/p50/p95 + error-code ranking)",
+            "side_effects": ["none"],
+            "next_commands": ["usage clear"]
+        })),
+        "usage clear" => Some(serde_json::json!({
+            "use_when": ["Delete the accumulated local usage log."],
+            "output": "usage_clear action JSON",
+            "side_effects": ["removes ~/.shadowdroid/usage.jsonl (and its rotation)"],
+            "next_commands": ["usage status"]
+        })),
         "connect" => Some(serde_json::json!({
             "use_when": ["Need to install/start the ShadowDroid server and establish the host-device control pipe."],
             "output": "connected action JSON with device/server/app state and UiAutomation advisory",

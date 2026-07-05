@@ -22,12 +22,12 @@
 //! rejected by modern clients) + `serverAuth` EKU.
 
 use anyhow::{anyhow, bail, Context, Result};
+use rcgen::string::Ia5String;
 use rcgen::{
     date_time_ymd, BasicConstraints, CertificateParams, DistinguishedName, DnType,
     ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PublicKeyData, SanType,
     SerialNumber,
 };
-use rcgen::string::Ia5String;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
 use serde::Serialize;
@@ -199,7 +199,8 @@ fn next_serial() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(1);
-    base.wrapping_add(COUNTER.fetch_add(1, Ordering::Relaxed)).max(1)
+    base.wrapping_add(COUNTER.fetch_add(1, Ordering::Relaxed))
+        .max(1)
 }
 
 fn write_private(path: &Path, pem: &str) -> Result<()> {
@@ -379,8 +380,8 @@ fn info_in(net_dir: &Path) -> Result<CaInfo> {
             cert_path.display()
         );
     }
-    let cert_pem =
-        std::fs::read_to_string(&cert_path).with_context(|| format!("read {}", cert_path.display()))?;
+    let cert_pem = std::fs::read_to_string(&cert_path)
+        .with_context(|| format!("read {}", cert_path.display()))?;
     let first = pem_blocks(&cert_pem)
         .into_iter()
         .find(|b| b.label == "CERTIFICATE")
@@ -431,7 +432,10 @@ fn backup_in(net_dir: &Path) -> Result<()> {
 }
 
 fn bak_path(p: &Path) -> PathBuf {
-    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     p.with_file_name(format!("{name}.bak"))
 }
 
@@ -705,15 +709,27 @@ mod tests {
 
     #[test]
     fn spki_algorithm_labels_known_and_unknown() {
-        assert_eq!(spki_algorithm_label("1.2.840.113549.1.1.1").as_deref(), Some("RSA"));
-        assert_eq!(spki_algorithm_label("1.2.840.10045.2.1").as_deref(), Some("EC"));
-        assert_eq!(spki_algorithm_label("1.3.101.112").as_deref(), Some("Ed25519"));
+        assert_eq!(
+            spki_algorithm_label("1.2.840.113549.1.1.1").as_deref(),
+            Some("RSA")
+        );
+        assert_eq!(
+            spki_algorithm_label("1.2.840.10045.2.1").as_deref(),
+            Some("EC")
+        );
+        assert_eq!(
+            spki_algorithm_label("1.3.101.112").as_deref(),
+            Some("Ed25519")
+        );
         assert_eq!(spki_algorithm_label("1.2.3.4").as_deref(), Some("1.2.3.4"));
     }
 
     #[test]
     fn bak_path_appends_suffix() {
-        assert_eq!(bak_path(Path::new("/net/ca.crt")), Path::new("/net/ca.crt.bak"));
+        assert_eq!(
+            bak_path(Path::new("/net/ca.crt")),
+            Path::new("/net/ca.crt.bak")
+        );
     }
 
     /// The live path and the dir-scoped helper must agree on the CA filename, or
@@ -728,11 +744,17 @@ mod tests {
     fn read_source_prefers_marker_then_infers() {
         let dir = tempfile::tempdir().unwrap();
         // No marker: inferred from our generated subject vs. anything else.
-        assert_eq!(read_source_in(dir.path(), "CN=ShadowDroid MITM CA"), SOURCE_GENERATED);
+        assert_eq!(
+            read_source_in(dir.path(), "CN=ShadowDroid MITM CA"),
+            SOURCE_GENERATED
+        );
         assert_eq!(read_source_in(dir.path(), "CN=My Corp Root"), "unknown");
         // Marker wins when present.
         write(dir.path(), paths::CA_SOURCE_FILE, "imported\n");
-        assert_eq!(read_source_in(dir.path(), "CN=ShadowDroid MITM CA"), SOURCE_IMPORTED);
+        assert_eq!(
+            read_source_in(dir.path(), "CN=ShadowDroid MITM CA"),
+            SOURCE_IMPORTED
+        );
     }
 
     #[test]
@@ -796,7 +818,9 @@ mod tests {
         let cert = params.self_signed(&key).unwrap();
         let cert_p = write(src.path(), "leaf.crt", &cert.pem());
         let key_p = write(src.path(), "leaf.key", &key.serialize_pem());
-        let err = import_into(store.path(), &cert_p, Some(&key_p)).unwrap_err().to_string();
+        let err = import_into(store.path(), &cert_p, Some(&key_p))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("not a CA certificate"), "{err}");
     }
 
@@ -808,7 +832,9 @@ mod tests {
         let (_cert_b, key_b) = gen_ca_pem();
         let cert_p = write(src.path(), "a.crt", &cert);
         let key_p = write(src.path(), "b.key", &key_b);
-        let err = import_into(store.path(), &cert_p, Some(&key_p)).unwrap_err().to_string();
+        let err = import_into(store.path(), &cert_p, Some(&key_p))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("does not match the certificate"), "{err}");
     }
 
@@ -823,7 +849,9 @@ mod tests {
         let cert = params.self_signed(&key).unwrap();
         let cert_p = write(src.path(), "old.crt", &cert.pem());
         let key_p = write(src.path(), "old.key", &key.serialize_pem());
-        let err = import_into(store.path(), &cert_p, Some(&key_p)).unwrap_err().to_string();
+        let err = import_into(store.path(), &cert_p, Some(&key_p))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("expired"), "{err}");
         // A rejected import must not touch the store.
         assert!(!ca_cert_in(store.path()).exists());
@@ -866,7 +894,11 @@ mod tests {
     /// gated on openssl since CI images vary.
     #[test]
     fn normalize_key_converts_legacy_via_openssl() {
-        if std::process::Command::new("openssl").arg("version").output().is_err() {
+        if std::process::Command::new("openssl")
+            .arg("version")
+            .output()
+            .is_err()
+        {
             return;
         }
         // Produce a SEC1 EC key ("BEGIN EC PRIVATE KEY") and confirm it converts.

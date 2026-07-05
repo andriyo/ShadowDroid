@@ -334,7 +334,10 @@ fn render_coroutines(resp: &Value, out: Option<&PathBuf>) -> String {
     let mut s = String::new();
 
     if !resp.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-        let err = resp.get("error").and_then(Value::as_str).unwrap_or("unknown");
+        let err = resp
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
         let _ = writeln!(s, "✗ coroutine dump unavailable: {err}");
         if let Some(hint) = resp.get("hint").and_then(Value::as_str) {
             let _ = writeln!(s, "  hint: {hint}");
@@ -345,7 +348,10 @@ fn render_coroutines(resp: &Value, out: Option<&PathBuf>) -> String {
     let total = resp.get("total").and_then(Value::as_i64).unwrap_or(0);
     let active = resp.get("active").and_then(Value::as_bool).unwrap_or(true);
     if !active {
-        let _ = writeln!(s, "⚠ probes installed but INERT — coroutines are not being tracked");
+        let _ = writeln!(
+            s,
+            "⚠ probes installed but INERT — coroutines are not being tracked"
+        );
         if let Some(hint) = resp.get("hint").and_then(Value::as_str) {
             let _ = writeln!(s, "  {hint}");
         }

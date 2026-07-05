@@ -14,6 +14,7 @@
 use anyhow::Result;
 
 use crate::device::client::ServerClient;
+use crate::fusion::Outcome;
 use crate::proto::{Element, ScrollResp};
 use crate::selector::{Selector, SelectorArgs};
 
@@ -38,7 +39,7 @@ pub struct ScrollArgs {
     pub duration_ms: u32,
 }
 
-pub async fn run(client: &ServerClient, args: &ScrollArgs) -> Result<()> {
+pub async fn run(client: &ServerClient, args: &ScrollArgs) -> Result<Outcome> {
     let selector = args.selector.exactly_one()?;
 
     // Fast path: drive a scrollable on-device. On any error (older server with
@@ -142,11 +143,11 @@ fn swipe_within(x1: i32, y1: i32, x2: i32, y2: i32, finger_dir: &str) -> (i32, i
     }
 }
 
-/// Emit the result of the fast on-device path (coords only, no element detail).
-fn emit_server(selector: &Selector, resp: &ScrollResp, tap: bool) -> Result<()> {
-    crate::events::emit_action(
+/// Result of the fast on-device path (coords only, no element detail).
+fn emit_server(selector: &Selector, resp: &ScrollResp, tap: bool) -> Result<Outcome> {
+    Ok(Outcome::Action(
         "scroll_to",
-        &serde_json::json!({
+        serde_json::json!({
             "selector": selector.label(),
             "matched": resp.matched,
             "swipes": resp.swipes,
@@ -154,8 +155,7 @@ fn emit_server(selector: &Selector, resp: &ScrollResp, tap: bool) -> Result<()> 
             "tapped": tap && resp.matched,
             "element": resp.matched.then(|| serde_json::json!({ "tap": [resp.x, resp.y] })),
         }),
-    );
-    Ok(())
+    ))
 }
 
 fn emit(
@@ -165,10 +165,10 @@ fn emit(
     reason: &str,
     element: Option<&Element>,
     tapped: bool,
-) -> Result<()> {
-    crate::events::emit_action(
+) -> Result<Outcome> {
+    Ok(Outcome::Action(
         "scroll_to",
-        &serde_json::json!({
+        serde_json::json!({
             "selector": selector.label(),
             "matched": matched,
             "swipes": swipes,
@@ -178,6 +178,5 @@ fn emit(
                 "id": e.id, "text": e.text, "rid": e.rid, "desc": e.desc, "tap": e.tap,
             })),
         }),
-    );
-    Ok(())
+    ))
 }

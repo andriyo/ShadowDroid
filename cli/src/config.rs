@@ -37,6 +37,11 @@ pub struct ShadowDroidConfig {
     pub debug_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_configuration: Option<String>,
+    /// Opt-in local usage log (`shadowdroid usage`): verb + duration + error
+    /// code per invocation, written to ~/.shadowdroid/usage.jsonl. Never
+    /// argument values; never leaves the machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_log: Option<bool>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub apps: BTreeMap<String, AppConfig>,
 
@@ -235,6 +240,7 @@ impl ShadowDroidConfig {
         self.debugger = other.debugger.or(self.debugger.take());
         self.debug_mode = other.debug_mode.or(self.debug_mode.take());
         self.run_configuration = other.run_configuration.or(self.run_configuration.take());
+        self.usage_log = other.usage_log.or(self.usage_log.take());
         self.apps.extend(other.apps);
     }
 }

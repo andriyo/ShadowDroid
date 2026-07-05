@@ -271,11 +271,10 @@ fn process_connect(ctx: Arc<ProxyContext>, req: Request<Incoming>) -> Response<P
             // `auto` negotiates HTTP/1.1 vs HTTP/2 from the ALPN the leaf offered,
             // so an h2 app is served h2 (not downgraded); `with_upgrades` keeps the
             // HTTP/1.1 WebSocket path working.
-            if let Err(e) = hyper_util::server::conn::auto::Builder::new(
-                hyper_util::rt::TokioExecutor::new(),
-            )
-            .serve_connection_with_upgrades(io, svc)
-            .await
+            if let Err(e) =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection_with_upgrades(io, svc)
+                    .await
             {
                 tracing::debug!("inner serve {host}: {e}");
             }
@@ -374,7 +373,22 @@ async fn proxy_websocket(
                 if in_scope {
                     capture(
                         &ctx,
-                        error_flow(&id, req.method(), &scheme, &host, &path, &req_headers, &[], false, None, &[], 0, e.to_string(), Some("websocket".into()), false),
+                        error_flow(
+                            &id,
+                            req.method(),
+                            &scheme,
+                            &host,
+                            &path,
+                            &req_headers,
+                            &[],
+                            false,
+                            None,
+                            &[],
+                            0,
+                            e.to_string(),
+                            Some("websocket".into()),
+                            false,
+                        ),
                     );
                 }
                 return error_response(StatusCode::BAD_GATEWAY, &e.to_string());
@@ -414,7 +428,10 @@ async fn proxy_websocket(
     let upstream_io = match hyper::upgrade::on(upstream_resp).await {
         Ok(u) => u,
         Err(e) => {
-            return error_response(StatusCode::BAD_GATEWAY, &format!("upstream ws upgrade: {e}"))
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("upstream ws upgrade: {e}"),
+            )
         }
     };
     // Once the device sees our 101 it upgrades; copy bytes both ways until close.
@@ -568,7 +585,12 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
     }
     fn verify_tls13_signature(
         &self,
@@ -576,7 +598,12 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
     }
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
@@ -768,7 +795,8 @@ async fn proxy_request(
 
     // ── forward upstream ──
     let up_body: Option<reqwest::Body> = if let Some((prefix, rest)) = req_stream.take() {
-        let s = futures::stream::iter(prefix.into_iter().map(Ok::<Bytes, std::io::Error>)).chain(rest);
+        let s =
+            futures::stream::iter(prefix.into_iter().map(Ok::<Bytes, std::io::Error>)).chain(rest);
         Some(reqwest::Body::wrap_stream(s))
     } else if req_bytes.is_empty() {
         None
@@ -776,15 +804,40 @@ async fn proxy_request(
         Some(reqwest::Body::from(req_bytes.clone()))
     };
     let started = std::time::Instant::now();
-    let resp = match send_upstream(&ctx.client, &method, &url, &req_headers, up_body, &ctx.shared)
-        .await
+    let resp = match send_upstream(
+        &ctx.client,
+        &method,
+        &url,
+        &req_headers,
+        up_body,
+        &ctx.shared,
+    )
+    .await
     {
         Ok(resp) => resp,
         Err(e) => {
             // Never reached the server (DNS / connect / upstream TLS).
             let dur_ms = started.elapsed().as_millis() as u64;
             if in_scope {
-                capture(&ctx, error_flow(&id, &method, &scheme, &host, &path, &req_headers, &req_bytes, req_streaming, None, &[], dur_ms, e.to_string(), matched.clone(), modified));
+                capture(
+                    &ctx,
+                    error_flow(
+                        &id,
+                        &method,
+                        &scheme,
+                        &host,
+                        &path,
+                        &req_headers,
+                        &req_bytes,
+                        req_streaming,
+                        None,
+                        &[],
+                        dur_ms,
+                        e.to_string(),
+                        matched.clone(),
+                        modified,
+                    ),
+                );
             }
             return Ok(error_response(StatusCode::BAD_GATEWAY, &e.to_string()));
         }
@@ -833,7 +886,25 @@ async fn proxy_request(
         BodyRead::Error(e) => {
             let dur_ms = started.elapsed().as_millis() as u64;
             if in_scope {
-                capture(&ctx, error_flow(&id, &method, &scheme, &host, &path, &req_headers, &req_bytes, req_streaming, Some(status_code), &resp_headers, dur_ms, e.clone(), matched.clone(), modified));
+                capture(
+                    &ctx,
+                    error_flow(
+                        &id,
+                        &method,
+                        &scheme,
+                        &host,
+                        &path,
+                        &req_headers,
+                        &req_bytes,
+                        req_streaming,
+                        Some(status_code),
+                        &resp_headers,
+                        dur_ms,
+                        e.clone(),
+                        matched.clone(),
+                        modified,
+                    ),
+                );
             }
             return Ok(error_response(StatusCode::BAD_GATEWAY, &e));
         }
@@ -1070,7 +1141,10 @@ fn content_length(headers: &[(String, String)]) -> Option<u64> {
 async fn read_body_capped(resp: reqwest::Response, headers: &[(String, String)]) -> BodyRead {
     let len_hint = content_length(headers);
     let force = is_streaming_content_type(headers);
-    let stream: ByteStream = Box::pin(resp.bytes_stream().map(|r| r.map_err(std::io::Error::other)));
+    let stream: ByteStream = Box::pin(
+        resp.bytes_stream()
+            .map(|r| r.map_err(std::io::Error::other)),
+    );
     read_stream_capped(stream, force, len_hint, BUFFER_CAP).await
 }
 
@@ -1896,7 +1970,10 @@ mod tests {
 
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         gz.write_all(&plain).unwrap();
-        assert_eq!(decompress(&ce("gzip"), &gz.finish().unwrap()).unwrap(), plain);
+        assert_eq!(
+            decompress(&ce("gzip"), &gz.finish().unwrap()).unwrap(),
+            plain
+        );
 
         let mut br = Vec::new();
         {
@@ -1950,8 +2027,11 @@ mod tests {
         }
 
         // Exceeds the cap → spill to Streamed, keeping the pulled prefix.
-        match read_stream_capped(chunks(vec![b"aaaa", b"bbbb", b"cccc"]), false, Some(12), 6).await {
-            BodyRead::Streamed { prefix, len_hint, .. } => {
+        match read_stream_capped(chunks(vec![b"aaaa", b"bbbb", b"cccc"]), false, Some(12), 6).await
+        {
+            BodyRead::Streamed {
+                prefix, len_hint, ..
+            } => {
                 assert_eq!(len_hint, Some(12));
                 assert!(prefix.iter().map(|c| c.len()).sum::<usize>() > 6);
             }
@@ -1979,7 +2059,10 @@ mod tests {
     fn make_flow_streamed_request_drops_body_and_uses_content_length() {
         let headers = vec![
             ("Content-Length".to_string(), "1048576".to_string()),
-            ("Content-Type".to_string(), "application/octet-stream".to_string()),
+            (
+                "Content-Type".to_string(),
+                "application/octet-stream".to_string(),
+            ),
         ];
         let rec = super::make_flow(super::FlowParts {
             id: "f1",
@@ -2020,7 +2103,10 @@ mod tests {
     #[test]
     fn redact_headers_masks_only_sensitive() {
         let mut headers = vec![
-            ("Authorization".to_string(), "Bearer secret-token".to_string()),
+            (
+                "Authorization".to_string(),
+                "Bearer secret-token".to_string(),
+            ),
             ("Content-Type".to_string(), "application/json".to_string()),
             ("set-cookie".to_string(), "session=abc".to_string()),
             ("X-Trace".to_string(), "keep-me".to_string()),
@@ -2037,9 +2123,15 @@ mod tests {
         // A peer alert during the handshake reads as "app doesn't trust the CA".
         let alert = io::Error::other("received fatal alert: UnknownCA");
         let reason = tls_failure_reason(&alert);
-        assert!(reason.contains("rejected the proxy's TLS certificate"), "{reason}");
+        assert!(
+            reason.contains("rejected the proxy's TLS certificate"),
+            "{reason}"
+        );
         assert!(reason.contains("net trust"), "{reason}");
-        assert!(reason.contains("UnknownCA"), "raw error preserved: {reason}");
+        assert!(
+            reason.contains("UnknownCA"),
+            "raw error preserved: {reason}"
+        );
 
         // Anything else is reported as a lower-level handshake failure.
         let reset = io::Error::other("connection reset by peer");

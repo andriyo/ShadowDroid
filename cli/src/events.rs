@@ -302,6 +302,43 @@ pub fn emit(value: &impl Serialize) {
     );
 }
 
+/// Crash/ANR events found by the since-last-command probe, staged for the very
+/// next envelope this process emits (action, raw read, or error) as an
+/// `"events":[…]` key. One-shot: each CLI invocation emits exactly one result
+/// object, so the slot is drained by whichever envelope goes out. Resolved
+/// values only (the probe is awaited before stashing) — emission stays sync.
+static PENDING_EVENTS: std::sync::Mutex<Option<Vec<serde_json::Value>>> =
+    std::sync::Mutex::new(None);
+
+/// Stage probe results for the next emitted envelope. Empty input is a no-op.
+pub fn stash_events(events: Vec<serde_json::Value>) {
+    if events.is_empty() {
+        return;
+    }
+    if let Ok(mut slot) = PENDING_EVENTS.lock() {
+        *slot = Some(events);
+    }
+}
+
+fn take_events() -> Option<Vec<serde_json::Value>> {
+    PENDING_EVENTS.lock().ok().and_then(|mut slot| slot.take())
+}
+
+/// Inject staged events into an envelope map (no-op when none are staged).
+fn attach_events(m: &mut serde_json::Map<String, serde_json::Value>) {
+    if let Some(events) = take_events() {
+        m.insert("events".into(), serde_json::Value::Array(events));
+    }
+}
+
+/// Attach staged events to an arbitrary top-level JSON object (used by raw
+/// reads like `ui dump`, which don't go through the action envelope).
+pub fn attach_events_to(value: &mut serde_json::Value) {
+    if let serde_json::Value::Object(m) = value {
+        attach_events(m);
+    }
+}
+
 /// Build the `{"type":"action","cmd":…, …body}` envelope. Split from
 /// [`emit_action`] so the contract can be unit-tested without capturing stdout.
 fn action_envelope(cmd: &str, body: &serde_json::Value) -> serde_json::Value {
@@ -313,6 +350,7 @@ fn action_envelope(cmd: &str, body: &serde_json::Value) -> serde_json::Value {
             m.insert(k.clone(), v.clone());
         }
     }
+    attach_events(&mut m);
     serde_json::Value::Object(m)
 }
 
@@ -340,6 +378,10 @@ fn error_envelope(
             m.insert(k, v);
         }
     }
+    // A failed action still reports what happened around it — a tap that
+    // errored with element_not_found *because the app crashed* carries the
+    // crash in the same error line.
+    attach_events(&mut m);
     serde_json::Value::Object(m)
 }
 
@@ -362,6 +404,7 @@ mod tests {
 
     #[test]
     fn action_envelope_has_type_and_cmd_and_no_ts() {
+        let _guard = ENVELOPE_TEST_LOCK.lock().unwrap();
         let v = action_envelope("tap", &serde_json::json!({"x": 1, "matched": true}));
         assert_eq!(v["type"], "action");
         assert_eq!(v["cmd"], "tap");
@@ -373,6 +416,7 @@ mod tests {
 
     #[test]
     fn error_envelope_has_required_fields_and_no_ts() {
+        let _guard = ENVELOPE_TEST_LOCK.lock().unwrap();
         let v = error_envelope(
             "usage",
             "usage",
@@ -409,6 +453,41 @@ mod tests {
             input: false,
         }
     }
+
+    #[test]
+    fn stashed_events_ride_the_next_envelope_once() {
+        // Serialized via a lock so parallel tests don't race the global slot.
+        let _guard = ENVELOPE_TEST_LOCK.lock().unwrap();
+        stash_events(vec![serde_json::json!({"type":"crash","kind":"java"})]);
+        let v = action_envelope("tap", &serde_json::json!({"x": 1}));
+        assert_eq!(v["events"][0]["kind"], "java");
+        // Drained: the next envelope is clean.
+        let v2 = action_envelope("tap", &serde_json::json!({"x": 1}));
+        assert!(v2.get("events").is_none(), "{v2}");
+    }
+
+    #[test]
+    fn stashed_events_ride_error_envelopes() {
+        let _guard = ENVELOPE_TEST_LOCK.lock().unwrap();
+        stash_events(vec![serde_json::json!({"type":"crash","kind":"anr"})]);
+        let v = error_envelope(
+            "run",
+            "element_not_found",
+            "no match",
+            serde_json::json!({}),
+        );
+        assert_eq!(v["events"][0]["kind"], "anr");
+    }
+
+    #[test]
+    fn empty_stash_is_a_no_op() {
+        let _guard = ENVELOPE_TEST_LOCK.lock().unwrap();
+        stash_events(Vec::new());
+        let v = action_envelope("tap", &serde_json::json!({}));
+        assert!(v.get("events").is_none(), "{v}");
+    }
+
+    static ENVELOPE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn compact_element_drops_bounds_and_false_flags() {

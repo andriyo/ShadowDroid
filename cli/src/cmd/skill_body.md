@@ -71,6 +71,69 @@ shadowdroid ui wait --pkg-not com.example.app     # wait for the foreground to L
 shadowdroid ui screenshot /tmp/after.png          # writes the PNG; result includes width/height + screen_hash (compare to ui wait's)
 ```
 
+### Collapse the loop: `--observe` and `--if-screen`
+
+The loop-fusion verbs (`tap`, `text`, `key`, `back`, `home`, swipes, drags,
+pinch) take two flags that cut round-trips:
+
+```bash
+shadowdroid ui tap --text "Sign in" --observe       # response includes the post-action compact screen — no follow-up dump
+shadowdroid ui tap --text "Buy" --if-screen a1b2c3d4e5f67890   # only act if the screen still matches this hash
+```
+
+`--observe` waits for the action to settle (`--observe-delay-ms`, default 150)
+and attaches the resulting screen under `screen` in the same response.
+`--if-screen <hash>` is optimistic concurrency for the UI: pass the
+`screen_hash` from your last read; if a dialog or navigation changed the screen
+in between, the command **refuses to act** and fails with
+`code:"screen_changed"` — with the fresh compact screen in `detail.screen`, so
+the failure is your re-observe. Combine both for a check-act-observe cycle in
+one call.
+
+### Crashes surface on your next command — no watcher needed
+
+Every `ui` and `app` response (success or error) carries an `events` array when
+the app **crashed or ANRed since your previous command**:
+
+```json
+{"type":"action","cmd":"wait","matched":false,"timeout":true,
+ "events":[{"type":"crash","kind":"java","package":"com.example.app",
+            "exception":"java.lang.IllegalStateException","stack":["…top 5 frames…"]}]}
+```
+
+If you tap and the app dies, your next `ui dump` says so — you don't have to
+guess why the launcher is suddenly on screen. No `events` key means nothing
+crashed. (`SHADOWDROID_NO_EVENTS=1` disables the probe.)
+
+## When something looks wrong: `why` and `log`
+
+`why` is one bounded read answering "what just went wrong?" — reach for it
+after any surprise instead of a forensic command sequence:
+
+```bash
+shadowdroid why | jq '{verdict, explanation, hints}'
+shadowdroid why | jq '.evidence.crash.project_frames'   # your-code stack frames, mapped to files
+```
+
+It fuses the last crash/ANR (stack frames mapped into your project's source
+files when a project root is configured), recent error-level logs, the current
+screen, and network failures (when the `net` proxy runs) into an explicit
+`verdict` (`app_crashed`, `app_not_responding`, `tls_rejected`,
+`backend_errors`, `app_not_foreground`, …) with `evidence` and next-step
+`hints`. Read-only; works even when the on-device server is down.
+
+`log` is structured, bounded logcat — never raw-tail `adb logcat`:
+
+```bash
+shadowdroid log --last 2m                  # configured app's lines + parsed crashes, deduped
+shadowdroid log --level e --grep "auth"    # error-level lines matching a regex
+shadowdroid log --all --last 30s --max 50  # every process, tightly capped
+```
+
+One JSON object per line (`{"type":"log",…}` entries, `{"type":"crash",…}`
+parsed blocks with `project_frames`), then an action summary. Scoped to the
+configured app by default; repeated lines collapse with a `repeat` count.
+
 `--text`/`--desc` match a **normalized, case-insensitive substring** by default:
 before comparing, surrounding whitespace is collapsed, curly quotes/ellipsis are
 folded to ASCII, and zero-width characters are stripped — so `--text "sign in"`
@@ -219,18 +282,28 @@ otherwise hijacks the first text-field focus.
 ## When something breaks
 
 ```bash
+shadowdroid why               # what just went wrong? verdict + evidence + hints
+shadowdroid log --last 5m     # what did the app log? (structured, bounded)
 shadowdroid doctor            # device state / APK / forward / server / owners / clock
 shadowdroid doctor --fix      # repair (reinstall, re-forward, restart)
 shadowdroid collect --app com.example.app   # bundle logs+screen+screenshot+diagnostics
 ```
 
+Failures explain themselves: selector misses come back with `top_texts` (what
+IS on screen) and `closest` (ranked near-matches for what you searched);
+`ui wait` timeouts carry `top_texts` and `current_app`; `screen_changed`
+carries the fresh screen; crashes ride the `events` key of whatever you run
+next. Prefer reading the error's `detail` over immediately re-dumping.
+
 ## Output contract
 
-Every command prints exactly one JSON object on **stdout**: successes as
+Most one-shot commands print exactly one JSON object on **stdout**: successes as
 `{"type":"action","cmd":…}` (or a read's payload), failures as
-`{"type":"error","code":…,"msg":…}`. Even unknown-flag / usage errors are JSON
-and name the offending flag (with a spelling suggestion). Parse stdout and
-branch on `type`; never scrape human text.
+`{"type":"error","code":…,"msg":…}`. JSONL commands are explicit: `watch`
+streams one event per line, and `log` prints filtered log/crash lines followed
+by a summary. Parse stdout as JSON, line by line for JSONL commands, and branch
+on `type`; never scrape human text. Even unknown-flag / usage errors are JSON
+and name the offending flag with a spelling suggestion.
 
 ShadowDroid's own operational logs go to **stderr**, so `… | jq` already sees
 clean JSON. If you merge streams with `2>&1`, or just want the tidiest output,
