@@ -220,8 +220,8 @@ pub enum Cmd {
     Usage(crate::cmd::usage::UsageCmd),
     /// Inspect, generate, and validate user/project JSON config.
     Config(crate::cmd::config::ConfigArgs),
-    /// Generate or refresh an agent-integration file (claude-code / cursor /
-    /// codex / gemini / antigravity); `skill --sync` updates installed ones.
+    /// Generate, install, or refresh Agent Skills (claude-code / cursor /
+    /// codex / gemini / antigravity) at user or project scope.
     Skill(crate::cmd::skill::SkillArgs),
     /// Detect Android Studio and install the ShadowDroid Android Studio plugin.
     Studio(crate::cmd::studio::StudioArgs),

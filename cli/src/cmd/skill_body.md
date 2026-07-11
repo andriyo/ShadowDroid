@@ -358,7 +358,8 @@ project automatically.
 Installed ShadowDroid skills carry a version/hash marker. Safe refresh is:
 
 ```bash
-shadowdroid skill --sync
+shadowdroid skill --sync                 # user-scoped installs
+shadowdroid skill --sync --scope project # current project installs
 ```
 
 Pristine older skills are refreshed. Customized or markerless files are

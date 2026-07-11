@@ -1,10 +1,11 @@
-//! `shadowdroid skill <agent> [--out PATH | --install]` — generate an
-//! agent-integration file so a coding agent knows how to drive Android with
-//! ShadowDroid. Agents: claude-code, cursor, codex, gemini, antigravity (the
-//! last four match the set Android's own CLI installs skills for).
+//! `shadowdroid skill <agent> [--out PATH | --install [--scope user|project]]`
+//! — generate an Agent Skills `SKILL.md` so a coding agent knows how to drive
+//! Android with ShadowDroid. Agents: claude-code, cursor, codex, gemini, and
+//! antigravity.
 //!
 //! One curated body (driving guidance, in the current grammar) is wrapped in
-//! the right frontmatter/location per agent, with an auto-generated command
+//! standard frontmatter and the right discovery location per agent/scope, with
+//! an auto-generated command
 //! reference appended from the live introspection catalog ([crate::cmd::introspect])
 //! so it never drifts from the actual CLI. Prints to stdout by default;
 //! `--out` writes a chosen path; `--install` writes the agent's conventional
@@ -29,17 +30,20 @@ use crate::hostenv::home_dir;
 pub struct SkillArgs {
     /// Target agent system. Omit together with `--sync` to refresh every
     /// already-installed skill instead.
-    #[arg(value_parser = ["claude-code", "cursor", "codex", "gemini", "antigravity"])]
+    #[arg(
+        value_parser = ["claude-code", "cursor", "codex", "gemini", "antigravity"],
+        conflicts_with = "sync"
+    )]
     pub agent: Option<String>,
-    /// Write the generated file to this path (default: print to stdout).
-    #[arg(short = 'o', long)]
+    /// Write the generated SKILL.md to this path (default: print to stdout).
+    #[arg(short = 'o', long, conflicts_with_all = ["install", "sync"])]
     pub out: Option<PathBuf>,
-    /// Write to the agent's conventional location instead of stdout.
-    ///
-    /// claude-code / cursor / gemini / antigravity installs are global under
-    /// $HOME; codex installs are project-scoped, relative to the CWD.
-    #[arg(long)]
+    /// Install to the agent's conventional skill directory instead of stdout.
+    #[arg(long, conflicts_with = "sync")]
     pub install: bool,
+    /// Installation/sync scope. User is global; project is relative to the CWD.
+    #[arg(long, value_enum, value_name = "SCOPE", default_value = "user")]
+    pub scope: SkillScope,
     /// Refresh every already-installed ShadowDroid skill to this CLI's version.
     /// Unmodified skills are rewritten in place; skills you've hand-edited are
     /// left alone and reported — unless you also pass --force.
@@ -51,6 +55,22 @@ pub struct SkillArgs {
     pub force: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
+pub enum SkillScope {
+    #[default]
+    User,
+    Project,
+}
+
+impl SkillScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Project => "project",
+        }
+    }
+}
+
 const DESCRIPTION: &str = "Develop and debug Android apps with predictable structured JSON via the \
 `shadowdroid` CLI: deploy and control apps/devices, inspect and automate UI, diagnose logs/crashes, \
 debug and inspect layouts, capture/intercept OkHttp traffic, and manage permissions/files. Use for \
@@ -59,7 +79,7 @@ underlying build engine.";
 
 pub fn run(args: &SkillArgs) -> Result<()> {
     if args.sync {
-        return sync_skills(args.force);
+        return sync_skills(args.scope, args.force);
     }
     let agent = args.agent.as_deref().ok_or_else(|| {
         anyhow!("specify an agent (claude-code|cursor|codex|gemini|antigravity), or pass --sync to refresh installed skills")
@@ -68,12 +88,12 @@ pub fn run(args: &SkillArgs) -> Result<()> {
     let path = if let Some(out) = &args.out {
         Some(out.clone())
     } else if args.install {
-        Some(conventional_path(agent)?)
+        Some(conventional_path(agent, args.scope)?)
     } else {
         None
     };
 
-    let content = generated_content(agent, path.as_deref(), args.install)?;
+    let content = generated_content(agent)?;
 
     match path {
         Some(p) => {
@@ -82,9 +102,10 @@ pub fn run(args: &SkillArgs) -> Result<()> {
             let mut payload = json!({
                     "agent": agent, "path": p.display().to_string(),
                     "absolute_path": absolute_path.display().to_string(),
+                    "scope": if args.install { Some(args.scope.as_str()) } else { None },
                     "bytes": content.len(),
             });
-            if let Some(note) = install_note(agent, &p, args.install) {
+            if let Some(note) = install_note(agent, args.scope, args.install) {
                 payload["note"] = Value::String(note.to_string());
             }
             crate::events::emit_action("skill", &payload);
@@ -94,18 +115,17 @@ pub fn run(args: &SkillArgs) -> Result<()> {
     Ok(())
 }
 
-/// Install the conventional ShadowDroid skill files that are safe to manage
-/// automatically. Global skill locations are always created/updated. Codex's
-/// `AGENTS.md` is project-scoped, so this only refreshes it when it already
-/// exists and is ShadowDroid-generated.
+/// Install the conventional user-scoped ShadowDroid skills that are safe to
+/// manage automatically. Project skills stay explicit because `init` may run
+/// from an arbitrary directory.
 pub fn install_default_skills() -> Value {
     let mut installed = Vec::new();
-    let mut skipped = Vec::new();
+    let skipped: Vec<Value> = Vec::new();
     let mut failed = Vec::new();
 
-    for agent in ["claude-code", "cursor", "gemini", "antigravity"] {
-        match conventional_path(agent)
-            .and_then(|path| install_skill_at(agent, &path, true).map(|bytes| (path, bytes)))
+    for agent in ["claude-code", "cursor", "codex", "gemini", "antigravity"] {
+        match conventional_path(agent, SkillScope::User)
+            .and_then(|path| install_skill_at(agent, &path).map(|bytes| (path, bytes)))
         {
             Ok((path, bytes)) => installed.push(json!({
                 "agent": agent,
@@ -114,40 +134,6 @@ pub fn install_default_skills() -> Value {
             })),
             Err(err) => failed.push(json!({"agent": agent, "error": err.to_string()})),
         }
-    }
-
-    let codex_path = PathBuf::from("AGENTS.md");
-    if codex_path.exists() {
-        match inspect("codex", &codex_path) {
-            Ok((Decision::UpToDate, _)) => installed.push(json!({
-                "agent": "codex",
-                "path": codex_path.display().to_string(),
-                "bytes": std::fs::metadata(&codex_path).map(|m| m.len()).unwrap_or(0),
-                "already_current": true,
-            })),
-            Ok((Decision::NormalizeMarker | Decision::StalePristine(_), expected)) => {
-                match write_skill(&codex_path, &expected) {
-                    Ok(()) => installed.push(json!({
-                        "agent": "codex",
-                        "path": codex_path.display().to_string(),
-                        "bytes": expected.len(),
-                    })),
-                    Err(err) => failed.push(json!({"agent": "codex", "error": err.to_string()})),
-                }
-            }
-            Ok((Decision::Customized | Decision::Untracked, _)) => skipped.push(json!({
-                "agent": "codex",
-                "path": codex_path.display().to_string(),
-                "reason": "existing AGENTS.md is not ShadowDroid-generated",
-            })),
-            Err(err) => failed.push(json!({"agent": "codex", "error": err.to_string()})),
-        }
-    } else {
-        skipped.push(json!({
-            "agent": "codex",
-            "path": codex_path.display().to_string(),
-            "reason": "AGENTS.md is project-scoped; run `shadowdroid skill codex --install` from the repo root to create it",
-        }));
     }
 
     json!({
@@ -160,8 +146,8 @@ pub fn install_default_skills() -> Value {
     })
 }
 
-fn install_skill_at(agent: &str, path: &Path, install: bool) -> Result<usize> {
-    let content = generated_content(agent, Some(path), install)?;
+fn install_skill_at(agent: &str, path: &Path) -> Result<usize> {
+    let content = generated_content(agent)?;
     let bytes = content.len();
     write_skill_checked(agent, path, &content, false)?;
     Ok(bytes)
@@ -176,118 +162,78 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
         .join(path))
 }
 
-fn install_note(agent: &str, path: &Path, install: bool) -> Option<&'static str> {
-    match agent {
-        "claude-code" => Some(
-            "Claude Code skills are global; restart or reload Claude Code if it was already running.",
+fn install_note(agent: &str, scope: SkillScope, install: bool) -> Option<&'static str> {
+    if !install {
+        return Some(
+            "This is an Agent Skills SKILL.md; place it in a supported <skills>/<name>/SKILL.md directory.",
+        );
+    }
+    match (agent, scope) {
+        ("claude-code", SkillScope::User) => Some(
+            "Claude Code personal skill installed. A newly created top-level skills directory may require restarting Claude Code.",
         ),
-        "cursor" if install || is_cursor_skill_path(path) => Some(
-            "Cursor personal skills are global. Restart or reload Cursor if it was already running. For a project rule instead, pass --out <project>/.cursor/rules/shadowdroid.mdc.",
+        ("cursor", SkillScope::User) => Some(
+            "Cursor personal skill installed. Restart Cursor if it does not appear in the skills list.",
         ),
-        "cursor" => Some(
-            "Cursor project rules are workspace-scoped. Open the matching project folder in Cursor, or use --install for a global personal skill.",
+        ("codex", SkillScope::User) => Some(
+            "Codex user skill installed. Codex detects changes automatically; restart if it does not appear in /skills.",
         ),
-        "codex" => Some(
-            "Codex AGENTS.md instructions are project-scoped; place the file at the repo root opened by Codex.",
+        ("gemini", SkillScope::User) => Some(
+            "Gemini CLI user skill installed. Use `/skills reload` or restart Gemini CLI.",
         ),
-        "gemini" => Some(
-            "Gemini CLI skills are global (~/.gemini/skills). Restart Gemini CLI if it was already running.",
+        ("antigravity", SkillScope::User) => Some(
+            "Antigravity global skill installed. Use `/skills` to verify discovery.",
         ),
-        "antigravity" => Some(
-            "Antigravity skills are global (~/.gemini/antigravity*). Restart Antigravity if it was already running.",
+        ("claude-code", SkillScope::Project) => Some(
+            "Claude Code project skill installed relative to the current directory.",
+        ),
+        (_, SkillScope::Project) => Some(
+            "Shared project skill installed under .agents/skills; Codex, Cursor, Gemini CLI, and Antigravity can discover it.",
         ),
         _ => None,
     }
 }
 
-/// The agent's conventional integration location (relative to $HOME or $CWD).
-fn conventional_path(agent: &str) -> Result<PathBuf> {
+/// The agent's conventional skill location (relative to $HOME or the CWD).
+fn conventional_path(agent: &str, scope: SkillScope) -> Result<PathBuf> {
+    if scope == SkillScope::Project {
+        return Ok(match agent {
+            "claude-code" => PathBuf::from(".claude/skills/shadowdroid/SKILL.md"),
+            "cursor" | "codex" | "gemini" | "antigravity" => {
+                PathBuf::from(".agents/skills/shadowdroid/SKILL.md")
+            }
+            other => return Err(anyhow!("unknown agent '{other}'")),
+        });
+    }
+
     let home = home_dir()?;
     Ok(match agent {
         "claude-code" => home.join(".claude/skills/shadowdroid/SKILL.md"),
         "cursor" => home.join(".cursor/skills/shadowdroid/SKILL.md"),
+        "codex" => home.join(".agents/skills/shadowdroid/SKILL.md"),
         "gemini" => home.join(".gemini/skills/shadowdroid/SKILL.md"),
-        "antigravity" => antigravity_skill_path(&home),
-        "codex" => PathBuf::from("AGENTS.md"),
+        "antigravity" => home.join(".gemini/config/skills/shadowdroid/SKILL.md"),
         other => return Err(anyhow!("unknown agent '{other}'")),
     })
 }
 
-/// Antigravity's global skills dir is cited as both `.gemini/antigravity-cli`
-/// (Antigravity guides) and `.gemini/antigravity` (Android's CLI docs); use
-/// whichever already exists, else default to the former.
-fn antigravity_skill_path(home: &Path) -> PathBuf {
-    for sub in [".gemini/antigravity-cli", ".gemini/antigravity"] {
-        let dir = home.join(sub);
-        if dir.is_dir() {
-            return dir.join("skills/shadowdroid/SKILL.md");
-        }
-    }
-    home.join(".gemini/antigravity-cli/skills/shadowdroid/SKILL.md")
-}
-
-fn content_for_destination(
-    agent: &str,
-    body: &str,
-    path: Option<&Path>,
-    install: bool,
-) -> Result<String> {
-    if agent == "cursor" {
-        if install || path.is_some_and(is_cursor_skill_path) {
-            return Ok(wrap_skill_md(body));
-        }
-        if path.is_some_and(is_cursor_project_rule_path) {
-            return Ok(wrap_cursor_project_rule(body));
-        }
-    }
-    wrap_for_agent(agent, body)
-}
-
-fn is_cursor_skill_path(path: &Path) -> bool {
-    let raw = normalized_path(path);
-    raw.contains(".cursor/skills") || path.file_name().is_some_and(|name| name == "SKILL.md")
-}
-
-fn is_cursor_project_rule_path(path: &Path) -> bool {
-    let raw = normalized_path(path);
-    raw.contains(".cursor/rules")
-        || path
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("mdc"))
-}
-
+#[cfg(test)]
 fn normalized_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
 fn wrap_for_agent(agent: &str, body: &str) -> Result<String> {
-    Ok(match agent {
-        // SKILL.md (name + description frontmatter) — Claude Code, Gemini CLI,
-        // and Antigravity all consume this identical shape.
-        "claude-code" | "gemini" | "antigravity" => wrap_skill_md(body),
-        // Cursor stdout defaults to a project rule because that is the most
-        // copy-paste friendly format for an arbitrary destination.
-        "cursor" => wrap_cursor_project_rule(body),
-        // Codex / generic AGENTS.md: a self-contained section, no frontmatter.
-        "codex" => format!("# ShadowDroid — driving Android\n\n{body}\n"),
-        other => {
-            return Err(anyhow!(
-                "unknown agent '{other}' (claude-code|cursor|codex|gemini|antigravity)"
-            ));
-        }
-    })
+    match agent {
+        "claude-code" | "cursor" | "codex" | "gemini" | "antigravity" => Ok(wrap_skill_md(body)),
+        other => Err(anyhow!(
+            "unknown agent '{other}' (claude-code|cursor|codex|gemini|antigravity)"
+        )),
+    }
 }
 
 fn wrap_skill_md(body: &str) -> String {
     format!(
         "---\nname: shadowdroid\ndescription: {desc}\n---\n\n# ShadowDroid\n\n{body}\n",
-        desc = DESCRIPTION,
-    )
-}
-
-fn wrap_cursor_project_rule(body: &str) -> String {
-    format!(
-        "---\ndescription: {desc}\nglobs:\nalwaysApply: false\n---\n\n# ShadowDroid\n\n{body}\n",
         desc = DESCRIPTION,
     )
 }
@@ -301,10 +247,10 @@ fn wrap_cursor_project_rule(body: &str) -> String {
 
 const MARKER_PREFIX: &str = "<!-- shadowdroid-skill ";
 
-/// Build the full file: curated body + per-destination wrapper + version marker.
-fn generated_content(agent: &str, dest: Option<&Path>, install: bool) -> Result<String> {
+/// Build the full file: curated body + standard wrapper + version marker.
+fn generated_content(agent: &str) -> Result<String> {
     let body = format!("{}\n\n{}", SKILL_BODY.trim(), command_reference());
-    let core = content_for_destination(agent, &body, dest, install)?;
+    let core = wrap_for_agent(agent, &body)?;
     Ok(append_marker(&core))
 }
 
@@ -417,22 +363,17 @@ fn write_skill_checked(agent: &str, path: &Path, content: &str, force: bool) -> 
 
 // ── detect + refresh installed skills ─────────────────────────────────────
 
-/// The auto-refreshable global skill locations (single-purpose SKILL.md files
-/// under $HOME). Codex's AGENTS.md and Cursor project `.mdc` rules are
-/// project-scoped and may hold unrelated content, so they're excluded.
-fn global_skill_targets() -> Vec<(&'static str, PathBuf)> {
-    let Ok(home) = home_dir() else {
-        return Vec::new();
-    };
-    vec![
-        (
-            "claude-code",
-            home.join(".claude/skills/shadowdroid/SKILL.md"),
-        ),
-        ("cursor", home.join(".cursor/skills/shadowdroid/SKILL.md")),
-        ("gemini", home.join(".gemini/skills/shadowdroid/SKILL.md")),
-        ("antigravity", antigravity_skill_path(&home)),
-    ]
+/// Auto-refreshable skill locations for one scope. Project targets are
+/// de-duplicated because four agents share `.agents/skills`.
+fn skill_targets(scope: SkillScope) -> Vec<(&'static str, PathBuf)> {
+    let mut seen = std::collections::HashSet::new();
+    ["claude-code", "codex", "cursor", "gemini", "antigravity"]
+        .into_iter()
+        .filter_map(|agent| {
+            let path = conventional_path(agent, scope).ok()?;
+            seen.insert(path.clone()).then_some((agent, path))
+        })
+        .collect()
 }
 
 enum Decision {
@@ -451,7 +392,7 @@ enum Decision {
 fn inspect(agent: &str, path: &Path) -> Result<(Decision, String)> {
     let installed =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let expected = generated_content(agent, Some(path), true)?;
+    let expected = generated_content(agent)?;
     if installed == expected {
         return Ok((Decision::UpToDate, expected));
     }
@@ -469,14 +410,14 @@ fn inspect(agent: &str, path: &Path) -> Result<(Decision, String)> {
 }
 
 /// `skill --sync`: refresh installed skills to this CLI's version.
-fn sync_skills(force: bool) -> Result<()> {
+fn sync_skills(scope: SkillScope, force: bool) -> Result<()> {
     let version = env!("CARGO_PKG_VERSION");
     let mut refreshed = Vec::new();
     let mut up_to_date = Vec::new();
     let mut skipped_customized = Vec::new();
     let mut skipped_untracked = Vec::new();
 
-    for (agent, path) in global_skill_targets() {
+    for (agent, path) in skill_targets(scope) {
         if !path.exists() {
             continue;
         }
@@ -514,6 +455,7 @@ fn sync_skills(force: bool) -> Result<()> {
 
     let mut payload = json!({
         "version": version,
+        "scope": scope.as_str(),
         "refreshed": refreshed, "up_to_date": up_to_date,
     });
     if !skipped_customized.is_empty() {
@@ -539,7 +481,7 @@ pub fn refresh_for_connect() -> Option<Value> {
     let mut refreshed = Vec::new();
     let mut need_sync: Vec<&str> = Vec::new();
 
-    for (agent, path) in global_skill_targets() {
+    for (agent, path) in skill_targets(SkillScope::User) {
         if !path.exists() {
             continue;
         }
@@ -655,32 +597,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cursor_install_uses_global_skill_format() {
-        let content = content_for_destination(
-            "cursor",
-            "body",
-            Some(Path::new("/home/user/.cursor/skills/shadowdroid/SKILL.md")),
-            true,
-        )
-        .unwrap();
-
-        assert!(content.starts_with("---\nname: shadowdroid\n"));
-        assert!(!content.contains("alwaysApply: false"));
-    }
-
-    #[test]
-    fn cursor_project_rule_output_uses_mdc_format() {
-        let content = content_for_destination(
-            "cursor",
-            "body",
-            Some(Path::new(".cursor/rules/shadowdroid.mdc")),
-            false,
-        )
-        .unwrap();
-
-        assert!(content.starts_with("---\ndescription: "));
-        assert!(content.contains("globs:\nalwaysApply: false"));
-        assert!(!content.contains("\nname: shadowdroid\n"));
+    fn every_agent_uses_standard_skill_md_format() {
+        for agent in ["claude-code", "cursor", "codex", "gemini", "antigravity"] {
+            let content = wrap_for_agent(agent, "body").unwrap();
+            assert!(
+                content.starts_with("---\nname: shadowdroid\ndescription: "),
+                "{agent}: {content}"
+            );
+            assert!(content.contains("# ShadowDroid"), "{agent}: {content}");
+            assert!(!content.contains("alwaysApply"), "{agent}: {content}");
+        }
     }
 
     #[test]
@@ -701,38 +627,44 @@ mod tests {
     }
 
     #[test]
-    fn new_agents_use_skill_md_format() {
-        for agent in ["gemini", "antigravity"] {
-            let c = wrap_for_agent(agent, "body").unwrap();
-            assert!(c.starts_with("---\nname: shadowdroid\n"), "{agent}: {c}");
-            assert!(c.contains("# ShadowDroid"), "{agent}");
+    fn user_paths_follow_current_agent_conventions() {
+        // Tolerant of an unset $HOME (e.g. minimal CI), since the path is built
+        // from it.
+        for (agent, suffix) in [
+            ("claude-code", ".claude/skills/shadowdroid/SKILL.md"),
+            ("cursor", ".cursor/skills/shadowdroid/SKILL.md"),
+            ("codex", ".agents/skills/shadowdroid/SKILL.md"),
+            ("gemini", ".gemini/skills/shadowdroid/SKILL.md"),
+            ("antigravity", ".gemini/config/skills/shadowdroid/SKILL.md"),
+        ] {
+            if let Ok(path) = conventional_path(agent, SkillScope::User) {
+                assert!(
+                    normalized_path(&path).ends_with(suffix),
+                    "{agent}: {}",
+                    path.display()
+                );
+            }
         }
     }
 
     #[test]
-    fn conventional_paths_for_new_agents() {
-        // Tolerant of an unset $HOME (e.g. minimal CI), since the path is built
-        // from it.
-        if let Ok(g) = conventional_path("gemini") {
-            assert!(
-                normalized_path(&g).ends_with(".gemini/skills/shadowdroid/SKILL.md"),
-                "{}",
-                g.display()
-            );
-        }
-        if let Ok(a) = conventional_path("antigravity") {
-            assert!(
-                normalized_path(&a).contains(".gemini/antigravity"),
-                "{}",
-                a.display()
+    fn project_paths_use_native_claude_and_shared_agent_skills() {
+        assert_eq!(
+            conventional_path("claude-code", SkillScope::Project).unwrap(),
+            PathBuf::from(".claude/skills/shadowdroid/SKILL.md")
+        );
+        for agent in ["cursor", "codex", "gemini", "antigravity"] {
+            assert_eq!(
+                conventional_path(agent, SkillScope::Project).unwrap(),
+                PathBuf::from(".agents/skills/shadowdroid/SKILL.md"),
+                "{agent}"
             );
         }
     }
 
     #[test]
     fn skill_marker_round_trips_and_flags_edits() {
-        let path = Path::new("/tmp/.claude/skills/shadowdroid/SKILL.md");
-        let content = generated_content("claude-code", Some(path), true).unwrap();
+        let content = generated_content("claude-code").unwrap();
 
         let (body, version, stored) = split_marker(&content).expect("marker present");
         assert_eq!(version, env!("CARGO_PKG_VERSION"));
@@ -757,7 +689,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("SKILL.md");
         std::fs::write(&path, "personal instructions\n").unwrap();
-        let generated = generated_content("claude-code", Some(&path), true).unwrap();
+        let generated = generated_content("claude-code").unwrap();
 
         let err = write_skill_checked("claude-code", &path, &generated, false).unwrap_err();
         assert_eq!(

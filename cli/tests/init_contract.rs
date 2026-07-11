@@ -57,8 +57,9 @@ fn json_success_with_skill_install_is_one_compact_terminal_action() {
             .as_array()
             .unwrap()
             .len()
-            >= 4
+            >= 5
     );
+    assert!(home.join(".agents/skills/shadowdroid/SKILL.md").is_file());
 }
 
 #[test]

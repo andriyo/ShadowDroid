@@ -702,25 +702,30 @@ command with complete construction data; omitting `--depth` emits the full tree.
 Schema version 2 carries canonical paths, global/command args, constraints,
 output contracts, and agent decision hints straight from the CLI definition.
 
-`shadowdroid init` installs/updates global agent skills automatically.
-Project-scoped Codex `AGENTS.md` remains explicit so installers do not write
-into an arbitrary current directory. `shadowdroid skill <agent>` is still
-available when you want a specific integration file, project-scoped output, or a
-dry run. Supported agents: `claude-code`, `cursor`, `codex`, `gemini`,
-`antigravity`.
+`shadowdroid init` installs/updates user-scoped agent skills automatically.
+Project installs remain explicit so initialization never writes into an
+arbitrary repository. `shadowdroid skill <agent>` prints a standard
+`SKILL.md`; add `--install` and choose `--scope user|project` to put it in the
+agent's discovery path. `AGENTS.md` is a separate always-on instruction
+mechanism, not a skill. Supported agents: `claude-code`, `cursor`, `codex`,
+`gemini`, `antigravity`.
 
 ```bash
-shadowdroid skill claude-code --install   # → ~/.claude/skills/shadowdroid/SKILL.md
-shadowdroid skill cursor      --install   # → ~/.cursor/skills/shadowdroid/SKILL.md
-shadowdroid skill gemini      --install   # → ~/.gemini/skills/shadowdroid/SKILL.md
-shadowdroid skill antigravity --install   # → ~/.gemini/antigravity*/skills/shadowdroid/SKILL.md
-shadowdroid skill codex                   # → prints an AGENTS.md section to stdout
-shadowdroid skill codex --install         # → writes ./AGENTS.md after a safety check
+shadowdroid skill claude-code --install # → ~/.claude/skills/shadowdroid/SKILL.md
+shadowdroid skill cursor      --install # → ~/.cursor/skills/shadowdroid/SKILL.md
+shadowdroid skill codex       --install # → ~/.agents/skills/shadowdroid/SKILL.md
+shadowdroid skill gemini      --install # → ~/.gemini/skills/shadowdroid/SKILL.md
+shadowdroid skill antigravity --install # → ~/.gemini/config/skills/shadowdroid/SKILL.md
 ```
 
-Cursor `--install` creates a personal skill available across projects; pass
-`--out /path/to/project/.cursor/rules/shadowdroid.mdc` to write a project-scoped
-Cursor rule instead.
+User scope is the default. For project scope, Claude Code uses
+`.claude/skills/shadowdroid/SKILL.md`; Codex, Cursor, Gemini CLI, and
+Antigravity share the interoperable `.agents/skills/shadowdroid/SKILL.md`:
+
+```bash
+shadowdroid skill codex       --install --scope project
+shadowdroid skill claude-code --install --scope project
+```
 
 Installed skills are version-stamped. After upgrading the CLI, refresh them in
 one shot. Pristine older files are rewritten; customized or markerless files
@@ -729,11 +734,12 @@ check. Pass `--force` only after reviewing the destination and intentionally
 choosing to replace it:
 
 ```bash
-shadowdroid skill --sync   # refresh every installed skill to this version
+shadowdroid skill --sync                 # refresh user-scoped installs
+shadowdroid skill --sync --scope project # refresh installs in the current project
 ```
 
-`connect` runs this refresh automatically (pristine skills only), so an upgraded
-CLI keeps its installed skills current with no extra step.
+`connect` refreshes user-scoped installs automatically (pristine skills only),
+so an upgraded CLI keeps personal skills current with no extra step.
 
 ## FAQ
 

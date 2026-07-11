@@ -154,8 +154,8 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         "skill" => Some(serde_json::json!({
             "use_when": ["Need to generate or refresh ShadowDroid instructions for a supported coding agent."],
             "output": "agent integration file content or install/sync JSON",
-            "side_effects": ["--install/--sync write conventional agent skill/rule files; existing customized or markerless files are preserved unless --force is explicit"],
-            "next_actions": ["skill --sync", "commands --json --depth 1", "init"]
+            "side_effects": ["--install/--sync write conventional Agent Skills SKILL.md files at --scope user|project; existing customized or markerless files are preserved unless --force is explicit"],
+            "next_actions": ["skill --sync", "skill --sync --scope project", "commands --json --depth 1", "init"]
         })),
         "studio" => Some(serde_json::json!({
             "use_when": ["Need Android Studio plugin installation/status for debugger, Layout Inspector, source mapping, or recomposition features."],
