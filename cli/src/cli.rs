@@ -776,7 +776,7 @@ pub enum NetCmd {
         )]
         canary_host: String,
     },
-    /// Proxy + device-wiring status (running? pointed at us? held flows).
+    /// Proxy + device-wiring status (daemon, http_proxy, and adb reverse).
     Status,
     /// Recall past flows from the session log.
     Log {
@@ -2152,7 +2152,9 @@ async fn dispatch_app_inner(
         }
         AppCmd::Start { package, activity } => {
             let package = require_app_package(client, config, serial, package, "app start").await?;
-            let r = client.app_start(&package, activity.as_deref()).await?;
+            let r =
+                app_start_with_transport_recovery(client, serial, &package, activity.as_deref())
+                    .await?;
             let mut body = json!({
                 "package": package,
                 "activity": r.activity,
@@ -2207,6 +2209,71 @@ async fn dispatch_app_inner(
             ))
         }
     }
+}
+
+async fn app_start_with_transport_recovery(
+    client: &ServerClient,
+    serial: &Serial,
+    package: &str,
+    activity: Option<&str>,
+) -> Result<crate::proto::AppStartResp> {
+    match client.app_start(package, activity).await {
+        Ok(response) => Ok(response),
+        Err(err) if is_transient_transport_error(&err) => {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                if let Some(component) = adb::foreground_activity(serial).await {
+                    if let Some(foreground_activity) =
+                        matching_started_activity(&component, package, activity)
+                    {
+                        return Ok(crate::proto::AppStartResp {
+                            ok: true,
+                            activity: Some(foreground_activity),
+                            launcher_activities: Vec::new(),
+                            warning: Some(
+                                "the server response was interrupted after launch; ShadowDroid verified the requested foreground activity through ADB"
+                                    .into(),
+                            ),
+                        });
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(err);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn matching_started_activity(
+    component: &str,
+    package: &str,
+    requested_activity: Option<&str>,
+) -> Option<String> {
+    let (foreground_package, foreground_activity) = component.split_once('/')?;
+    if foreground_package != package {
+        return None;
+    }
+    let normalize = |activity: &str| {
+        if activity.starts_with('.') {
+            format!("{package}{activity}")
+        } else {
+            activity.to_string()
+        }
+    };
+    let foreground_activity = normalize(foreground_activity);
+    if let Some(requested) = requested_activity {
+        let requested = requested
+            .split_once('/')
+            .map(|(component_package, activity)| (component_package == package).then_some(activity))
+            .unwrap_or(Some(requested))?;
+        if normalize(requested) != foreground_activity {
+            return None;
+        }
+    }
+    Some(foreground_activity)
 }
 
 async fn require_app_package(
@@ -3207,6 +3274,35 @@ mod tests {
         assert!(should_fall_back_to_adb(&anyhow::anyhow!(
             "connection refused"
         )));
+    }
+
+    #[test]
+    fn interrupted_app_start_recovery_requires_the_requested_foreground() {
+        let package = "io.github.andriyo.shadowdroid.sample";
+        assert_eq!(
+            matching_started_activity(
+                "io.github.andriyo.shadowdroid.sample/.MainActivity",
+                package,
+                Some(".MainActivity")
+            )
+            .as_deref(),
+            Some("io.github.andriyo.shadowdroid.sample.MainActivity")
+        );
+        assert!(matching_started_activity(
+            "io.github.andriyo.shadowdroid.sample/.AltLauncherActivity",
+            package,
+            Some(".MainActivity")
+        )
+        .is_none());
+        assert!(
+            matching_started_activity("com.android.launcher/.Launcher", package, None).is_none()
+        );
+        assert!(matching_started_activity(
+            "io.github.andriyo.shadowdroid.sample/.MainActivity",
+            package,
+            Some("other.package/.MainActivity")
+        )
+        .is_none());
     }
 
     #[test]

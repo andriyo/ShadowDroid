@@ -690,7 +690,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "app start" => Some(serde_json::json!({
             "use_when": ["Need to launch a package's default activity, or a specific launcher/activity with --activity when Android exposes several choices."],
-            "output": "app start action JSON including launched activity, launcher candidates, and ambiguity warnings",
+            "output": "app start action JSON including launched activity, launcher candidates, ambiguity warnings, and ADB-verified recovery when the server response is interrupted after launch",
             "side_effects": ["launches the app"],
             "next_commands": ["app wait <pkg> --front", "ui dump", "debug snapshot --app <pkg>"],
             "examples": ["app start com.example.app --activity .MainActivity"]
@@ -953,8 +953,8 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "next_commands": ["net status", "doctor --fix"]
         })),
         "net status" => Some(serde_json::json!({
-            "use_when": ["Need to verify whether the proxy daemon is running, the device points at it, or flows are held."],
-            "output": "net_status action JSON",
+            "use_when": ["Need to verify whether the proxy daemon is running and both the device http_proxy and adb reverse mapping point at it."],
+            "output": "net_status action JSON with separate http_proxy_matches and adb_reverse_matches wiring checks",
             "side_effects": ["none"],
             "next_commands": ["net start", "net stop", "watch"]
         })),

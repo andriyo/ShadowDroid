@@ -12,7 +12,10 @@ use adb_client::server::ADBServer;
 use adb_client::server_device::ADBServerDevice;
 use adb_client::ADBDeviceExt;
 use anyhow::{anyhow, bail, Context, Result};
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::task::spawn_blocking;
 use tracing::debug;
 
@@ -196,6 +199,82 @@ pub async fn reverse_remove(serial: impl Into<String>, device_port: u16) -> Resu
     })
     .await
     .context("reverse_remove task panicked")?
+}
+
+/// One `adb reverse --list` entry. The ADB server prefixes each line with an
+/// internal transport name; callers only care about the device and host socket
+/// endpoints that follow it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReverseMapping {
+    pub device: String,
+    pub host: String,
+}
+
+/// List reverse socket mappings for one device without shelling out to `adb`.
+/// `adb_client` 3.2 supports adding/removing reverse mappings but does not
+/// expose the protocol's `reverse:list-forward` command, so this read-only call
+/// uses the same local ADB server wire protocol directly.
+pub async fn reverse_list(serial: impl Into<String>) -> Result<Vec<ReverseMapping>> {
+    let serial = serial.into();
+    spawn_blocking(move || {
+        let mut stream = TcpStream::connect(("127.0.0.1", 5037))
+            .context("connect to local ADB server for reverse list")?;
+        let timeout = Some(Duration::from_secs(2));
+        stream.set_read_timeout(timeout)?;
+        stream.set_write_timeout(timeout)?;
+
+        adb_server_request(&mut stream, &format!("host:transport:{serial}"))?;
+        adb_server_request(&mut stream, "reverse:list-forward")?;
+        let body = adb_server_read_hex_body(&mut stream)?;
+        let output = String::from_utf8(body).context("ADB reverse list was not UTF-8")?;
+        Ok(parse_reverse_list(&output))
+    })
+    .await
+    .context("reverse_list task panicked")?
+}
+
+fn adb_server_request(stream: &mut TcpStream, command: &str) -> Result<()> {
+    let request = format!("{:04x}{command}", command.len());
+    stream.write_all(request.as_bytes())?;
+
+    let mut status = [0_u8; 4];
+    stream.read_exact(&mut status)?;
+    match &status {
+        b"OKAY" => Ok(()),
+        b"FAIL" => {
+            let message = String::from_utf8_lossy(&adb_server_read_hex_body(stream)?).into_owned();
+            bail!("ADB server rejected {command:?}: {message}")
+        }
+        other => bail!(
+            "unexpected ADB server response to {command:?}: {:?}",
+            String::from_utf8_lossy(other)
+        ),
+    }
+}
+
+fn adb_server_read_hex_body(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    let mut length = [0_u8; 4];
+    stream.read_exact(&mut length)?;
+    let length = usize::from_str_radix(std::str::from_utf8(&length)?, 16)
+        .context("parse ADB response length")?;
+    let mut body = vec![0_u8; length];
+    stream.read_exact(&mut body)?;
+    Ok(body)
+}
+
+fn parse_reverse_list(output: &str) -> Vec<ReverseMapping> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace().rev();
+            let host = fields.next()?;
+            let device = fields.next()?;
+            Some(ReverseMapping {
+                device: device.to_string(),
+                host: host.to_string(),
+            })
+        })
+        .collect()
 }
 
 /// Force-stop a package via `am force-stop`. Idempotent — safe to call when
@@ -457,7 +536,28 @@ fn parse_getprop_line(line: &str) -> Option<(&str, &str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_getprop_line, parse_ls_long};
+    use super::{parse_getprop_line, parse_ls_long, parse_reverse_list, ReverseMapping};
+
+    #[test]
+    fn parses_reverse_list_endpoints() {
+        let mappings = parse_reverse_list(
+            "host-16 tcp:8080 tcp:43127\ntransport-id-3 localabstract:debug tcp:9000\n",
+        );
+        assert_eq!(
+            mappings,
+            vec![
+                ReverseMapping {
+                    device: "tcp:8080".into(),
+                    host: "tcp:43127".into(),
+                },
+                ReverseMapping {
+                    device: "localabstract:debug".into(),
+                    host: "tcp:9000".into(),
+                },
+            ]
+        );
+        assert!(parse_reverse_list("\n").is_empty());
+    }
 
     #[test]
     fn parses_ls_long_format() {

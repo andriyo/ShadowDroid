@@ -93,7 +93,23 @@ pub async fn inspect(serial: &Serial, package: &str) -> Result<CheckReport> {
                 .to_string(),
         );
     }
-    if !trust.system_store && !trust.user_store {
+    let store_unreadable =
+        trust.system_store_status == "unreadable" || trust.user_store_status == "unreadable";
+    let store_mismatch =
+        trust.system_store_status == "mismatch" || trust.user_store_status == "mismatch";
+    if store_unreadable {
+        notes.push(
+            "Android denied shell readback of at least one trust store, so `net check` does not claim that the ShadowDroid CA is installed. Verify with a known HTTPS request and `net log`."
+                .to_string(),
+        );
+    }
+    if store_mismatch {
+        notes.push(
+            "A certificate exists at the ShadowDroid subject-hash path, but its identity does not match the active proxy CA. Reinstall the active CA before HTTPS interception."
+                .to_string(),
+        );
+    }
+    if !trust.system_store && !trust.user_store && !store_unreadable {
         notes.push(format!(
             "ShadowDroid CA was not found in the device trust stores. Recommended setup: `{}`.",
             trust.recommended_command
@@ -176,6 +192,12 @@ fn app_ca_trust_expectation(
         return (
             Some(true),
             "ShadowDroid CA is in the system store, which Android exposes to apps unless the client pins or bypasses the platform trust manager.".into(),
+        );
+    }
+    if trust.system_store_status == "unreadable" || trust.user_store_status == "unreadable" {
+        return (
+            None,
+            "Android denied shell readback of a trust store, so the active ShadowDroid CA identity could not be verified.".into(),
         );
     }
     if !trust.user_store {
@@ -268,6 +290,8 @@ mod tests {
             ca_generated: true,
             system_store: false,
             user_store: true,
+            system_store_status: "missing".into(),
+            user_store_status: "verified".into(),
             recommended_command: "shadowdroid net trust --auto".into(),
             recommendation_reason: "root".into(),
         };

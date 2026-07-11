@@ -89,6 +89,8 @@ pub struct TrustEvidence {
     pub ca_generated: bool,
     pub system_store: bool,
     pub user_store: bool,
+    pub system_store_status: String,
+    pub user_store_status: String,
     pub recommended_command: String,
     pub recommendation_reason: String,
 }
@@ -101,16 +103,18 @@ pub async fn evidence(serial: &Serial, play_store_image: bool) -> TrustEvidence 
         .await
         .map(|out| out.trim() == "0")
         .unwrap_or(false);
-    let (system_store, user_store) = if let Some(hash) = &hash {
+    let (system_status, user_status) = if let Some(hash) = &hash {
         let sys = format!("{SYSTEM_CACERTS}/{hash}.0");
         let usr = format!("{USER_CACERTS}/{hash}.0");
         (
-            cert_present(serial, &sys).await,
-            cert_present(serial, &usr).await,
+            cert_status(serial, &sys).await,
+            cert_status(serial, &usr).await,
         )
     } else {
-        (false, false)
+        (CertStatus::Missing, CertStatus::Missing)
     };
+    let system_store = system_status == CertStatus::Verified;
+    let user_store = user_status == CertStatus::Verified;
     let (recommended_command, recommendation_reason) = if play_store_image || !adbd_root {
         (
             "shadowdroid net trust --ui".to_string(),
@@ -128,6 +132,8 @@ pub async fn evidence(serial: &Serial, play_store_image: bool) -> TrustEvidence 
         ca_generated,
         system_store,
         user_store,
+        system_store_status: system_status.as_str().to_string(),
+        user_store_status: user_status.as_str().to_string(),
         recommended_command,
         recommendation_reason,
     }
@@ -166,13 +172,103 @@ async fn try_user_store(serial: &Serial, hash: &str) -> bool {
     cert_present(serial, &dest).await
 }
 
-/// Verify-by-readback that avoids the false positive where `ls:`'s *error*
-/// message echoes the path (so a plain `contains(hash)` wrongly matches).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CertStatus {
+    Verified,
+    Missing,
+    Unreadable,
+    Mismatch,
+    Invalid,
+}
+
+impl CertStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::Missing => "missing",
+            Self::Unreadable => "unreadable",
+            Self::Mismatch => "mismatch",
+            Self::Invalid => "invalid_certificate",
+        }
+    }
+}
+
+/// Verify the exact active CA by readback. A matching Android subject-hash
+/// filename is insufficient: an older certificate with the same subject has
+/// the same path, and locked devices may echo that path in a Permission denied
+/// error. Only successfully-read certificate bytes that match our CA count.
 pub(crate) async fn cert_present(serial: &Serial, dest: &str) -> bool {
-    let out = adb::shell(serial, format!("ls {dest} 2>&1"))
+    cert_status(serial, dest).await == CertStatus::Verified
+}
+
+async fn cert_status(serial: &Serial, dest: &str) -> CertStatus {
+    const EXIT_MARKER: &str = "__shadowdroid_cert_ls_exit__:";
+    let listing = adb::shell(serial, format!("ls {dest} 2>&1; echo {EXIT_MARKER}$?"))
         .await
         .unwrap_or_default();
-    !out.to_lowercase().contains("no such file") && out.contains(dest)
+    if let Some(status) = classify_cert_listing(&listing) {
+        return status;
+    }
+
+    let Ok(installed) = adb::pull(serial, dest.to_string()).await else {
+        return CertStatus::Unreadable;
+    };
+    let Ok(local_path) = paths::ca_cert_path() else {
+        return CertStatus::Invalid;
+    };
+    let Ok(local) = std::fs::read(local_path) else {
+        return CertStatus::Invalid;
+    };
+    match certificates_match(&local, &installed) {
+        Ok(true) => CertStatus::Verified,
+        Ok(false) => CertStatus::Mismatch,
+        Err(_) => CertStatus::Invalid,
+    }
+}
+
+/// `None` means `ls` proved the file readable and identity comparison should
+/// continue. Every error state is explicit so echoed paths never count as CA
+/// evidence.
+fn classify_cert_listing(listing: &str) -> Option<CertStatus> {
+    const EXIT_MARKER: &str = "__shadowdroid_cert_ls_exit__:";
+    let lower = listing.to_lowercase();
+    if lower.contains("permission denied") {
+        return Some(CertStatus::Unreadable);
+    }
+    if lower.contains("no such file") {
+        return Some(CertStatus::Missing);
+    }
+    let listed = listing
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(EXIT_MARKER))
+        .and_then(|exit| exit.parse::<i32>().ok())
+        == Some(0);
+    if !listed {
+        return Some(CertStatus::Unreadable);
+    }
+    None
+}
+
+fn certificates_match(expected: &[u8], installed: &[u8]) -> Result<bool> {
+    Ok(certificate_der(expected)? == certificate_der(installed)?)
+}
+
+fn certificate_der(bytes: &[u8]) -> Result<Vec<u8>> {
+    let bytes = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .map(|start| &bytes[start..])
+        .unwrap_or(bytes);
+    if bytes.starts_with(b"-----BEGIN CERTIFICATE-----") {
+        let (_, pem) = x509_parser::pem::parse_x509_pem(bytes)
+            .map_err(|e| anyhow::anyhow!("parse PEM certificate: {e}"))?;
+        pem.parse_x509()
+            .map_err(|e| anyhow::anyhow!("parse X.509 certificate: {e}"))?;
+        return Ok(pem.contents);
+    }
+    x509_parser::parse_x509_certificate(bytes)
+        .map_err(|e| anyhow::anyhow!("parse DER certificate: {e}"))?;
+    Ok(bytes.to_vec())
 }
 
 async fn ui_install(serial: &Serial) -> Result<()> {
@@ -240,4 +336,51 @@ pub(crate) fn ca_subject_hash_of(ca: &std::path::Path) -> Result<String> {
 
 fn emit(body: Value) {
     crate::events::emit_action("net_trust", &body);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{certificates_match, classify_cert_listing, CertStatus};
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+
+    fn test_ca(common_name: &str) -> String {
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, common_name);
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params
+            .self_signed(&KeyPair::generate().unwrap())
+            .unwrap()
+            .pem()
+    }
+
+    #[test]
+    fn certificate_identity_rejects_same_subject_with_different_key() {
+        let active = test_ca("ShadowDroid CA");
+        let stale_same_subject = test_ca("ShadowDroid CA");
+        assert!(certificates_match(active.as_bytes(), active.as_bytes()).unwrap());
+        assert!(!certificates_match(active.as_bytes(), stale_same_subject.as_bytes()).unwrap());
+    }
+
+    #[test]
+    fn permission_denied_path_is_not_certificate_evidence() {
+        let output = "ls: /data/misc/user/0/cacerts-added/7f45a904.0: Permission denied\n\
+                      __shadowdroid_cert_ls_exit__:1\n";
+        assert_eq!(classify_cert_listing(output), Some(CertStatus::Unreadable));
+        assert_eq!(
+            classify_cert_listing(
+                "ls: /system/etc/security/cacerts/7f45a904.0: No such file or directory\n\
+                 __shadowdroid_cert_ls_exit__:1\n"
+            ),
+            Some(CertStatus::Missing)
+        );
+        assert_eq!(
+            classify_cert_listing(
+                "/system/etc/security/cacerts/7f45a904.0\n\
+                 __shadowdroid_cert_ls_exit__:0\n"
+            ),
+            None
+        );
+    }
 }

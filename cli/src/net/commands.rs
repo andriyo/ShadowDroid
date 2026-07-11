@@ -337,6 +337,10 @@ pub async fn status(serial: &Serial) -> Result<()> {
         .as_ref()
         .and_then(|d| d.get("port").and_then(|p| p.as_u64()))
         .map(|p| p as u16);
+    let host_port = daemon
+        .as_ref()
+        .and_then(|d| d.get("host_port").and_then(|p| p.as_u64()))
+        .map(|p| p as u16);
 
     let http_proxy = adb::shell(serial, "settings get global http_proxy")
         .await
@@ -344,10 +348,22 @@ pub async fn status(serial: &Serial) -> Result<()> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty() && s != "null");
 
-    let pointed = match (&http_proxy, port) {
-        (Some(hp), Some(p)) => hp == &format!("localhost:{p}") || hp.ends_with(&format!(":{p}")),
-        _ => false,
+    let http_proxy_matches = port.is_some_and(|port| proxy_points_at(&http_proxy, port));
+    let (adb_reverse_matches, adb_reverse_mappings, adb_reverse_error) = match (port, host_port) {
+        (Some(device_port), Some(host_port)) => match adb::reverse_list(serial).await {
+            Ok(mappings) => {
+                let matches = reverse_mapping_matches(&mappings, device_port, host_port);
+                let mappings = mappings
+                    .into_iter()
+                    .map(|mapping| json!({"device": mapping.device, "host": mapping.host}))
+                    .collect::<Vec<_>>();
+                (matches, mappings, None)
+            }
+            Err(err) => (false, Vec::new(), Some(err.to_string())),
+        },
+        _ => (false, Vec::new(), None),
     };
+    let pointed = http_proxy_matches && adb_reverse_matches;
 
     emit(
         "net_status",
@@ -356,11 +372,27 @@ pub async fn status(serial: &Serial) -> Result<()> {
             "running": running,
             "daemon": daemon,
             "http_proxy": http_proxy,
+            "http_proxy_matches": http_proxy_matches,
+            "adb_reverse_matches": adb_reverse_matches,
+            "adb_reverse_mappings": adb_reverse_mappings,
+            "adb_reverse_error": adb_reverse_error,
             "pointed_at_proxy": pointed,
             "ca_generated": paths::ca_cert_path().map(|p| p.exists()).unwrap_or(false),
         }),
     );
     Ok(())
+}
+
+fn reverse_mapping_matches(
+    mappings: &[adb::ReverseMapping],
+    device_port: u16,
+    host_port: u16,
+) -> bool {
+    let expected_device = format!("tcp:{device_port}");
+    let expected_host = format!("tcp:{host_port}");
+    mappings
+        .iter()
+        .any(|mapping| mapping.device == expected_device && mapping.host == expected_host)
 }
 
 /// Point the device at the host proxy: `adb reverse` so the device's
@@ -1004,6 +1036,18 @@ mod tests {
         );
         assert!(proxy_points_at(&Some("localhost:8080".into()), 8080));
         assert!(!proxy_points_at(&Some("proxy.example:8080".into()), 8080));
+    }
+
+    #[test]
+    fn reverse_status_requires_both_expected_endpoints() {
+        let mappings = vec![adb::ReverseMapping {
+            device: "tcp:8080".into(),
+            host: "tcp:43127".into(),
+        }];
+        assert!(reverse_mapping_matches(&mappings, 8080, 43127));
+        assert!(!reverse_mapping_matches(&mappings, 8081, 43127));
+        assert!(!reverse_mapping_matches(&mappings, 8080, 43128));
+        assert!(!reverse_mapping_matches(&[], 8080, 43127));
     }
 
     #[test]
