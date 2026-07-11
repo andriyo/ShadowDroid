@@ -266,9 +266,9 @@ shadowdroid init --no-studio-plugin # only inspect Studio and install skills
 ```
 
 Put repeated values in config instead of spending prompt/context on every
-command. ShadowDroid loads `~/.shadowdroid/config.json` first, then
-`.shadowdroid.json` files from the current directory's ancestors, with the
-nearest project file winning:
+command. Config lives in a folder: the global `~/.shadowdroid/config.json` is
+loaded first, then a project `.shadowdroid/config.json` from each of the current
+directory's ancestors, with the nearest project file winning.
 
 ```bash
 shadowdroid config schema --json
@@ -281,6 +281,11 @@ shadowdroid config validate --json
   "device": "emulator-5554",
   "app": "Livd",
   "project": "/Users/you/Work/Livd",
+  "proxy": {
+    "ca_trusted": true,
+    "hosts": ["*.livd.app"],
+    "trust_store": "user"
+  },
   "apps": {
     "Livd": {
       "package": "com.livd",
@@ -294,6 +299,24 @@ shadowdroid config validate --json
 The `project` path matters for debugging: `why` and `log` use it to map crash
 stack frames back to files in your source tree (`project_frames`), so the agent
 gets `app/src/main/java/.../CartRepo.kt:42` instead of a bare class name.
+
+### Per-project proxy CA
+
+The `net` MITM proxy signs with a CA that ShadowDroid resolves per invocation:
+an explicit `proxy.ca_cert`/`proxy.ca_key` in config (absolute or `~/` paths),
+else a per-project convention CA at `<project>/.shadowdroid/ca.{crt,key}`, else
+the global `~/.shadowdroid/net/ca.{crt,key}`. Mint a project CA with
+`shadowdroid net ca reset --project` (or import your own with `net ca import
+--project --cert …`); `config init --project` and the project-scoped `net ca`
+verbs write a `.shadowdroid/.gitignore` so the CA cert, key, and `.bak` backups
+are never committed.
+
+Set `proxy.ca_trusted: true` to tell ShadowDroid the CA is already trusted on
+the device (e.g. baked into a custom emulator image) — `net trust`/`net check`
+then skip the adb install and trust-store readback and report the basis as
+`asserted`. Even without it, a successful `net trust`/`net check` is cached per
+device (keyed by CA fingerprint), so repeat runs skip the probe; pass `--fresh`
+to force a real check.
 
 ## The agent loop
 

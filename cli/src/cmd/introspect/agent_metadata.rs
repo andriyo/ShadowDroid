@@ -108,7 +108,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         "config" => Some(serde_json::json!({
             "use_when": ["Repeated app, package, device, project, or debugger parameters would cost tokens across commands."],
             "output": "json for schema/paths/validate when --json is passed",
-            "side_effects": ["config init writes .shadowdroid.json or ~/.shadowdroid/config.json"],
+            "side_effects": ["config init writes .shadowdroid/config.json (project) or ~/.shadowdroid/config.json (--user)"],
             "next_commands": ["config paths --json", "config schema --json", "config init --project", "config validate --json", "debug auto"]
         })),
         "config paths" => Some(serde_json::json!({
@@ -118,7 +118,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "next_commands": ["config schema --json", "config validate --json", "config init"]
         })),
         "config schema" => Some(serde_json::json!({
-            "use_when": ["Need the supported .shadowdroid.json shape before generating or editing config."],
+            "use_when": ["Need the supported .shadowdroid/config.json shape (incl. the proxy block: ca_cert/ca_key/ca_trusted) before generating or editing config."],
             "output": "machine-readable config schema and example when --json is passed",
             "side_effects": ["none"],
             "next_commands": ["config init --project", "config validate --json"]
@@ -132,7 +132,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         "config init" => Some(serde_json::json!({
             "use_when": ["Need to create or update project/user defaults for app package, device, Android Studio, debugger, or run configuration."],
             "output": "config write report; --json for changed fields and target path",
-            "side_effects": ["writes .shadowdroid.json by default or ~/.shadowdroid/config.json with --user"],
+            "side_effects": ["writes .shadowdroid/config.json (project, + .shadowdroid/.gitignore for CA secrets) or ~/.shadowdroid/config.json with --user"],
             "next_commands": ["config validate --json", "debug auto", "app current"]
         })),
         "config validate" => Some(serde_json::json!({
@@ -901,20 +901,20 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "net check" => Some(serde_json::json!({
             "use_when": ["Need to know whether a package is likely interceptable before relying on HTTP(S) events."],
-            "output": "interceptability verdict JSON with device image, CA store evidence, and recommended trust command",
-            "side_effects": ["none"],
+            "output": "interceptability verdict JSON with device image, CA store evidence (trust.basis: probed|asserted|cached), and recommended trust command",
+            "side_effects": ["none (may write the verify-once trust cache after a positive probe); --fresh ignores proxy.ca_trusted + cache and re-probes"],
             "next_commands": ["net trust", "net start", "watch"]
         })),
         "net trust" => Some(serde_json::json!({
-            "use_when": ["Need the device/app to trust ShadowDroid's CA before expecting decrypted HTTPS traffic."],
-            "output": "certificate trust/install JSON",
-            "side_effects": ["pushes or installs a CA certificate; --auto chooses the best available path; --system may require emulator/root; --ui drives Settings UI"],
+            "use_when": ["Need the device/app to trust the proxy CA before expecting decrypted HTTPS traffic. Skipped automatically when proxy.ca_trusted is set or a prior verification is cached."],
+            "output": "certificate trust/install JSON (basis: asserted|cached|probed)",
+            "side_effects": ["pushes/installs the resolved CA (project or global); --auto chooses the best path; --system may require emulator/root; --ui drives Settings UI; --fresh forces a real install/verify; caches a positive result per device"],
             "next_commands": ["net check <pkg>", "net start", "watch"]
         })),
         "net ca" => Some(serde_json::json!({
-            "use_when": ["Need to use your own CA (e.g. an existing mitmproxy/Charles/corporate CA the device already trusts) instead of ShadowDroid's generated one, or to inspect/regenerate the signing CA."],
-            "output": "CA management JSON (import/info/reset)",
-            "side_effects": ["import/reset replace ~/.shadowdroid/net/ca.{crt,key}"],
+            "use_when": ["Need to use your own CA (e.g. an existing mitmproxy/Charles/corporate CA the device already trusts) instead of the generated one, or to inspect/regenerate the signing CA. Scope with --project (<project>/.shadowdroid/ca.*) or --global (~/.shadowdroid/net/ca.*); default auto-picks the project CA when a .shadowdroid/ dir exists."],
+            "output": "CA management JSON (import/info/reset) with the resolved scope + dir",
+            "side_effects": ["import/reset replace the CA in the resolved scope and clear the device trust cache; a project import/reset also writes .shadowdroid/.gitignore"],
             "next_commands": ["net ca info", "net trust", "net start"]
         })),
         "net ca import" => Some(serde_json::json!({

@@ -37,6 +37,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::config::ShadowDroidConfig;
+use crate::ids::Serial;
 use crate::net::paths;
 
 /// Provenance markers written to `ca.source`.
@@ -54,29 +56,16 @@ pub struct CertAuthority {
 }
 
 impl CertAuthority {
-    /// Load the CA from `~/.shadowdroid/net/ca.{crt,key}`, generating + persisting
-    /// it on first use.
-    pub fn load_or_generate() -> Result<Arc<CertAuthority>> {
-        Self::load_or_generate_from(&paths::ensure_net_dir()?)
-    }
-
-    /// Dir-scoped core of [`load_or_generate`] (the dir is always
-    /// `paths::net_dir()` in production; parameterised for tests).
-    fn load_or_generate_from(dir: &Path) -> Result<Arc<CertAuthority>> {
-        let cert_path = ca_cert_in(dir);
-        let key_path = ca_key_in(dir);
-
-        let (cert_pem, key) = if cert_path.exists() && key_path.exists() {
-            let key_pem = std::fs::read_to_string(&key_path)
-                .with_context(|| format!("read {}", key_path.display()))?;
-            let cert_pem = std::fs::read_to_string(&cert_path)
-                .with_context(|| format!("read {}", cert_path.display()))?;
-            let key = KeyPair::from_pem(&key_pem).map_err(|e| anyhow!("parse CA key: {e}"))?;
-            (cert_pem, key)
-        } else {
-            generate_ca_files(dir)?
-        };
-
+    /// Load a CA from an explicit cert+key PEM pair, with **no** generation on
+    /// miss. The detached daemon uses this: it is handed the already-resolved
+    /// paths (via `--ca-cert`/`--ca-key`) and must never mint a new CA, since it
+    /// runs without config context and can't know *which* CA the project wants.
+    pub fn load_from_files(cert_path: &Path, key_path: &Path) -> Result<Arc<CertAuthority>> {
+        let key_pem = std::fs::read_to_string(key_path)
+            .with_context(|| format!("read {}", key_path.display()))?;
+        let cert_pem = std::fs::read_to_string(cert_path)
+            .with_context(|| format!("read {}", cert_path.display()))?;
+        let key = KeyPair::from_pem(&key_pem).map_err(|e| anyhow!("parse CA key: {e}"))?;
         Self::build(&cert_pem, key)
     }
 
@@ -213,6 +202,140 @@ fn write_private(path: &Path, pem: &str) -> Result<()> {
     Ok(())
 }
 
+// ── CA source resolution (which CA does `net` sign + install?) ────────────────
+
+/// The resolved location of the CA a `net` invocation should use, plus enough
+/// provenance to report it and to decide whether it may be generated.
+#[derive(Debug, Clone)]
+pub struct CaPaths {
+    pub cert: PathBuf,
+    pub key: PathBuf,
+    /// The directory the CA lives in, when ShadowDroid manages it (the global
+    /// `net` dir or a project `.shadowdroid/`). `None` for an explicit config
+    /// path pair, which ShadowDroid never generates into.
+    pub dir: Option<PathBuf>,
+    /// `explicit` (config path) | `project` (convention file) | `global`.
+    pub origin: &'static str,
+    /// Whether [`ensure_ca`] may mint the CA here when missing. True only for the
+    /// global dir; an explicit pair must already exist, and a project CA is born
+    /// only via `net ca reset/import --project`.
+    pub generatable: bool,
+}
+
+/// Resolve which CA the proxy signs with and which CA `net trust` installs.
+/// Order: (1) explicit `proxy.ca_cert`+`proxy.ca_key` from config, (2) a
+/// per-project convention CA at `<project>/.shadowdroid/ca.{crt,key}` when both
+/// files exist, (3) the global `~/.shadowdroid/net/ca.{crt,key}` (generated on
+/// first use — today's behavior). `serial` is accepted for a future per-device
+/// override but is not consulted yet.
+pub fn resolve_ca(config: &ShadowDroidConfig, _serial: Option<&Serial>) -> Result<CaPaths> {
+    let proxy = config.proxy.as_ref();
+    match (
+        proxy.and_then(|p| p.ca_cert.as_deref()),
+        proxy.and_then(|p| p.ca_key.as_deref()),
+    ) {
+        (Some(cert), Some(key)) => {
+            let cert = expand_required_path("proxy.ca_cert", cert)?;
+            let key = expand_required_path("proxy.ca_key", key)?;
+            if !cert.is_file() {
+                bail!("proxy.ca_cert does not exist: {}", cert.display());
+            }
+            if !key.is_file() {
+                bail!("proxy.ca_key does not exist: {}", key.display());
+            }
+            return Ok(CaPaths {
+                cert,
+                key,
+                dir: None,
+                origin: "explicit",
+                generatable: false,
+            });
+        }
+        (Some(_), None) => {
+            bail!("proxy.ca_cert is set but proxy.ca_key is not — both are required")
+        }
+        (None, Some(_)) => {
+            bail!("proxy.ca_key is set but proxy.ca_cert is not — both are required")
+        }
+        (None, None) => {}
+    }
+
+    if let Ok(dir) = crate::config::project_shadowdroid_dir() {
+        let cert = ca_cert_in(&dir);
+        let key = ca_key_in(&dir);
+        if cert.is_file() && key.is_file() {
+            return Ok(CaPaths {
+                cert,
+                key,
+                dir: Some(dir),
+                origin: "project",
+                generatable: false,
+            });
+        }
+    }
+
+    let dir = paths::net_dir()?;
+    Ok(CaPaths {
+        cert: paths::ca_cert_path()?,
+        key: paths::ca_key_path()?,
+        dir: Some(dir),
+        origin: "global",
+        generatable: true,
+    })
+}
+
+/// Ensure the resolved CA exists on disk, generating a fresh ShadowDroid CA when
+/// permitted (the global dir). An explicit or project CA that is missing is a
+/// hard error with an actionable message — we never silently fabricate a CA a
+/// user pointed us at.
+pub fn ensure_ca(ca: &CaPaths) -> Result<()> {
+    if ca.cert.is_file() && ca.key.is_file() {
+        return Ok(());
+    }
+    if !ca.generatable {
+        bail!(
+            "the {} CA is missing: {} / {}. Import one with `net ca import` or generate a \
+             project CA with `net ca reset --project`.",
+            ca.origin,
+            ca.cert.display(),
+            ca.key.display()
+        );
+    }
+    let dir = ca
+        .dir
+        .as_deref()
+        .ok_or_else(|| anyhow!("a generatable CA must have a directory"))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    generate_ca_files(dir)?;
+    Ok(())
+}
+
+/// SHA-256 (hex) of the CA certificate in `cert_path`, normalised to DER so
+/// cosmetically-different encodings of the same certificate hash identically.
+/// Stable identity used to detect a changed CA on daemon reuse and to key the
+/// per-serial verify-once trust cache.
+pub fn fingerprint_of(cert_path: &Path) -> Result<String> {
+    let bytes = std::fs::read(cert_path)
+        .with_context(|| format!("read {}", cert_path.display()))?;
+    let der = crate::net::trust::certificate_der(&bytes)?;
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(&der);
+    Ok(crate::release::hex_lower(&hasher.finalize()))
+}
+
+/// Expand a config path (`~/` allowed) and require it be absolute — a bare
+/// relative path can't be resolved against the file that set it once configs are
+/// merged, so it is rejected here and by `config validate`.
+fn expand_required_path(field: &str, raw: &str) -> Result<PathBuf> {
+    let expanded = crate::config::expand_config_path(&Some(raw.to_string()))
+        .ok_or_else(|| anyhow!("{field} is empty"))?;
+    if !expanded.is_absolute() {
+        bail!("{field} must be an absolute path or start with `~/` (got {raw:?})");
+    }
+    Ok(expanded)
+}
+
 // ── `net ca` management (import / info / reset) ───────────────────────────────
 
 /// A read-only description of the CA currently on disk — backs `net ca info` and
@@ -252,15 +375,15 @@ pub struct CaInfo {
 /// Validation (all before anything is written): the cert parses and is a CA, the
 /// key parses and its public key matches the cert, the cert is not expired, and
 /// the full mint-a-leaf path succeeds with the pair.
-pub fn import_ca(cert_src: &Path, key_src: Option<&Path>) -> Result<(CaInfo, Vec<String>)> {
-    import_into(&paths::ensure_net_dir()?, cert_src, key_src)
-}
-
-fn import_into(
+/// Directory-scoped: import into `net_dir` (a project `.shadowdroid/` or the
+/// global net dir), which is created if missing so a first project CA can land.
+pub fn import_into(
     net_dir: &Path,
     cert_src: &Path,
     key_src: Option<&Path>,
 ) -> Result<(CaInfo, Vec<String>)> {
+    std::fs::create_dir_all(net_dir)
+        .with_context(|| format!("create {}", net_dir.display()))?;
     let cert_file = std::fs::read_to_string(cert_src)
         .with_context(|| format!("read certificate {}", cert_src.display()))?;
     let cert_blocks: Vec<PemBlock> = pem_blocks(&cert_file)
@@ -365,12 +488,8 @@ fn import_into(
     Ok((info_in(net_dir)?, warnings))
 }
 
-/// Describe the CA currently on disk. Errors if none exists yet.
-pub fn ca_info() -> Result<CaInfo> {
-    info_in(&paths::net_dir()?)
-}
-
-fn info_in(net_dir: &Path) -> Result<CaInfo> {
+/// Describe the CA in `net_dir`. Errors if none exists yet.
+pub fn info_in(net_dir: &Path) -> Result<CaInfo> {
     let cert_path = ca_cert_in(net_dir);
     let key_path = ca_key_in(net_dir);
     if !cert_path.exists() {
@@ -403,17 +522,34 @@ fn info_in(net_dir: &Path) -> Result<CaInfo> {
     })
 }
 
-/// Discard the current CA (backing it up to `.bak`) and generate a fresh
-/// ShadowDroid CA — the escape hatch after an import. Returns the new [`CaInfo`].
-pub fn reset_ca() -> Result<CaInfo> {
-    reset_in(&paths::ensure_net_dir()?)
-}
-
-fn reset_in(net_dir: &Path) -> Result<CaInfo> {
+/// Discard the CA in `net_dir` (backing it up to `.bak`) and generate a fresh
+/// ShadowDroid CA — the escape hatch after an import, and how a project CA is
+/// first minted (`net ca reset --project`). Returns the new [`CaInfo`].
+pub fn reset_in(net_dir: &Path) -> Result<CaInfo> {
+    std::fs::create_dir_all(net_dir)
+        .with_context(|| format!("create {}", net_dir.display()))?;
     backup_in(net_dir)?;
     // Files are gone, so this regenerates + records `generated` provenance.
     generate_ca_files(net_dir)?;
     info_in(net_dir)
+}
+
+/// The CA directory a `net ca` verb operates on. Explicit `--project`/`--global`
+/// win; otherwise auto: the project `.shadowdroid/` when one already exists, else
+/// the global net dir. Returns the dir and an origin label for the emit.
+pub fn ca_scope_dir(project: bool, global: bool) -> Result<(PathBuf, &'static str)> {
+    if global {
+        return Ok((paths::net_dir()?, "global"));
+    }
+    if project {
+        return Ok((crate::config::project_shadowdroid_dir()?, "project"));
+    }
+    let pdir = crate::config::project_shadowdroid_dir()?;
+    if pdir.is_dir() {
+        Ok((pdir, "project"))
+    } else {
+        Ok((paths::net_dir()?, "global"))
+    }
 }
 
 /// Move any existing `ca.{crt,key,source}` aside to `<name>.bak`, so replacing
@@ -793,7 +929,9 @@ mod tests {
         // The imported cert is now the live one, and it can build + mint.
         let live = std::fs::read_to_string(ca_cert_in(store.path())).unwrap();
         assert_eq!(live, cert);
-        let ca = CertAuthority::load_or_generate_from(store.path()).unwrap();
+        let ca =
+            CertAuthority::load_from_files(&ca_cert_in(store.path()), &ca_key_in(store.path()))
+                .unwrap();
         ca.server_config("post-import.example").unwrap();
     }
 

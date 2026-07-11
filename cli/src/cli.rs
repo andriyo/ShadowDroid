@@ -26,7 +26,7 @@
 //!    surface uniformly via [`report_error`]; a structured server error should
 //!    carry a machine `code` ([`crate::device::client::ServerError`]).
 //! 4. **If it reads config defaults** (app/project/studio-url/…), wire them in
-//!    `apply_config_defaults` so flags fall back to `.shadowdroid.json`.
+//!    `apply_config_defaults` so flags fall back to `.shadowdroid/config.json`.
 //! 5. **Match selectors** through [`crate::selector`] (host side) so `--text`
 //!    normalization stays consistent with `ui find`/`tap`.
 
@@ -719,6 +719,9 @@ pub enum NetCmd {
         /// App package, app alias from config, or installed package name.
         #[arg(value_name = "PACKAGE")]
         package: Option<String>,
+        /// Ignore `proxy.ca_trusted` and the verify-once cache; probe the device.
+        #[arg(long)]
+        fresh: bool,
     },
     /// Install / trust the ShadowDroid CA on the device.
     Trust {
@@ -731,6 +734,10 @@ pub enum NetCmd {
         /// Drive the Settings "Install a certificate" UI (real device, non-root).
         #[arg(long)]
         ui: bool,
+        /// Ignore `proxy.ca_trusted` and the verify-once cache; install/verify
+        /// against the device for real.
+        #[arg(long)]
+        fresh: bool,
     },
     /// Manage the proxy's signing CA (use your own, inspect it, or regenerate).
     #[command(subcommand)]
@@ -941,13 +948,34 @@ pub enum NetCaCmd {
         /// SEC1 keys are converted to PKCS#8 via openssl automatically.
         #[arg(long, value_name = "PATH")]
         key: Option<PathBuf>,
+        #[command(flatten)]
+        scope: CaScopeArgs,
     },
     /// Show the current signing CA: source, subject, validity, key type, and the
     /// Android trust-store hash.
-    Info,
+    Info {
+        #[command(flatten)]
+        scope: CaScopeArgs,
+    },
     /// Discard the current CA (backed up to `.bak`) and generate a fresh
-    /// ShadowDroid CA — the way back after an import.
-    Reset,
+    /// ShadowDroid CA — the way back after an import, and how a per-project CA is
+    /// first minted (`--project`).
+    Reset {
+        #[command(flatten)]
+        scope: CaScopeArgs,
+    },
+}
+
+/// `--project` / `--global` scope selector for the `net ca` verbs. Neither flag
+/// = auto: the project `.shadowdroid/` when one exists, else the global CA.
+#[derive(clap::Args)]
+pub struct CaScopeArgs {
+    /// Operate on the per-project CA (`<project>/.shadowdroid/ca.*`).
+    #[arg(long, conflicts_with = "global")]
+    pub project: bool,
+    /// Operate on the global CA (`~/.shadowdroid/net/ca.*`).
+    #[arg(long, conflicts_with = "project")]
+    pub global: bool,
 }
 
 #[derive(Subcommand)]
@@ -999,6 +1027,12 @@ pub struct NetDaemonArgs {
     /// Host loopback port the proxy binds (per-serial; set by the parent `net start`).
     #[arg(long, default_value_t = crate::net::DEFAULT_PROXY_PORT)]
     pub host_port: u16,
+    /// Signing CA certificate to load (resolved by the parent `net start`).
+    #[arg(long)]
+    pub ca_cert: PathBuf,
+    /// Signing CA private key to load (resolved by the parent `net start`).
+    #[arg(long)]
+    pub ca_key: PathBuf,
     /// Host globs to scope capture to (repeatable; empty = all).
     #[arg(long)]
     pub host: Vec<String>,
@@ -1640,8 +1674,54 @@ fn apply_app_config(args: &mut AppCmd, config: &ShadowDroidConfig) {
 }
 
 fn apply_net_config(args: &mut NetCmd, config: &ShadowDroidConfig) {
-    if let NetCmd::Check { package } = args {
+    if let NetCmd::Check { package, .. } = args {
         fill_app(package, config);
+    }
+    let Some(proxy) = config.proxy.as_ref() else {
+        return;
+    };
+    // Flag > config: only fill knobs the user left at their clap default.
+    match args {
+        NetCmd::Start {
+            port,
+            host,
+            anticache,
+            anticomp,
+            verify_upstream,
+            redact,
+            ..
+        } => {
+            if *port == crate::net::DEFAULT_PROXY_PORT {
+                if let Some(p) = proxy.port {
+                    *port = p;
+                }
+            }
+            if host.is_empty() && !proxy.hosts.is_empty() {
+                *host = proxy.hosts.clone();
+            }
+            // These are opt-in booleans (default off); config can only turn them on.
+            *anticache |= proxy.anticache.unwrap_or(false);
+            *anticomp |= proxy.anticomp.unwrap_or(false);
+            *verify_upstream |= proxy.verify_upstream.unwrap_or(false);
+            *redact |= proxy.redact.unwrap_or(false);
+        }
+        NetCmd::Trust {
+            auto,
+            system,
+            ui,
+            ..
+        } => {
+            if !*auto && !*system && !*ui {
+                match proxy.trust_store.as_deref() {
+                    Some("system") => *system = true,
+                    Some("ui") => *ui = true,
+                    // "user" has no dedicated flag; the default auto path installs
+                    // system-then-user, so leave the flags unset.
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1936,15 +2016,38 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
     };
 
     match c {
-        NetCmd::Check { package } => {
+        NetCmd::Check { package, fresh } => {
             let package = resolve_net_check_package(serial, config, package.clone()).await?;
-            nc::check(serial, &package).await
+            let tctx = crate::net::trust::TrustContext::resolve(config, serial, *fresh)?;
+            nc::check(serial, &package, &tctx).await
         }
-        NetCmd::Trust { auto, system, ui } => nc::trust(serial, *auto, *system, *ui).await,
+        NetCmd::Trust {
+            auto,
+            system,
+            ui,
+            fresh,
+        } => {
+            let tctx = crate::net::trust::TrustContext::resolve(config, serial, *fresh)?;
+            // A genuine install needs the CA on disk; an assertion doesn't touch
+            // the device, so don't mint a bogus CA just to assert it's trusted.
+            if !tctx.asserted {
+                crate::net::ca::ensure_ca(&tctx.ca)?;
+            }
+            nc::trust(serial, *auto, *system, *ui, &tctx).await
+        }
         NetCmd::Ca(sub) => match sub {
-            NetCaCmd::Import { cert, key } => nc::ca_import(serial, cert, key.as_deref()).await,
-            NetCaCmd::Info => nc::ca_info().await,
-            NetCaCmd::Reset => nc::ca_reset(serial).await,
+            NetCaCmd::Import { cert, key, scope } => {
+                let (dir, origin) = crate::net::ca::ca_scope_dir(scope.project, scope.global)?;
+                nc::ca_import(serial, &dir, origin, cert, key.as_deref()).await
+            }
+            NetCaCmd::Info { scope } => {
+                let (dir, origin) = crate::net::ca::ca_scope_dir(scope.project, scope.global)?;
+                nc::ca_info(&dir, origin).await
+            }
+            NetCaCmd::Reset { scope } => {
+                let (dir, origin) = crate::net::ca::ca_scope_dir(scope.project, scope.global)?;
+                nc::ca_reset(serial, &dir, origin).await
+            }
         },
         NetCmd::Start {
             port,
@@ -1955,6 +2058,11 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
             verify_upstream,
             redact,
         } => {
+            // Resolve which CA to sign with (config override → per-project
+            // convention → global) and make it exist before the daemon, which
+            // is load-only, tries to read it.
+            let ca = crate::net::ca::resolve_ca(config, Some(serial))?;
+            crate::net::ca::ensure_ca(&ca)?;
             nc::start(
                 serial,
                 nc::StartOpts {
@@ -1965,6 +2073,8 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
                     anticomp: *anticomp,
                     verify_upstream: *verify_upstream,
                     redact: *redact,
+                    ca_cert: ca.cert,
+                    ca_key: ca.key,
                 },
             )
             .await
@@ -1972,8 +2082,21 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
         NetCmd::Stop {
             revoke_ca,
             canary_host,
-        } => nc::stop(serial, *revoke_ca, canary_host).await,
-        NetCmd::Status => nc::status(serial).await,
+        } => {
+            // Resolve the CA to remove (revoke path); fall back to the global cert
+            // if config resolution fails so teardown never blocks on CA config.
+            let ca_cert = crate::net::ca::resolve_ca(config, Some(serial))
+                .map(|c| c.cert)
+                .or_else(|_| crate::net::paths::ca_cert_path())
+                .unwrap_or_default();
+            nc::stop(serial, *revoke_ca, canary_host, &ca_cert).await
+        }
+        NetCmd::Status => {
+            let ca = crate::net::ca::resolve_ca(config, Some(serial))
+                .ok()
+                .map(|c| c.cert);
+            nc::status(serial, ca.as_deref()).await
+        }
         NetCmd::Log {
             host,
             path,
@@ -2077,6 +2200,8 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
         NetCmd::Daemon(a) => {
             crate::net::daemon::run(DaemonConfig {
                 serial: Serial::new(a.serial.clone()),
+                ca_cert: a.ca_cert.clone(),
+                ca_key: a.ca_key.clone(),
                 port: a.port,
                 host_port: a.host_port,
                 app_filters: a.host.clone(),

@@ -84,7 +84,24 @@ fn commands_json_is_one_valid_json_object() {
 #[test]
 fn config_paths_json_is_valid_json() {
     let (out, code) = run(&["config", "paths", "--json"]);
-    serde_json::from_str::<serde_json::Value>(out.trim())
-        .expect("config paths --json is valid JSON");
+    let v: serde_json::Value =
+        serde_json::from_str(out.trim()).expect("config paths --json is valid JSON");
     assert_eq!(code, 0);
+    // The project config is the folder form.
+    assert!(
+        v["project_config"]
+            .as_str()
+            .is_some_and(|p| p.ends_with(".shadowdroid/config.json")),
+        "project_config should be the folder form: {v}"
+    );
+}
+
+#[test]
+fn net_daemon_help_exposes_ca_flags() {
+    // The detached daemon is spawned with individual flags; the CA must be one of
+    // them (regression guard for the parent→daemon CA threading).
+    let (out, code) = run(&["net", "daemon", "--help"]);
+    assert_eq!(code, 0, "--help exits 0");
+    assert!(out.contains("--ca-cert"), "net daemon should accept --ca-cert:\n{out}");
+    assert!(out.contains("--ca-key"), "net daemon should accept --ca-key:\n{out}");
 }

@@ -29,7 +29,9 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
     )
     .context("write pidfile")?;
 
-    let ca = CertAuthority::load_or_generate()?;
+    // Load the CA the parent resolved for us; never generate here (the daemon
+    // has no config context and can't know which CA the project wants).
+    let ca = CertAuthority::load_from_files(&cfg.ca_cert, &cfg.ca_key)?;
     let (flow_tx, mut flow_rx) = mpsc::unbounded_channel::<FlowRecord>();
     let (event_tx, _event_rx) = broadcast::channel::<Arc<Event>>(1024);
     let shared = Arc::new(SharedState {
@@ -57,6 +59,10 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         port: cfg.port,
         host_port: cfg.host_port,
         started: events::now_ts(),
+        // Best-effort — a missing/unhashable cert just yields an empty
+        // fingerprint (the reuse guard treats that as "unknown", never a
+        // false positive).
+        ca_fingerprint: crate::net::ca::fingerprint_of(&cfg.ca_cert).unwrap_or_default(),
         flow_count: AtomicU64::new(0),
         events: event_tx,
     });
@@ -155,7 +161,11 @@ pub fn spawn(cfg: &DaemonConfig) -> Result<u32> {
         .arg("--port")
         .arg(cfg.port.to_string())
         .arg("--host-port")
-        .arg(cfg.host_port.to_string());
+        .arg(cfg.host_port.to_string())
+        .arg("--ca-cert")
+        .arg(&cfg.ca_cert)
+        .arg("--ca-key")
+        .arg(&cfg.ca_key);
     for app in &cfg.app_filters {
         cmd.arg("--host").arg(app);
     }

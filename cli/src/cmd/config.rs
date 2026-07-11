@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 use crate::config as cfg;
-use crate::config::{AppConfig, ShadowDroidConfig};
+use crate::config::{AppConfig, ProxyConfig, ShadowDroidConfig};
 
 #[derive(Args, Debug)]
 pub struct ConfigArgs {
@@ -53,7 +53,7 @@ pub struct ConfigInitArgs {
     /// Write ~/.shadowdroid/config.json.
     #[arg(long, conflicts_with = "project")]
     pub user: bool,
-    /// Write ./.shadowdroid.json. This is the default.
+    /// Write ./.shadowdroid/config.json. This is the default.
     #[arg(long, conflicts_with = "user")]
     pub project: bool,
     /// Default app alias agents can use, e.g. Livd.
@@ -86,6 +86,16 @@ pub struct ConfigInitArgs {
     /// Android Studio run configuration whose debugger settings should be reused.
     #[arg(long)]
     pub run_configuration: Option<String>,
+    /// Proxy signing CA certificate path (absolute or ~/). Sets proxy.ca_cert.
+    #[arg(long, value_name = "PATH")]
+    pub ca_cert: Option<String>,
+    /// Proxy signing CA private key path (absolute or ~/). Sets proxy.ca_key.
+    #[arg(long, value_name = "PATH")]
+    pub ca_key: Option<String>,
+    /// Assert the proxy CA is already trusted on the device (skip install +
+    /// readback). Sets proxy.ca_trusted.
+    #[arg(long)]
+    pub ca_trusted: bool,
     /// Replace an existing app alias if it points at a different package.
     #[arg(long)]
     pub force: bool,
@@ -210,13 +220,42 @@ fn init_config(args: &ConfigInitArgs) -> Result<()> {
         );
     }
 
+    // Proxy CA fields. Preserve an existing proxy block even when this run does
+    // not touch it, so re-running `config init` never drops proxy settings.
+    if args.ca_cert.is_some() || args.ca_key.is_some() || args.ca_trusted || config.proxy.is_some()
+    {
+        let mut proxy: ProxyConfig = config.proxy.take().unwrap_or_default();
+        if let Some(v) = args.ca_cert.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            proxy.ca_cert = Some(v.to_string());
+            changed.push("proxy.ca_cert".to_string());
+        }
+        if let Some(v) = args.ca_key.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            proxy.ca_key = Some(v.to_string());
+            changed.push("proxy.ca_key".to_string());
+        }
+        if args.ca_trusted {
+            proxy.ca_trusted = Some(true);
+            changed.push("proxy.ca_trusted".to_string());
+        }
+        config.proxy = Some(proxy);
+    }
+
     cfg::write_config_file(&path, &config)?;
+
+    // For project scope the folder lives inside the repo, so keep the CA secrets
+    // out of git. User scope is under $HOME (not a repo) — nothing to ignore.
+    let gitignore_added = match path.parent() {
+        Some(dir) if !args.user => cfg::ensure_shadowdroid_gitignore(dir)?,
+        _ => Vec::new(),
+    };
+
     let value = json!({
         "type": "shadowdroid_config_init",
         "ok": true,
         "scope": scope,
         "path": path.display().to_string(),
         "changed": changed,
+        "gitignore_added": gitignore_added,
         "config": config,
         "next_commands": [
             "shadowdroid config validate --json",
@@ -250,7 +289,7 @@ fn paths_value() -> Result<Value> {
         "loaded": loaded.iter().map(display_path).collect::<Vec<_>>(),
         "precedence": [
             "~/.shadowdroid/config.json",
-            ".shadowdroid.json files from ancestors, root to current directory",
+            ".shadowdroid/config.json from ancestors, root to current directory",
             "explicit CLI flags"
         ],
         "project_config_wins_over_user": true,
@@ -262,7 +301,7 @@ fn schema_value() -> Value {
         "type": "shadowdroid_config_schema",
         "format": "json",
         "user_config": "~/.shadowdroid/config.json",
-        "project_config": ".shadowdroid.json",
+        "project_config": ".shadowdroid/config.json",
         "precedence": [
             "user config",
             "project configs from ancestors, root to current directory",
@@ -279,12 +318,30 @@ fn schema_value() -> Value {
             "debug_mode": {"type": "string", "optional": true, "enum": ["auto", "java", "native", "mixed"], "description": "Default semantic debugger mode."},
             "run_configuration": {"type": "string", "optional": true, "description": "Default Android Studio run configuration."},
             "usage_log": {"type": "boolean", "optional": true, "description": "Opt-in local usage log (verb, duration, error code — never argument values) at ~/.shadowdroid/usage.jsonl; see `shadowdroid usage`."},
+            "proxy": {
+                "type": "object",
+                "optional": true,
+                "description": "MITM proxy (`net`) defaults. Requires a CLI new enough to know this block (older CLIs reject unknown fields).",
+                "properties": {"$ref": "#/proxy_entry"}
+            },
             "apps": {
                 "type": "object",
                 "optional": true,
                 "description": "Map of app aliases to package/debugger defaults.",
                 "additional_properties": {"$ref": "#/app_entry"}
             }
+        },
+        "proxy_entry": {
+            "ca_cert": {"type": "string", "optional": true, "description": "Signing CA certificate path (absolute or ~/). Leave unset to use the per-project convention CA .shadowdroid/ca.{crt,key} or the global CA."},
+            "ca_key": {"type": "string", "optional": true, "description": "Signing CA private key path (absolute or ~/); required when ca_cert is set."},
+            "ca_trusted": {"type": "boolean", "optional": true, "description": "Assert the CA is already trusted on the device: net trust/net check skip the adb install + readback and report basis 'asserted'. Does not override the app's Network-Security-Config verdict."},
+            "port": {"type": "integer", "optional": true, "description": "Default device-facing proxy port for net start (default 8080)."},
+            "hosts": {"type": "array", "optional": true, "description": "Default host allowlist (globs) for net start/log/intercept."},
+            "trust_store": {"type": "string", "optional": true, "enum": ["system", "user", "ui"], "description": "Preferred device trust store for net trust."},
+            "verify_upstream": {"type": "boolean", "optional": true, "description": "Default for net start --verify-upstream."},
+            "anticache": {"type": "boolean", "optional": true, "description": "Default for net start --anticache."},
+            "anticomp": {"type": "boolean", "optional": true, "description": "Default for net start --anticomp."},
+            "redact": {"type": "boolean", "optional": true, "description": "Default for net start --redact."}
         },
         "app_entry": {
             "package": {"type": "string", "required": true, "description": "Android package/process name."},
@@ -410,6 +467,50 @@ fn validate_config(
             validate_debug_mode(path, &format!("apps.{alias}.debug_mode"), mode, errors);
         }
     }
+    if let Some(proxy) = &config.proxy {
+        validate_proxy(path, proxy, errors);
+    }
+}
+
+fn validate_proxy(path: &Path, proxy: &ProxyConfig, errors: &mut Vec<String>) {
+    // Explicit CA paths must be absolute or ~/-prefixed — a bare relative path
+    // can't be resolved once configs are merged (see config::resolve_ca).
+    for (field, value) in [
+        ("proxy.ca_cert", &proxy.ca_cert),
+        ("proxy.ca_key", &proxy.ca_key),
+    ] {
+        if let Some(raw) = value.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let absolute = raw.starts_with("~/") || Path::new(raw).is_absolute();
+            if !absolute {
+                errors.push(format!(
+                    "{}: {field} must be an absolute path or start with `~/` (got {raw:?})",
+                    path.display()
+                ));
+            }
+        }
+    }
+    match (proxy.ca_cert.is_some(), proxy.ca_key.is_some()) {
+        (true, false) => errors.push(format!(
+            "{}: proxy.ca_cert is set but proxy.ca_key is missing (both are required)",
+            path.display()
+        )),
+        (false, true) => errors.push(format!(
+            "{}: proxy.ca_key is set but proxy.ca_cert is missing (both are required)",
+            path.display()
+        )),
+        _ => {}
+    }
+    if let Some(store) = proxy.trust_store.as_deref() {
+        if !matches!(store, "system" | "user" | "ui") {
+            errors.push(format!(
+                "{}: proxy.trust_store must be one of system, user, ui (got {store:?})",
+                path.display()
+            ));
+        }
+    }
+    if proxy.port == Some(0) {
+        errors.push(format!("{}: proxy.port must not be 0", path.display()));
+    }
 }
 
 fn validate_debug_mode(path: &Path, field: &str, mode: &str, errors: &mut Vec<String>) {
@@ -468,7 +569,7 @@ fn print_human(value: &Value) -> Result<()> {
         "shadowdroid_config_schema" | "shadowdroid_config_explain" => {
             println!("ShadowDroid config is JSON.");
             println!("User config: ~/.shadowdroid/config.json");
-            println!("Project config: .shadowdroid.json");
+            println!("Project config: .shadowdroid/config.json");
             println!("Run `shadowdroid config schema --json` for a machine-readable schema.");
             println!("Minimal project config:");
             println!("{}", serde_json::to_string_pretty(&value["example"])?);
@@ -516,7 +617,7 @@ mod tests {
 
     #[test]
     fn debug_mode_validation_follows_the_value_enum() {
-        let path = Path::new(".shadowdroid.json");
+        let path = Path::new(".shadowdroid/config.json");
         let mut errors = Vec::new();
         for ok in ["auto", "JAVA", " mixed "] {
             validate_debug_mode(path, "debug_mode", ok, &mut errors);
@@ -530,5 +631,52 @@ mod tests {
             "{}",
             errors[0]
         );
+    }
+
+    #[test]
+    fn validate_proxy_flags_relative_paths_pair_store_and_port() {
+        let path = Path::new(".shadowdroid/config.json");
+
+        // Relative ca_cert + lone ca_key are both errors.
+        let mut errors = Vec::new();
+        validate_proxy(
+            path,
+            &ProxyConfig {
+                ca_cert: Some("certs/ca.pem".into()),
+                ..Default::default()
+            },
+            &mut errors,
+        );
+        assert!(errors.iter().any(|e| e.contains("absolute path")));
+        assert!(errors.iter().any(|e| e.contains("ca_key is missing")));
+
+        // Absolute (or ~/) paths + valid store + non-zero port pass.
+        let mut ok = Vec::new();
+        validate_proxy(
+            path,
+            &ProxyConfig {
+                ca_cert: Some("~/ca.pem".into()),
+                ca_key: Some("/keys/ca.key".into()),
+                trust_store: Some("user".into()),
+                port: Some(8080),
+                ..Default::default()
+            },
+            &mut ok,
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+
+        // Bad store enum + zero port are errors.
+        let mut bad = Vec::new();
+        validate_proxy(
+            path,
+            &ProxyConfig {
+                trust_store: Some("keychain".into()),
+                port: Some(0),
+                ..Default::default()
+            },
+            &mut bad,
+        );
+        assert!(bad.iter().any(|e| e.contains("trust_store must be one of")));
+        assert!(bad.iter().any(|e| e.contains("port must not be 0")));
     }
 }

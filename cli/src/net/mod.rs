@@ -87,9 +87,19 @@ pub struct RuleSpec {
 }
 
 /// Config handed to the daemon process at spawn.
+///
+/// NB: the serde derives are for logging/tests only — `daemon::spawn` re-execs
+/// `net daemon` with individual clap flags (not a serialized blob), so any new
+/// field that must reach the daemon also needs an arg in `NetDaemonArgs`, an
+/// emit in `spawn`, and a read in the `NetCmd::Daemon` dispatch arm.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DaemonConfig {
     pub serial: crate::ids::Serial,
+    /// Resolved signing-CA certificate + key the daemon loads (never generates).
+    /// Resolved in the config-aware parent (`net start`) so the daemon can stay
+    /// config-independent. See [crate::net::ca::resolve_ca].
+    pub ca_cert: std::path::PathBuf,
+    pub ca_key: std::path::PathBuf,
     /// The device-facing proxy port: the device's `http_proxy` points here and
     /// `adb reverse` maps it back to the host. Stays stable (default 8080) — it
     /// lives in the device's per-device adb namespace, so two devices can both

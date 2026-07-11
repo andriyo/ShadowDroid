@@ -471,7 +471,11 @@ pub async fn run(
             .ok()
             .and_then(|r| r.package)
             .unwrap_or_else(|| app.to_string());
-        let check = match crate::net::check::inspect(&serial, &package).await {
+        let inspected = match crate::net::trust::TrustContext::resolve(config, &serial, false) {
+            Ok(tctx) => crate::net::check::inspect(&serial, &package, &tctx).await,
+            Err(e) => Err(e),
+        };
+        let check = match inspected {
             Ok(rep) => {
                 let status = match rep.verdict.as_str() {
                     "interceptable" => Status::Ok,
@@ -668,7 +672,7 @@ fn studio_checks() -> Vec<Check> {
                     code: "studio",
                     status: Status::Warn,
                     detail: "Android Studio was not detected.".into(),
-                    remedy: Some("run `shadowdroid init` after installing Android Studio, or configure android_studio in .shadowdroid.json".into()),
+                    remedy: Some("run `shadowdroid init` after installing Android Studio, or configure android_studio in .shadowdroid/config.json".into()),
                 });
             } else {
                 let installed = report

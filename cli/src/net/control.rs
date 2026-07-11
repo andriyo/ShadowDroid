@@ -34,6 +34,10 @@ pub struct DaemonState {
     /// device reboot without restarting the daemon or discarding its rules.
     pub host_port: u16,
     pub started: f64,
+    /// SHA-256 of the CA cert the daemon signs with, so a repeated `net start`
+    /// resolving a *different* CA (e.g. switching projects on one device) can
+    /// warn that the live daemon is still using the old one.
+    pub ca_fingerprint: String,
     pub flow_count: AtomicU64,
     /// Live event fan-out to `watch` subscribers. `Arc` so the broadcast value
     /// is cheaply `Clone` (the `Event` tree itself isn't `Clone`).
@@ -81,6 +85,7 @@ pub async fn serve_client(
                     "port": state.port,
                     "host_port": state.host_port,
                     "started": state.started,
+                    "ca_fingerprint": state.ca_fingerprint,
                     "flows": state.flow_count.load(Ordering::Relaxed),
                     "held": held_flows.len(),
                     "held_flows": held_flows,

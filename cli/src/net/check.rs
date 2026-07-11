@@ -53,8 +53,13 @@ pub struct DeviceImage {
 }
 
 /// Inspect an installed package and produce a verdict. Errors only if the
-/// package isn't installed.
-pub async fn inspect(serial: &Serial, package: &str) -> Result<CheckReport> {
+/// package isn't installed. `tctx` carries the resolved CA and trust posture
+/// (assertion/cache) so the store-trust portion honors `proxy.ca_trusted`.
+pub async fn inspect(
+    serial: &Serial,
+    package: &str,
+    tctx: &crate::net::trust::TrustContext,
+) -> Result<CheckReport> {
     if adb::pm_path(serial, package).await?.is_none() {
         bail!("{package} is not installed on {serial}");
     }
@@ -64,7 +69,8 @@ pub async fn inspect(serial: &Serial, package: &str) -> Result<CheckReport> {
     let min_sdk = parse_kv_int(&dump, "minSdk");
     let version_name = adb::pm_version(serial, package).await.ok().flatten();
     let device_image = inspect_device_image(serial).await;
-    let trust = crate::net::trust::evidence(serial, device_image.play_store_image).await;
+    let trust =
+        crate::net::trust::evidence(serial, device_image.play_store_image, tctx).await;
 
     let (verdict, reason) = verdict(debuggable, target_sdk);
     let (ca_trusted_by_app, ca_trust_basis) =
@@ -109,7 +115,14 @@ pub async fn inspect(serial: &Serial, package: &str) -> Result<CheckReport> {
                 .to_string(),
         );
     }
-    if !trust.system_store && !trust.user_store && !store_unreadable {
+    if trust.basis == "asserted" {
+        notes.push(
+            "CA store trust is asserted via proxy.ca_trusted (not probed); the store readback and \
+             install were skipped. Re-run with `net check --fresh` to verify against the device."
+                .to_string(),
+        );
+    }
+    if trust.basis == "probed" && !trust.system_store && !trust.user_store && !store_unreadable {
         notes.push(format!(
             "ShadowDroid CA was not found in the device trust stores. Recommended setup: `{}`.",
             trust.recommended_command
@@ -134,8 +147,12 @@ pub async fn inspect(serial: &Serial, package: &str) -> Result<CheckReport> {
 }
 
 /// `net check <pkg>` — inspect + emit.
-pub async fn run(serial: &Serial, package: &str) -> Result<()> {
-    let report = inspect(serial, package).await?;
+pub async fn run(
+    serial: &Serial,
+    package: &str,
+    tctx: &crate::net::trust::TrustContext,
+) -> Result<()> {
+    let report = inspect(serial, package, tctx).await?;
     let mut v = serde_json::to_value(&report).unwrap_or_default();
     if let serde_json::Value::Object(map) = &mut v {
         map.insert("type".into(), json!("action"));
@@ -188,6 +205,20 @@ fn app_ca_trust_expectation(
     debuggable: bool,
     target_sdk: Option<u32>,
 ) -> (Option<bool>, String) {
+    // Asserted trust: the store (system vs user) is unknown, so only the
+    // targetSdk<=23 case is definite; otherwise defer to the NSC heuristic.
+    if trust.basis == "asserted" {
+        if target_sdk.is_some_and(|sdk| sdk <= 23) {
+            return (
+                Some(true),
+                "CA trust asserted (proxy.ca_trusted) and targetSdk <= 23 trusts user CAs by default.".into(),
+            );
+        }
+        return (
+            None,
+            "CA trust asserted (proxy.ca_trusted); for targetSdk >= 24 whether the app honors it still depends on its Network Security Config (or the CA being in the system store).".into(),
+        );
+    }
     if trust.system_store {
         return (
             Some(true),
@@ -292,6 +323,7 @@ mod tests {
             user_store: true,
             system_store_status: "missing".into(),
             user_store_status: "verified".into(),
+            basis: "probed".into(),
             recommended_command: "shadowdroid net trust --auto".into(),
             recommendation_reason: "root".into(),
         };
@@ -309,5 +341,28 @@ mod tests {
             app_ca_trust_expectation(&trust, false, Some(34)).0,
             Some(true)
         );
+    }
+
+    #[test]
+    fn asserted_basis_defers_to_sdk_heuristic() {
+        let trust = crate::net::trust::TrustEvidence {
+            hash: None,
+            adbd_root: false,
+            ca_generated: true,
+            system_store: false,
+            user_store: false,
+            system_store_status: "asserted".into(),
+            user_store_status: "asserted".into(),
+            basis: "asserted".into(),
+            recommended_command: "shadowdroid net trust --ui".into(),
+            recommendation_reason: "asserted".into(),
+        };
+        // Asserted + old SDK is definitely trusted; asserted + modern SDK is
+        // unknown (depends on NSC / system store), never a hard "not installed".
+        assert_eq!(
+            app_ca_trust_expectation(&trust, false, Some(21)).0,
+            Some(true)
+        );
+        assert_eq!(app_ca_trust_expectation(&trust, false, Some(34)).0, None);
     }
 }

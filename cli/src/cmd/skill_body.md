@@ -36,9 +36,10 @@ shadowdroid config init --project --app Example --package com.example.app --proj
 shadowdroid config validate --json
 ```
 
-Project config lives in `.shadowdroid.json`; user config lives in
-`~/.shadowdroid/config.json`. Project config wins over user config. Minimal
-project config:
+Project config lives in `.shadowdroid/config.json`; user config lives in
+`~/.shadowdroid/config.json`. Project config wins over user config. The project
+`.shadowdroid/` folder also holds companion files — most importantly a
+git-ignored per-project proxy CA (`ca.{crt,key}`). Minimal project config:
 
 ```json
 {
@@ -190,16 +191,27 @@ shadowdroid net show f1 --body --body-file /tmp/response.json
 shadowdroid net override --url 'https://api.example.com/v1/dict*' --file fixtures/dict.json
 ```
 
-To reuse a CA the device already trusts (an existing mitmproxy/Charles/corporate
-CA) instead of ShadowDroid's generated one, import it before `net trust` — then
-the whole chain (`trust`, `check`, leaf signing) uses your CA:
+The signing CA is resolved per invocation: `proxy.ca_cert`/`proxy.ca_key` in
+config, else a per-project `<project>/.shadowdroid/ca.{crt,key}`, else the global
+`~/.shadowdroid/net/ca.{crt,key}`. Scope the `net ca` verbs with
+`--project`/`--global` (default auto-picks the project CA when a `.shadowdroid/`
+dir exists). To reuse a CA the device already trusts (mitmproxy/Charles/corporate)
+instead of the generated one, import it before `net trust` — then the whole chain
+(`trust`, `check`, leaf signing) uses your CA:
 
 ```bash
-shadowdroid net ca import --cert mitmproxy-ca.pem      # combined cert+key PEM
-shadowdroid net ca import --cert corp.crt --key corp.key
-shadowdroid net ca info | jq        # source (generated|imported), validity, hash
+shadowdroid net ca reset --project                    # mint a per-project CA (git-ignored)
+shadowdroid net ca import --cert mitmproxy-ca.pem      # combined cert+key PEM (auto scope)
+shadowdroid net ca import --project --cert corp.crt --key corp.key
+shadowdroid net ca info | jq        # source (generated|imported), scope, validity, hash
 shadowdroid net ca reset            # go back to a generated CA
 ```
+
+If the CA is already trusted on the device (e.g. baked into a custom emulator
+image), set `proxy.ca_trusted: true` so `net trust`/`net check` skip the install
+and readback (reported as basis `asserted`). Otherwise a successful check is
+cached per device (by CA fingerprint) and reused; `net check --fresh` /
+`net trust --fresh` force a real probe.
 
 The proxy serves HTTP/2 and HTTP/1.1, decodes gzip/deflate/br/zstd, and streams
 SSE / large responses (and large request uploads) through instead of buffering.

@@ -16,9 +16,10 @@ use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 
 fn home() -> Result<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("$HOME not set"))
+    // Delegate to the shared helper so `net` honors `%USERPROFILE%` on Windows,
+    // matching the rest of the CLI (the daemon + control socket are TCP precisely
+    // so `net` runs on Windows too).
+    crate::hostenv::home_dir()
 }
 
 /// `~/.shadowdroid/net/` — does not create it.
@@ -45,6 +46,19 @@ pub const CA_SOURCE_FILE: &str = "ca.source";
 
 pub fn ca_cert_path() -> Result<PathBuf> {
     Ok(net_dir()?.join(CA_CERT_FILE))
+}
+
+pub fn ca_key_path() -> Result<PathBuf> {
+    Ok(net_dir()?.join(CA_KEY_FILE))
+}
+
+/// Per-serial verify-once trust cache: records that a CA (by fingerprint) was
+/// observed installed on this device, so a repeat `net trust`/`net check` can
+/// skip the adb readback. Global + `$HOME`-keyed (like the other per-serial
+/// state); never in the project folder — trust is a `(CA, device)` fact, not a
+/// project fact.
+pub fn trust_cache_path(serial: &Serial) -> Result<PathBuf> {
+    Ok(net_dir()?.join(format!("{}.trust.json", sanitize(serial))))
 }
 
 /// The control endpoint file — stores the daemon's loopback-TCP control port.

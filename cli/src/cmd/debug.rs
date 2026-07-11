@@ -517,7 +517,7 @@ async fn resolve_app_by_label(
         [] => Ok(None),
         [one] => Ok(Some(one.clone())),
         many => anyhow::bail!(
-            "app name `{}` matched multiple installed labels: {}. Add an alias to .shadowdroid.json.",
+            "app name `{}` matched multiple installed labels: {}. Add an alias to .shadowdroid/config.json.",
             requested,
             many.iter()
                 .map(|(package, label)| format!("{label} ({package})"))

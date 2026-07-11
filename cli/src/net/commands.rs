@@ -44,6 +44,10 @@ pub struct StartOpts {
     pub anticomp: bool,
     pub verify_upstream: bool,
     pub redact: bool,
+    /// Resolved signing-CA cert + key (from [`crate::net::ca::resolve_ca`], made
+    /// to exist by `ensure_ca`) that the daemon loads and `net start` reports.
+    pub ca_cert: PathBuf,
+    pub ca_key: PathBuf,
 }
 
 const NETWORK_STATE_SCHEMA: u32 = 1;
@@ -85,6 +89,8 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
         anticomp,
         verify_upstream,
         redact,
+        ca_cert,
+        ca_key,
     } = opts;
     // A live daemon may outlive the device-side reverse/proxy settings (most
     // commonly after a device reboot). Reuse its actual ports and repair the
@@ -104,6 +110,25 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
             bail!(
                 "the running net daemon predates automatic rewiring metadata; run `shadowdroid net stop` once, then `net start`"
             );
+        };
+
+        // If the live daemon signs with a different CA than we just resolved
+        // (e.g. `net start` from a different project on the same device), warn —
+        // reuse keeps the daemon's original CA; a restart is needed to switch.
+        let ca_mismatch = {
+            let running = daemon_status
+                .get("ca_fingerprint")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let resolved = crate::net::ca::fingerprint_of(&ca_cert).unwrap_or_default();
+            (!running.is_empty() && !resolved.is_empty() && running != resolved).then(|| {
+                format!(
+                    "the running proxy still signs with a different CA ({running:.12}…); it keeps \
+                     that CA until you `net stop` then `net start`. Resolved CA for this directory: \
+                     {} ({resolved:.12}…).",
+                    ca_cert.display()
+                )
+            })
         };
 
         let state_existed = load_device_network_state(serial)?.is_some();
@@ -137,6 +162,7 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
                 "rewired": true,
                 "rules_preserved": true,
                 "state_recovered": !state_existed,
+                "ca_warning": ca_mismatch,
             }),
         );
         return Ok(());
@@ -163,6 +189,8 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
     save_device_network_state(&device_state)?;
     let cfg = DaemonConfig {
         serial: serial.clone(),
+        ca_cert: ca_cert.clone(),
+        ca_key: ca_key.clone(),
         port,
         host_port,
         app_filters: apps.clone(),
@@ -228,14 +256,19 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
             "anticomp": anticomp,
             "verify_upstream": verify_upstream,
             "redact": redact,
-            "ca": paths::ca_cert_path()?.display().to_string(),
+            "ca": ca_cert.display().to_string(),
             "hint": "next: `net check <pkg>` to confirm trust; `watch` streams HTTP events alongside screen/crash events",
         }),
     );
     Ok(())
 }
 
-pub async fn stop(serial: &Serial, revoke_ca: bool, canary_host: &str) -> Result<()> {
+pub async fn stop(
+    serial: &Serial,
+    revoke_ca: bool,
+    canary_host: &str,
+    ca_cert: &Path,
+) -> Result<()> {
     let state = load_device_network_state(serial)?;
     let daemon_status = control::request(serial, json!({"op": "status"})).await.ok();
     let pid = control::daemon_pid(serial);
@@ -299,7 +332,9 @@ pub async fn stop(serial: &Serial, revoke_ca: bool, canary_host: &str) -> Result
     }
 
     let ca_removed = if revoke_ca {
-        crate::net::trust::remove(serial).await.unwrap_or(false)
+        crate::net::trust::remove(serial, ca_cert)
+            .await
+            .unwrap_or(false)
     } else {
         false
     };
@@ -326,7 +361,7 @@ pub async fn stop(serial: &Serial, revoke_ca: bool, canary_host: &str) -> Result
     Ok(())
 }
 
-pub async fn status(serial: &Serial) -> Result<()> {
+pub async fn status(serial: &Serial, ca_cert: Option<&Path>) -> Result<()> {
     let running = control::is_running(serial).await;
     let daemon = if running {
         control::request(serial, json!({"op": "status"})).await.ok()
@@ -377,7 +412,12 @@ pub async fn status(serial: &Serial) -> Result<()> {
             "adb_reverse_mappings": adb_reverse_mappings,
             "adb_reverse_error": adb_reverse_error,
             "pointed_at_proxy": pointed,
-            "ca_generated": paths::ca_cert_path().map(|p| p.exists()).unwrap_or(false),
+            // The CA `net start` would use here (resolved), falling back to the
+            // global CA when resolution isn't possible.
+            "ca": ca_cert.map(|p| p.display().to_string()),
+            "ca_generated": ca_cert
+                .map(|p| p.exists())
+                .unwrap_or_else(|| paths::ca_cert_path().map(|p| p.exists()).unwrap_or(false)),
         }),
     );
     Ok(())
@@ -645,12 +685,22 @@ fn write_body_file(id: &str, resp_body: Option<&str>, truncated: bool, path: &Pa
 
 // ── not yet implemented (later tasks) ─────────────────────────
 
-pub async fn check(serial: &Serial, package: &str) -> Result<()> {
-    crate::net::check::run(serial, package).await
+pub async fn check(
+    serial: &Serial,
+    package: &str,
+    tctx: &crate::net::trust::TrustContext,
+) -> Result<()> {
+    crate::net::check::run(serial, package, tctx).await
 }
 
-pub async fn trust(serial: &Serial, auto: bool, system: bool, ui: bool) -> Result<()> {
-    crate::net::trust::run(serial, auto, system, ui).await
+pub async fn trust(
+    serial: &Serial,
+    auto: bool,
+    system: bool,
+    ui: bool,
+    tctx: &crate::net::trust::TrustContext,
+) -> Result<()> {
+    crate::net::trust::run(serial, auto, system, ui, tctx).await
 }
 
 // ── CA management (`net ca`) ──────────────────────────────────
@@ -662,9 +712,24 @@ async fn proxy_running(serial: &Serial) -> bool {
     !serial.as_str().is_empty() && control::is_running(serial).await
 }
 
-/// `net ca import` — install a user-provided CA as the proxy's signing CA.
-pub async fn ca_import(serial: &Serial, cert: &Path, key: Option<&Path>) -> Result<()> {
-    let (info, warnings) = crate::net::ca::import_ca(cert, key)?;
+/// `net ca import [--project|--global]` — install a user-provided CA as the
+/// proxy's signing CA in the resolved scope.
+pub async fn ca_import(
+    serial: &Serial,
+    dir: &Path,
+    origin: &str,
+    cert: &Path,
+    key: Option<&Path>,
+) -> Result<()> {
+    let (info, warnings) = crate::net::ca::import_into(dir, cert, key)?;
+    // A new CA invalidates any cached "trusted" verdict for this device.
+    crate::net::trust::clear_trust_cache(serial);
+    // Keep the freshly-written CA secrets (and .bak backups) out of git.
+    let gitignore_added = if origin == "project" {
+        crate::config::ensure_shadowdroid_gitignore(dir).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
     // The device still trusts the *old* CA (or none), and a live daemon holds the
     // old CA in memory — spell out both so leaves actually validate.
@@ -682,8 +747,11 @@ pub async fn ca_import(serial: &Serial, cert: &Path, key: Option<&Path>) -> Resu
         "net_ca_import",
         json!({
             "imported": true,
+            "scope": origin,
+            "dir": dir.display().to_string(),
             "ca": info,
             "warnings": warnings,
+            "gitignore_added": gitignore_added,
             "backup": "the previous CA (if any) was saved alongside as ca.crt.bak / ca.key.bak",
             "next": next,
         }),
@@ -691,16 +759,28 @@ pub async fn ca_import(serial: &Serial, cert: &Path, key: Option<&Path>) -> Resu
     Ok(())
 }
 
-/// `net ca info` — describe the CA currently in use.
-pub async fn ca_info() -> Result<()> {
-    let info = crate::net::ca::ca_info()?;
-    emit("net_ca_info", serde_json::to_value(&info)?);
+/// `net ca info [--project|--global]` — describe the CA in the resolved scope.
+pub async fn ca_info(dir: &Path, origin: &str) -> Result<()> {
+    let info = crate::net::ca::info_in(dir)?;
+    let mut value = serde_json::to_value(&info)?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("scope".into(), json!(origin));
+    }
+    emit("net_ca_info", value);
     Ok(())
 }
 
-/// `net ca reset` — regenerate a fresh ShadowDroid CA (the current one is backed up).
-pub async fn ca_reset(serial: &Serial) -> Result<()> {
-    let info = crate::net::ca::reset_ca()?;
+/// `net ca reset [--project|--global]` — regenerate a fresh ShadowDroid CA in the
+/// resolved scope (the current one is backed up). Also how a project CA is first
+/// minted.
+pub async fn ca_reset(serial: &Serial, dir: &Path, origin: &str) -> Result<()> {
+    let info = crate::net::ca::reset_in(dir)?;
+    crate::net::trust::clear_trust_cache(serial);
+    let gitignore_added = if origin == "project" {
+        crate::config::ensure_shadowdroid_gitignore(dir).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let mut next = vec!["re-run `shadowdroid net trust` to install the regenerated CA".to_string()];
     if proxy_running(serial).await {
         next.push(
@@ -711,7 +791,10 @@ pub async fn ca_reset(serial: &Serial) -> Result<()> {
         "net_ca_reset",
         json!({
             "reset": true,
+            "scope": origin,
+            "dir": dir.display().to_string(),
             "ca": info,
+            "gitignore_added": gitignore_added,
             "backup": "the previous CA was saved alongside as ca.crt.bak / ca.key.bak",
             "next": next,
         }),

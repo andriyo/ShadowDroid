@@ -103,7 +103,7 @@ pub fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex_lower(&digest))
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         use std::fmt::Write;
