@@ -196,40 +196,169 @@ pub async fn run(args: &StudioArgs) -> Result<()> {
 
 pub async fn run_init(args: &InitArgs) -> Result<()> {
     let install_studio = !args.no_studio_plugin || args.install_studio_plugin;
-    if install_studio {
-        if let Err(err) = install(args.studio.as_deref(), args.plugin.as_deref(), args.json).await {
-            if args.json {
-                crate::events::emit(&serde_json::json!({
-                    "type": "init_step",
-                    "step": "studio_plugin",
-                    "ok": false,
-                    "error": err.to_string(),
-                    "next_command": "shadowdroid init --no-studio-plugin",
-                }));
-            } else {
-                eprintln!("Studio plugin: {err}");
-                eprintln!(
-                    "Next: install Android Studio or pass --studio, then rerun `shadowdroid init`."
-                );
-            }
+    let plugin = if install_studio {
+        Some(
+            install_report(args.studio.as_deref(), args.plugin.as_deref())
+                .await
+                .map_err(|err| format!("{err:#}")),
+        )
+    } else {
+        None
+    };
+
+    let skills = (!args.no_skills).then(skill::install_default_skills);
+    let studio = status_report(args.studio.as_deref()).map_err(|err| format!("{err:#}"));
+
+    let terminal = init_terminal_value(install_studio, plugin.as_ref(), skills.as_ref(), &studio);
+
+    if args.json {
+        if let Ok(payload) = &terminal {
+            // `init --json` has exactly one writer. Substeps above return data
+            // rather than printing their own reports, and failures are returned
+            // for `main` to render as the single typed error envelope.
+            crate::events::emit_action("init", payload);
         }
     } else {
-        status(args.studio.as_deref(), args.json).await?;
+        print_init_human(plugin.as_ref(), skills.as_ref(), &studio);
     }
 
-    if !args.no_skills {
-        let skills = skill::install_default_skills();
-        if args.json {
-            crate::events::emit(&skills);
-        } else {
-            print_skill_install_human(&skills);
+    terminal.map(|_| ())
+}
+
+type InitStepResult<T> = std::result::Result<T, String>;
+
+fn init_terminal_value(
+    install_studio: bool,
+    plugin: Option<&InitStepResult<InstallReport>>,
+    skills: Option<&serde_json::Value>,
+    studio: &InitStepResult<StudioReport>,
+) -> Result<serde_json::Value> {
+    let mut steps = serde_json::Map::new();
+    let mut failed_steps = Vec::new();
+    let mut next_actions = Vec::<String>::new();
+
+    let plugin_value = match plugin {
+        Some(Ok(report)) => serde_json::json!({
+            "requested": true,
+            "ok": true,
+            "report": report,
+        }),
+        Some(Err(error)) => {
+            failed_steps.push("studio_plugin");
+            next_actions.extend([
+                "inspect detail.steps.studio_plugin.error; install Android Studio or pass the intended --studio path".to_string(),
+                "rerun `shadowdroid init --no-studio-plugin --json` only if continuing without the Studio integration is intended".to_string(),
+            ]);
+            serde_json::json!({
+                "requested": true,
+                "ok": false,
+                "error": error,
+            })
         }
+        None => serde_json::json!({
+            "requested": install_studio,
+            "ok": !install_studio,
+        }),
+    };
+    steps.insert("studio_plugin".into(), plugin_value);
+
+    let skills_value = match skills {
+        Some(report) => {
+            let failures = report
+                .get("failed")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            if failures > 0 {
+                failed_steps.push("agent_skills");
+                next_actions.push(
+                    "inspect detail.steps.agent_skills.report.failed; review each destination before choosing whether to rerun its skill install with --force"
+                        .to_string(),
+                );
+            }
+            serde_json::json!({
+                "requested": true,
+                "ok": failures == 0,
+                "failed_count": failures,
+                "report": report,
+            })
+        }
+        None => serde_json::json!({
+            "requested": false,
+            "ok": true,
+        }),
+    };
+    steps.insert("agent_skills".into(), skills_value);
+
+    let studio_value = match studio {
+        Ok(report) => serde_json::json!({
+            "ok": true,
+            "report": report,
+        }),
+        Err(error) => {
+            failed_steps.push("studio_status");
+            next_actions.push(
+                "run `shadowdroid studio status --json` and repair the reported registry or Studio discovery error"
+                    .to_string(),
+            );
+            serde_json::json!({
+                "ok": false,
+                "error": error,
+            })
+        }
+    };
+    steps.insert("studio_status".into(), studio_value);
+
+    if !failed_steps.is_empty() {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "init_failed",
+            "init",
+            format!(
+                "ShadowDroid initialization failed in {} step(s): {}",
+                failed_steps.len(),
+                failed_steps.join(", ")
+            ),
+        )
+        .detail(serde_json::json!({
+            "failed_steps": failed_steps,
+            "steps": steps,
+        }))
+        .next_actions(next_actions)
+        .into());
     }
 
-    if install_studio {
-        status(args.studio.as_deref(), args.json).await?;
+    let next_actions = studio
+        .as_ref()
+        .map(|report| report.guidance.clone())
+        .unwrap_or_default();
+    Ok(serde_json::json!({
+        "steps": steps,
+        "next_actions": next_actions,
+    }))
+}
+
+fn print_init_human(
+    plugin: Option<&InitStepResult<InstallReport>>,
+    skills: Option<&serde_json::Value>,
+    studio: &InitStepResult<StudioReport>,
+) {
+    match plugin {
+        Some(Ok(report)) => print_install_human(report),
+        Some(Err(error)) => {
+            eprintln!("Studio plugin: {error}");
+            eprintln!(
+                "Next: install Android Studio or pass --studio, then rerun `shadowdroid init`."
+            );
+        }
+        None => {}
     }
-    Ok(())
+    if let Some(skills) = skills {
+        print_skill_install_human(skills);
+    }
+    match studio {
+        Ok(report) => print_status_human(report),
+        Err(error) => eprintln!("Android Studio status: {error}"),
+    }
 }
 
 async fn status(explicit_studio: Option<&Path>, json: bool) -> Result<()> {
@@ -271,6 +400,19 @@ async fn install(
     explicit_plugin: Option<&Path>,
     json: bool,
 ) -> Result<()> {
+    let report = install_report(explicit_studio, explicit_plugin).await?;
+    if json {
+        crate::events::emit(&report);
+    } else {
+        print_install_human(&report);
+    }
+    Ok(())
+}
+
+async fn install_report(
+    explicit_studio: Option<&Path>,
+    explicit_plugin: Option<&Path>,
+) -> Result<InstallReport> {
     let mut studios = discover_android_studios(explicit_studio)?;
     if studios.is_empty() {
         bail!(
@@ -302,7 +444,7 @@ async fn install(
         Path::new(&selected.path),
         Path::new(&selected.product_info),
     )?;
-    let report = InstallReport {
+    Ok(InstallReport {
         studio: refreshed,
         plugin: plugin_info,
         installed_dir: installed_dir.display().to_string(),
@@ -311,14 +453,7 @@ async fn install(
             "Restart Android Studio to load or update the plugin.".into(),
             "After restart, run `shadowdroid debug status` to confirm the bridge.".into(),
         ],
-    };
-
-    if json {
-        crate::events::emit(&report);
-    } else {
-        print_install_human(&report);
-    }
-    Ok(())
+    })
 }
 
 fn discover_android_studios(explicit: Option<&Path>) -> Result<Vec<StudioInfo>> {
@@ -761,7 +896,7 @@ fn newest_zip(dir: &Path) -> Result<Option<PathBuf>> {
             zips.push((modified, path));
         }
     }
-    zips.sort_by(|a, b| b.0.cmp(&a.0));
+    zips.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     Ok(zips.into_iter().map(|(_, path)| path).next())
 }
 

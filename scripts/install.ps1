@@ -2,6 +2,7 @@ param(
     [string]$Version = $(if ($env:SHADOWDROID_VERSION) { $env:SHADOWDROID_VERSION } else { "latest" }),
     [string]$InstallDir = $(if ($env:SHADOWDROID_INSTALL_DIR) { $env:SHADOWDROID_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA "ShadowDroid\bin" }),
     [string]$Repo = $(if ($env:SHADOWDROID_REPO) { $env:SHADOWDROID_REPO } else { "andriyo/ShadowDroid" }),
+    [string]$ReleaseBaseUrl = $(if ($env:SHADOWDROID_RELEASE_BASE_URL) { $env:SHADOWDROID_RELEASE_BASE_URL } else { "" }),
     [switch]$NoPathUpdate,
     [switch]$Uninstall,
     [switch]$RemovePath,
@@ -31,6 +32,8 @@ Environment overrides:
   SHADOWDROID_VERSION
   SHADOWDROID_INSTALL_DIR
   SHADOWDROID_REPO
+  SHADOWDROID_RELEASE_BASE_URL  HTTPS asset base URL. Plain HTTP is accepted
+                               only for 127.0.0.1/localhost release smoke tests.
 
 Examples:
   powershell -ExecutionPolicy Bypass -c "irm https://github.com/andriyo/ShadowDroid/releases/latest/download/shadowdroid-installer.ps1 | iex"
@@ -109,7 +112,16 @@ switch ($arch) {
 }
 
 $asset = "shadowdroid-$target.zip"
-if ($Version -eq "latest") {
+if (-not [string]::IsNullOrWhiteSpace($ReleaseBaseUrl)) {
+    $baseUri = [Uri]$ReleaseBaseUrl
+    $isSecure = $baseUri.Scheme -eq "https"
+    $isLoopbackHttp = $baseUri.Scheme -eq "http" -and $baseUri.IsLoopback
+    if (-not $isSecure -and -not $isLoopbackHttp) {
+        throw "Refusing non-HTTPS release URL: $ReleaseBaseUrl"
+    }
+    $baseUrl = $ReleaseBaseUrl.TrimEnd('/')
+}
+elseif ($Version -eq "latest") {
     $baseUrl = "https://github.com/$Repo/releases/latest/download"
 } else {
     $baseUrl = "https://github.com/$Repo/releases/download/$Version"

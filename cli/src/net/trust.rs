@@ -143,7 +143,14 @@ pub async fn run(
 ) -> Result<()> {
     let selected = [auto, system, ui].into_iter().filter(|v| *v).count();
     if selected > 1 {
-        bail!("choose only one trust mode: --auto, --system, or --ui");
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "trust_mode_conflict",
+            "input",
+            "choose only one trust mode: --auto, --system, or --ui",
+        )
+        .detail(json!({"auto": auto, "system": system, "ui": ui}))
+        .next_actions(["remove all but one trust-mode flag, then retry `shadowdroid net trust`"])
+        .into());
     }
 
     // Assertion: the user vouches the CA is already trusted — don't touch the device.
@@ -400,7 +407,8 @@ pub(crate) async fn cert_present(serial: &Serial, dest: &str, ca_cert: &Path) ->
 
 async fn cert_status(serial: &Serial, dest: &str, ca_cert: &Path) -> CertStatus {
     const EXIT_MARKER: &str = "__shadowdroid_cert_ls_exit__:";
-    let listing = adb::shell(serial, format!("ls {dest} 2>&1; echo {EXIT_MARKER}$?"))
+    let dest_arg = crate::config::quote_device_shell_arg(dest);
+    let listing = adb::shell(serial, format!("ls {dest_arg} 2>&1; echo {EXIT_MARKER}$?"))
         .await
         .unwrap_or_default();
     if let Some(status) = classify_cert_listing(&listing) {

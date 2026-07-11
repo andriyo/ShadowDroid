@@ -3,8 +3,9 @@
 // Optional add-on to the core `shadowdroid-agent` AAR. It supplies the one
 // piece that cannot be zero-app-code: an OkHttp `Interceptor` the host app adds
 // to its client (debug-only) so the agent can see plaintext request/response
-// **above TLS** — defeating cert pinning / Cronet / QUIC that the host MITM
-// proxy can't.
+// **above OkHttp's TLS layer** — including certificate-pinned OkHttp traffic
+// that the host MITM proxy cannot reach. It does not instrument Cronet, QUIC,
+// or other HTTP clients.
 //
 // `compileOnly` OkHttp + the core agent: a local `files()` AAR carries no
 // transitive deps, so the consuming app must already provide OkHttp (it does —
@@ -40,8 +41,14 @@ kotlin {
     }
 }
 
+val okhttp4 = "com.squareup.okhttp3:okhttp:4.12.0"
+
 dependencies {
     // Provided by the consuming app (core agent AAR + the app's own OkHttp).
     compileOnly(project(":shadowdroid-agent"))
-    compileOnly("com.squareup.okhttp3:okhttp:4.12.0")
+    compileOnly(okhttp4)
+
+    testImplementation(project(":shadowdroid-agent"))
+    testImplementation(okhttp4)
+    testImplementation("junit:junit:4.13.2")
 }

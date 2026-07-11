@@ -12,11 +12,11 @@ import java.util.concurrent.atomic.AtomicBoolean
  * debug builds and reached by ShadowDroid's CLI over a loopback control channel
  * (`adb forward`).
  *
- * It is intentionally a small, extensible host: capabilities register a command
- * verb in [handle]. It answers `info`/`ping`, and — when the OkHttp companion
- * interceptor is wired into the host app — the network verbs `capture`,
- * `intercept`, `resume`, `drop`, and `status` (above-TLS, in-process capture +
- * agent-in-the-loop interception; see [Capture] / [Intercept]).
+ * It is intentionally a small, extensible host. It answers `info`/`ping`, and
+ * — when the optional OkHttp companion interceptor is wired into the host app
+ * — the network verbs `capture`, `intercept`, `resume`, `drop`, and `status`.
+ * That provider observes OkHttp only; the core AAR does not capture networking
+ * by itself (see [Capture] / [Intercept]).
  */
 object ShadowDroidAgent {
     const val TAG = "ShadowDroidAgent"
@@ -96,15 +96,18 @@ object ShadowDroidAgent {
         }
     }
 
-    private fun capture(clear: Boolean): String =
-        JSONObject().apply {
+    private fun capture(clear: Boolean): String {
+        if (!Capture.providerAvailable()) return missingCaptureProvider()
+        return JSONObject().apply {
             put("ok", true)
             val flows = Capture.drain(clear)
             put("flows", flows)
             put("count", flows.length())
         }.toString()
+    }
 
     private fun intercept(rest: String): String {
+        if (!Capture.providerAvailable()) return missingCaptureProvider()
         val spec = if (rest.isEmpty()) JSONObject() else JSONObject(rest)
         Intercept.arm(spec)
         return statusJson()
@@ -114,7 +117,7 @@ object ShadowDroidAgent {
         JSONObject().apply {
             put("ok", true)
             put("package", packageName)
-            put("captured", Capture.size())
+            put("capture", Capture.status())
             put("intercept", Intercept.status())
             put(
                 "coroutines",
@@ -136,7 +139,10 @@ object ShadowDroidAgent {
         return JSONObject().apply {
             put("ok", resolved)
             put("id", id)
-            if (!resolved) put("error", "no held flow with id '$id'")
+            if (!resolved) {
+                put("error", "no held flow with id '$id'")
+                put("hint", "Run `shadowdroid aar agent` and use an id listed under held flows.")
+            }
         }.toString()
     }
 
@@ -148,6 +154,13 @@ object ShadowDroidAgent {
             """"pid":${Process.myPid()},"port":$port,""" +
             """"coroutines":${Coroutines.available()}}"""
 
+    private fun missingCaptureProvider(): String =
+        JSONObject()
+            .put("ok", false)
+            .put("error", "no in-app HTTP capture provider is registered")
+            .put("hint", Capture.MISSING_PROVIDER_HINT)
+            .toString()
+
     private fun jsonError(message: String): String =
-        """{"ok":false,"error":"${message.replace("\"", "'")}"}"""
+        JSONObject().put("ok", false).put("error", message).toString()
 }

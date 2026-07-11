@@ -156,6 +156,7 @@ pub fn compact_screen_value(screen: &ScreenResponse) -> Value {
         .collect();
     json!({
         "screen_hash": screen.screen_hash,
+        "screen_hash_version": screen.screen_hash_version,
         "viewport": screen.viewport,
         "current_app": screen.current_app,
         "element_count": screen.element_count,
@@ -221,6 +222,10 @@ async fn enrich_not_found(
         }
         obj.insert("current_app".into(), json!(screen.current_app));
         obj.insert("screen_hash".into(), json!(screen.screen_hash));
+        obj.insert(
+            "screen_hash_version".into(),
+            json!(screen.screen_hash_version),
+        );
         obj.insert(
             "hint".into(),
             json!(

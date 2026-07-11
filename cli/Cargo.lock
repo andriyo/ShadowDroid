@@ -2122,6 +2122,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rustls",
+ "rustls-platform-verifier",
  "ruzstd",
  "serde",
  "serde_json",

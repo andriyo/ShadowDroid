@@ -42,12 +42,14 @@ object SelectorRoutes {
 
         route.post("/xpath") {
             val request: XpathReq = call.receive()
-            val selector = SelectorReq(xpath = request.query, all = !request.tap)
+            // Always collect the complete match set. Taking the first match on
+            // a tap silently bypassed ShadowDroid's strict ambiguity contract
+            // and made identical screens behave differently depending on tree
+            // order.
+            val selector = SelectorReq(xpath = request.query, all = true)
             val matches = findElementMatches(selector, uiDevice, instr)
             if (request.tap) {
-                val match =
-                    matches.firstOrNull()
-                        ?: throw NotFound("element_not_found", "no element matched xpath")
+                val match = chooseUnique(matches, selector)
                 val tap = tapMatch(match, uiDevice)
                 call.respond(FindTapResp(matched = match.element, x = tap.x, y = tap.y, action = tap.action))
             } else {
@@ -84,10 +86,12 @@ object SelectorRoutes {
             // one `/find` uses) — not `By.textContains`, which is case-sensitive
             // and unnormalized. A match with a usable tap point is on-screen.
             val selector = SelectorReq(text = r.text, rid = r.rid, desc = r.desc)
+
             fun visibleHit(): Element? =
                 findElementMatches(selector, uiDevice, instr)
                     .map { it.element }
                     .firstOrNull { it.tap != null }
+
             var found = visibleHit()
             var swipes = 0
             while (found == null && swipes < r.max_swipes) {
@@ -127,9 +131,15 @@ internal fun chooseUnique(
             if (exact.size == 1) {
                 exact[0]
             } else {
+                val message =
+                    if (request.xpath != null) {
+                        "xpath matched ${matches.size} elements; add a unique @resource-id or @content-desc clause"
+                    } else {
+                        "selector matched ${matches.size} elements; narrow with --exact, --rid, or --clickable"
+                    }
                 throw BadRequest(
                     "ambiguous_match",
-                    "selector matched ${matches.size} elements; narrow with --exact, --rid, or --clickable",
+                    message,
                     detail = mapOf("count" to matches.size, "candidates" to candidatesDetail(matches)),
                 )
             }
@@ -341,8 +351,7 @@ internal fun normalizeForMatch(s: String): String {
 }
 
 /** Zero-width and bidi marks: visually absent, but break a naive comparison. */
-private fun isZeroWidthOrBidi(c: Char): Boolean =
-    c in '\u200B'..'\u200F' || c in '\u202A'..'\u202E' || c == '\u2060' || c == '\uFEFF'
+private fun isZeroWidthOrBidi(c: Char): Boolean = c in '\u200B'..'\u200F' || c in '\u202A'..'\u202E' || c == '\u2060' || c == '\uFEFF'
 
 private data class XpathMatcher(
     val clauses: List<XpathClause>,

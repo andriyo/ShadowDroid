@@ -76,6 +76,26 @@ impl ServerClient {
         check_then_json(resp).await
     }
 
+    /// POST with a command-specific wall-clock budget. Long-running server
+    /// operations such as app waits and device shell commands must not inherit
+    /// the generic 30-second UI timeout, but they also must not run without a
+    /// host-side deadline.
+    async fn post_with_timeout<B: Serialize, T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+        timeout: Duration,
+    ) -> Result<T> {
+        let resp = self
+            .http
+            .post(format!("{}{}", self.base, path))
+            .timeout(timeout)
+            .json(body)
+            .send()
+            .await?;
+        check_then_json(resp).await
+    }
+
     async fn post_empty<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         let resp = self
             .http
@@ -370,9 +390,10 @@ impl ServerClient {
         timeout_ms: u32,
         front: bool,
     ) -> Result<AppWaitResp> {
-        self.post(
+        self.post_with_timeout(
             "/app/wait",
             &serde_json::json!({"package": package, "timeout_ms": timeout_ms, "front": front}),
+            Duration::from_millis(timeout_ms as u64 + 1_000),
         )
         .await
     }
@@ -444,9 +465,10 @@ impl ServerClient {
     }
 
     pub async fn shell(&self, cmd: &str, timeout_ms: u32) -> Result<ShellResp> {
-        self.post(
+        self.post_with_timeout(
             "/shell",
             &serde_json::json!({"cmd": cmd, "timeout_ms": timeout_ms}),
+            Duration::from_millis(timeout_ms.max(1) as u64 + 1_000),
         )
         .await
     }

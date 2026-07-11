@@ -16,6 +16,7 @@
 //!      a hyphen, so folding it would cause false matches),
 //!   3. collapses every run of Unicode whitespace (NBSP, tabs, newlines, thin
 //!      spaces, …) to one ASCII space and trims the ends.
+//!
 //! Matching is then **case-insensitive**: a substring test by default, full
 //! equality under `exact`.
 
@@ -116,8 +117,34 @@ impl SelectorArgs {
             (Some(t), None, None) => Ok(Selector::Text(t.clone())),
             (None, Some(r), None) => Ok(Selector::Rid(r.clone())),
             (None, None, Some(d)) => Ok(Selector::Desc(d.clone())),
-            (None, None, None) => anyhow::bail!("pass exactly one of --text / --rid / --desc"),
-            _ => anyhow::bail!("pass only one of --text / --rid / --desc"),
+            (None, None, None) => Err(crate::diagnostic::DiagnosticError::new(
+                "selector_required",
+                "input",
+                "pass exactly one selector: --text, --rid, or --desc",
+            )
+            .detail(serde_json::json!({"provided": []}))
+            .next_actions(["rerun the command with exactly one of --text, --rid, or --desc"])
+            .into()),
+            _ => {
+                let provided = [
+                    self.text.as_ref().map(|_| "text"),
+                    self.rid.as_ref().map(|_| "rid"),
+                    self.desc.as_ref().map(|_| "desc"),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+                Err(crate::diagnostic::DiagnosticError::new(
+                    "selector_conflict",
+                    "input",
+                    "pass only one selector: --text, --rid, or --desc",
+                )
+                .detail(serde_json::json!({"provided": provided}))
+                .next_actions([
+                    "choose the most stable single selector (prefer --rid), remove the others, and retry",
+                ])
+                .into())
+            }
         }
     }
 }

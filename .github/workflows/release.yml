@@ -116,9 +116,12 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v6
 
-      - name: Build agent AAR
+      - name: Build agent AARs
         working-directory: agent
-        run: ./gradlew --no-daemon :shadowdroid-agent:assembleRelease
+        run: |
+          ./gradlew --no-daemon \
+            :shadowdroid-agent:assembleRelease \
+            :shadowdroid-agent-okhttp:assembleRelease
 
       - name: Stage AAR asset
         shell: bash
@@ -126,11 +129,13 @@ jobs:
           mkdir -p dist
           cp agent/shadowdroid-agent/build/outputs/aar/shadowdroid-agent-release.aar \
             dist/shadowdroid-agent.aar
+          cp agent/shadowdroid-agent-okhttp/build/outputs/aar/shadowdroid-agent-okhttp-release.aar \
+            dist/shadowdroid-agent-okhttp.aar
 
       - uses: actions/upload-artifact@v7
         with:
           name: agent-aar
-          path: dist/shadowdroid-agent.aar
+          path: dist/shadowdroid-agent*.aar
           if-no-files-found: error
 
   build-cli:
@@ -197,16 +202,14 @@ jobs:
           path: shadowdroid-${{ matrix.target }}.*
           if-no-files-found: error
 
-  publish:
-    name: Publish GitHub Release
+  stage-release:
+    name: Stage release candidate
     needs:
       - build-apks
       - build-studio-plugin
       - build-agent-aar
       - build-cli
     runs-on: ubuntu-24.04
-    env:
-      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v6
 
@@ -229,6 +232,122 @@ jobs:
               shasum -a 256 "$f"
             done > SHA256SUMS
           )
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-candidate
+          path: dist/*
+          if-no-files-found: error
+
+  smoke-candidate-installers:
+    name: Smoke candidate installer on ${{ matrix.os }}
+    needs: stage-release
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-15
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-candidate
+          path: candidate
+
+      - name: Smoke candidate macOS/Linux installer
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+          python3 -m http.server "$port" --bind 127.0.0.1 --directory candidate \
+            >"$RUNNER_TEMP/shadowdroid-candidate-http.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          base_url="http://127.0.0.1:$port"
+          ready=0
+          for _ in $(seq 1 20); do
+            if curl -fsS "$base_url/SHA256SUMS" >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 0.25
+          done
+          if [ "$ready" -ne 1 ]; then
+            cat "$RUNNER_TEMP/shadowdroid-candidate-http.log"
+            exit 1
+          fi
+          install_dir="$RUNNER_TEMP/shadowdroid-bin"
+          SHADOWDROID_RELEASE_BASE_URL="$base_url" \
+            sh candidate/shadowdroid-installer.sh \
+              --version "$GITHUB_REF_NAME" \
+              --install-dir "$install_dir"
+          "$install_dir/shadowdroid" --version | grep "shadowdroid ${GITHUB_REF_NAME#v}"
+          sh candidate/shadowdroid-installer.sh --install-dir "$install_dir" --uninstall
+          test ! -e "$install_dir/shadowdroid"
+
+      - name: Smoke candidate Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $candidate = Join-Path $PWD "candidate"
+          $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+          $listener.Start()
+          $port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+          $listener.Stop()
+          $server = Start-Process `
+            -FilePath "python" `
+            -ArgumentList @("-m", "http.server", $port, "--bind", "127.0.0.1") `
+            -WorkingDirectory $candidate `
+            -PassThru `
+            -WindowStyle Hidden
+          try {
+            $baseUrl = "http://127.0.0.1:$port"
+            $ready = $false
+            for ($attempt = 0; $attempt -lt 20; $attempt++) {
+              try {
+                Invoke-WebRequest -Uri "$baseUrl/SHA256SUMS" -UseBasicParsing | Out-Null
+                $ready = $true
+                break
+              }
+              catch {
+                Start-Sleep -Milliseconds 250
+              }
+            }
+            if (-not $ready) {
+              throw "candidate HTTP server did not start"
+            }
+            $env:SHADOWDROID_RELEASE_BASE_URL = $baseUrl
+            $installer = Join-Path $candidate "shadowdroid-installer.ps1"
+            $installDir = Join-Path $env:RUNNER_TEMP "shadowdroid-bin"
+            powershell -ExecutionPolicy Bypass -File $installer -Version $env:GITHUB_REF_NAME -InstallDir $installDir -NoPathUpdate
+            & (Join-Path $installDir "shadowdroid.exe") --version | Select-String "shadowdroid $($env:GITHUB_REF_NAME.TrimStart('v'))"
+            powershell -ExecutionPolicy Bypass -File $installer -InstallDir $installDir -Uninstall
+            if (Test-Path (Join-Path $installDir "shadowdroid.exe")) {
+              throw "shadowdroid.exe still exists after uninstall"
+            }
+          }
+          finally {
+            Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+          }
+
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - stage-release
+      - smoke-candidate-installers
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-candidate
+          path: dist
 
       - name: Write release notes
         shell: bash

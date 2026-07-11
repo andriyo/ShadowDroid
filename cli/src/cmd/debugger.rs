@@ -3,7 +3,7 @@
 //! These commands talk to the ShadowDroid Android Studio plugin over its local
 //! loopback HTTP bridge. They do not need the on-device ShadowDroid server.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -229,16 +229,16 @@ pub enum BreakCmd {
 
 #[derive(Args)]
 pub struct SessionSelector {
-    /// Debug session index from `debug sessions`.
+    /// Stable session id (preferred) or current index from `debug sessions`.
     #[arg(long)]
-    pub session: Option<usize>,
+    pub session: Option<String>,
 }
 
 #[derive(Args)]
 pub struct StackArgs {
-    /// Debug session index from `debug sessions`.
+    /// Stable session id (preferred) or current index from `debug sessions`.
     #[arg(long)]
-    pub session: Option<usize>,
+    pub session: Option<String>,
     /// Maximum number of frames per stack.
     #[arg(long, default_value_t = 64)]
     pub limit: u32,
@@ -249,9 +249,9 @@ pub struct StackArgs {
 
 #[derive(Args)]
 pub struct VariablesArgs {
-    /// Debug session index from `debug sessions`.
+    /// Stable session id (preferred) or current index from `debug sessions`.
     #[arg(long)]
-    pub session: Option<usize>,
+    pub session: Option<String>,
     /// Execution stack/thread index from `debug threads`.
     #[arg(long)]
     pub thread: Option<String>,
@@ -276,9 +276,9 @@ pub struct VariablesArgs {
 pub struct EvalArgs {
     /// Deterministic expression path: `this`, a local name, fields, and array indexes.
     pub expression: String,
-    /// Debug session index from `debug sessions`.
+    /// Stable session id (preferred) or current index from `debug sessions`.
     #[arg(long)]
-    pub session: Option<usize>,
+    pub session: Option<String>,
     /// Execution stack/thread index from `debug threads`.
     #[arg(long)]
     pub thread: Option<String>,
@@ -310,9 +310,9 @@ pub struct InspectArgs {
     /// Relative path from --handle, e.g. `.field[0]`.
     #[arg(long)]
     pub path: Option<String>,
-    /// Debug session index from `debug sessions`.
+    /// Stable session id (preferred) or current index from `debug sessions`.
     #[arg(long)]
-    pub session: Option<usize>,
+    pub session: Option<String>,
     /// Execution stack/thread index from `debug threads`.
     #[arg(long)]
     pub thread: Option<String>,
@@ -347,9 +347,9 @@ pub enum CoroutinesCmd {
 
 #[derive(Args)]
 pub struct CoroutineSnapshotArgs {
-    /// Debug session index from `debug sessions`.
+    /// Stable session id (preferred) or current index from `debug sessions`.
     #[arg(long)]
-    pub session: Option<usize>,
+    pub session: Option<String>,
     /// Maximum threads/frames/continuations to include.
     #[arg(long, default_value_t = 64)]
     pub limit: u32,
@@ -363,9 +363,9 @@ pub struct CoroutineSnapshotArgs {
 
 #[derive(Args)]
 pub struct CoroutineThreadsArgs {
-    /// Debug session index from `debug sessions`.
+    /// Stable session id (preferred) or current index from `debug sessions`.
     #[arg(long)]
-    pub session: Option<usize>,
+    pub session: Option<String>,
     /// Maximum threads to include.
     #[arg(long, default_value_t = 32)]
     pub limit: u32,
@@ -376,9 +376,9 @@ pub struct CoroutineThreadsArgs {
 
 #[derive(Args)]
 pub struct CoroutineContinuationArgs {
-    /// Debug session index from `debug sessions`.
+    /// Stable session id (preferred) or current index from `debug sessions`.
     #[arg(long)]
-    pub session: Option<usize>,
+    pub session: Option<String>,
     /// Execution stack/thread index from `debug threads`.
     #[arg(long)]
     pub thread: Option<String>,
@@ -398,9 +398,9 @@ pub struct CoroutineFlowArgs {
     /// Deterministic expression path to a Flow/StateFlow-like object.
     #[arg(long)]
     pub expr: String,
-    /// Debug session index from `debug sessions`.
+    /// Stable session id (preferred) or current index from `debug sessions`.
     #[arg(long)]
-    pub session: Option<usize>,
+    pub session: Option<String>,
     /// Execution stack/thread index from `debug threads`.
     #[arg(long)]
     pub thread: Option<String>,
@@ -417,9 +417,9 @@ pub struct CoroutineFlowArgs {
 
 #[derive(Args)]
 pub struct ContinueUntilArgs {
-    /// Debug session index from `debug sessions`.
+    /// Stable session id (preferred) or current index from `debug sessions`.
     #[arg(long)]
-    pub session: Option<usize>,
+    pub session: Option<String>,
     /// Source file path to match against the top frame.
     #[arg(long, requires = "line")]
     pub file: Option<PathBuf>,
@@ -463,9 +463,9 @@ pub enum WatchCmd {
 
 #[derive(Args)]
 pub struct WatchListArgs {
-    /// Debug session index from `debug sessions`.
+    /// Stable session id (preferred) or current index from `debug sessions`.
     #[arg(long)]
-    pub session: Option<usize>,
+    pub session: Option<String>,
     /// Object expansion depth for evaluated watch values.
     #[arg(long, default_value_t = 1)]
     pub depth: u32,
@@ -737,7 +737,7 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
         }
         DebuggerCmd::Stop(selector) => control(&bridge, session_action::STOP, selector).await?,
         DebuggerCmd::Stack(args) => {
-            let session_s = args.session.map(|s| s.to_string());
+            let session_s = args.session.clone();
             let limit_s = args.limit.to_string();
             let timeout_ms_s = args.timeout_ms.to_string();
             let params = [
@@ -751,7 +751,7 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
                 .unwrap_or_else(|err| read_error_json("debugger_stack", err))
         }
         DebuggerCmd::Threads(args) => {
-            let session_s = args.session.map(|s| s.to_string());
+            let session_s = args.session.clone();
             let limit_s = args.limit.to_string();
             let timeout_ms_s = args.timeout_ms.to_string();
             let params = [
@@ -765,7 +765,7 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
                 .unwrap_or_else(|err| read_error_json("debugger_threads", err))
         }
         DebuggerCmd::Variables(args) => {
-            let session_s = args.session.map(|s| s.to_string());
+            let session_s = args.session.clone();
             let frame_s = args.frame.map(|s| s.to_string());
             let depth_s = args.depth.to_string();
             let max_fields_s = args.max_fields.to_string();
@@ -786,7 +786,7 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
                 .unwrap_or_else(|err| read_error_json("debugger_variables", err))
         }
         DebuggerCmd::Eval(args) => {
-            let session_s = args.session.map(|s| s.to_string());
+            let session_s = args.session.clone();
             let frame_s = args.frame.map(|s| s.to_string());
             let depth_s = args.depth.to_string();
             let max_fields_s = args.max_fields.to_string();
@@ -832,7 +832,7 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
                     "error": "missing expression or --handle",
                 })
             } else {
-                let session_s = args.session.map(|s| s.to_string());
+                let session_s = args.session.clone();
                 let frame_s = args.frame.map(|s| s.to_string());
                 let depth_s = args.depth.to_string();
                 let max_fields_s = args.max_fields.to_string();
@@ -877,7 +877,7 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
         }
         DebuggerCmd::Coroutines(cmd) => match cmd {
             CoroutinesCmd::Snapshot(args) => {
-                let session_s = args.session.map(|s| s.to_string());
+                let session_s = args.session.clone();
                 let limit_s = args.limit.to_string();
                 let depth_s = args.depth.to_string();
                 let timeout_ms_s = args.timeout_ms.to_string();
@@ -893,7 +893,7 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
                     .unwrap_or_else(|err| read_error_json("debug_coroutines_snapshot", err))
             }
             CoroutinesCmd::Threads(args) => {
-                let session_s = args.session.map(|s| s.to_string());
+                let session_s = args.session.clone();
                 let limit_s = args.limit.to_string();
                 let timeout_ms_s = args.timeout_ms.to_string();
                 let params = [
@@ -907,7 +907,7 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
                     .unwrap_or_else(|err| read_error_json("debug_coroutines_threads", err))
             }
             CoroutinesCmd::Continuation(args) => {
-                let session_s = args.session.map(|s| s.to_string());
+                let session_s = args.session.clone();
                 let frame_s = args.frame.map(|f| f.to_string());
                 let depth_s = args.depth.to_string();
                 let timeout_ms_s = args.timeout_ms.to_string();
@@ -924,7 +924,7 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
                     .unwrap_or_else(|err| read_error_json("debug_coroutines_continuation", err))
             }
             CoroutinesCmd::Flow(args) => {
-                let session_s = args.session.map(|s| s.to_string());
+                let session_s = args.session.clone();
                 let frame_s = args.frame.map(|f| f.to_string());
                 let depth_s = args.depth.to_string();
                 let timeout_ms_s = args.timeout_ms.to_string();
@@ -956,7 +956,7 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
             bridge.get(route::WATCHES_ADD, &params).await?
         }
         DebuggerCmd::Watch(WatchCmd::List(args)) => {
-            let session_s = args.session.map(|s| s.to_string());
+            let session_s = args.session.clone();
             let depth_s = args.depth.to_string();
             let max_fields_s = args.max_fields.to_string();
             let max_array_items_s = args.max_array_items.to_string();
@@ -979,12 +979,29 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
         }
         DebuggerCmd::Watch(WatchCmd::Clear) => bridge.get(route::WATCHES_CLEAR, &[]).await?,
     };
+    if value.get("ok").and_then(Value::as_bool) == Some(false) {
+        let message = value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("Android Studio debugger operation did not complete");
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "debugger_operation_failed",
+            "debugger",
+            message,
+        )
+        .detail(serde_json::json!({"bridge_reply": value}))
+        .next_actions([
+            "inspect detail.bridge_reply and select a valid suspended session when required",
+            "run `shadowdroid studio status --json` before retrying",
+        ])
+        .into());
+    }
     emit(&value)?;
     Ok(())
 }
 
 async fn continue_until(bridge: &BridgeClient, args: &ContinueUntilArgs) -> Result<Value> {
-    let session_s = args.session.map(|s| s.to_string());
+    let session_s = args.session.clone();
     let canonical_file = match &args.file {
         Some(path) => Some(canonicalize_for_bridge(path)?),
         None => None,
@@ -997,7 +1014,7 @@ async fn continue_until(bridge: &BridgeClient, args: &ContinueUntilArgs) -> Resu
             bridge,
             session_action::RESUME,
             &SessionSelector {
-                session: args.session,
+                session: args.session.clone(),
             },
         )
         .await?;
@@ -1015,7 +1032,7 @@ async fn continue_until(bridge: &BridgeClient, args: &ContinueUntilArgs) -> Resu
             }
             tokio::time::sleep(std::time::Duration::from_millis(args.poll_ms.max(25))).await;
             let status = bridge.get(route::STATUS, &[]).await?;
-            if !selected_session_suspended(&status, args.session, bridge.device()) {
+            if !selected_session_suspended(&status, args.session.as_deref(), bridge.device()) {
                 continue;
             }
             let stack = bridge
@@ -1064,17 +1081,25 @@ async fn continue_until(bridge: &BridgeClient, args: &ContinueUntilArgs) -> Resu
 
 fn selected_session_suspended(
     status: &Value,
-    selected: Option<usize>,
+    selected: Option<&str>,
     device: Option<&str>,
 ) -> bool {
     status
         .get("sessions")
         .and_then(Value::as_array)
         .and_then(|sessions| {
-            // Mirror the plugin's selectSession precedence: explicit index, then
-            // device, then the first session.
-            if let Some(index) = selected {
-                sessions.get(index)
+            // Mirror the plugin's selectSession precedence: explicit stable id
+            // (or legacy current index), then device, then the first session.
+            if let Some(selector) = selected {
+                sessions
+                    .iter()
+                    .find(|session| session.get("id").and_then(Value::as_str) == Some(selector))
+                    .or_else(|| {
+                        selector
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|index| sessions.get(index))
+                    })
             } else if let Some(dev) = device {
                 sessions
                     .iter()
@@ -1134,7 +1159,7 @@ async fn control(
     action: &'static str,
     selector: &SessionSelector,
 ) -> Result<Value> {
-    let session_s = selector.session.map(|s| s.to_string());
+    let session_s = selector.session.clone();
     let params = [
         (query::ACTION, Some(action)),
         (query::SESSION, session_s.as_deref()),
@@ -1195,30 +1220,69 @@ impl BridgeClient {
 
     pub(crate) async fn get(&self, path: &str, params: &[(&str, Option<&str>)]) -> Result<Value> {
         let url = self.url(path, params);
-        let response = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| {
+        let response = self.http.get(&url).send().await.map_err(|error| {
+            crate::diagnostic::DiagnosticError::new(
+                "studio_bridge_unreachable",
+                "debugger",
                 format!(
-                    "connecting to Android Studio debugger bridge at {}. Install/start the ShadowDroid Android Studio plugin or pass --studio-url.",
+                    "cannot reach the Android Studio debugger bridge at {}: {error}",
                     self.base_url
-                )
-            })?;
+                ),
+            )
+            .retryable(true)
+            .detail(serde_json::json!({"base_url": self.base_url, "route": path}))
+            .next_actions([
+                "run `shadowdroid studio status --json`",
+                "start Android Studio with the plugin installed, or pass --studio-url, then retry",
+            ])
+        })?;
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .context("reading debugger bridge response")?;
-        let value: Value = serde_json::from_str(&body)
-            .with_context(|| format!("debugger bridge returned non-JSON response: {body}"))?;
+        let body = response.text().await.map_err(|error| {
+            crate::diagnostic::DiagnosticError::new(
+                "studio_bridge_response",
+                "debugger",
+                format!("failed reading the Android Studio debugger bridge response: {error}"),
+            )
+            .retryable(true)
+            .detail(serde_json::json!({"route": path, "status": status.as_u16()}))
+            .next_actions(["run `shadowdroid studio status --json`, then retry"])
+        })?;
+        let value: Value = serde_json::from_str(&body).map_err(|error| {
+            crate::diagnostic::DiagnosticError::new(
+                "studio_bridge_protocol",
+                "debugger",
+                format!("Android Studio debugger bridge returned invalid JSON: {error}"),
+            )
+            .detail(serde_json::json!({
+                "route": path,
+                "status": status.as_u16(),
+                "body_preview": body.chars().take(512).collect::<String>(),
+            }))
+            .next_actions([
+                "run `shadowdroid studio status --json` and verify plugin/CLI versions",
+                "restart Android Studio after updating the plugin, then retry",
+            ])
+        })?;
         if !status.is_success() {
             let message = value
                 .get("error")
                 .and_then(Value::as_str)
                 .unwrap_or("request failed");
-            bail!("debugger bridge request failed (HTTP {status}): {message}");
+            return Err(crate::diagnostic::DiagnosticError::new(
+                "debugger_bridge_rejected",
+                "debugger",
+                format!("Android Studio debugger bridge rejected the request (HTTP {status}): {message}"),
+            )
+            .detail(serde_json::json!({
+                "route": path,
+                "status": status.as_u16(),
+                "bridge_reply": value,
+            }))
+            .next_actions([
+                "inspect detail.bridge_reply and select a valid project/session when required",
+                "run `shadowdroid debug studio sessions` or `shadowdroid studio status --json`",
+            ])
+            .into());
         }
         Ok(value)
     }
@@ -1359,8 +1423,8 @@ mod tests {
     #[test]
     fn suspension_selects_session_by_device() {
         let status = json!({"sessions": [
-            {"index": 0, "suspended": false, "device": {"serial": "emulator-5554", "avd": "Pixel_9"}},
-            {"index": 1, "suspended": true,  "device": {"serial": "emulator-5556", "avd": "Pixel_9_Pro_XL"}},
+            {"id": "session_1", "index": 0, "suspended": false, "device": {"serial": "emulator-5554", "avd": "Pixel_9"}},
+            {"id": "session_2", "index": 1, "suspended": true,  "device": {"serial": "emulator-5556", "avd": "Pixel_9_Pro_XL"}},
         ]});
         // by serial
         assert!(selected_session_suspended(
@@ -1379,12 +1443,14 @@ mod tests {
             None,
             Some("Pixel_9_Pro_XL")
         ));
-        // explicit index wins over device
+        // explicit stable id wins over device
         assert!(!selected_session_suspended(
             &status,
-            Some(0),
+            Some("session_1"),
             Some("emulator-5556")
         ));
+        // A current numeric index is still accepted by the bridge contract.
+        assert!(selected_session_suspended(&status, Some("1"), None));
         // unknown device matches nothing (does not fall back to first)
         assert!(!selected_session_suspended(
             &status,

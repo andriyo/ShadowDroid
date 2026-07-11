@@ -3,6 +3,7 @@ package io.github.andriyo.shadowdroid.routes
 import android.app.Instrumentation
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.os.SystemClock
 import androidx.test.uiautomator.UiDevice
 import io.github.andriyo.shadowdroid.ErrorBody
 import io.github.andriyo.shadowdroid.ErrorEnvelope
@@ -18,8 +19,14 @@ import io.ktor.server.response.respond
 import io.ktor.server.response.respondBytes
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.get
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 object ScreenRoutes {
     /** GET /v1/screen?format=elements|xml and GET /v1/screenshot.png. */
@@ -28,6 +35,12 @@ object ScreenRoutes {
         uiDevice: UiDevice,
         instr: Instrumentation,
     ) {
+        // Activity, PID, and IME visibility previously ran three shell commands
+        // in the request path. Keep those compatibility fields, but refresh
+        // them asynchronously and serve the latest snapshot so the primary
+        // observe loop is bounded by the accessibility-tree walk, not dumpsys.
+        val enrichmentCache = ScreenEnrichmentCache.shared(uiDevice, instr)
+
         route.get("/screen") {
             val format = call.request.queryParameters["format"] ?: "elements"
             if (format == "xml") {
@@ -38,16 +51,17 @@ object ScreenRoutes {
                 return@get
             }
             val root = instr.uiAutomation.rootInActiveWindow
-            val elements = TreeWalker.walk(root, uiDevice.displayWidth, uiDevice.displayHeight)
-            val ime = detectImeState(uiDevice, elements)
+            val viewport = Viewport(uiDevice.displayWidth, uiDevice.displayHeight)
+            val elements = TreeWalker.walk(root, viewport.w, viewport.h)
             val pkg = uiDevice.currentPackageName
-            val activity = currentFocusedActivity(uiDevice)
-            val pid = pidForPackage(uiDevice, pkg)
+            val enrichment = enrichmentCache.snapshot(pkg)
+            val ime = detectImeState(elements, enrichment)
+            val currentApp = AppRef(`package` = pkg, activity = enrichment.activity, pid = enrichment.pid)
             call.respond(
                 ScreenResponse(
-                    screen_hash = TreeWalker.hashOf(elements),
-                    viewport = Viewport(uiDevice.displayWidth, uiDevice.displayHeight),
-                    current_app = AppRef(`package` = pkg, activity = activity, pid = pid),
+                    screen_hash = TreeWalker.hashOf(elements, viewport, currentApp, ime),
+                    viewport = viewport,
+                    current_app = currentApp,
                     element_count = elements.size,
                     ime = ime,
                     elements = elements,
@@ -105,13 +119,12 @@ object ScreenRoutes {
 }
 
 private fun detectImeState(
-    uiDevice: UiDevice,
     elements: List<Element>,
+    enrichment: ScreenEnrichment,
 ): ImeState {
     val focusedElement = elements.firstOrNull { it.focused }
     val focusedInput = elements.firstOrNull { it.focused && it.input }
-    val dumpsys = runCatching { uiDevice.executeShellCommand("dumpsys input_method") }
-    val keyboardVisible = dumpsys.getOrNull()?.let(::parseKeyboardVisible)
+    val keyboardVisible = enrichment.keyboardVisible
     val suggestedActions =
         if (keyboardVisible == true) {
             listOf("shadowdroid ui key back", "shadowdroid ui hide-keyboard")
@@ -124,18 +137,128 @@ private fun detectImeState(
         focused_input = focusedInput,
         detection =
             when {
-                keyboardVisible != null -> "dumpsys input_method"
-                dumpsys.isFailure -> "unavailable"
+                enrichment.keyboardDetectionAvailable -> "dumpsys input_method (cached)"
                 else -> "unavailable"
             },
         reason =
             when {
-                keyboardVisible != null -> null
-                dumpsys.isFailure -> dumpsys.exceptionOrNull()?.message ?: "dumpsys input_method failed"
-                else -> "dumpsys input_method did not expose a recognized keyboard visibility field"
+                enrichment.keyboardDetectionAvailable -> null
+                else -> enrichment.keyboardReason
             },
         suggested_actions = suggestedActions,
     )
+}
+
+internal data class ScreenEnrichment(
+    val `package`: String?,
+    val activity: String?,
+    val pid: Int?,
+    val keyboardVisible: Boolean?,
+    val keyboardDetectionAvailable: Boolean,
+    val keyboardReason: String?,
+    val refreshedAtMs: Long,
+)
+
+/**
+ * Best-effort, stale-while-refresh cache for fields that require device shell
+ * commands. A package transition never reuses the previous package's activity
+ * or PID; the first response for the new package reports those fields as null
+ * while a refresh runs in the background.
+ */
+internal class ScreenEnrichmentCache private constructor(
+    private val uiDevice: UiDevice,
+    private val instr: Instrumentation,
+) {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val refreshInFlight = AtomicBoolean(false)
+    private val value =
+        AtomicReference(
+            ScreenEnrichment(
+                `package` = null,
+                activity = null,
+                pid = null,
+                keyboardVisible = null,
+                keyboardDetectionAvailable = false,
+                keyboardReason = "background refresh pending",
+                refreshedAtMs = 0L,
+            ),
+        )
+
+    init {
+        requestRefresh(uiDevice.currentPackageName)
+    }
+
+    fun snapshot(currentPackage: String?): ScreenEnrichment {
+        val cached = value.get()
+        val now = SystemClock.elapsedRealtime()
+        val packageMatches = cached.`package` == currentPackage
+        if (!packageMatches || now - cached.refreshedAtMs >= ENRICHMENT_TTL_MS) {
+            requestRefresh(currentPackage)
+        }
+        return if (packageMatches) {
+            cached
+        } else {
+            // Keyboard visibility is device-global and remains useful while the
+            // package-specific fields refresh.
+            cached.copy(`package` = currentPackage, activity = null, pid = null)
+        }
+    }
+
+    private fun requestRefresh(currentPackage: String?) {
+        if (!refreshInFlight.compareAndSet(false, true)) return
+        scope.launch {
+            try {
+                val keyboardDump = runCatching { uiDevice.executeShellCommand("dumpsys input_method") }
+                val keyboardVisible = keyboardDump.getOrNull()?.let(::parseKeyboardVisible)
+                val keyboardReason =
+                    when {
+                        keyboardDump.isFailure ->
+                            keyboardDump.exceptionOrNull()?.message ?: "dumpsys input_method failed"
+                        keyboardVisible == null ->
+                            "dumpsys input_method did not expose a recognized keyboard visibility field"
+                        else -> null
+                    }
+                value.set(
+                    ScreenEnrichment(
+                        `package` = currentPackage,
+                        activity = currentFocusedActivity(uiDevice),
+                        pid = pidForPackage(instr, uiDevice, currentPackage),
+                        keyboardVisible = keyboardVisible,
+                        keyboardDetectionAvailable = keyboardVisible != null,
+                        keyboardReason = keyboardReason,
+                        refreshedAtMs = SystemClock.elapsedRealtime(),
+                    ),
+                )
+            } finally {
+                refreshInFlight.set(false)
+                // If the foreground package changed while the old package was
+                // being enriched, immediately schedule the new snapshot. Do
+                // not require a second client request to notice the transition.
+                val latestPackage = uiDevice.currentPackageName
+                if (latestPackage != currentPackage) {
+                    requestRefresh(latestPackage)
+                }
+            }
+        }
+    }
+
+    companion object {
+        private const val ENRICHMENT_TTL_MS = 1_000L
+
+        @Volatile
+        private var instance: ScreenEnrichmentCache? = null
+
+        fun shared(
+            uiDevice: UiDevice,
+            instr: Instrumentation,
+        ): ScreenEnrichmentCache {
+            instance?.takeIf { it.uiDevice === uiDevice }?.let { return it }
+            return synchronized(this) {
+                instance?.takeIf { it.uiDevice === uiDevice }
+                    ?: ScreenEnrichmentCache(uiDevice, instr).also { instance = it }
+            }
+        }
+    }
 }
 
 private fun parseKeyboardVisible(dumpsys: String): Boolean? {

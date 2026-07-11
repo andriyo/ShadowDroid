@@ -55,25 +55,42 @@ class ShadowDroidServerTest {
     }
 
     /**
-     * Loops forever so the process stays alive. Polls UiAutomation every 500ms
-     * — if it disappears (e.g. system_server killed it), we exit gracefully
-     * and the next `am instrument` invocation will reconnect.
+     * Loops forever so the process stays alive. Polls UiAutomation every 500ms.
+     * A null root is normal during window transitions, so only a sustained run
+     * of unavailable roots/errors ends the process and asks the next
+     * `am instrument` invocation to reconnect.
      */
     @Test
     @LargeTest
     fun runServerForever() {
         Log.i(TAG, "ShadowDroid server entering main loop")
         val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val health = UiAutomationHealthTracker(MAX_CONSECUTIVE_HEALTH_FAILURES)
         while (true) {
             try {
                 val nodeInfo = instrumentation.uiAutomation.rootInActiveWindow
                 if (nodeInfo == null) {
-                    Log.w(TAG, "UiAutomation lost its root window — exiting so we can be restarted")
-                    return
+                    if (health.recordUnavailable()) {
+                        Log.w(TAG, "UiAutomation root unavailable for the full grace period — exiting for restart")
+                        return
+                    }
+                    if (health.consecutiveFailures == 1) {
+                        Log.w(TAG, "UiAutomation root temporarily unavailable — keeping server alive")
+                    }
+                } else {
+                    if (health.consecutiveFailures > 0) {
+                        Log.i(TAG, "UiAutomation root recovered after ${health.consecutiveFailures} failed checks")
+                    }
+                    health.recordHealthy()
                 }
             } catch (t: Throwable) {
-                Log.e(TAG, "UiAutomation health-check threw — exiting", t)
-                return
+                if (health.recordUnavailable()) {
+                    Log.e(TAG, "UiAutomation health-check failed for the full grace period — exiting", t)
+                    return
+                }
+                if (health.consecutiveFailures == 1) {
+                    Log.w(TAG, "UiAutomation health-check failed transiently — keeping server alive", t)
+                }
             }
             Thread.sleep(500)
         }
@@ -90,6 +107,28 @@ class ShadowDroidServerTest {
 
     companion object {
         const val DEFAULT_PORT = 7912
+        private const val MAX_CONSECUTIVE_HEALTH_FAILURES = 20 // 10 seconds
         private const val TAG = "ShadowDroid"
+    }
+}
+
+internal class UiAutomationHealthTracker(
+    private val failureLimit: Int,
+) {
+    var consecutiveFailures: Int = 0
+        private set
+
+    init {
+        require(failureLimit > 0)
+    }
+
+    /** Returns true when the unavailable grace period has been exhausted. */
+    fun recordUnavailable(): Boolean {
+        consecutiveFailures++
+        return consecutiveFailures >= failureLimit
+    }
+
+    fun recordHealthy() {
+        consecutiveFailures = 0
     }
 }

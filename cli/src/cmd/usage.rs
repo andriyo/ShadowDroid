@@ -23,6 +23,16 @@ use crate::events::emit_action;
 /// Rotate at ~5 MiB: usage.jsonl → usage.jsonl.1 (one generation kept).
 const ROTATE_BYTES: u64 = 5 * 1024 * 1024;
 
+struct LockCleanup(Option<PathBuf>);
+
+impl Drop for LockCleanup {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 #[derive(clap::Subcommand)]
 pub enum UsageCmd {
     /// Is usage logging on, where does it write, how big is the log?
@@ -49,11 +59,22 @@ fn enabled(config: &ShadowDroidConfig) -> bool {
     crate::hostenv::env_truthy("SHADOWDROID_USAGE_LOG") || config.usage_log == Some(true)
 }
 
+/// Usage consent is read only from the user config, never the merged project
+/// config. A checked-out repository must not be able to opt the user into even
+/// local-only logging.
+fn user_usage_config() -> ShadowDroidConfig {
+    config::user_config_path()
+        .ok()
+        .filter(|path| path.is_file())
+        .and_then(|path| config::parse_config_file(&path).ok())
+        .unwrap_or_default()
+}
+
 /// Append one record for this invocation. Called unconditionally from the run
 /// wrapper; checks enablement itself and never fails the command (any I/O
 /// problem degrades to a debug log line).
 pub fn record(started: Instant, result: &Result<()>) {
-    let config = ShadowDroidConfig::load().unwrap_or_default();
+    let config = user_usage_config();
     if !enabled(&config) {
         return;
     }
@@ -63,6 +84,7 @@ pub fn record(started: Instant, result: &Result<()>) {
         return;
     }
     let mut entry = json!({
+        "schema_version": 2,
         "ts_ms": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -74,9 +96,48 @@ pub fn record(started: Instant, result: &Result<()>) {
     });
     if let Err(err) = result {
         entry["code"] = json!(crate::cli::error_code_of(err));
+        if let Some(diagnostic) = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<crate::diagnostic::DiagnosticError>())
+        {
+            entry["stage"] = json!(diagnostic.stage);
+            entry["retryable"] = json!(diagnostic.retryable);
+        } else {
+            entry["stage"] = json!("runtime");
+        }
     }
     if let Err(io) = append(&entry) {
         tracing::debug!("usage log write failed: {io:#}");
+    }
+}
+
+/// Record a clap parse failure, which exits before the normal `run` wrapper can
+/// observe a `Result`. Only the partial command path and error category are
+/// retained; invalid argument names/values are deliberately excluded.
+pub fn record_parse_error(kind: &str, had_suggestion: bool) {
+    let config = user_usage_config();
+    if !enabled(&config) {
+        return;
+    }
+    let verb = verb_from_argv();
+    let entry = json!({
+        "schema_version": 2,
+        "ts_ms": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+        "verb": if verb.is_empty() { "(unparsed)" } else { verb.as_str() },
+        "ms": 0,
+        "ok": false,
+        "code": "usage",
+        "stage": "parse",
+        "retryable": false,
+        "parse_kind": kind,
+        "had_suggestion": had_suggestion,
+        "v": env!("CARGO_PKG_VERSION"),
+    });
+    if let Err(io) = append(&entry) {
+        tracing::debug!("usage parse-error log write failed: {io:#}");
     }
 }
 
@@ -103,25 +164,56 @@ fn append(entry: &Value) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // Size-capped: rotate once past the cap, keep one prior generation.
-    if std::fs::metadata(&path)
-        .map(|m| m.len() > ROTATE_BYTES)
-        .unwrap_or(false)
+    // Only the process that wins the short-lived cross-process lock rotates.
+    // Other concurrent invocations can still safely O_APPEND their one line.
+    let lock_path = path.with_extension("lock");
+    let mut rotation_lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+        .ok();
+    if rotation_lock.is_none()
+        && std::fs::metadata(&lock_path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > std::time::Duration::from_secs(60))
     {
-        let _ = std::fs::rename(&path, path.with_extension("jsonl.1"));
+        let _ = std::fs::remove_file(&lock_path);
+        rotation_lock = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .ok();
     }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
+    let owns_rotation_lock = rotation_lock.is_some();
+    let _cleanup = LockCleanup(owns_rotation_lock.then(|| lock_path.clone()));
+    if rotation_lock.is_some()
+        && std::fs::metadata(&path)
+            .map(|m| m.len() > ROTATE_BYTES)
+            .unwrap_or(false)
+    {
+        let rotated = path.with_extension("jsonl.1");
+        let _ = std::fs::remove_file(&rotated);
+        let _ = std::fs::rename(&path, rotated);
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
     writeln!(file, "{entry}")?;
+    drop(rotation_lock);
     Ok(())
 }
 
 pub fn run(cmd: &UsageCmd) -> Result<()> {
     match cmd {
         UsageCmd::Status => {
-            let config = ShadowDroidConfig::load().unwrap_or_default();
+            let config = user_usage_config();
             let path = usage_log_path()?;
             let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             emit_action(
@@ -193,6 +285,8 @@ fn report(days: u32) -> Result<()> {
     }
     let mut by_verb: std::collections::BTreeMap<String, VerbStats> = Default::default();
     let mut by_code: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut by_stage: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut by_version: std::collections::BTreeMap<String, u64> = Default::default();
     let mut total = 0u64;
     let mut oldest_ms: Option<u64> = None;
 
@@ -212,6 +306,12 @@ fn report(days: u32) -> Result<()> {
             .unwrap_or("(unknown)")
             .to_string();
         let ok = v.get("ok").and_then(|b| b.as_bool()).unwrap_or(true);
+        let version = v
+            .get("v")
+            .and_then(|s| s.as_str())
+            .unwrap_or("(unknown)")
+            .to_string();
+        *by_version.entry(version).or_insert(0) += 1;
         let ms = v.get("ms").and_then(|m| m.as_u64()).unwrap_or(0);
         let stats = by_verb.entry(verb).or_insert(VerbStats {
             count: 0,
@@ -228,6 +328,12 @@ fn report(days: u32) -> Result<()> {
                 .unwrap_or("error")
                 .to_string();
             *by_code.entry(code).or_insert(0) += 1;
+            let stage = v
+                .get("stage")
+                .and_then(|s| s.as_str())
+                .unwrap_or("runtime")
+                .to_string();
+            *by_stage.entry(stage).or_insert(0) += 1;
         }
     }
 
@@ -239,6 +345,7 @@ fn report(days: u32) -> Result<()> {
                 "verb": verb,
                 "count": s.count,
                 "errors": s.errors,
+                "error_rate": if s.count == 0 { 0.0 } else { s.errors as f64 / s.count as f64 },
                 "p50_ms": percentile(&s.durations, 0.5),
                 "p95_ms": percentile(&s.durations, 0.95),
             })
@@ -251,6 +358,16 @@ fn report(days: u32) -> Result<()> {
         .map(|(code, count)| json!({"code": code, "count": count}))
         .collect();
     codes.sort_by_key(|v| std::cmp::Reverse(v["count"].as_u64().unwrap_or(0)));
+    let recommendations = build_recommendations(&verbs, &codes);
+
+    let stages: Vec<Value> = by_stage
+        .into_iter()
+        .map(|(stage, errors)| json!({"stage": stage, "errors": errors}))
+        .collect();
+    let versions: Vec<Value> = by_version
+        .into_iter()
+        .map(|(version, count)| json!({"version": version, "count": count}))
+        .collect();
 
     emit_action(
         "usage_report",
@@ -260,10 +377,63 @@ fn report(days: u32) -> Result<()> {
             "oldest_ts_ms": oldest_ms,
             "verbs": verbs,
             "error_codes": codes,
+            "error_stages": stages,
+            "versions": versions,
+            "recommendations": recommendations,
+            "feedback_loop": "prioritize recommendations, add a regression test, implement, then compare error rate and p95 by version",
             "path": path.display().to_string(),
         }),
     );
     Ok(())
+}
+
+/// Turn observed friction into an agent-ready, evidence-backed improvement
+/// queue. This deliberately recommends work; it never edits code or sends data.
+fn build_recommendations(verbs: &[Value], codes: &[Value]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for verb in verbs {
+        let count = verb.get("count").and_then(Value::as_u64).unwrap_or(0);
+        let errors = verb.get("errors").and_then(Value::as_u64).unwrap_or(0);
+        let p95 = verb.get("p95_ms").and_then(Value::as_u64).unwrap_or(0);
+        let name = verb
+            .get("verb")
+            .and_then(Value::as_str)
+            .unwrap_or("(unknown)");
+        if count >= 4 && errors * 4 >= count {
+            out.push(json!({
+                "priority": "high",
+                "kind": "reliability",
+                "verb": name,
+                "evidence": {"count": count, "errors": errors},
+                "next_action": format!("reproduce the dominant failure for `{name}`, add a contract regression, and make its diagnostic recovery path executable"),
+            }));
+        }
+        if count >= 3 && p95 >= 1_000 {
+            out.push(json!({
+                "priority": "medium",
+                "kind": "latency",
+                "verb": name,
+                "evidence": {"count": count, "p95_ms": p95},
+                "next_action": format!("profile `{name}` and add a warm-path latency budget regression"),
+            }));
+        }
+    }
+    for code in codes.iter().take(3) {
+        let count = code.get("count").and_then(Value::as_u64).unwrap_or(0);
+        if count < 2 {
+            continue;
+        }
+        let name = code.get("code").and_then(Value::as_str).unwrap_or("error");
+        out.push(json!({
+            "priority": "high",
+            "kind": "error_code",
+            "code": name,
+            "evidence": {"count": count},
+            "next_action": format!("audit `{name}` failures for a deterministic next_actions command and an automated recovery test"),
+        }));
+    }
+    out.truncate(10);
+    out
 }
 
 /// Nearest-rank percentile over an ascending-sorted slice.
@@ -285,5 +455,17 @@ mod tests {
         assert_eq!(percentile(&[7], 0.5), 7);
         assert_eq!(percentile(&[1, 2, 3, 4], 0.5), 3);
         assert_eq!(percentile(&[1, 2, 3, 4, 100], 0.95), 100);
+    }
+
+    #[test]
+    fn recommendations_require_repeated_evidence() {
+        let verbs = vec![json!({
+            "verb": "ui dump", "count": 4, "errors": 1, "p95_ms": 1200
+        })];
+        let codes = vec![json!({"code": "wait_timeout", "count": 2})];
+        let result = build_recommendations(&verbs, &codes);
+        assert!(result.iter().any(|v| v["kind"] == "reliability"));
+        assert!(result.iter().any(|v| v["kind"] == "latency"));
+        assert!(result.iter().any(|v| v["code"] == "wait_timeout"));
     }
 }

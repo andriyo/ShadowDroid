@@ -138,8 +138,8 @@ pub async fn run(
     let mut foreground: Option<String> = None;
     let mut screen_summary: Option<Value> = None;
     let mut server_ok = false;
-    match installer::ensure_ready(serial, None, true).await {
-        Ok(client) => {
+    match installer::probe_existing(serial, true).await {
+        Ok(Some(client)) => {
             server_ok = true;
             checked.push("screen");
             if let Ok(screen) = client.screen().await {
@@ -147,15 +147,27 @@ pub async fn run(
                 screen_summary = Some(json!({
                     "current_app": screen.current_app,
                     "screen_hash": screen.screen_hash,
+                    "screen_hash_version": screen.screen_hash_version,
                     "top_texts": top_screen_texts(&screen.elements, 12),
                     "keyboard_visible": screen.ime.keyboard_visible,
                 }));
             }
         }
+        Ok(None) => {
+            checked.push("screen_unavailable");
+            evidence.insert(
+                "server_error".into(),
+                json!("no already-established ShadowDroid server session is reachable; read-only diagnostics did not start one"),
+            );
+            // Host-side fallback: at least name the foreground component.
+            if let Some(component) = adb::foreground_activity(serial).await {
+                foreground = component.split('/').next().map(str::to_string);
+                evidence.insert("foreground_component".into(), json!(component));
+            }
+        }
         Err(err) => {
             checked.push("screen_unavailable");
             evidence.insert("server_error".into(), json!(err.to_string()));
-            // Host-side fallback: at least name the foreground component.
             if let Some(component) = adb::foreground_activity(serial).await {
                 foreground = component.split('/').next().map(str::to_string);
                 evidence.insert("foreground_component".into(), json!(component));

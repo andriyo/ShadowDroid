@@ -18,6 +18,41 @@ fn emit(cmd: &str, body: serde_json::Value) {
     crate::events::emit_action(cmd, &body);
 }
 
+fn checked_control_reply(op: &str, reply: serde_json::Value) -> Result<serde_json::Value> {
+    match reply.get("ok").and_then(serde_json::Value::as_bool) {
+        Some(true) => Ok(reply),
+        Some(false) => {
+            let message = reply
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("network daemon rejected the operation");
+            Err(crate::diagnostic::DiagnosticError::new(
+                "net_daemon_rejected",
+                "net",
+                format!("net daemon rejected `{op}`: {message}"),
+            )
+            .detail(json!({"operation": op, "reply": reply}))
+            .next_actions([
+                "inspect detail.reply and correct the flow id, rule, or daemon state",
+                "run `shadowdroid net status` before retrying",
+            ])
+            .into())
+        }
+        None => Err(crate::diagnostic::DiagnosticError::new(
+            "net_daemon_protocol",
+            "net",
+            format!("net daemon returned a malformed reply for `{op}`"),
+        )
+        .retryable(true)
+        .detail(json!({"operation": op, "reply": reply}))
+        .next_actions([
+            "run `shadowdroid net stop`, then `shadowdroid net start`",
+            "retry the original command",
+        ])
+        .into()),
+    }
+}
+
 /// Best-effort terminate a wedged daemon by pid when the control socket is
 /// unreachable. Portable: `kill` on Unix, `taskkill` on Windows (the control
 /// socket is TCP precisely so `net` works on Windows, so the fallback must too).
@@ -96,7 +131,10 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
     // commonly after a device reboot). Reuse its actual ports and repair the
     // wiring idempotently instead of forcing stop/start and losing rules.
     if control::is_running(serial).await {
-        let daemon_status = control::request(serial, json!({"op": "status"})).await?;
+        let daemon_status = checked_control_reply(
+            "status",
+            control::request(serial, json!({"op": "status"})).await?,
+        )?;
         let daemon_port = daemon_status
             .get("port")
             .and_then(|value| value.as_u64())
@@ -626,16 +664,16 @@ pub async fn show(
     har: bool,
     body_file: Option<&Path>,
 ) -> Result<()> {
-    if har {
-        // Single-flow HAR export lives in `net export har <id>`.
-        emit(
-            "net_show",
-            json!({"id": id, "hint": "use `net export har <id>` for HAR"}),
-        );
-    }
     // Completed flows live in the session log; a *held* (in-flight) flow lives
     // only in the daemon — try the store first, then ask the daemon.
     if let Some(flow) = store::find_by_id(serial, id)? {
+        if har {
+            println!(
+                "{}",
+                serde_json::to_string(&crate::net::export::to_har(&[flow]))?
+            );
+            return Ok(());
+        }
         if let Some(path) = body_file {
             return write_body_file(id, flow.resp_body.as_deref(), flow.resp_truncated, path);
         }
@@ -645,21 +683,52 @@ pub async fn show(
     if control::is_running(serial).await {
         // Ask the daemon with bodies so `--body-file` works on a held flow too.
         if let Ok(reply) = control::request(serial, json!({"op": "show", "id": id})).await {
-            if let Some(flow) = reply.get("flow").filter(|v| !v.is_null()) {
-                if let Some(path) = body_file {
-                    let resp_body = flow.get("resp_body").and_then(|v| v.as_str());
-                    let truncated = flow
-                        .get("resp_truncated")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    return write_body_file(id, resp_body, truncated, path);
+            if let Some(flow_value) = reply.get("flow").filter(|v| !v.is_null()) {
+                let flow: crate::net::flow::FlowRecord = serde_json::from_value(flow_value.clone())
+                    .map_err(|error| {
+                        crate::diagnostic::DiagnosticError::new(
+                            "net_daemon_protocol",
+                            "net",
+                            format!("network daemon returned an invalid held flow: {error}"),
+                        )
+                        .retryable(true)
+                        .detail(json!({"id": id, "reply": reply}))
+                        .next_actions([
+                            "run `shadowdroid net status` to verify the daemon version",
+                            "restart the proxy, then retry `shadowdroid net show`",
+                        ])
+                    })?;
+                if har {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&crate::net::export::to_har(&[flow]))?
+                    );
+                    return Ok(());
                 }
-                println!("{}", serde_json::to_string(flow)?);
+                if let Some(path) = body_file {
+                    return write_body_file(
+                        id,
+                        flow.resp_body.as_deref(),
+                        flow.resp_truncated,
+                        path,
+                    );
+                }
+                println!("{}", serde_json::to_string(&flow.detail(body))?);
                 return Ok(());
             }
         }
     }
-    bail!("no flow `{id}` in the session log or held set (try `net log`)");
+    Err(crate::diagnostic::DiagnosticError::new(
+        "net_flow_not_found",
+        "net",
+        format!("no flow `{id}` exists in the session log or held set"),
+    )
+    .detail(json!({"id": id}))
+    .next_actions([
+        "run `shadowdroid net log` and choose an emitted flow id",
+        "if the request is still in flight, run `shadowdroid net status` and retry",
+    ])
+    .into())
 }
 
 /// Write a flow's captured response body to `path` and emit a summary instead of
@@ -815,7 +884,20 @@ pub async fn export(
         None => store::read_all(serial)?,
     };
     if flows.is_empty() {
-        bail!("no flows to export (try `net log`)");
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "net_export_empty",
+            "net",
+            match id.as_deref() {
+                Some(id) => format!("no completed flow `{id}` exists to export"),
+                None => "no completed flows exist to export".to_string(),
+            },
+        )
+        .detail(json!({"flow_id": id, "format": format}))
+        .next_actions([
+            "run `shadowdroid net log` and choose a completed flow id",
+            "generate the request again while the proxy is running, then retry the export",
+        ])
+        .into());
     }
     match format {
         "curl" => {
@@ -844,27 +926,33 @@ pub async fn intercept(
     hold_ms: u32,
     on_timeout: String,
 ) -> Result<()> {
-    let reply = control::request(
+    let reply = checked_control_reply("intercept", control::request(
         serial,
         json!({"op": "intercept", "matcher": matcher, "at": at, "hold_ms": hold_ms, "on_timeout": on_timeout}),
     )
-    .await?;
+    .await?)?;
     emit("net_intercept", reply);
     Ok(())
 }
 
 pub async fn resume(serial: &Serial, id: &str, mutation: Mutation) -> Result<()> {
-    let reply = control::request(
-        serial,
-        json!({"op": "resume", "id": id, "mutation": mutation}),
-    )
-    .await?;
+    let reply = checked_control_reply(
+        "resume",
+        control::request(
+            serial,
+            json!({"op": "resume", "id": id, "mutation": mutation}),
+        )
+        .await?,
+    )?;
     emit("net_resume", reply);
     Ok(())
 }
 
 pub async fn drop_flow(serial: &Serial, id: &str, status: Option<u16>) -> Result<()> {
-    let reply = control::request(serial, json!({"op": "drop", "id": id, "status": status})).await?;
+    let reply = checked_control_reply(
+        "drop",
+        control::request(serial, json!({"op": "drop", "id": id, "status": status})).await?,
+    )?;
     emit("net_drop", reply);
     Ok(())
 }
@@ -876,18 +964,21 @@ pub async fn respond(
     body: Option<Vec<u8>>,
     headers: Vec<(String, String)>,
 ) -> Result<()> {
-    let reply = control::request(
+    let reply = checked_control_reply("respond", control::request(
         serial,
         json!({"op": "respond", "id": id, "status": status, "body": body.unwrap_or_default(), "headers": headers}),
     )
-    .await?;
+    .await?)?;
     emit("net_respond", reply);
     Ok(())
 }
 
 pub async fn rule_add(serial: &Serial, spec: RuleSpec) -> Result<()> {
     let warning = map_remote_path_warning(&spec);
-    let mut reply = control::request(serial, json!({"op": "rule_add", "spec": spec})).await?;
+    let mut reply = checked_control_reply(
+        "rule_add",
+        control::request(serial, json!({"op": "rule_add", "spec": spec})).await?,
+    )?;
     if let Some(w) = warning {
         if let Some(obj) = reply.as_object_mut() {
             obj.insert("warning".into(), json!(w));
@@ -911,7 +1002,10 @@ pub async fn override_local(serial: &Serial, url_glob: &str, file: &Path) -> Res
         content_type: None,
         args: vec![file.display().to_string()],
     };
-    let reply = control::request(serial, json!({"op": "rule_add", "spec": spec})).await?;
+    let reply = checked_control_reply(
+        "rule_add",
+        control::request(serial, json!({"op": "rule_add", "spec": spec})).await?,
+    )?;
     emit(
         "net_override",
         json!({
@@ -968,19 +1062,28 @@ fn map_remote_path_warning(spec: &RuleSpec) -> Option<String> {
 }
 
 pub async fn rule_list(serial: &Serial) -> Result<()> {
-    let reply = control::request(serial, json!({"op": "rule_list"})).await?;
+    let reply = checked_control_reply(
+        "rule_list",
+        control::request(serial, json!({"op": "rule_list"})).await?,
+    )?;
     emit("net_rule_list", reply);
     Ok(())
 }
 
 pub async fn rule_rm(serial: &Serial, id: &str) -> Result<()> {
-    let reply = control::request(serial, json!({"op": "rule_rm", "id": id})).await?;
+    let reply = checked_control_reply(
+        "rule_rm",
+        control::request(serial, json!({"op": "rule_rm", "id": id})).await?,
+    )?;
     emit("net_rule_rm", reply);
     Ok(())
 }
 
 pub async fn rule_clear(serial: &Serial) -> Result<()> {
-    let reply = control::request(serial, json!({"op": "rule_clear"})).await?;
+    let reply = checked_control_reply(
+        "rule_clear",
+        control::request(serial, json!({"op": "rule_clear"})).await?,
+    )?;
     emit("net_rule_clear", reply);
     Ok(())
 }
@@ -999,7 +1102,10 @@ pub async fn rules_apply(serial: &Serial, file: &Path) -> Result<()> {
     };
     let mut ids = Vec::new();
     for spec in &specs {
-        let reply = control::request(serial, json!({"op": "rule_add", "spec": spec})).await?;
+        let reply = checked_control_reply(
+            "rule_add",
+            control::request(serial, json!({"op": "rule_add", "spec": spec})).await?,
+        )?;
         if let Some(id) = reply.get("id").and_then(|v| v.as_str()) {
             ids.push(id.to_string());
         }
@@ -1027,7 +1133,10 @@ pub async fn replay(serial: &Serial, from: &Path, host: Option<String>) -> Resul
         });
     }
     let count = flows.len();
-    let reply = control::request(serial, json!({"op": "replay", "flows": flows})).await?;
+    let reply = checked_control_reply(
+        "replay",
+        control::request(serial, json!({"op": "replay", "flows": flows})).await?,
+    )?;
     emit(
         "net_replay",
         json!({"loaded": count, "from": from.display().to_string(), "daemon": reply}),
@@ -1040,6 +1149,15 @@ mod tests {
     use super::*;
     use crate::net::flow::FlowRecord;
     use crate::net::Matcher;
+
+    #[test]
+    fn rejected_control_reply_is_a_nonzero_typed_failure() {
+        let err =
+            checked_control_reply("resume", json!({"ok": false, "error": "no such held flow"}))
+                .unwrap_err();
+        assert_eq!(crate::cli::error_code_of(&err), "net_daemon_rejected");
+        assert!(err.to_string().contains("no such held flow"));
+    }
 
     #[test]
     fn merge_timeline_orders_by_ts_and_keeps_last_n() {

@@ -190,9 +190,9 @@ pub struct ReplayArgs {
 
 #[derive(Args, Clone)]
 pub struct StudioWaitArgs {
-    /// Debug session index from `debug sessions`.
+    /// Stable session id (preferred) or current index from `debug sessions`.
     #[arg(long)]
-    pub session: Option<usize>,
+    pub session: Option<String>,
     /// Stop waiting after this many milliseconds.
     #[arg(long, default_value_t = 10000)]
     pub timeout_ms: u64,
@@ -218,9 +218,9 @@ pub struct StepUntilLogArgs {
 
 #[derive(Args, Clone)]
 pub struct RunUntilCrashArgs {
-    /// Debug session index from `debug sessions`.
+    /// Stable session id (preferred) or current index from `debug sessions`.
     #[arg(long)]
-    pub session: Option<usize>,
+    pub session: Option<String>,
     /// Stop waiting after this many milliseconds.
     #[arg(long, default_value_t = 30000)]
     pub timeout_ms: u64,
@@ -440,9 +440,9 @@ async fn debug_auto(
     let sample_valid = snapshot
         .get("sample_valid")
         .cloned()
-        .unwrap_or_else(|| json!(false));
+        .unwrap_or(Value::Bool(false));
 
-    emit_json(&json!({
+    let result = json!({
         "type": "debug_auto",
         "schema_version": 1,
         "ok": ok,
@@ -457,7 +457,21 @@ async fn debug_auto(
         "steps": steps,
         "attach": attach,
         "snapshot": snapshot,
-    }))
+    });
+    if !ok {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "debug_auto_failed",
+            "debugger",
+            "automatic Android debug setup did not complete",
+        )
+        .detail(result)
+        .next_actions([
+            "inspect detail.steps for the first failed stage",
+            "run `shadowdroid studio status --json` or `shadowdroid doctor --json`, then retry",
+        ])
+        .into());
+    }
+    emit_json(&result)
 }
 
 async fn resolve_auto_app(
@@ -584,7 +598,7 @@ async fn snapshot_cmd(
 ) -> Result<()> {
     let value = snapshot_value(serial, client, &args, studio_url).await?;
     if let Some(path) = args.out {
-        write_json_file(&path, &value)?;
+        crate::cmd::artifact::write_json_and_emit("debug_snapshot", &path, &value)?;
     } else {
         println!("{}", serde_json::to_string(&value)?);
     }
@@ -620,7 +634,7 @@ async fn snapshot_value(
     Ok(json!({
         "type": "debug_snapshot",
         "schema_version": 1,
-        "sample_valid": sample.get("valid").cloned().unwrap_or_else(|| json!(false)),
+        "sample_valid": sample.get("valid").cloned().unwrap_or(Value::Bool(false)),
         "sample": sample,
         "ts": now_ms(),
         "device": {
@@ -789,7 +803,7 @@ async fn record_cmd(
             Some(event) = log_rx.recv() => write_event(&mut out, &event)?,
             _ = ticker.tick() => {
                 let screen = client.screen().await.context("record screen")?;
-                let app_value = serde_json::to_value(&screen.current_app).unwrap_or_else(|_| json!(null));
+                let app_value = serde_json::to_value(&screen.current_app).unwrap_or(Value::Null);
                 if last_app.as_ref() != Some(&app_value) {
                     write_event(&mut out, &json!({
                         "type": "app_lifecycle",
@@ -808,6 +822,7 @@ async fn record_cmd(
                         "type": "screen",
                         "ts": now_ms(),
                         "screen_hash": screen.screen_hash,
+                        "screen_hash_version": screen.screen_hash_version,
                         "element_count": screen.element_count,
                         "current_app": screen.current_app,
                         "viewport": screen.viewport,
@@ -875,7 +890,14 @@ async fn record_cmd(
             "elapsed_ms": started.elapsed().as_millis() as u64,
         }),
     )?;
-    eprintln!("recorded {}", args.out.display());
+    crate::events::emit_action(
+        "debug_record",
+        &json!({
+            "artifact": args.out.display().to_string(),
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+            "next_actions": [format!("run `shadowdroid debug replay {}` to replay recorded UI actions", args.out.display())],
+        }),
+    );
     Ok(())
 }
 
@@ -1001,14 +1023,16 @@ async fn replay_cmd(client: &ServerClient, args: ReplayArgs) -> Result<()> {
 
     let repeat = args.repeat.max(1);
     // Per-run post-action screen hashes (only populated with --diff).
-    let mut runs: Vec<Vec<String>> = Vec::new();
+    let mut runs: Vec<Vec<(String, u32)>> = Vec::new();
+    let mut failed_actions = 0usize;
 
     for run in 1..=repeat {
-        let mut hashes: Vec<String> = Vec::new();
+        let mut hashes: Vec<(String, u32)> = Vec::new();
         for (i, value) in actions.iter().enumerate() {
             let result = perform_action(client, value).await;
             let ok = result.is_ok();
             if let Err(err) = &result {
+                failed_actions += 1;
                 println!(
                     "{}",
                     serde_json::to_string(
@@ -1016,9 +1040,17 @@ async fn replay_cmd(client: &ServerClient, args: ReplayArgs) -> Result<()> {
                     )?
                 );
                 if args.stop_on_error {
-                    return Err(anyhow::anyhow!(
-                        "replay action {i} failed on run {run}: {err}"
-                    ));
+                    return Err(crate::diagnostic::DiagnosticError::new(
+                        "replay_action_failed",
+                        "debugger",
+                        format!("replay action {i} failed on run {run}: {err}"),
+                    )
+                    .detail(json!({"run": run, "index": i, "event": value}))
+                    .next_actions([
+                        "inspect the failed replay_action event and current screen",
+                        "correct the recording or rerun without --stop-on-error to collect all failures",
+                    ])
+                    .into());
                 }
             }
             if args.delay_ms > 0 {
@@ -1028,18 +1060,28 @@ async fn replay_cmd(client: &ServerClient, args: ReplayArgs) -> Result<()> {
                 if args.settle_ms > 0 {
                     tokio::time::sleep(Duration::from_millis(args.settle_ms)).await;
                 }
-                let hash = client
-                    .screen()
-                    .await
-                    .map(|s| s.screen_hash)
-                    .unwrap_or_default();
+                let identity = client.screen().await.map(|screen| {
+                    (screen.screen_hash, screen.screen_hash_version)
+                }).map_err(|error| {
+                    crate::diagnostic::DiagnosticError::new(
+                        "replay_screen_read_failed",
+                        "debugger",
+                        format!("could not read the screen after replay action {i} on run {run}: {error}"),
+                    )
+                    .retryable(true)
+                    .detail(json!({"run": run, "index": i, "event": value}))
+                    .next_actions([
+                        "run `shadowdroid doctor --json` and repair the first unhealthy lifecycle check",
+                        "inspect the current screen, restore the expected app state, and retry the replay",
+                    ])
+                })?;
                 println!(
                     "{}",
                     serde_json::to_string(
-                        &json!({"type":"replay_action","run":run,"index":i,"ok":ok,"screen_hash":hash})
+                        &json!({"type":"replay_action","run":run,"index":i,"ok":ok,"screen_hash":identity.0,"screen_hash_version":identity.1})
                     )?
                 );
-                hashes.push(hash);
+                hashes.push(identity);
             } else if ok {
                 println!(
                     "{}",
@@ -1063,6 +1105,8 @@ async fn replay_cmd(client: &ServerClient, args: ReplayArgs) -> Result<()> {
                 "type":"replay_repeat_summary",
                 "repeat": repeat,
                 "actions": actions.len(),
+                "ok": failed_actions == 0,
+                "failed_actions": failed_actions,
                 "divergent_steps": divergences.len(),
                 "stable": divergences.is_empty(),
             }))?
@@ -1071,9 +1115,24 @@ async fn replay_cmd(client: &ServerClient, args: ReplayArgs) -> Result<()> {
         println!(
             "{}",
             serde_json::to_string(
-                &json!({"type":"replay_done","seen":seen,"replayable":actions.len(),"repeat":repeat})
+                &json!({"type":"replay_done","ok":failed_actions == 0,"seen":seen,"replayable":actions.len(),"repeat":repeat,"failed_actions":failed_actions})
             )?
         );
+    }
+    if failed_actions > 0 {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "replay_actions_failed",
+            "debugger",
+            format!("{failed_actions} replay action(s) failed"),
+        )
+        .detail(
+            json!({"failed_actions": failed_actions, "repeat": repeat, "actions": actions.len()}),
+        )
+        .next_actions([
+            "inspect preceding replay_action errors and the current screen",
+            "repair the recording or target state, then rerun",
+        ])
+        .into());
     }
     Ok(())
 }
@@ -1082,23 +1141,30 @@ async fn replay_cmd(client: &ServerClient, args: ReplayArgs) -> Result<()> {
 /// hash was not identical across all runs — i.e. the flow behaved
 /// non-deterministically there. Returns one `replay_divergence` value per
 /// divergent step.
-fn find_divergences(runs: &[Vec<String>]) -> Vec<Value> {
+fn find_divergences(runs: &[Vec<(String, u32)>]) -> Vec<Value> {
     let mut out = Vec::new();
     if runs.len() < 2 {
         return out;
     }
     let steps = runs.iter().map(Vec::len).max().unwrap_or(0);
     for step in 0..steps {
-        let distinct: std::collections::BTreeSet<&str> = runs
+        let distinct: std::collections::BTreeSet<(&str, u32)> = runs
             .iter()
             .filter_map(|r| r.get(step))
-            .map(String::as_str)
+            .map(|(hash, version)| (hash.as_str(), *version))
             .collect();
         if distinct.len() > 1 {
             let per_run: Vec<Value> = runs
                 .iter()
                 .enumerate()
-                .map(|(ri, r)| json!({"run": ri + 1, "screen_hash": r.get(step)}))
+                .map(|(ri, r)| {
+                    let identity = r.get(step);
+                    json!({
+                        "run": ri + 1,
+                        "screen_hash": identity.map(|(hash, _)| hash),
+                        "screen_hash_version": identity.map(|(_, version)| version),
+                    })
+                })
                 .collect();
             out.push(json!({
                 "type": "replay_divergence",
@@ -1118,9 +1184,10 @@ async fn step_until_screen_change(
     studio_url: Option<&str>,
 ) -> Result<()> {
     let bridge = BridgeClient::new(studio_url)?;
-    let session_s = args.session.map(|s| s.to_string());
+    let session_s = args.session.clone();
     let initial = client.screen().await.context("reading initial screen")?;
     let initial_hash = initial.screen_hash.clone();
+    let initial_hash_version = initial.screen_hash_version;
     let deadline = Instant::now() + Duration::from_millis(args.timeout_ms);
     let mut steps = 0u64;
 
@@ -1128,15 +1195,24 @@ async fn step_until_screen_change(
         if Instant::now() >= deadline {
             let snapshot =
                 final_snapshot(serial, client, &args.app, studio_url, args.depth, 120).await?;
-            emit_json(&json!({
-                "type": "step_until_screen_change",
-                "ok": false,
-                "timeout": true,
+            return Err(crate::diagnostic::DiagnosticError::new(
+                "debug_wait_timeout",
+                "debugger",
+                format!("screen did not change within {}ms", args.timeout_ms),
+            )
+            .retryable(true)
+            .detail(json!({
                 "steps": steps,
+                "timeout_ms": args.timeout_ms,
                 "initial_screen_hash": initial_hash,
+                "screen_hash_version": initial_hash_version,
                 "snapshot": snapshot,
-            }))?;
-            return Ok(());
+            }))
+            .next_actions([
+                "inspect detail.snapshot to confirm the selected thread and frame are making progress",
+                "choose another session or increase --timeout-ms, then retry",
+            ])
+            .into());
         }
 
         studio_control(&bridge, session_action::STEP_OVER, session_s.as_deref()).await?;
@@ -1151,7 +1227,9 @@ async fn step_until_screen_change(
                 "ok": true,
                 "steps": steps,
                 "initial_screen_hash": initial_hash,
+                "initial_screen_hash_version": initial_hash_version,
                 "screen_hash": screen.screen_hash,
+                "screen_hash_version": screen.screen_hash_version,
                 "snapshot": snapshot,
             }))?;
             return Ok(());
@@ -1166,7 +1244,7 @@ async fn step_until_log(
     studio_url: Option<&str>,
 ) -> Result<()> {
     let bridge = BridgeClient::new(studio_url)?;
-    let session_s = args.wait.session.map(|s| s.to_string());
+    let session_s = args.wait.session.clone();
     let (log_tx, mut log_rx) = mpsc::channel(256);
     spawn_logcat(serial.clone(), log_tx);
     let deadline = Instant::now() + Duration::from_millis(args.wait.timeout_ms);
@@ -1183,15 +1261,26 @@ async fn step_until_log(
                 120,
             )
             .await?;
-            emit_json(&json!({
-                "type": "step_until_log",
-                "ok": false,
-                "timeout": true,
+            return Err(crate::diagnostic::DiagnosticError::new(
+                "debug_wait_timeout",
+                "debugger",
+                format!(
+                    "log pattern {:?} did not appear within {}ms",
+                    args.pattern, args.wait.timeout_ms
+                ),
+            )
+            .retryable(true)
+            .detail(json!({
                 "pattern": args.pattern,
                 "steps": steps,
+                "timeout_ms": args.wait.timeout_ms,
                 "snapshot": snapshot,
-            }))?;
-            return Ok(());
+            }))
+            .next_actions([
+                "inspect detail.snapshot and verify the log pattern and selected session",
+                "correct the pattern or increase --timeout-ms, then retry",
+            ])
+            .into());
         }
 
         studio_control(&bridge, session_action::STEP_OVER, session_s.as_deref()).await?;
@@ -1249,7 +1338,7 @@ async fn run_until_crash(
         Ok(bridge) => (Some(bridge), None),
         Err(err) => (None, Some(err.to_string())),
     };
-    let session_s = args.session.map(|s| s.to_string());
+    let session_s = args.session.clone();
     let (crash_tx, mut crash_rx) = mpsc::channel(32);
     spawn_crash_logcat(serial.clone(), args.app.clone(), crash_tx);
     let resume = if let Some(bridge) = &bridge {
@@ -1283,8 +1372,24 @@ async fn run_until_crash(
             if let Some(error) = snapshot_error {
                 result["snapshot_error"] = json!(error);
             }
-            emit_or_write_json(args.out.as_deref(), &result)?;
-            return Ok(());
+            if let Some(path) = args.out.as_deref() {
+                crate::cmd::artifact::write_json(path, &result)?;
+            }
+            return Err(crate::diagnostic::DiagnosticError::new(
+                "crash_wait_timeout",
+                "debugger",
+                format!("no crash was detected within {}ms", args.timeout_ms),
+            )
+            .retryable(true)
+            .detail(json!({
+                "result": result,
+                "written_to": args.out.as_ref().map(|path| path.display().to_string()),
+            }))
+            .next_actions([
+                "inspect detail.result.snapshot and confirm the target app/process",
+                "reproduce the failure again or increase --timeout-ms",
+            ])
+            .into());
         }
 
         match tokio::time::timeout(Duration::from_millis(100), crash_rx.recv()).await {
@@ -1596,6 +1701,7 @@ fn debug_sample_value(
         "reasons": reasons,
         "requested_app": args.app.clone(),
         "screen_hash": screen.screen_hash.clone(),
+        "screen_hash_version": screen.screen_hash_version,
         "element_count": screen.element_count,
         "current_app": screen.current_app.clone(),
         "foreground_activity": foreground_activity.clone(),
@@ -1848,7 +1954,12 @@ async fn collect_matching_device_files(
                 let name = device_artifact_name(prefix, &remote);
                 match adb::pull(serial, &remote).await {
                     Ok(bytes) => bundle.write_bytes(&name, &bytes),
-                    Err(pull_err) => match adb::shell(serial, format!("cat {remote}")).await {
+                    Err(pull_err) => match adb::shell(
+                        serial,
+                        format!("cat {}", crate::config::quote_device_shell_arg(&remote)),
+                    )
+                    .await
+                    {
                         Ok(text) if !text.trim().is_empty() => bundle.write_text(&name, &text),
                         Ok(_) => bundle.errors.push(format!("{remote}: empty/unreadable")),
                         Err(cat_err) => bundle.errors.push(format!(
@@ -1962,7 +2073,7 @@ fn emit_json(value: &Value) -> Result<()> {
 
 fn emit_or_write_json(path: Option<&Path>, value: &Value) -> Result<()> {
     if let Some(path) = path {
-        write_json_file(path, value)
+        crate::cmd::artifact::write_json_and_emit("debug_artifact", path, value)
     } else {
         emit_json(value)
     }
@@ -1998,15 +2109,6 @@ fn write_event(out: &mut File, value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn write_json_file(path: &Path, value: &Value) -> Result<()> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    std::fs::write(path, serde_json::to_vec_pretty(value)?)
-        .with_context(|| format!("writing {}", path.display()))
-}
-
 fn stable_hash(value: &Value) -> String {
     let bytes = serde_json::to_vec(value).unwrap_or_default();
     blake3::hash(&bytes).to_hex().to_string()
@@ -2027,8 +2129,8 @@ mod tests {
     fn find_divergences_flags_steps_that_differ_across_runs() {
         // step 0 stable across runs, step 1 diverges on run 2.
         let runs = vec![
-            vec!["aaaa".to_string(), "bbbb".to_string()],
-            vec!["aaaa".to_string(), "cccc".to_string()],
+            vec![("aaaa".to_string(), 2), ("bbbb".to_string(), 2)],
+            vec![("aaaa".to_string(), 2), ("cccc".to_string(), 2)],
         ];
         let d = find_divergences(&runs);
         assert_eq!(d.len(), 1);
@@ -2039,12 +2141,12 @@ mod tests {
     #[test]
     fn find_divergences_stable_runs_have_none() {
         let runs = vec![
-            vec!["aaaa".to_string(), "bbbb".to_string()],
-            vec!["aaaa".to_string(), "bbbb".to_string()],
+            vec![("aaaa".to_string(), 2), ("bbbb".to_string(), 2)],
+            vec![("aaaa".to_string(), 2), ("bbbb".to_string(), 2)],
         ];
         assert!(find_divergences(&runs).is_empty());
         // A single run can't diverge.
-        assert!(find_divergences(&[vec!["aaaa".to_string()]]).is_empty());
+        assert!(find_divergences(&[vec![("aaaa".to_string(), 2)]]).is_empty());
     }
 
     #[test]

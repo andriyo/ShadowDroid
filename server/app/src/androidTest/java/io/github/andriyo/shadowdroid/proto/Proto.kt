@@ -44,6 +44,7 @@ data class AppRef(
 @Serializable
 data class ScreenResponse(
     val screen_hash: String,
+    val screen_hash_version: Int = 2,
     val viewport: Viewport,
     val current_app: AppRef,
     val element_count: Int,

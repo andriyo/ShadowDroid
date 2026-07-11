@@ -30,8 +30,8 @@ object FileRoutes {
             @Suppress("DEPRECATION")
             val bytes = call.receiveChannel().readRemaining().readBytes()
             file.writeBytes(bytes)
-            applyMode(file, requestedMode)
-            call.respond(FileWriteResp(path = file.path, bytes = bytes.size.toLong(), mode = fileMode(file, requestedMode)))
+            requestedMode?.let { applyMode(file, it) }
+            call.respond(FileWriteResp(path = file.path, bytes = bytes.size.toLong(), mode = fileMode(file)))
         }
 
         route.get("/files/{path...}") {
@@ -81,8 +81,8 @@ private fun resolveRequestedFile(
     }
 }
 
-private fun parseMode(value: String?): Int {
-    if (value == null) return 420
+private fun parseMode(value: String?): Int? {
+    if (value == null) return null
     val mode =
         value.toIntOrNull()
             ?: throw BadRequest("bad_mode", "mode must be an integer permission bitmask")
@@ -106,12 +106,11 @@ private fun applyMode(
 
 private fun fileMode(
     file: File,
-    fallback: Int,
 ): Int =
     try {
         Os.stat(file.path).st_mode and 0x1FF
     } catch (_: ErrnoException) {
-        fallback
+        0
     }
 
 @Serializable

@@ -42,6 +42,7 @@ use crate::cmd::debugger::{DebugMode, DebuggerCmd};
 use crate::cmd::device_profile::ProfileApplyArgs;
 use crate::cmd::focus::FocusArgs;
 use crate::cmd::layout::{LayoutArgs, LayoutCmd};
+use crate::cmd::permissions::AppOpScope;
 use crate::cmd::scroll::ScrollArgs;
 use crate::cmd::studio::{StudioArgs, StudioCmd};
 use crate::config::{expand_config_path, ShadowDroidConfig};
@@ -192,6 +193,12 @@ pub enum Cmd {
         /// Emit JSON instead of a human tree.
         #[arg(long)]
         json: bool,
+        /// Limit command-tree expansion (1 = top-level routing catalog).
+        #[arg(long, value_name = "N", conflicts_with = "describe")]
+        depth: Option<usize>,
+        /// Return one command contract by its space-separated path, e.g. "ui tap".
+        #[arg(long, value_name = "COMMAND_PATH", conflicts_with = "depth")]
+        describe: Option<String>,
     },
     /// Structured, bounded logcat: app-scoped JSON log lines with crash/ANR
     /// blocks parsed out, windowed (`--last 60s`) and deduplicated. Works
@@ -369,13 +376,16 @@ pub enum PermCmd {
 
 #[derive(Subcommand)]
 pub enum AppopsCmd {
-    /// Get appop mode(s) for a package (all ops, or one named op).
+    /// Get appop mode(s), preserving UID/package scopes and effective precedence.
     Get { package: String, op: Option<String> },
-    /// Set an appop mode (allow|deny|ignore|default|foreground|…).
+    /// Set and verify an appop mode at an explicit UID or package scope.
     Set {
         package: String,
         op: String,
         mode: String,
+        /// Android policy scope. UID modes govern package modes when both exist.
+        #[arg(long, value_enum)]
+        scope: AppOpScope,
     },
 }
 
@@ -430,9 +440,10 @@ pub enum FilesCmd {
     Push {
         local: String,
         remote: String,
-        /// Unix permission bits for the pushed file (octal, e.g. 644).
-        #[arg(long, default_value = "644", value_parser = parse_octal_mode)]
-        mode: u32,
+        /// Require Unix permission bits after the push (octal, e.g. 644).
+        /// Omit on shared/FUSE storage where Android controls the effective mode.
+        #[arg(long, value_parser = parse_octal_mode)]
+        mode: Option<u32>,
     },
     /// Pull a device file to the host.
     Pull { remote: String, local: String },
@@ -814,7 +825,7 @@ pub enum NetCmd {
         #[arg(long, value_name = "PATH")]
         body_file: Option<PathBuf>,
         /// Emit the flow as a single-entry HAR object.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "body_file")]
         har: bool,
     },
     /// Export flows for interop: `har`, `curl`, or `fixtures` (a replayable
@@ -867,10 +878,10 @@ pub enum NetCmd {
         #[arg(long, value_name = "NAME")]
         remove_header: Vec<String>,
         /// Replace the body with this literal string.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "body_file")]
         body: Option<String>,
         /// Replace the body with the contents of this file.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "body")]
         body_file: Option<PathBuf>,
         /// Regex-replace within the body: --replace <REGEX> <REPL>.
         #[arg(long, num_args = 2, value_names = ["REGEX", "REPL"])]
@@ -896,10 +907,10 @@ pub enum NetCmd {
         #[arg(long, default_value_t = 200)]
         set_status: u16,
         /// Response body as a literal string.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "body_file")]
         body: Option<String>,
         /// Response body from this file.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "body")]
         body_file: Option<PathBuf>,
         /// Set a response header; repeatable.
         #[arg(long, value_name = "NAME=VALUE")]
@@ -1065,9 +1076,21 @@ fn parse_cli() -> Cli {
                 let _ = err.print();
                 std::process::exit(0);
             }
-            // Bare invocation with no subcommand: clap prints help; keep its exit 2.
+            // Bare invocation is a machine-readable usage failure. Explicit
+            // `--help` remains the human help path.
             if kind == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand {
-                let _ = err.print();
+                crate::cmd::usage::record_parse_error("MissingSubcommand", false);
+                emit_error(
+                    "usage",
+                    "missing_subcommand",
+                    "no command was provided",
+                    json!({
+                        "next_actions": [
+                            "run `shadowdroid commands --json --depth 1` for the agent command catalog",
+                            "run `shadowdroid --help` for human-readable help"
+                        ]
+                    }),
+                );
                 std::process::exit(2);
             }
             // A genuine usage error → structured JSON that *names* the bad flag
@@ -1098,6 +1121,17 @@ fn parse_cli() -> Cli {
                 "hint".into(),
                 json!("run `shadowdroid <command> --help` for usage"),
             );
+            extra.insert(
+                "next_actions".into(),
+                json!([
+                    "apply the suggested spelling when present",
+                    "run `shadowdroid commands --json --depth 2` to discover valid command paths"
+                ]),
+            );
+            crate::cmd::usage::record_parse_error(
+                &format!("{kind:?}"),
+                extra.contains_key("suggestion"),
+            );
             emit_error("usage", "usage", &msg, serde_json::Value::Object(extra));
             std::process::exit(2);
         }
@@ -1116,6 +1150,24 @@ pub async fn run() -> Result<()> {
 
 async fn run_inner() -> Result<()> {
     let cli = parse_cli();
+
+    // Recovery and self-description must remain available when a discovered
+    // config file is malformed. These commands either inspect raw config files
+    // themselves or do not use config at all, so dispatch them before the normal
+    // layered load.
+    match &cli.cmd {
+        Cmd::Commands {
+            json,
+            depth,
+            describe,
+        } => return crate::cmd::introspect::run(*json, *depth, describe.as_deref()),
+        Cmd::Config(args) => return crate::cmd::config::run(args),
+        Cmd::Skill(args) => return crate::cmd::skill::run(args),
+        Cmd::Usage(args) => return crate::cmd::usage::run(args),
+        Cmd::Update { check, json } => return crate::update::cmd_update(*check, *json).await,
+        _ => {}
+    }
+
     let config = ShadowDroidConfig::load()?;
     let device = cli.device.or_else(|| config.device.clone());
     let apk = cli.apk;
@@ -1136,12 +1188,14 @@ async fn run_inner() -> Result<()> {
     // `app install`/`reinstall` are pure host-side `adb`.
     match &cmd {
         Cmd::Devices => return cmd_devices().await,
-        Cmd::Update { check, json } => return crate::update::cmd_update(*check, *json).await,
         Cmd::Init(args) => return crate::cmd::studio::run_init(args).await,
-        // Pure self-introspection / file generation — no device needed.
-        Cmd::Commands { json } => return crate::cmd::introspect::run(*json),
-        Cmd::Config(args) => return crate::cmd::config::run(args),
-        Cmd::Skill(args) => return crate::cmd::skill::run(args),
+        Cmd::Update { .. }
+        | Cmd::Commands { .. }
+        | Cmd::Config(_)
+        | Cmd::Skill(_)
+        | Cmd::Usage(_) => {
+            unreachable!("recovery command handled before config load")
+        }
         Cmd::Studio(args) => return crate::cmd::studio::run(args).await,
         // `aar` install/status/remove are host-only (Gradle + filesystem); the
         // capture/intercept/resume/drop/agent verbs talk to the running in-app
@@ -1206,7 +1260,6 @@ async fn run_inner() -> Result<()> {
             let serial = resolve_serial(device.as_deref()).await?;
             return crate::cmd::why::run(&serial, &config, project.as_deref(), args).await;
         }
-        Cmd::Usage(c) => return crate::cmd::usage::run(c),
         Cmd::Perm(c) => {
             let serial = resolve_serial(device.as_deref()).await?;
             return dispatch_perm(c, &serial).await;
@@ -1366,6 +1419,10 @@ async fn dispatch_ui_inner(
             let mut body = crate::cmd::authoring::audit_elements(&screen.elements);
             if let serde_json::Value::Object(m) = &mut body {
                 m.insert("screen_hash".into(), json!(screen.screen_hash));
+                m.insert(
+                    "screen_hash_version".into(),
+                    json!(screen.screen_hash_version),
+                );
             }
             Ok(Outcome::Action("ui_audit", body))
         }
@@ -1628,9 +1685,11 @@ async fn dispatch_ui_inner(
                     package_not,
                     exact,
                 },
-                gone,
-                timeout_ms,
-                poll_ms,
+                WaitOptions {
+                    gone,
+                    timeout_ms,
+                    poll_ms,
+                },
                 serial,
                 apk,
                 any_apk_version,
@@ -1706,19 +1765,14 @@ fn apply_net_config(args: &mut NetCmd, config: &ShadowDroidConfig) {
             *redact |= proxy.redact.unwrap_or(false);
         }
         NetCmd::Trust {
-            auto,
-            system,
-            ui,
-            ..
-        } => {
-            if !*auto && !*system && !*ui {
-                match proxy.trust_store.as_deref() {
-                    Some("system") => *system = true,
-                    Some("ui") => *ui = true,
-                    // "user" has no dedicated flag; the default auto path installs
-                    // system-then-user, so leave the flags unset.
-                    _ => {}
-                }
+            auto, system, ui, ..
+        } if !*auto && !*system && !*ui => {
+            match proxy.trust_store.as_deref() {
+                Some("system") => *system = true,
+                Some("ui") => *ui = true,
+                // "user" has no dedicated flag; the default auto path installs
+                // system-then-user, so leave the flags unset.
+                _ => {}
             }
         }
         _ => {}
@@ -1896,10 +1950,10 @@ fn apply_debugger_config(cmd: &mut DebuggerCmd, config: &ShadowDroidConfig) {
                 }
             }
         },
-        DebuggerCmd::Watch(crate::cmd::debugger::WatchCmd::Add { project, .. }) => {
-            if project.is_none() {
-                *project = config.project.clone();
-            }
+        DebuggerCmd::Watch(crate::cmd::debugger::WatchCmd::Add { project, .. })
+            if project.is_none() =>
+        {
+            *project = config.project.clone();
         }
         _ => {}
     }
@@ -1947,9 +2001,12 @@ async fn dispatch_appops(c: &AppopsCmd, serial: &Serial) -> Result<()> {
         AppopsCmd::Get { package, op } => {
             permissions::appop_get(serial, package, op.as_deref()).await
         }
-        AppopsCmd::Set { package, op, mode } => {
-            permissions::appop_set(serial, package, op, mode).await
-        }
+        AppopsCmd::Set {
+            package,
+            op,
+            mode,
+            scope,
+        } => permissions::appop_set(serial, package, op, mode, *scope).await,
     }
 }
 
@@ -2144,7 +2201,16 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
         } => {
             let replace = match replace {
                 Some(v) if v.len() == 2 => Some((v[0].clone(), v[1].clone())),
-                Some(_) => bail!("--replace expects exactly REGEX and REPL"),
+                Some(values) => {
+                    return Err(crate::diagnostic::DiagnosticError::new(
+                        "invalid_replace_arity",
+                        "input",
+                        "--replace expects exactly REGEX and REPL",
+                    )
+                    .detail(json!({"provided_count": values.len()}))
+                    .next_actions(["rerun with `--replace <REGEX> <REPL>` as two adjacent values"])
+                    .into())
+                }
                 None => None,
             };
             let mutation = crate::net::Mutation {
@@ -2222,7 +2288,16 @@ fn parse_header_pairs(pairs: &[String]) -> Result<Vec<(String, String)>> {
         .map(|p| {
             p.split_once('=')
                 .map(|(n, v)| (n.trim().to_string(), v.to_string()))
-                .ok_or_else(|| anyhow!("--set-header expects NAME=VALUE, got {p:?}"))
+                .ok_or_else(|| {
+                    crate::diagnostic::DiagnosticError::new(
+                        "invalid_header_assignment",
+                        "input",
+                        "--set-header expects NAME=VALUE",
+                    )
+                    .detail(json!({"assignment": p}))
+                    .next_actions(["rerun with each header spelled as `--set-header NAME=VALUE`"])
+                    .into()
+                })
         })
         .collect()
 }
@@ -2230,7 +2305,14 @@ fn parse_header_pairs(pairs: &[String]) -> Result<Vec<(String, String)>> {
 /// Resolve a body from `--body <str>` or `--body-file <path>` (mutually exclusive).
 fn read_body_arg(inline: &Option<String>, file: &Option<PathBuf>) -> Result<Option<Vec<u8>>> {
     match (inline, file) {
-        (Some(_), Some(_)) => bail!("--body and --body-file are mutually exclusive"),
+        (Some(_), Some(path)) => Err(crate::diagnostic::DiagnosticError::new(
+            "body_source_conflict",
+            "input",
+            "--body and --body-file are mutually exclusive",
+        )
+        .detail(json!({"body_file": path.display().to_string()}))
+        .next_actions(["remove either --body or --body-file, then retry"])
+        .into()),
         (Some(s), None) => Ok(Some(s.clone().into_bytes())),
         (None, Some(p)) => Ok(Some(
             std::fs::read(p).with_context(|| format!("reading {}", p.display()))?,
@@ -2321,6 +2403,24 @@ async fn dispatch_app_inner(
         } => {
             let package = require_app_package(client, config, serial, package, "app wait").await?;
             let r = client.app_wait(&package, timeout_ms, front).await?;
+            if !r.matched {
+                return Err(crate::diagnostic::DiagnosticError::new(
+                    "app_wait_timeout",
+                    "app",
+                    format!(
+                        "{package} did not reach the requested app state within {timeout_ms}ms"
+                    ),
+                )
+                .retryable(true)
+                .detail(json!({
+                    "package": package,
+                    "timeout_ms": timeout_ms,
+                    "front": front,
+                    "current": r.current,
+                }))
+                .next_actions(["shadowdroid app current --json", "shadowdroid why"])
+                .into());
+            }
             Ok(Outcome::Action(
                 "app_wait",
                 json!({"package":package,"matched":r.matched,"current":r.current}),
@@ -2418,29 +2518,36 @@ async fn require_app_package(
         return Ok(package);
     }
     if let Some(input) = resolved.input {
-        bail!(
-            "`{input}` did not resolve to one installed package for `shadowdroid {command}` \
-             (resolution source: {}). Pass a package explicitly or add an alias with \
-             `shadowdroid config init --project --app <name> --package <pkg>`.",
-            resolved.source
-        );
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "app_resolution_failed",
+            "app",
+            format!("{input:?} did not resolve to one installed package for `shadowdroid {command}`"),
+        )
+        .detail(json!({"input": input, "resolution_source": resolved.source}))
+        .next_actions([
+            format!("rerun `shadowdroid {command}` with an explicit installed package"),
+            "add a project alias with `shadowdroid config init --project --app <name> --package <pkg>`".to_string(),
+        ])
+        .into());
     }
     let foreground = client
         .app_current()
         .await
         .ok()
         .and_then(|current| current.package);
-    let mut msg =
-        format!("`shadowdroid {command}` needs a package, and no default app is configured.");
-    if let Some(package) = foreground {
-        msg.push_str(&format!(
-            " Foreground package is `{package}`; rerun `shadowdroid {command} {package}` if that is the target."
-        ));
-    }
-    msg.push_str(
-        " Or create a default with `shadowdroid config init --project --app <name> --package <pkg>`.",
-    );
-    bail!("{msg}")
+    let message =
+        format!("`shadowdroid {command}` needs a package, and no default app is configured");
+    let foreground_command = foreground
+        .as_ref()
+        .map(|package| format!("shadowdroid {command} {package}"));
+    Err(
+        crate::diagnostic::DiagnosticError::new("app_required", "app", message)
+            .detail(json!({"foreground_package": foreground}))
+            .next_actions(foreground_command.into_iter().chain(std::iter::once(
+                "shadowdroid config init --project --app <name> --package <pkg>".to_string(),
+            )))
+            .into(),
+    )
 }
 
 async fn dispatch_device(c: DeviceCmd, client: &ServerClient, serial: &Serial) -> Result<()> {
@@ -2448,6 +2555,23 @@ async fn dispatch_device(c: DeviceCmd, client: &ServerClient, serial: &Serial) -
         DeviceCmd::Info => cmd_device_info(client, serial).await?,
         DeviceCmd::Shell { cmd, timeout_ms } => {
             let r = client.shell(&cmd, timeout_ms).await?;
+            if r.exit_code.is_some_and(|code| code != 0) {
+                return Err(crate::diagnostic::DiagnosticError::new(
+                    "device_shell_nonzero",
+                    "device",
+                    format!(
+                        "device shell command exited with status {}",
+                        r.exit_code.unwrap_or_default()
+                    ),
+                )
+                .detail(json!({
+                    "input": r.input,
+                    "output": r.output,
+                    "exit_code": r.exit_code,
+                }))
+                .next_actions(["inspect detail.output and correct the device shell command"])
+                .into());
+            }
             emit_action(
                 "shell",
                 &json!({"input":r.input,"output":r.output,"exit_code":r.exit_code}),
@@ -2532,14 +2656,33 @@ async fn dispatch_files(c: FilesCmd, client: &ServerClient, serial: &Serial) -> 
             // paths the instrumentation uid can't write (e.g. /sdcard under
             // scoped storage). A structured client error (4xx, e.g. bad_mode) is
             // a contract violation adb can't fix, so surface it instead.
-            match client.push_file(&remote, bytes, Some(mode)).await {
-                Ok(r) => emit_action(
-                    "push",
-                    &json!({"local":local,"remote":remote,"path":r.path,"bytes":r.bytes,"mode":r.mode,"requested_mode":mode,"via":"server"}),
-                ),
+            match client.push_file(&remote, bytes, mode).await {
+                Ok(r) => {
+                    if mode.is_some_and(|requested| requested != r.mode) {
+                        return Err(file_mode_postcondition_error(
+                            &local,
+                            &remote,
+                            mode,
+                            Some(r.mode),
+                            "server",
+                        ));
+                    }
+                    emit_action(
+                        "push",
+                        &json!({"local":local,"remote":remote,"path":r.path,"bytes":r.bytes,"mode":r.mode,"requested_mode":mode,"via":"server"}),
+                    );
+                }
                 Err(err) if should_fall_back_to_adb(&err) => {
                     adb::push(serial, std::path::PathBuf::from(&local), remote.clone()).await?;
-                    let mode_applied = chmod_via_adb(serial, mode, &remote).await;
+                    let mode_applied = match mode {
+                        Some(requested) => Some(chmod_via_adb(serial, requested, &remote).await),
+                        None => None,
+                    };
+                    if mode_applied == Some(false) {
+                        return Err(file_mode_postcondition_error(
+                            &local, &remote, mode, None, "adb",
+                        ));
+                    }
                     emit_action(
                         "push",
                         &json!({"local":local,"remote":remote,"bytes":bytes_len,"requested_mode":mode,"mode_applied":mode_applied,"via":"adb"}),
@@ -2561,6 +2704,33 @@ async fn dispatch_files(c: FilesCmd, client: &ServerClient, serial: &Serial) -> 
         }
     }
     Ok(())
+}
+
+fn file_mode_postcondition_error(
+    local: &str,
+    remote: &str,
+    requested_mode: Option<u32>,
+    observed_mode: Option<u32>,
+    via: &str,
+) -> anyhow::Error {
+    crate::diagnostic::DiagnosticError::new(
+        "file_mode_postcondition_failed",
+        "files",
+        format!("file was pushed, but {remote} did not reach the requested Unix mode"),
+    )
+    .detail(json!({
+        "local": local,
+        "remote": remote,
+        "requested_mode": requested_mode,
+        "observed_mode": observed_mode,
+        "via": via,
+        "transfer_completed": true,
+    }))
+    .next_actions([
+        "use an app-specific/device filesystem path that supports chmod, then retry with --mode",
+        "omit --mode when pushing to Android shared/FUSE storage and accept its platform-managed mode",
+    ])
+    .into()
 }
 
 fn shell_single_quote(value: &str) -> String {
@@ -2617,11 +2787,32 @@ async fn chmod_via_adb(serial: &Serial, mode: u32, remote: &str) -> bool {
 /// (`element_not_found`, …) and HTTP `status` survive; otherwise falls back to a
 /// generic `error` code with the human message. Called by `main` on `Err`.
 pub fn report_error(err: &anyhow::Error) {
-    if let Some(se) = err
+    if let Some(diagnostic) = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<crate::diagnostic::DiagnosticError>())
+    {
+        emit_error(
+            &diagnostic.stage,
+            &diagnostic.code,
+            &diagnostic.message,
+            json!({
+                "retryable": diagnostic.retryable,
+                "detail": diagnostic.detail,
+                "next_actions": diagnostic.next_actions,
+            }),
+        );
+    } else if let Some(se) = err
         .chain()
         .find_map(|e| e.downcast_ref::<crate::device::client::ServerError>())
     {
-        let mut extra = json!({ "status": se.status.as_u16() });
+        let retryable = se.status.is_server_error()
+            || se.status == reqwest::StatusCode::REQUEST_TIMEOUT
+            || se.status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+        let mut extra = json!({
+            "status": se.status.as_u16(),
+            "retryable": retryable,
+            "next_actions": server_error_next_actions(&se.code),
+        });
         if let Some(detail) = &se.detail {
             extra["detail"] = detail.clone();
         }
@@ -2634,7 +2825,13 @@ pub fn report_error(err: &anyhow::Error) {
             "run",
             "ambiguous_match",
             &amb.to_string(),
-            json!({ "detail": { "candidates": amb.candidates } }),
+            json!({
+                "detail": { "candidates": amb.candidates },
+                "next_actions": [
+                    "choose a candidate's unique resource id, content description, or element id",
+                    "rerun the action with the refined selector"
+                ]
+            }),
         );
     } else if let Some(sc) = err
         .chain()
@@ -2650,17 +2847,76 @@ pub fn report_error(err: &anyhow::Error) {
                 "expected": sc.expected,
                 "actual": sc.actual,
                 "screen": sc.screen,
-            }}),
+            }, "next_actions": [
+                "re-plan from detail.screen instead of issuing another dump",
+                "retry the action with detail.actual as --if-screen"
+            ]}),
         );
     } else {
-        emit_error("run", "error", &err.to_string(), json!({}));
+        emit_error(
+            "run",
+            "error",
+            &err.to_string(),
+            json!({
+                "next_actions": [
+                    "run `shadowdroid doctor --json` and inspect the first unhealthy check",
+                    "run `shadowdroid commands --json --depth 2` to verify the intended command contract"
+                ]
+            }),
+        );
+    }
+}
+
+fn server_error_next_actions(code: &str) -> Vec<&'static str> {
+    match code {
+        "element_not_found" => vec![
+            "inspect detail.top_texts and detail.closest when present",
+            "refine the selector or wait for the expected screen, then retry",
+        ],
+        "ambiguous_match" => vec![
+            "choose a candidate's unique resource id, content description, or element id",
+            "retry with the refined selector",
+        ],
+        "server_version_mismatch" | "server_unavailable" => vec![
+            "run `shadowdroid connect` to reconcile the on-device server",
+            "retry the original command",
+        ],
+        "package_not_found" => vec![
+            "check detail.package, then run `shadowdroid app current` or `shadowdroid app info <package>` to confirm the intended package",
+            "install it with `shadowdroid app install <apk>` or retry with the installed package name",
+        ],
+        "no_launch_intent" => vec![
+            "run `shadowdroid app info <package>` to confirm the package is installed",
+            "pass the intended component explicitly with `shadowdroid app start <package> --activity <activity>`",
+        ],
+        "app_stop_failed" => vec![
+            "inspect detail.exit_code, detail.output, and detail.remaining_pid to see what Android rejected or kept alive",
+            "retry `shadowdroid app stop <package>`; if the PID persists, run `shadowdroid doctor --json`",
+        ],
+        "app_clear_failed" => vec![
+            "inspect detail.exit_code and detail.output for Android's package-manager response",
+            "stop the app with `shadowdroid app stop <package>`, retry clear, or use `shadowdroid app reinstall <apk>` for a clean state",
+        ],
+        code if code.starts_with("invalid_") => vec![
+            "correct the rejected value using detail and the command help",
+            "retry the command with a literal validated value",
+        ],
+        _ => vec![
+            "inspect detail for the rejected state or input",
+            "run `shadowdroid doctor --json` if the failure persists",
+        ],
     }
 }
 
 /// The machine error code `report_error` would assign — shared with the usage
 /// log so failure statistics use the same vocabulary the agent sees.
 pub fn error_code_of(err: &anyhow::Error) -> String {
-    if let Some(se) = err
+    if let Some(diagnostic) = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<crate::diagnostic::DiagnosticError>())
+    {
+        diagnostic.code.clone()
+    } else if let Some(se) = err
         .chain()
         .find_map(|e| e.downcast_ref::<crate::device::client::ServerError>())
     {
@@ -2678,6 +2934,14 @@ pub fn error_code_of(err: &anyhow::Error) -> String {
     } else {
         "error".into()
     }
+}
+
+/// A domain error may preserve a child command's status while still flowing
+/// through the normal usage recorder and single structured-error boundary.
+pub fn process_exit_code_of(err: &anyhow::Error) -> Option<i32> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<crate::diagnostic::DiagnosticError>())
+        .and_then(|diagnostic| diagnostic.process_exit_code)
 }
 
 // ── specific handlers ──────────────────────────────────────────
@@ -2726,6 +2990,7 @@ async fn cmd_screen(
         .collect();
     Ok(Outcome::Raw(json!({
         "screen_hash": screen.screen_hash,
+        "screen_hash_version": screen.screen_hash_version,
         "viewport": screen.viewport,
         "current_app": screen.current_app,
         "element_count": screen.element_count,
@@ -2794,6 +3059,7 @@ async fn cmd_screenshot(
     // or failed dump must not fail the screenshot, so the error is swallowed.
     if let Ok(screen) = client.screen().await {
         body["screen_hash"] = json!(screen.screen_hash);
+        body["screen_hash_version"] = json!(screen.screen_hash_version);
     }
     Ok(Outcome::Action("screenshot", body))
 }
@@ -2903,18 +3169,44 @@ async fn cmd_tap(
     match (id, a, b) {
         (Some(id), None, None) => tap_element_id(client, id).await,
         (Some(_), Some(_), _) | (Some(_), None, Some(_)) => {
-            bail!("tap --id cannot be combined with positional coordinates or element id")
+            Err(crate::diagnostic::DiagnosticError::new(
+                "tap_target_conflict",
+                "input",
+                "tap --id cannot be combined with positional coordinates or an element id",
+            )
+            .detail(json!({"id": id, "first_positional": a, "second_positional": b}))
+            .next_actions([
+                "choose exactly one target form: --id ID, positional ID, X Y, or one selector",
+            ])
+            .into())
         }
         (None, Some(x), Some(y)) => {
             client.tap_xy(x, y).await?;
             Ok(("tap", json!({"via":"coords","x":x,"y":y})))
         }
         (None, Some(a), None) => {
-            let id = u32::try_from(a).map_err(|_| anyhow!("element id must be >= 0, got {a}"))?;
+            let id = u32::try_from(a).map_err(|_| {
+                crate::diagnostic::DiagnosticError::new(
+                    "invalid_element_id",
+                    "input",
+                    format!("element id must be non-negative, got {a}"),
+                )
+                .detail(json!({"element_id": a}))
+                .next_actions(["use a non-negative id from a fresh `shadowdroid ui dump`"])
+            })?;
             tap_element_id(client, id).await
         }
         (None, None, _) => {
-            bail!("tap needs a target: <id>, <x> <y>, or --text/--rid/--desc/--xpath <value>")
+            Err(crate::diagnostic::DiagnosticError::new(
+                "tap_target_required",
+                "input",
+                "tap needs a target",
+            )
+            .detail(json!({"accepted_forms": ["ID", "X Y", "--id ID", "--text VALUE", "--rid VALUE", "--desc VALUE", "--xpath VALUE"]}))
+            .next_actions([
+                "read a fresh `shadowdroid ui dump`, then retry with one id, coordinate pair, or selector",
+            ])
+            .into())
         }
     }
 }
@@ -2984,6 +3276,12 @@ struct WaitQuery {
     exact: bool,
 }
 
+struct WaitOptions {
+    gone: bool,
+    timeout_ms: u32,
+    poll_ms: u32,
+}
+
 /// Outcome of one `wait_query_matches` probe: whether the screen satisfies the
 /// query, and (when a selector was given) the element that satisfied it — so the
 /// result can echo the matched node back, like `ui tap` does.
@@ -2995,29 +3293,54 @@ struct WaitOutcome {
 async fn cmd_wait(
     client: &ServerClient,
     query: WaitQuery,
-    gone: bool,
-    timeout_ms: u32,
-    poll_ms: u32,
+    options: WaitOptions,
     serial: &Serial,
     apk: Option<&std::path::Path>,
     any_apk_version: bool,
 ) -> Result<Outcome> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+    let WaitOptions {
+        gone,
+        timeout_ms,
+        poll_ms,
+    } = options;
+    let started = tokio::time::Instant::now();
+    let deadline = started + std::time::Duration::from_millis(timeout_ms as u64);
     let mut client = client.clone();
     loop {
-        let screen = match client.screen().await {
-            Ok(screen) => screen,
-            Err(err)
-                if is_transient_transport_error(&err) && std::time::Instant::now() < deadline =>
-            {
-                client = reconnect_after_screen_error(serial, apk, any_apk_version, &err).await?;
-                continue;
+        let screen = match tokio::time::timeout_at(deadline, client.screen()).await {
+            Err(_) => {
+                return Err(wait_timeout_error(
+                    timeout_ms,
+                    gone,
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                ))
             }
-            Err(err) => return Err(err),
+            Ok(result) => match result {
+                Ok(screen) => screen,
+                Err(err)
+                    if is_transient_transport_error(&err)
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    client = tokio::time::timeout_at(
+                        deadline,
+                        reconnect_after_screen_error(serial, apk, any_apk_version, &err),
+                    )
+                    .await
+                    .map_err(|_| {
+                        wait_timeout_error(timeout_ms, gone, None, None, None, Vec::new())
+                    })??;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            },
         };
         let outcome = wait_query_matches(&query, &screen.current_app, &screen.elements);
         let matched = outcome.matched;
         let screen_hash = screen.screen_hash;
+        let screen_hash_version = screen.screen_hash_version;
         let current_app = json!({
             "package": screen.current_app.package,
             "activity": screen.current_app.activity,
@@ -3027,6 +3350,7 @@ async fn cmd_wait(
                 "matched": matched,
                 "gone": gone,
                 "screen_hash": screen_hash,
+                "screen_hash_version": screen_hash_version,
                 "current_app": current_app,
             });
             if let Some(el) = outcome.element {
@@ -3034,23 +3358,63 @@ async fn cmd_wait(
             }
             return Ok(Outcome::Action("wait", body));
         }
-        if std::time::Instant::now() >= deadline {
-            let hint = if gone {
-                "still present after timeout — the selector may be too broad, or the element is re-created each frame"
-            } else {
-                "never matched — verify the selector against the live screen (`shadowdroid ui find …` or `ui audit`), or the screen may have changed (see `top_texts`); the target screen may also just not have finished loading"
-            };
+        if tokio::time::Instant::now() >= deadline {
             // The most common timeout cause is the screen having *changed* to
             // something unexpected (e.g. an error page). Echo the visible texts
             // so the caller sees what the screen became without a second probe.
             let top_texts = top_screen_texts(&screen.elements, 12);
-            return Ok(Outcome::Action(
-                "wait",
-                json!({"matched":matched,"gone":gone,"screen_hash":screen_hash,"current_app":current_app,"timeout":true,"hint":hint,"top_texts":top_texts}),
+            return Err(wait_timeout_error(
+                timeout_ms,
+                gone,
+                Some(screen_hash),
+                Some(screen_hash_version),
+                Some(current_app),
+                top_texts,
             ));
         }
-        tokio::time::sleep(std::time::Duration::from_millis(poll_ms.max(1) as u64)).await;
+        let sleep = std::time::Duration::from_millis(poll_ms.max(1) as u64);
+        tokio::time::sleep_until((tokio::time::Instant::now() + sleep).min(deadline)).await;
     }
+}
+
+fn wait_timeout_error(
+    timeout_ms: u32,
+    gone: bool,
+    screen_hash: Option<String>,
+    screen_hash_version: Option<u32>,
+    current_app: Option<serde_json::Value>,
+    top_texts: Vec<String>,
+) -> anyhow::Error {
+    crate::diagnostic::DiagnosticError::new(
+        "wait_timeout",
+        "ui",
+        if gone {
+            format!("element remained present after {timeout_ms}ms")
+        } else {
+            format!("element did not appear within {timeout_ms}ms")
+        },
+    )
+    .retryable(true)
+    .detail(json!({
+        "timeout_ms": timeout_ms,
+        "gone": gone,
+        "screen_hash": screen_hash,
+        "screen_hash_version": screen_hash_version,
+        "current_app": current_app,
+        "top_texts": top_texts,
+    }))
+    .next_actions(if gone {
+        [
+            "inspect detail.top_texts; refine an overly broad selector or wait for a stable replacement",
+            "run `shadowdroid why` if navigation appears stuck",
+        ]
+    } else {
+        [
+            "inspect detail.top_texts and current_app, then correct the selector or expected screen",
+            "run `shadowdroid why` if the app reached an unexpected state",
+        ]
+    })
+    .into()
 }
 
 async fn read_screen_with_reconnect(
@@ -3215,7 +3579,7 @@ async fn cmd_connect(
         crate::cmd::device_profile::disable_stylus_tutorial(&serial).await;
     let state = client.state().await?;
     let mut out = json!({
-        "type": "connected",
+        "status": "connected",
         "device": serial,
         "server_version": state.server_version.clone(),
         "api_version": state.api_version,
@@ -3244,15 +3608,18 @@ async fn cmd_connect(
     if let Some(skills) = crate::cmd::skill::refresh_for_connect() {
         out["skills"] = skills;
     }
-    println!("{}", serde_json::to_string(&out).unwrap());
+    emit_action("connect", &out);
     Ok(())
 }
 
 async fn cmd_disconnect(device: Option<&str>) -> Result<()> {
     let serial = resolve_serial(device).await?;
+    let _guard = installer::acquire_lifecycle_lock(&serial)?;
     free_ui_automation_slot(&serial).await?;
-    let out = json!({"type": "disconnected", "device": serial});
-    println!("{}", serde_json::to_string(&out).unwrap());
+    emit_action(
+        "disconnect",
+        &json!({"status": "disconnected", "device": serial}),
+    );
     Ok(())
 }
 
@@ -3275,8 +3642,8 @@ async fn free_ui_automation_slot(serial: &Serial) -> Result<()> {
 
 /// `shadowdroid test -- <cmd>`: free the UiAutomation slot, run the user's
 /// instrumentation-test command with stdio inherited, then reconnect (unless
-/// `reconnect` is false). Exits with the command's own status code so CI / agents
-/// see pass/fail.
+/// `reconnect` is false). A failed child flows through the structured error
+/// boundary while preserving the child's status code for CI and agents.
 async fn cmd_test(
     device: Option<&str>,
     apk: Option<&std::path::Path>,
@@ -3284,12 +3651,13 @@ async fn cmd_test(
     reconnect: bool,
     command: Vec<String>,
 ) -> Result<()> {
-    use std::io::Write;
-
     let serial = resolve_serial(device).await?;
-    free_ui_automation_slot(&serial)
-        .await
-        .context("freeing the UiAutomation slot before the test run")?;
+    {
+        let _guard = installer::acquire_lifecycle_lock(&serial)?;
+        free_ui_automation_slot(&serial)
+            .await
+            .context("freeing the UiAutomation slot before the test run")?;
+    }
 
     // Inherit stdio so the test runner's output streams live to the user.
     let program = command
@@ -3301,31 +3669,72 @@ async fn cmd_test(
         .with_context(|| format!("failed to launch `{}`", command.join(" ")))?;
     let exit_code = status.code();
 
-    let reconnected = if reconnect {
-        installer::ensure_ready(&serial, apk, any_apk_version)
-            .await
-            .is_ok()
+    let reconnect_result = if reconnect {
+        Some(installer::ensure_ready(&serial, apk, any_apk_version).await)
     } else {
-        false
+        None
     };
+    let reconnect_error = reconnect_result
+        .as_ref()
+        .and_then(|result| result.as_ref().err())
+        .map(ToString::to_string);
+    let reconnected = reconnect_result.as_ref().map(Result::is_ok);
+
+    if !status.success() {
+        let mut next_actions =
+            vec!["inspect the test command output above, fix the failing test, and rerun"];
+        if reconnect_error.is_some() {
+            next_actions.push("run `shadowdroid doctor` to repair the failed post-test reconnect");
+        }
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "test_command_failed",
+            "test",
+            format!("test command exited with status {}", exit_code.unwrap_or(1)),
+        )
+        .detail(json!({
+            "device": serial,
+            "command": command,
+            "exit_code": exit_code,
+            "reconnect_requested": reconnect,
+            "reconnected": reconnected,
+            "reconnect_error": reconnect_error,
+        }))
+        .next_actions(next_actions)
+        .process_exit_code(exit_code.filter(|code| *code > 0).unwrap_or(1))
+        .into());
+    }
+
+    // A successful user test followed by a failed reconnect is still a failed
+    // ShadowDroid operation: the requested postcondition was not reached. Let
+    // the normal error boundary emit the single terminal error envelope.
+    if let Some(error) = reconnect_error {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "test_reconnect_failed",
+            "lifecycle",
+            format!("test command passed, but ShadowDroid could not reconnect: {error}"),
+        )
+        .retryable(true)
+        .detail(json!({
+            "device": serial,
+            "command": command,
+            "test_exit_code": exit_code,
+        }))
+        .next_actions([
+            "run `shadowdroid doctor` to inspect the failed reconnect",
+            "run `shadowdroid connect` after resolving the reported lifecycle issue",
+        ])
+        .into());
+    }
 
     let out = json!({
-        "type": "action",
-        "cmd": "test",
         "device": serial,
         "command": command,
         "exit_code": exit_code,
+        "reconnect_requested": reconnect,
         "reconnected": reconnected,
     });
-    println!("{}", serde_json::to_string(&out).unwrap());
-    let _ = std::io::stdout().flush();
-
-    if status.success() {
-        Ok(())
-    } else {
-        // Propagate the test runner's status so callers (CI/agents) see failure.
-        std::process::exit(exit_code.unwrap_or(1));
-    }
+    emit_action("test", &out);
+    Ok(())
 }
 
 pub(crate) async fn resolve_serial(explicit: Option<&str>) -> Result<Serial> {
@@ -3334,15 +3743,32 @@ pub(crate) async fn resolve_serial(explicit: Option<&str>) -> Result<Serial> {
     }
     let devices = adb::list_devices().await.context("listing devices")?;
     match devices.len() {
-        0 => Err(anyhow!(
-            "no Android devices attached. Run `shadowdroid devices` to check."
-        )),
+        0 => Err(crate::diagnostic::DiagnosticError::new(
+            "no_device",
+            "device",
+            "no usable Android device is attached",
+        )
+        .retryable(true)
+        .next_actions([
+            "run `shadowdroid devices` to inspect offline or unauthorized devices",
+            "start an emulator or authorize USB debugging, then retry",
+        ])
+        .into()),
         1 => Ok(Serial::from(devices.into_iter().next().unwrap())),
-        _ => Err(anyhow!(
-            "multiple devices attached ({}). Pass --device <serial> or set $SHADOWDROID_DEVICE.\nattached: {}",
-            devices.len(),
-            devices.join(", ")
-        )),
+        _ => Err(crate::diagnostic::DiagnosticError::new(
+            "multiple_devices",
+            "device",
+            format!(
+                "multiple usable Android devices are attached ({})",
+                devices.len()
+            ),
+        )
+        .detail(json!({"devices": devices}))
+        .next_actions([
+            "choose a serial from detail.devices and pass `--device <serial>`",
+            "set SHADOWDROID_DEVICE or config.device for subsequent commands",
+        ])
+        .into()),
     }
 }
 
@@ -3365,12 +3791,12 @@ mod tests {
     }
 
     #[test]
-    fn push_mode_default_is_0o644() {
+    fn push_mode_is_optional_on_platform_managed_storage() {
         let cli =
             Cli::try_parse_from(["shadowdroid", "files", "push", "a.txt", "/data/local/tmp/a"])
                 .unwrap();
         match cli.cmd {
-            Cmd::Files(FilesCmd::Push { mode, .. }) => assert_eq!(mode, 0o644),
+            Cmd::Files(FilesCmd::Push { mode, .. }) => assert_eq!(mode, None),
             _ => panic!("expected files push"),
         }
     }

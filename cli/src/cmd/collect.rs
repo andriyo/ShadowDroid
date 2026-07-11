@@ -165,17 +165,15 @@ pub async fn run(
     });
     bundle.write_json("collect.json", &manifest);
 
-    println!(
-        "{}",
-        serde_json::json!({
-            "type": "action",
-            "cmd": "collect",
+    crate::events::emit_action(
+        "collect",
+        &serde_json::json!({
             "bundle": bundle.dir.display().to_string(),
             "server_ok": server_ok,
             "healthy": healthy,
             "captured": bundle.captured,
             "errors": bundle.errors,
-        })
+        }),
     );
     Ok(())
 }

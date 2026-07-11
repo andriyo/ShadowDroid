@@ -63,6 +63,18 @@ fn invalid_subcommand_is_a_structured_error() {
 }
 
 #[test]
+fn bare_invocation_is_a_structured_discovery_error() {
+    let (out, code) = run(&[]);
+    let value = one_json_line(&out);
+    assert_eq!(value["type"], "error", "{value}");
+    assert_eq!(value["code"], "missing_subcommand", "{value}");
+    assert!(value["next_actions"]
+        .as_array()
+        .is_some_and(|actions| !actions.is_empty()));
+    assert_eq!(code, 2);
+}
+
+#[test]
 fn help_exits_zero_and_is_not_an_error_envelope() {
     let (out, code) = run(&["ui", "wait", "--help"]);
     assert_eq!(code, 0, "--help exits 0");
@@ -79,6 +91,25 @@ fn commands_json_is_one_valid_json_object() {
         serde_json::from_str(out.trim()).expect("commands --json is valid JSON");
     assert!(v.is_object(), "catalog is a JSON object");
     assert_eq!(code, 0);
+}
+
+#[test]
+fn early_closing_stdout_consumer_does_not_panic_the_cli() {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_shadowdroid"))
+        .args(["commands", "--json"])
+        .env("SHADOWDROID_QUIET", "1")
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn shadowdroid");
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut prefix = [0u8; 64];
+    stdout.read_exact(&mut prefix).expect("read catalog prefix");
+    drop(stdout);
+    let status = child.wait().expect("wait for shadowdroid");
+    assert_ne!(status.code(), Some(101), "broken pipe must not panic");
 }
 
 #[test]
@@ -102,6 +133,12 @@ fn net_daemon_help_exposes_ca_flags() {
     // them (regression guard for the parent→daemon CA threading).
     let (out, code) = run(&["net", "daemon", "--help"]);
     assert_eq!(code, 0, "--help exits 0");
-    assert!(out.contains("--ca-cert"), "net daemon should accept --ca-cert:\n{out}");
-    assert!(out.contains("--ca-key"), "net daemon should accept --ca-key:\n{out}");
+    assert!(
+        out.contains("--ca-cert"),
+        "net daemon should accept --ca-cert:\n{out}"
+    );
+    assert!(
+        out.contains("--ca-key"),
+        "net daemon should accept --ca-key:\n{out}"
+    );
 }

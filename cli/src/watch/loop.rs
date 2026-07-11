@@ -287,6 +287,7 @@ async fn handle_screen_wake(
                 return false;
             }
             state.last_hash = Some(screen.screen_hash.clone());
+            let screen_hash_version = screen.screen_hash_version;
             let hits = watchers.matches(&screen.screen_hash, &screen.elements);
             events::emit(&events::screen_event(
                 &cfg.serial,
@@ -297,6 +298,7 @@ async fn handle_screen_wake(
                 events::emit(&Event::WatcherFired {
                     name: hit.name.clone(),
                     screen_hash: hit.screen_hash.clone(),
+                    screen_hash_version,
                     matched: hit.matched.clone(),
                     ts: now_ts(),
                 });
@@ -490,6 +492,12 @@ async fn dispatch_command(
             let timeout_ms = timeout_ms(cmd, 20_000)?;
             let front = opt_bool(cmd, "front").unwrap_or(false);
             let r = cfg.client.app_wait(package, timeout_ms, front).await?;
+            if !r.matched {
+                bail!(
+                    "app_wait timed out after {timeout_ms}ms for {package}; current app: {:?}. Inspect `screen` and correct the package/state before retrying",
+                    r.current
+                );
+            }
             emit_action(
                 "app_wait",
                 &json!({"package":package, "matched":r.matched, "current":r.current}),
@@ -517,6 +525,14 @@ async fn dispatch_command(
             let value = req_any_str(cmd, &["value", "input", "cmdline"])?;
             let timeout_ms = timeout_ms(cmd, 30_000)?;
             let r = cfg.client.shell(value, timeout_ms).await?;
+            if r.exit_code.is_some_and(|code| code != 0) {
+                bail!(
+                    "device shell exited {} for {:?}; output: {}. Correct the command before retrying",
+                    r.exit_code.unwrap_or_default(),
+                    r.input,
+                    r.output.trim()
+                );
+            }
             emit_action(
                 "shell",
                 &json!({"input":r.input, "output":r.output, "exit_code":r.exit_code}),
@@ -650,6 +666,24 @@ async fn dispatch_command(
                 .await
                 .with_context(|| format!("reading {local}"))?;
             let r = cfg.client.push_file(remote, bytes, mode).await?;
+            if mode.is_some_and(|requested| requested != r.mode) {
+                return Err(crate::diagnostic::DiagnosticError::new(
+                    "file_mode_postcondition_failed",
+                    "files",
+                    format!("file was pushed, but {remote} did not reach the requested Unix mode"),
+                )
+                .detail(json!({
+                    "local": local,
+                    "remote": remote,
+                    "requested_mode": mode,
+                    "observed_mode": r.mode,
+                    "transfer_completed": true,
+                }))
+                .next_actions([
+                    "use a path that supports chmod, or omit mode on shared/FUSE storage",
+                ])
+                .into());
+            }
             let mut payload = json!({"local":local, "remote":remote, "path":r.path, "bytes":r.bytes, "mode":r.mode});
             if let Some(mode) = mode {
                 payload["requested_mode"] = json!(mode);
@@ -776,11 +810,9 @@ async fn wait_after_action(
         if let Some(filter) = &cfg.app_filter {
             if !should_emit_package(Some(filter.as_str()), screen.current_app.package.as_deref()) {
                 if std::time::Instant::now() >= deadline {
-                    emit_action(
-                        action_cmd,
-                        &json!({"matched":false, "timeout":true, "reason":"app_filter"}),
+                    bail!(
+                        "{action_cmd} timed out after {timeout}ms because the foreground app stayed outside the watch app filter; inspect `screen` or change the filter"
                     );
-                    return Ok(());
                 }
                 sleep(Duration::from_millis(poll_ms as u64)).await;
                 continue;
@@ -806,9 +838,16 @@ async fn wait_after_action(
                 screen.clone(),
                 cfg.screen_format,
             ));
+            if timed_out && !done {
+                bail!(
+                    "{action_cmd} wait timed out after {timeout}ms; current screen_hash={} (v{}). Inspect the emitted screen and refine the wait condition",
+                    screen.screen_hash,
+                    screen.screen_hash_version
+                );
+            }
             emit_action(
                 action_cmd,
-                &json!({"matched":done, "timeout": timed_out && !done, "screen_hash":screen.screen_hash, "hash_changed":hash_changed, "tap": tap.map(|tap| json!({
+                &json!({"matched":true, "timeout": false, "screen_hash":screen.screen_hash, "screen_hash_version":screen.screen_hash_version, "hash_changed":hash_changed, "tap": tap.map(|tap| json!({
                     "id":tap.id,
                     "x":tap.x,
                     "y":tap.y,
@@ -840,11 +879,10 @@ async fn wait_activity(client: &ServerClient, name: &str, timeout_ms: u32) -> Re
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
-            emit_action(
-                "wait_activity",
-                &json!({"name":name, "matched":false, "current":cur}),
+            bail!(
+                "wait_activity timed out after {timeout_ms}ms waiting for {name:?}; current activity: {:?}. Correct the activity or app state before retrying",
+                cur.activity
             );
-            return Ok(());
         }
         sleep(Duration::from_millis(200)).await;
     }
@@ -864,16 +902,16 @@ async fn wait_for(
         if matched != gone {
             emit_action(
                 "wait_for",
-                &json!({"matched":matched, "gone":gone, "screen_hash":screen.screen_hash}),
+                &json!({"matched":matched, "gone":gone, "screen_hash":screen.screen_hash, "screen_hash_version":screen.screen_hash_version}),
             );
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
-            emit_action(
-                "wait_for",
-                &json!({"matched":matched, "gone":gone, "screen_hash":screen.screen_hash, "timeout":true}),
+            bail!(
+                "wait_for timed out after {timeout_ms}ms (matched={matched}, gone={gone}); current screen_hash={} (v{}). Inspect `screen` and refine the selector/state",
+                screen.screen_hash,
+                screen.screen_hash_version
             );
-            return Ok(());
         }
         sleep(Duration::from_millis(poll_ms as u64)).await;
     }

@@ -41,12 +41,20 @@ pub struct AppRef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScreenResponse {
     pub screen_hash: String,
+    /// Canonical screen-identity schema. Servers predating the versioned,
+    /// length-delimited hash are interpreted as v1.
+    #[serde(default = "default_screen_hash_version")]
+    pub screen_hash_version: u32,
     pub viewport: Viewport,
     pub current_app: AppRef,
     pub element_count: u32,
     #[serde(default, skip_serializing_if = "ImeState::is_empty")]
     pub ime: ImeState,
     pub elements: Vec<Element>,
+}
+
+const fn default_screen_hash_version() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -346,6 +354,7 @@ mod tests {
         }"#;
         let screen: ScreenResponse = serde_json::from_str(body).unwrap();
         assert!(screen.ime.is_empty());
+        assert_eq!(screen.screen_hash_version, 1);
 
         let json = serde_json::to_string(&screen).unwrap();
         assert!(!json.contains("\"ime\""), "{json}");

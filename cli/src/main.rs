@@ -14,11 +14,29 @@
 //! Each module is documented in the file header. See README.md for the public
 //! command surface.
 
+// Rust's standard print macros panic when a downstream agent intentionally
+// closes a pipe early (`commands --json | head`). Route all unqualified stdout
+// writes in this crate through a non-panicking sink instead. Broken pipes are a
+// normal consumer decision, not a ShadowDroid crash.
+macro_rules! print {
+    ($($arg:tt)*) => {{
+        crate::events::write_stdout(format_args!($($arg)*), false)
+    }};
+}
+
+macro_rules! println {
+    () => {{ crate::events::write_stdout(format_args!(""), true) }};
+    ($($arg:tt)*) => {{
+        crate::events::write_stdout(format_args!($($arg)*), true)
+    }};
+}
+
 mod cli;
 mod cmd;
 mod config;
 mod crashscan;
 mod device;
+mod diagnostic;
 mod events;
 mod fusion;
 mod hostenv;
@@ -53,7 +71,8 @@ async fn main() {
     // A failed command prints one `{"type":"error",…}` line on stdout (not
     // anyhow's `Error: …` on stderr) so the JSON contract holds for failures too.
     if let Err(err) = cli::run().await {
+        let exit_code = cli::process_exit_code_of(&err).unwrap_or(1);
         cli::report_error(&err);
-        std::process::exit(1);
+        std::process::exit(exit_code);
     }
 }

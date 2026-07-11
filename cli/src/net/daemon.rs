@@ -32,7 +32,9 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
     // Load the CA the parent resolved for us; never generate here (the daemon
     // has no config context and can't know which CA the project wants).
     let ca = CertAuthority::load_from_files(&cfg.ca_cert, &cfg.ca_key)?;
-    let (flow_tx, mut flow_rx) = mpsc::unbounded_channel::<FlowRecord>();
+    // Each completed flow can contain multi-megabyte bodies. A bounded queue
+    // prevents a slow disk from turning a traffic burst into unbounded memory.
+    let (flow_tx, mut flow_rx) = mpsc::channel::<FlowRecord>(16);
     let (event_tx, _event_rx) = broadcast::channel::<Arc<Event>>(1024);
     let shared = Arc::new(SharedState {
         anticache: cfg.anticache,
@@ -45,6 +47,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         rules: RwLock::new(Vec::new()),
         replay: RwLock::new(None),
         tls_errors_seen: Mutex::new(HashSet::new()),
+        dropped_flows: AtomicU64::new(0),
     });
 
     let ctx = Arc::new(ProxyContext {
@@ -53,6 +56,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         flow_tx,
         shared: shared.clone(),
         serial: cfg.serial.clone(),
+        verify_upstream: cfg.verify_upstream,
     });
 
     let state = Arc::new(DaemonState {

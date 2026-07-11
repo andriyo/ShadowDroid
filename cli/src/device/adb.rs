@@ -5,8 +5,8 @@
 //!
 //! All `adb_client` calls are synchronous. Public functions wrap each call
 //! in `tokio::task::spawn_blocking` so they're safe to .await from the async
-//! CLI dispatch without stalling the runtime. The blocking work itself is
-//! always sub-second.
+//! CLI dispatch without stalling the runtime. Every wrapper also has a host-side
+//! deadline: ADB is an external service and can hang when a transport wedges.
 
 use adb_client::server::ADBServer;
 use adb_client::server_device::ADBServerDevice;
@@ -19,21 +19,45 @@ use std::time::Duration;
 use tokio::task::spawn_blocking;
 use tracing::debug;
 
+const ADB_TIMEOUT: Duration = Duration::from_secs(20);
+const ADB_TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
+
+async fn bounded_blocking<T, F>(label: &'static str, timeout: Duration, f: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    match tokio::time::timeout(timeout, spawn_blocking(f)).await {
+        Ok(joined) => joined.with_context(|| format!("{label} task panicked"))?,
+        Err(_) => Err(crate::diagnostic::DiagnosticError::new(
+            "adb_timeout",
+            "adb",
+            format!("{label} did not complete within {}ms", timeout.as_millis()),
+        )
+        .retryable(true)
+        .detail(serde_json::json!({
+            "operation": label,
+            "timeout_ms": timeout.as_millis() as u64,
+        }))
+        .next_actions(["shadowdroid devices", "shadowdroid doctor --json"])
+        .into()),
+    }
+}
+
 /// Return serials of devices currently in "device" state. Skips offline /
 /// unauthorized / no-permissions devices — those are not actionable.
 pub async fn list_devices() -> Result<Vec<String>> {
-    spawn_blocking(|| {
+    bounded_blocking("list devices", ADB_TIMEOUT, || {
         let mut server = ADBServer::default();
         let devices = server.devices().map_err(|e| anyhow!("adb devices: {e}"))?;
         // DeviceShort stringifies as `<serial> <state>`; we want only "device"
         Ok(devices
             .into_iter()
-            .filter(|d| format!("{d}").contains("device"))
+            .filter(|d| format!("{}", d.state) == "device")
             .map(|d| d.identifier)
             .collect())
     })
     .await
-    .context("list_devices task panicked")?
 }
 
 /// Open a device handle by serial. Fails fast if the device isn't connected.
@@ -49,7 +73,7 @@ fn get_device_sync(serial: &str) -> Result<ADBServerDevice> {
 pub async fn shell(serial: impl Into<String>, cmd: impl Into<String>) -> Result<String> {
     let serial = serial.into();
     let cmd = cmd.into();
-    spawn_blocking(move || {
+    bounded_blocking("device shell", ADB_TIMEOUT, move || {
         let mut device = get_device_sync(&serial)?;
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -65,7 +89,6 @@ pub async fn shell(serial: impl Into<String>, cmd: impl Into<String>) -> Result<
         Ok(String::from_utf8_lossy(&stdout).into_owned())
     })
     .await
-    .context("shell task panicked")?
 }
 
 /// Install an APK on the device. Uses the ADB streaming `exec:install` path
@@ -73,14 +96,13 @@ pub async fn shell(serial: impl Into<String>, cmd: impl Into<String>) -> Result<
 pub async fn install(serial: impl Into<String>, apk_path: impl Into<PathBuf>) -> Result<()> {
     let serial = serial.into();
     let apk_path = apk_path.into();
-    spawn_blocking(move || {
+    bounded_blocking("install APK", ADB_TRANSFER_TIMEOUT, move || {
         let mut device = get_device_sync(&serial)?;
         device
             .install(&apk_path, None)
             .map_err(|e| anyhow!("adb install {}: {e}", apk_path.display()))
     })
     .await
-    .context("install task panicked")?
 }
 
 /// Uninstall a package by name. Idempotent-ish: errors (e.g. "not installed")
@@ -88,14 +110,13 @@ pub async fn install(serial: impl Into<String>, apk_path: impl Into<PathBuf>) ->
 pub async fn uninstall(serial: impl Into<String>, package: impl Into<String>) -> Result<()> {
     let serial = serial.into();
     let package = package.into();
-    spawn_blocking(move || {
+    bounded_blocking("uninstall package", ADB_TRANSFER_TIMEOUT, move || {
         let mut device = get_device_sync(&serial)?;
         device
-            .uninstall(&package.as_str(), None)
+            .uninstall(package.as_str(), None)
             .map_err(|e| anyhow!("adb uninstall {package}: {e}"))
     })
     .await
-    .context("uninstall task panicked")?
 }
 
 /// Push a local file to the device over the ADB protocol. Used as a fallback
@@ -109,16 +130,15 @@ pub async fn push(
     let serial = serial.into();
     let local = local.into();
     let remote = remote.into();
-    spawn_blocking(move || {
+    bounded_blocking("push file", ADB_TRANSFER_TIMEOUT, move || {
         let mut device = get_device_sync(&serial)?;
         let mut file =
             std::fs::File::open(&local).with_context(|| format!("open {}", local.display()))?;
         device
-            .push(&mut file, &remote.as_str())
+            .push(&mut file, remote.as_str())
             .map_err(|e| anyhow!("adb push {} -> {remote}: {e}", local.display()))
     })
     .await
-    .context("push task panicked")?
 }
 
 /// Pull a device file to memory over the ADB protocol. Fallback counterpart to
@@ -126,7 +146,7 @@ pub async fn push(
 pub async fn pull(serial: impl Into<String>, remote: impl Into<String>) -> Result<Vec<u8>> {
     let serial = serial.into();
     let remote = remote.into();
-    spawn_blocking(move || {
+    bounded_blocking("pull file", ADB_TRANSFER_TIMEOUT, move || {
         let mut device = get_device_sync(&serial)?;
         let mut buf: Vec<u8> = Vec::new();
         device
@@ -135,14 +155,13 @@ pub async fn pull(serial: impl Into<String>, remote: impl Into<String>) -> Resul
         Ok(buf)
     })
     .await
-    .context("pull task panicked")?
 }
 
 /// Set up `adb forward tcp:<host_port> tcp:<device_port>`.
 /// A laptop-side connect to host_port is proxied to device_port.
 pub async fn forward(serial: impl Into<String>, host_port: u16, device_port: u16) -> Result<()> {
     let serial = serial.into();
-    spawn_blocking(move || {
+    bounded_blocking("create forward", ADB_TIMEOUT, move || {
         let mut device = get_device_sync(&serial)?;
         // adb_client's `forward(remote, local)` maps to the ADB protocol
         // `forward:<local>;<remote>`. We pass (remote=device, local=host).
@@ -153,20 +172,18 @@ pub async fn forward(serial: impl Into<String>, host_port: u16, device_port: u16
             .map_err(|e| anyhow!("adb forward tcp:{host_port} tcp:{device_port}: {e}"))
     })
     .await
-    .context("forward task panicked")?
 }
 
 /// Remove a previously-set forward rule by host port.
 pub async fn forward_remove(serial: impl Into<String>, host_port: u16) -> Result<()> {
     let serial = serial.into();
-    spawn_blocking(move || {
+    bounded_blocking("remove forward", ADB_TIMEOUT, move || {
         let mut device = get_device_sync(&serial)?;
         device
             .forward_remove(format!("tcp:{host_port}"))
             .map_err(|e| anyhow!("adb forward --remove tcp:{host_port}: {e}"))
     })
     .await
-    .context("forward_remove task panicked")?
 }
 
 /// Set up `adb reverse tcp:<device_port> tcp:<host_port>` — the *device's*
@@ -178,27 +195,25 @@ pub async fn forward_remove(serial: impl Into<String>, host_port: u16) -> Result
 /// `local` is the host socket.
 pub async fn reverse(serial: impl Into<String>, device_port: u16, host_port: u16) -> Result<()> {
     let serial = serial.into();
-    spawn_blocking(move || {
+    bounded_blocking("create reverse", ADB_TIMEOUT, move || {
         let mut device = get_device_sync(&serial)?;
         device
             .reverse(format!("tcp:{device_port}"), format!("tcp:{host_port}"))
             .map_err(|e| anyhow!("adb reverse tcp:{device_port} tcp:{host_port}: {e}"))
     })
     .await
-    .context("reverse task panicked")?
 }
 
 /// Remove a previously-set reverse rule by the device-side port.
 pub async fn reverse_remove(serial: impl Into<String>, device_port: u16) -> Result<()> {
     let serial = serial.into();
-    spawn_blocking(move || {
+    bounded_blocking("remove reverse", ADB_TIMEOUT, move || {
         let mut device = get_device_sync(&serial)?;
         device
             .reverse_remove(format!("tcp:{device_port}"))
             .map_err(|e| anyhow!("adb reverse --remove tcp:{device_port}: {e}"))
     })
     .await
-    .context("reverse_remove task panicked")?
 }
 
 /// One `adb reverse --list` entry. The ADB server prefixes each line with an
@@ -216,7 +231,7 @@ pub struct ReverseMapping {
 /// uses the same local ADB server wire protocol directly.
 pub async fn reverse_list(serial: impl Into<String>) -> Result<Vec<ReverseMapping>> {
     let serial = serial.into();
-    spawn_blocking(move || {
+    bounded_blocking("list reverse mappings", ADB_TIMEOUT, move || {
         let mut stream = TcpStream::connect(("127.0.0.1", 5037))
             .context("connect to local ADB server for reverse list")?;
         let timeout = Some(Duration::from_secs(2));
@@ -230,7 +245,6 @@ pub async fn reverse_list(serial: impl Into<String>) -> Result<Vec<ReverseMappin
         Ok(parse_reverse_list(&output))
     })
     .await
-    .context("reverse_list task panicked")?
 }
 
 fn adb_server_request(stream: &mut TcpStream, command: &str) -> Result<()> {
@@ -309,17 +323,17 @@ pub async fn am_instrument(
     Ok(())
 }
 
-/// Kill any lingering shell-owned `app_process` on device. ShadowDroid's
-/// backgrounded `am instrument` wrapper uses one, and tools like openatx's
-/// uiautomator2 `u2.jar` do too. Any live UiAutomation owner can make the next
-/// `am instrument` fail with "UiAutomationService already registered!".
+/// Kill only lingering `app_process` wrappers owned by ShadowDroid. Other tools
+/// such as uiautomator2 may legitimately own the single UiAutomation slot; an
+/// implicit connect/disconnect must never destroy them.
 pub async fn kill_instrument_zombies(serial: impl Into<String>) -> Result<()> {
     let serial = serial.into();
-    // First: kill any `app_process` shells. They run as uid=2000 (shell) and
-    // are what `am instrument` left behind from prior runs.
+    // The `am instrument` wrapper command line contains our test package. Match
+    // that ownership marker before killing instead of selecting every
+    // `app_process` on the device.
     let _ = shell(
         &serial,
-        "ps -A | grep app_process | awk '{print $2}' | xargs -r kill -9 2>/dev/null",
+        "ps -A -o PID,ARGS | grep app_process | grep 'io.github.andriyo.shadowdroid.test' | grep -v grep | awk '{print $1}' | xargs -r kill -9 2>/dev/null",
     )
     .await;
     // Then: nuke the actual test process by package. force-stop the app under
@@ -330,6 +344,19 @@ pub async fn kill_instrument_zombies(serial: impl Into<String>) -> Result<()> {
     // Give system_server a beat to actually release the UiAutomation slot.
     // Without this, the very next `am instrument` races and hits
     // "UiAutomationService already registered!".
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    Ok(())
+}
+
+/// Explicit takeover used only by `doctor --fix --force`. Unlike normal
+/// lifecycle cleanup this may stop foreign shell-hosted UiAutomation tooling.
+pub async fn kill_all_ui_automation_owners(serial: impl Into<String>) -> Result<()> {
+    let serial = serial.into();
+    let _ = shell(
+        &serial,
+        "ps -A -o PID,ARGS | grep -E 'app_process|uiautomator|com.wetest.uia2.Main|atx' | grep -v grep | awk '{print $1}' | xargs -r kill -9 2>/dev/null",
+    )
+    .await;
     tokio::time::sleep(std::time::Duration::from_millis(800)).await;
     Ok(())
 }
@@ -439,7 +466,7 @@ pub async fn list_packages(serial: impl Into<String>) -> Result<Vec<String>> {
 /// unfiltered. `list_devices` hides anything that isn't fully "device"; the
 /// `doctor` command needs to *surface* those unhealthy states.
 pub async fn list_devices_with_state() -> Result<Vec<(String, String)>> {
-    spawn_blocking(|| {
+    bounded_blocking("list devices with state", ADB_TIMEOUT, || {
         let mut server = ADBServer::default();
         let devices = server.devices().map_err(|e| anyhow!("adb devices: {e}"))?;
         Ok(devices
@@ -448,7 +475,6 @@ pub async fn list_devices_with_state() -> Result<Vec<(String, String)>> {
             .collect())
     })
     .await
-    .context("list_devices_with_state task panicked")?
 }
 
 /// Raw `ps` lines for processes that can hold the single device-wide

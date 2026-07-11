@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust CLI
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+
+      - name: Check formatting
+        working-directory: cli
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        working-directory: cli
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Test
+        working-directory: cli
+        run: cargo test --locked --all-targets
+
+  server:
+    name: Android server
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Android SDK packages
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platform-tools" \
+            "platforms;android-36"
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Check, test, and assemble server APK pair
+        working-directory: server
+        run: |
+          ./gradlew --no-daemon \
+            ktlintCheck \
+            :app:lintDebug \
+            :app:testDebugUnitTest \
+            :app:assembleDebug \
+            :app:assembleDebugAndroidTest
+
+  agent-and-sample:
+    name: In-app agent and sample app
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Android SDK packages
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platform-tools" \
+            "platforms;android-36"
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Check, test, and assemble in-app agent
+        working-directory: agent
+        run: |
+          ./gradlew --no-daemon \
+            :shadowdroid-agent:lintDebug \
+            :shadowdroid-agent:testDebugUnitTest \
+            :shadowdroid-agent:assembleRelease \
+            :shadowdroid-agent-okhttp:lintDebug \
+            :shadowdroid-agent-okhttp:testDebugUnitTest \
+            :shadowdroid-agent-okhttp:assembleRelease
+
+      - name: Stage the agent AAR used by the sample
+        run: |
+          mkdir -p samples/shadowdroid-test-app/shadowdroid
+          cp agent/shadowdroid-agent/build/outputs/aar/shadowdroid-agent-release.aar \
+            samples/shadowdroid-test-app/shadowdroid/shadowdroid-agent.aar
+
+      - name: Check, test, and assemble sample app
+        working-directory: samples/shadowdroid-test-app
+        run: |
+          ./gradlew --no-daemon \
+            :app:lintDebug \
+            :app:testDebugUnitTest \
+            :app:assembleDebug
+
+  studio-plugin:
+    name: Android Studio plugin
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Test and build plugin
+        working-directory: shadowdroid-plugin
+        run: ./gradlew --no-daemon test buildPlugin verifyPluginStructure

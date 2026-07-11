@@ -2,7 +2,11 @@ package io.github.andriyo.shadowdroid.dump
 
 import android.graphics.Rect
 import android.view.accessibility.AccessibilityNodeInfo
+import io.github.andriyo.shadowdroid.proto.AppRef
 import io.github.andriyo.shadowdroid.proto.Element
+import io.github.andriyo.shadowdroid.proto.ImeState
+import io.github.andriyo.shadowdroid.proto.Viewport
+import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 
 /**
@@ -75,10 +79,10 @@ object TreeWalker {
             val hasUsableBounds =
                 bounds.width() > 0 &&
                     bounds.height() > 0 &&
-                bounds.right > 0 &&
-                bounds.bottom > 0 &&
-                bounds.left < vw &&
-                bounds.top < vh
+                    bounds.right > 0 &&
+                    bounds.bottom > 0 &&
+                    bounds.left < vw &&
+                    bounds.top < vh
             val isPositiveButOffscreen =
                 bounds.width() > 0 &&
                     bounds.height() > 0 &&
@@ -133,30 +137,98 @@ object TreeWalker {
     }
 
     /**
-     * Stable hash of the rendered tree. Computed from the same set of fields
-     * we emit, so semantically-identical screens produce the same hash even if
-     * accessibility-event sequencing differs. Used by the watch loop's
-     * change-detection.
+     * Stable identity of the actionable screen state.
+     *
+     * Every field that can affect a subsequent action is encoded with an
+     * explicit null marker and byte length. This prevents concatenation
+     * collisions such as `(text="ab", desc="c")` and
+     * `(text="a", desc="bc")`, which produced the same input in v1. The
+     * version/domain prefix lets us evolve the canonical representation
+     * without accidentally comparing hashes produced by different schemas.
      */
-    fun hashOf(elements: List<Element>): String {
-        val md = MessageDigest.getInstance("SHA-256")
+    fun hashOf(
+        elements: List<Element>,
+        viewport: Viewport,
+        currentApp: AppRef,
+        ime: ImeState,
+    ): String {
+        val digest = CanonicalDigest(MessageDigest.getInstance("SHA-256"))
+        digest.putString("shadowdroid.screen.v2")
+        digest.putInt(viewport.w)
+        digest.putInt(viewport.h)
+        digest.putNullableString(currentApp.`package`)
+        digest.putNullableString(currentApp.activity)
+        digest.putNullableInt(currentApp.pid)
+        digest.putBoolean(ime.keyboard_visible)
+        digest.putNullableInt(ime.focused_element?.id)
+        digest.putNullableInt(ime.focused_input?.id)
+        digest.putInt(elements.size)
         for (e in elements) {
-            md.update(e.text.orEmpty().toByteArray())
-            md.update(e.desc.orEmpty().toByteArray())
-            md.update(e.rid.orEmpty().toByteArray())
-            md.update(e.klass.orEmpty().toByteArray())
-            md.update(e.bounds?.joinToString(",").orEmpty().toByteArray())
-            md.update(
-                byteArrayOf(
-                    if (e.clickable) 1 else 0,
-                    if (e.scrollable) 1 else 0,
-                    if (e.checked) 1 else 0,
-                    if (e.focused) 1 else 0,
-                    if (e.enabled) 1 else 0,
-                ),
-            )
+            digest.putInt(e.id)
+            digest.putNullableString(e.text)
+            digest.putNullableString(e.desc)
+            digest.putNullableString(e.klass)
+            digest.putNullableString(e.rid)
+            digest.putNullableIntList(e.bounds)
+            digest.putNullableIntList(e.tap)
+            digest.putBoolean(e.clickable)
+            digest.putBoolean(e.long_clickable)
+            digest.putBoolean(e.scrollable)
+            digest.putBoolean(e.checkable)
+            digest.putBoolean(e.focusable)
+            digest.putBoolean(e.enabled)
+            digest.putBoolean(e.selected)
+            digest.putBoolean(e.checked)
+            digest.putBoolean(e.focused)
+            digest.putBoolean(e.password)
+            digest.putBoolean(e.input)
         }
         // First 8 bytes hex to match the public screen_hash length.
-        return md.digest().take(8).joinToString("") { "%02x".format(it) }
+        return digest.finish().take(8).joinToString("") { "%02x".format(it) }
     }
+}
+
+/** Small binary encoder for the versioned screen identity above. */
+private class CanonicalDigest(
+    private val digest: MessageDigest,
+) {
+    private val intBytes = ByteArray(Int.SIZE_BYTES)
+
+    fun putBoolean(value: Boolean) {
+        digest.update((if (value) 1 else 0).toByte())
+    }
+
+    fun putInt(value: Int) {
+        intBytes[0] = (value ushr 24).toByte()
+        intBytes[1] = (value ushr 16).toByte()
+        intBytes[2] = (value ushr 8).toByte()
+        intBytes[3] = value.toByte()
+        digest.update(intBytes)
+    }
+
+    fun putNullableInt(value: Int?) {
+        putBoolean(value != null)
+        value?.let(::putInt)
+    }
+
+    fun putString(value: String) {
+        val bytes = value.toByteArray(StandardCharsets.UTF_8)
+        putInt(bytes.size)
+        digest.update(bytes)
+    }
+
+    fun putNullableString(value: String?) {
+        putBoolean(value != null)
+        value?.let(::putString)
+    }
+
+    fun putNullableIntList(values: List<Int>?) {
+        putBoolean(values != null)
+        if (values != null) {
+            putInt(values.size)
+            values.forEach(::putInt)
+        }
+    }
+
+    fun finish(): ByteArray = digest.digest()
 }

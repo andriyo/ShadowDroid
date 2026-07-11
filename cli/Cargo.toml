@@ -52,6 +52,7 @@ sha2 = "0.11"             # release APK checksum verification
 futures = "0.3"
 urlencoding = "2.1"   # used for ?package= query strings
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
+tempfile = "3.27"     # same-directory temporary files for atomic config replacement
 # once_cell removed: std::sync::OnceLock (stable since 1.70) covers our use case.
 # Bring it back if we need the &'static initialisation guarantee for ergonomics.
 
@@ -65,6 +66,7 @@ http-body-util = "0.1"
 bytes = "1"
 tokio-rustls = "0.26"
 rustls = "0.23"
+rustls-platform-verifier = "0.7" # make --verify-upstream apply to WSS as well as HTTP(S)
 rcgen = { version = "0.14", features = ["x509-parser"] }
 x509-parser = "0.18"     # inspect a user-provided CA cert (SPKI match, CA flag, validity) on `net ca import`; already in lock via rcgen
 flate2 = "1"             # decompress captured gzip/deflate response bodies (already in lock via zip)
@@ -72,7 +74,6 @@ brotli = "8"             # decompress captured `br` response bodies (pure Rust; 
 ruzstd = "0.8"           # decompress captured `zstd` response bodies (pure Rust decoder, no libzstd C dep)
 
 [dev-dependencies]
-tempfile = "3.27"
 wiremock = "0.6"          # mock the on-device HTTP server for unit tests
 
 [profile.release]

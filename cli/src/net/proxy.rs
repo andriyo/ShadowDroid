@@ -33,6 +33,7 @@ use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context as TaskCtx, Poll};
 use std::time::Duration;
@@ -69,11 +70,14 @@ pub struct ProxyContext {
     pub ca: Arc<CertAuthority>,
     pub client: reqwest::Client,
     /// Completed flows are pushed here; the daemon drains → store + broadcast.
-    pub flow_tx: mpsc::UnboundedSender<FlowRecord>,
+    pub flow_tx: mpsc::Sender<FlowRecord>,
     pub shared: Arc<SharedState>,
     /// This daemon's device serial — used to persist a `tls_error` to the
     /// session log so `net log` can recall handshake failures.
     pub serial: crate::ids::Serial,
+    /// Apply platform certificate and hostname verification to every upstream
+    /// TLS leg, including WebSockets (reqwest handles ordinary HTTP requests).
+    pub verify_upstream: bool,
 }
 
 /// Runtime-mutable proxy knobs. (Rules land here in P3.)
@@ -97,6 +101,9 @@ pub struct SharedState {
     /// Hosts we've already reported a `tls_error` for, so a client that keeps
     /// retrying a rejected handshake produces one signal, not a flood.
     pub tls_errors_seen: Mutex<HashSet<String>>,
+    /// Completed captures discarded because the bounded persistence queue was
+    /// full or closed. Exposed in `net status` so data loss is never silent.
+    pub dropped_flows: AtomicU64,
 }
 
 impl SharedState {
@@ -366,34 +373,42 @@ async fn proxy_websocket(
     let id = flow::new_id();
     let in_scope = ctx.shared.host_in_scope(&host);
 
-    let (status, resp_headers, upstream_resp) =
-        match ws_handshake_upstream(&scheme, &host, port, &path, &req_headers).await {
-            Ok(v) => v,
-            Err(e) => {
-                if in_scope {
-                    capture(
-                        &ctx,
-                        error_flow(
-                            &id,
-                            req.method(),
-                            &scheme,
-                            &host,
-                            &path,
-                            &req_headers,
-                            &[],
-                            false,
-                            None,
-                            &[],
-                            0,
-                            e.to_string(),
-                            Some("websocket".into()),
-                            false,
-                        ),
-                    );
-                }
-                return error_response(StatusCode::BAD_GATEWAY, &e.to_string());
+    let (status, resp_headers, upstream_resp) = match ws_handshake_upstream(
+        &scheme,
+        &host,
+        port,
+        &path,
+        &req_headers,
+        ctx.verify_upstream,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            if in_scope {
+                capture(
+                    &ctx,
+                    error_flow(
+                        &id,
+                        req.method(),
+                        &scheme,
+                        &host,
+                        &path,
+                        &req_headers,
+                        &[],
+                        false,
+                        None,
+                        &[],
+                        0,
+                        e.to_string(),
+                        Some("websocket".into()),
+                        false,
+                    ),
+                );
             }
-        };
+            return error_response(StatusCode::BAD_GATEWAY, &e.to_string());
+        }
+    };
 
     if in_scope {
         // The handshake itself is a capturable flow; frames aren't decoded.
@@ -472,25 +487,34 @@ async fn ws_handshake_upstream(
     port: u16,
     path: &str,
     req_headers: &[(String, String)],
+    verify_upstream: bool,
 ) -> Result<(u16, Vec<(String, String)>, Response<Incoming>)> {
-    let tcp = TcpStream::connect((host, port))
+    let tcp = tokio::time::timeout(Duration::from_secs(15), TcpStream::connect((host, port)))
         .await
+        .map_err(|_| anyhow!("connect {host}:{port} timed out after 15s"))?
         .map_err(|e| anyhow!("connect {host}:{port}: {e}"))?;
     let stream: Box<dyn IoStream> = if scheme == "https" {
         let sni = rustls::pki_types::ServerName::try_from(host.to_string())
             .map_err(|e| anyhow!("bad SNI {host}: {e}"))?;
         Box::new(
-            ws_tls_connector()
-                .connect(sni, tcp)
-                .await
-                .map_err(|e| anyhow!("upstream TLS {host}: {e}"))?,
+            tokio::time::timeout(
+                Duration::from_secs(15),
+                ws_tls_connector(verify_upstream)?.connect(sni, tcp),
+            )
+            .await
+            .map_err(|_| anyhow!("upstream TLS {host} timed out after 15s"))?
+            .map_err(|e| anyhow!("upstream TLS {host}: {e}"))?,
         )
     } else {
         Box::new(tcp)
     };
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-        .await
-        .map_err(|e| anyhow!("upstream handshake: {e}"))?;
+    let (mut sender, conn) = tokio::time::timeout(
+        Duration::from_secs(15),
+        hyper::client::conn::http1::handshake(TokioIo::new(stream)),
+    )
+    .await
+    .map_err(|_| anyhow!("upstream HTTP handshake timed out after 15s"))?
+    .map_err(|e| anyhow!("upstream handshake: {e}"))?;
     tokio::spawn(conn.with_upgrades());
 
     let mut builder = Request::builder().method(Method::GET).uri(path);
@@ -511,9 +535,9 @@ async fn ws_handshake_upstream(
     let upstream_req = builder
         .body(Empty::<Bytes>::new())
         .map_err(|e| anyhow!("build ws request: {e}"))?;
-    let resp = sender
-        .send_request(upstream_req)
+    let resp = tokio::time::timeout(Duration::from_secs(30), sender.send_request(upstream_req))
         .await
+        .map_err(|_| anyhow!("upstream WebSocket response timed out after 30s"))?
         .map_err(|e| anyhow!("upstream ws request: {e}"))?;
     let status = resp.status().as_u16();
     let headers = header_pairs(resp.headers());
@@ -545,11 +569,35 @@ fn ws_switching_response(headers: &[(String, String)]) -> Response<ProxyBody> {
         .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
 }
 
-/// A permissive TLS client connector for the upstream WebSocket leg — matches the
-/// proxy's default upstream posture (accepts self-signed dev backends). Built once.
-fn ws_tls_connector() -> tokio_rustls::TlsConnector {
-    static CONNECTOR: std::sync::OnceLock<tokio_rustls::TlsConnector> = std::sync::OnceLock::new();
-    CONNECTOR
+/// Build the TLS client connector for the upstream WebSocket leg. The default
+/// debugging posture accepts self-signed backends; `--verify-upstream` switches
+/// to the host platform's trust store and hostname verification, matching the
+/// ordinary reqwest upstream path.
+fn ws_tls_connector(verify_upstream: bool) -> Result<tokio_rustls::TlsConnector> {
+    if verify_upstream {
+        use rustls_platform_verifier::BuilderVerifierExt;
+
+        static SECURE_CONNECTOR: std::sync::OnceLock<
+            std::result::Result<tokio_rustls::TlsConnector, String>,
+        > = std::sync::OnceLock::new();
+        return SECURE_CONNECTOR
+            .get_or_init(|| {
+                let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+                let cfg = rustls::ClientConfig::builder_with_provider(provider)
+                    .with_safe_default_protocol_versions()
+                    .map_err(|e| format!("rustls protocol versions: {e}"))?
+                    .with_platform_verifier()
+                    .map_err(|e| format!("platform TLS verifier: {e}"))?
+                    .with_no_client_auth();
+                Ok(tokio_rustls::TlsConnector::from(Arc::new(cfg)))
+            })
+            .clone()
+            .map_err(anyhow::Error::msg);
+    }
+
+    static INSECURE_CONNECTOR: std::sync::OnceLock<tokio_rustls::TlsConnector> =
+        std::sync::OnceLock::new();
+    Ok(INSECURE_CONNECTOR
         .get_or_init(|| {
             let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
             let cfg = rustls::ClientConfig::builder_with_provider(provider.clone())
@@ -560,7 +608,7 @@ fn ws_tls_connector() -> tokio_rustls::TlsConnector {
                 .with_no_client_auth();
             tokio_rustls::TlsConnector::from(Arc::new(cfg))
         })
-        .clone()
+        .clone())
 }
 
 /// Accept-any server-cert verifier (upstream WebSocket leg only; signature math
@@ -1352,7 +1400,7 @@ fn capture(ctx: &ProxyContext, parts: FlowParts<'_>) {
         redact_headers(&mut rec.req_headers);
         redact_headers(&mut rec.resp_headers);
     }
-    let _ = ctx.flow_tx.send(rec);
+    enqueue_flow(ctx, rec);
 }
 
 /// Capture a streamed (pass-through) flow: same metadata as [`capture`] but with
@@ -1367,7 +1415,18 @@ fn capture_streamed(ctx: &ProxyContext, parts: FlowParts<'_>, len_hint: Option<u
         redact_headers(&mut rec.req_headers);
         redact_headers(&mut rec.resp_headers);
     }
-    let _ = ctx.flow_tx.send(rec);
+    enqueue_flow(ctx, rec);
+}
+
+fn enqueue_flow(ctx: &ProxyContext, rec: FlowRecord) {
+    if ctx.flow_tx.try_send(rec).is_err() {
+        let dropped = ctx.shared.dropped_flows.fetch_add(1, Ordering::Relaxed) + 1;
+        // Log sparsely under sustained overload while keeping the exact count
+        // discoverable through `net status`.
+        if dropped == 1 || dropped.is_power_of_two() {
+            tracing::warn!(dropped, "network capture queue full; flow discarded");
+        }
+    }
 }
 
 /// Headers whose values are replaced with a placeholder when `--redact` is on.
@@ -1601,10 +1660,12 @@ fn drop_response(status: Option<u16>) -> Response<ProxyBody> {
 
 // ── declarative rules (P3) ────────────────────────────────────
 
+type SyntheticResponse = (u16, Vec<(String, String)>, Bytes);
+
 /// Outcome of the request-phase rules: an optional short-circuit response
 /// (block / map-local), an accumulated delay, and whether anything changed.
 struct ReqRules {
-    short_circuit: Option<(u16, Vec<(String, String)>, Bytes)>,
+    short_circuit: Option<SyntheticResponse>,
     delay_ms: u32,
     modified: bool,
 }
@@ -1745,7 +1806,7 @@ fn replay_lookup(
     method: &str,
     host: &str,
     path: &str,
-) -> Option<(u16, Vec<(String, String)>, Bytes)> {
+) -> Option<SyntheticResponse> {
     let guard = shared.replay.read().unwrap();
     let flows = guard.as_ref()?;
     let f = flows
@@ -1951,8 +2012,8 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Rewind<T> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decompress, host_glob_match, release_held, resolve_held, tls_failure_reason, HeldFlow,
-        HoldDecision,
+        decompress, host_glob_match, release_held, resolve_held, tls_failure_reason,
+        ws_tls_connector, HeldFlow, HoldDecision,
     };
     use crate::net::flow::FlowRecord;
     use crate::net::Mutation;
@@ -1961,6 +2022,46 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
     use tokio::sync::oneshot;
+
+    async fn self_signed_tls_handshake(verify_upstream: bool) -> bool {
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let server_cfg = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into(),
+            )
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_cfg));
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            acceptor.accept(tcp).await.is_ok()
+        });
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let client_ok = ws_tls_connector(verify_upstream)
+            .unwrap()
+            .connect(name, tcp)
+            .await
+            .is_ok();
+        let _ = server.await;
+        client_ok
+    }
+
+    #[tokio::test]
+    async fn verify_upstream_applies_to_websocket_tls() {
+        assert!(self_signed_tls_handshake(false).await);
+        assert!(!self_signed_tls_handshake(true).await);
+    }
 
     #[test]
     fn decompress_round_trips_every_supported_encoding() {

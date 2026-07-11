@@ -200,6 +200,7 @@ pub fn write_fixtures(flows: &[FlowRecord], out: &Path) -> Result<Value> {
         .with_context(|| format!("writing {}", manifest_path.display()))?;
     Ok(json!({
         "type": "action",
+        "ok": true,
         "cmd": "export",
         "format": "fixtures",
         "out": out.display().to_string(),

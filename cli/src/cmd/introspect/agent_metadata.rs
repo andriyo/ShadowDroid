@@ -8,10 +8,17 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
     let key = path.join(" ");
     match key.as_str() {
         "commands" => Some(serde_json::json!({
-            "use_when": ["Discover ShadowDroid's command tree, flags, and agent decision hints without scraping human help text."],
-            "output": "json catalog when --json is passed; human tree otherwise",
+            "use_when": [
+                "Discover ShadowDroid's command tree, flags, output contracts, and agent decision hints without scraping human help text.",
+                "Inspect one command before constructing it, or fetch a shallow catalog when the full tree would cost unnecessary context."
+            ],
+            "output": "schema_version 2 JSON catalog with command paths, complete argument construction data, output contracts, and agent hints; --depth limits nesting and --describe returns one command",
             "side_effects": ["none"],
-            "next_commands": ["config schema --json", "ui dump", "watch"]
+            "next_commands": ["commands --json --depth 1", "commands --json --describe 'ui tap'", "config schema --json"],
+            "examples": [
+                "commands --json --depth 1",
+                "commands --json --describe 'net rule add'"
+            ]
         })),
         "devices" => Some(serde_json::json!({
             "use_when": ["Need to choose an adb serial or verify whether any emulator/device is attached before running device-backed commands."],
@@ -39,7 +46,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "next_commands": ["log", "ui dump", "net log", "collect"]
         })),
         "usage" => Some(serde_json::json!({
-            "use_when": ["Manage the opt-in local usage log (verb + duration + error code per invocation; no argument values, never uploaded)."],
+            "use_when": ["Manage the opt-in local usage log (verb, duration, version, outcome, and typed error stage/retry posture; no argument values, never uploaded)."],
             "output": "action JSON per subcommand",
             "side_effects": ["enable/disable write the user config; clear deletes the local log"],
             "next_commands": ["usage status", "usage report"]
@@ -63,10 +70,10 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "next_commands": ["usage status"]
         })),
         "usage report" => Some(serde_json::json!({
-            "use_when": ["See which verbs run most, their error rates and durations, and the top error codes — the data-driven UX backlog."],
-            "output": "usage_report action JSON (per-verb count/errors/p50/p95 + error-code ranking)",
+            "use_when": ["Turn repeated local agent friction into a prioritized, evidence-backed reliability and latency backlog."],
+            "output": "usage_report action JSON with per-verb count/error_rate/p50/p95, error codes and stages, version cohorts, recommendations, and an explicit feedback loop",
             "side_effects": ["none"],
-            "next_commands": ["usage clear"]
+            "next_commands": ["usage report --days 7", "commands --json --describe '<recommended verb>'", "usage clear"]
         })),
         "usage clear" => Some(serde_json::json!({
             "use_when": ["Delete the accumulated local usage log."],
@@ -101,12 +108,15 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "init" => Some(serde_json::json!({
             "use_when": ["Need first-run host setup or need to install/update agent skills and the Android Studio plugin bridge."],
-            "output": "setup report; --json emits machine-readable plugin/skill status",
+            "output": "human setup report, or exactly one compact init action with --json; plugin/skill step failures exit non-zero as init_failed with full step detail and next actions",
             "side_effects": ["writes/refreshes agent skill files unless --no-skills", "installs/updates the Android Studio plugin unless --no-studio-plugin"],
             "next_commands": ["studio status --json", "doctor --json", "commands --json"]
         })),
         "config" => Some(serde_json::json!({
-            "use_when": ["Repeated app, package, device, project, or debugger parameters would cost tokens across commands."],
+            "use_when": [
+                "Repeated app, package, device, project, or debugger parameters would cost tokens across commands.",
+                "A malformed discovered config blocks normal commands and you need a recovery path; config paths/schema/validate still run before the normal config load."
+            ],
             "output": "json for schema/paths/validate when --json is passed",
             "side_effects": ["config init writes .shadowdroid/config.json (project) or ~/.shadowdroid/config.json (--user)"],
             "next_commands": ["config paths --json", "config schema --json", "config init --project", "config validate --json", "debug auto"]
@@ -136,16 +146,16 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "next_commands": ["config validate --json", "debug auto", "app current"]
         })),
         "config validate" => Some(serde_json::json!({
-            "use_when": ["Need to verify discovered config files parse cleanly before relying on defaults."],
-            "output": "validation report; --json for machine-readable file/status details",
+            "use_when": ["Need to verify discovered config files parse cleanly before relying on defaults, including when a malformed file prevents other commands from starting."],
+            "output": "validation report on success; invalid config exits non-zero as config_invalid with each file, parse location, and errors in detail plus recovery actions",
             "side_effects": ["none"],
-            "next_commands": ["config paths --json", "doctor --json", "commands --json"]
+            "next_commands": ["config paths --json", "config schema --json", "commands --json --depth 1"]
         })),
         "skill" => Some(serde_json::json!({
             "use_when": ["Need to generate or refresh ShadowDroid instructions for a supported coding agent."],
             "output": "agent integration file content or install/sync JSON",
-            "side_effects": ["--install/--sync write conventional agent skill/rule files"],
-            "next_commands": ["commands --json", "init"]
+            "side_effects": ["--install/--sync write conventional agent skill/rule files; existing customized or markerless files are preserved unless --force is explicit"],
+            "next_commands": ["skill --sync", "commands --json --depth 1", "init"]
         })),
         "studio" => Some(serde_json::json!({
             "use_when": ["Need Android Studio plugin installation/status for debugger, Layout Inspector, source mapping, or recomposition features."],
@@ -168,7 +178,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "doctor" => Some(serde_json::json!({
             "use_when": ["ShadowDroid cannot connect, screen reads fail, adb/device state is unclear, or networking may be miswired."],
-            "output": "diagnostic report; use --json for machine-readable status",
+            "output": "healthy diagnostic report; unhealthy state exits non-zero as doctor_unhealthy with the full report in detail; use --json for machine-readable status",
             "side_effects": ["--fix may reinstall the server, recreate forwards, restart components, and clear dangling device proxy state"],
             "next_commands": ["doctor --fix", "connect", "collect"]
         })),
@@ -184,7 +194,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
                 "Need to correlate UI state with network responses, app crashes, or watcher automation during a flow."
             ],
             "avoid_when": ["Need one immediate actionable element list; use ui dump instead.", "Need a saved layout/source artifact; use layout snapshot instead."],
-            "output": "jsonl event stream: ready, screen_compact/screen, crash, watcher_fired, http/http_intercept, tls_error, warning, error",
+            "output": "jsonl event stream: ready, screen_compact/screen (with screen_hash_version), crash, watcher_fired, http/http_intercept, tls_error, warning, and timestamped in-stream error events (not one-shot error envelopes)",
             "side_effects": ["polls the screen", "tails logcat", "may run watcher actions", "auto-attaches to a running net proxy unless --no-net is passed"],
             "prerequisites": ["shadowdroid connect", "shadowdroid net start for HTTP(S) events"],
             "next_commands": ["ui tap", "ui text", "ui wait", "net start", "net show <id>", "debug snapshot"],
@@ -202,7 +212,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         "ui dump" => Some(serde_json::json!({
             "use_when": ["Need the current actionable UI state for selector choice before tapping, typing, or waiting."],
             "avoid_when": ["Need Compose/source/layout inspection or a durable artifact; use layout snapshot."],
-            "output": "compact screen JSON by default, including ime.keyboard_visible/focused input context; --full adds bounds and every UIAutomator flag",
+            "output": "compact screen JSON by default, including screen_hash + screen_hash_version and ime.keyboard_visible/focused input context; --full adds bounds and every UIAutomator flag",
             "side_effects": ["none"],
             "next_commands": ["ui tap --id <id>", "ui tap --text <text>", "ui text --id <id> <value>", "ui hide-keyboard", "ui wait"],
             "prefer_over": {
@@ -324,7 +334,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "ui wait" => Some(serde_json::json!({
             "use_when": ["Need to block until an element, activity, or package appears or disappears."],
-            "output": "JSON match result",
+            "output": "wait action with matched element/app on success; non-zero retryable wait_timeout with current app, screen hash/version, visible texts, and next actions on deadline",
             "side_effects": ["polls current UI/app state"],
             "next_commands": ["ui dump", "ui tap", "watch"]
         })),
@@ -415,9 +425,9 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "debug sessions" => Some(serde_json::json!({
             "use_when": ["Need to list active Android Studio debugger sessions before selecting one for stack, variables, stepping, or resume."],
-            "output": "debug session list JSON",
+            "output": "debug session list JSON; each entry has a stable id for the lifetime of that Studio debug session plus a current index and device identity",
             "side_effects": ["none"],
-            "next_commands": ["debug stack --session <n>", "debug variables --session <n>", "debug resume --session <n>"]
+            "next_commands": ["debug stack --session <id>", "debug variables --session <id>", "debug resume --session <id>"]
         })),
         "debug clients" => Some(serde_json::json!({
             "use_when": ["Need to discover attachable Android processes visible to Android Studio before debug attach."],
@@ -703,19 +713,19 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "app wait" => Some(serde_json::json!({
             "use_when": ["Need to block until a package is running or foregrounded before sampling UI/debug/layout state."],
-            "output": "wait result JSON",
+            "output": "app_wait action on match; non-zero app_wait_timeout error with current app state and recovery actions on deadline",
             "side_effects": ["polls app state"],
             "next_commands": ["ui dump", "debug snapshot", "layout snapshot"]
         })),
         "app install" => Some(serde_json::json!({
             "use_when": ["Need to install an APK and perform the usual test setup ritual in one command."],
-            "output": "install/setup result JSON",
+            "output": "one install/setup action when every requested step succeeds; non-zero app_install_failed with every step in detail otherwise",
             "side_effects": ["installs APK", "may clear app data", "may grant permissions", "may launch/wait for foreground depending on flags"],
             "next_commands": ["app current", "ui dump", "doctor --app <pkg>"]
         })),
         "app reinstall" => Some(serde_json::json!({
             "use_when": ["Need a clean reinstall path when stale app state or signatures may affect testing."],
-            "output": "reinstall/setup result JSON",
+            "output": "one reinstall/setup action when every requested step succeeds; non-zero app_reinstall_failed with every step in detail otherwise",
             "side_effects": ["uninstalls existing package", "installs APK", "may clear/grant/launch/wait depending on flags"],
             "next_commands": ["app current", "ui dump", "doctor --app <pkg>"]
         })),
@@ -763,20 +773,21 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "appops" => Some(serde_json::json!({
             "use_when": ["Need to inspect or change Android app-op modes such as location, notification, or background behavior."],
-            "output": "app-op get/set JSON",
+            "output": "app-op get/set JSON with separate UID/package modes and effective precedence",
             "side_effects": ["set mutates app-op mode"],
-            "next_commands": ["appops get <pkg>", "appops set <pkg> <op> <mode>", "app start <pkg>"]
+            "next_commands": ["appops get <pkg> <op>", "appops set <pkg> <op> <mode> --scope uid|package", "app start <pkg>"]
         })),
         "appops get" => Some(serde_json::json!({
-            "use_when": ["Need current app-op modes for a package before changing them or for diagnostics."],
-            "output": "app-op state JSON",
+            "use_when": ["Need current UID/package app-op modes and the governing effective mode before changing policy or for diagnostics."],
+            "output": "per-op uid_mode, package_mode, governing_scope, and effective_mode JSON",
             "side_effects": ["none"],
-            "next_commands": ["appops set <pkg> <op> <mode>", "collect"]
+            "next_commands": ["appops set <pkg> <op> <mode> --scope uid|package", "collect"]
         })),
         "appops set" => Some(serde_json::json!({
-            "use_when": ["Need to force an app-op mode for a specific test path."],
-            "output": "app-op set JSON",
-            "side_effects": ["mutates one app-op mode"],
+            "use_when": ["Need to force an app-op mode for a specific test path after inspecting which UID/package scope governs."],
+            "prerequisites": ["run appops get and choose --scope uid or --scope package explicitly"],
+            "output": "before/after scoped app-op state, effective_changed, and verified postcondition JSON",
+            "side_effects": ["mutates one app-op at the explicitly selected scope"],
             "next_commands": ["appops get <pkg> <op>", "app start <pkg>", "ui dump"]
         })),
         "profile" => Some(serde_json::json!({
@@ -817,7 +828,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "device shell" => Some(serde_json::json!({
             "use_when": ["Need a device shell command that should run through ShadowDroid's JSON envelope rather than raw adb."],
-            "output": "shell action JSON with stdout and exit_code when available",
+            "output": "shell action JSON on exit 0; non-zero device_shell_nonzero error with command/output/exit_code in detail otherwise",
             "side_effects": ["whatever the shell command does"],
             "next_commands": ["device info", "ui dump", "collect"]
         })),
@@ -942,7 +953,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "net start" => Some(serde_json::json!({
             "use_when": ["Need watch to include HTTP(S) events or need to intercept/modify traffic."],
-            "output": "action JSON with proxy/device wiring details",
+            "output": "action JSON with host-side proxy daemon and device wiring details",
             "side_effects": ["starts host proxy daemon", "sets adb reverse", "sets device global http_proxy"],
             "next_commands": ["watch", "net status", "net check <pkg>", "net intercept"]
         })),
@@ -954,7 +965,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "net status" => Some(serde_json::json!({
             "use_when": ["Need to verify whether the proxy daemon is running and both the device http_proxy and adb reverse mapping point at it."],
-            "output": "net_status action JSON with separate http_proxy_matches and adb_reverse_matches wiring checks",
+            "output": "net_status action JSON with separate http_proxy_matches/adb_reverse_matches wiring checks and dropped_flows backpressure count",
             "side_effects": ["none"],
             "next_commands": ["net start", "net stop", "watch"]
         })),
@@ -1013,13 +1024,15 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "next_commands": ["net rule add", "net rule list", "watch"]
         })),
         "net rule add" => Some(serde_json::json!({
-            "use_when": ["Need to add one response/request mutation rule such as map-local, set-status, replace, block, or delay."],
+            "use_when": ["Need to add one explicit request- or response-phase mutation rule. Use set-request-header or set-response-header; the ambiguous set-header kind is rejected."],
             "output": "rule add JSON with rule id",
             "side_effects": ["mutates active proxy rules"],
             "next_commands": ["net rule list", "watch", "net rule rm <id>"],
             "examples": [
                 "net rule add map-local response.json --host api.example.com --path /v1/dict",
-                "net rule add set-status 503 --host api.example.com"
+                "net rule add set-status 503 --host api.example.com",
+                "net rule add set-request-header x-debug 1 --host api.example.com",
+                "net rule add set-response-header cache-control no-store --host api.example.com"
             ]
         })),
         "net override" => Some(serde_json::json!({
@@ -1056,20 +1069,20 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "next_commands": ["net rule list", "watch", "ui dump"]
         })),
         "aar" => Some(serde_json::json!({
-            "use_when": ["Need the in-app debug agent path for apps you can build: above-TLS capture/intercept (pinned/Cronet traffic) or in-process coroutine dumps."],
+            "use_when": ["Need the debug-only in-app agent for apps you can build: process/coroutine diagnostics, or above-TLS OkHttp capture/interception through the optional companion interceptor (including pinned OkHttp traffic)."],
             "output": "AAR install/status/capture/intercept/coroutines JSON or human setup reports",
             "side_effects": ["install/remove mutate project files; intercept/resume/drop affect in-app flows"],
             "next_commands": ["aar status", "aar install", "aar agent", "aar capture", "aar coroutines"]
         })),
         "aar install" => Some(serde_json::json!({
-            "use_when": ["Need to wire the debug-only ShadowDroid in-app agent AAR into a Gradle app project."],
+            "use_when": ["Need to wire the debug-only core AAR into a Gradle app project; add --okhttp for the optional companion, then explicitly add ShadowDroidCaptureInterceptor() to each debug OkHttpClient."],
             "output": "install report with dependency/AAR path/build status",
-            "side_effects": ["copies the AAR into the project", "edits the app module Gradle build file", "--build runs assembleDebug"],
+            "side_effects": ["copies core and requested companion AARs into the project", "edits the app module Gradle build file", "--build runs assembleDebug"],
             "prerequisites": ["run in or pass --project-root for an app you can build"],
             "next_commands": ["aar status", "app install", "aar agent"]
         })),
         "aar status" => Some(serde_json::json!({
-            "use_when": ["Need to verify whether the in-app agent AAR is wired into the project before relying on AAR capture/intercept commands."],
+            "use_when": ["Need to verify core AAR wiring, optional OkHttp companion wiring, and coroutine-probe activation before relying on those capabilities."],
             "output": "AAR wiring status JSON/human report",
             "side_effects": ["none"],
             "next_commands": ["aar install", "doctor --app <pkg>", "aar agent"]
@@ -1081,24 +1094,24 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "next_commands": ["aar status"]
         })),
         "aar agent" => Some(serde_json::json!({
-            "use_when": ["Need running in-app agent status: package, armed matcher, held flows, and capture count."],
+            "use_when": ["Need running in-app agent status: package, capture-provider availability/name, armed matcher, held flows, and capture count."],
             "output": "running agent status JSON/human report",
             "side_effects": ["none"],
             "prerequisites": ["debug build with AAR installed must be running"],
             "next_commands": ["aar capture", "aar intercept", "doctor --app <pkg>"]
         })),
         "aar capture" => Some(serde_json::json!({
-            "use_when": ["Need to drain above-TLS HTTP(S) flows captured by the in-app agent, including pinned/Cronet cases."],
+            "use_when": ["Need to drain above-TLS OkHttp flows captured by the optional ShadowDroidCaptureInterceptor, including certificate-pinned OkHttp calls."],
             "output": "captured flow JSON or exported artifacts",
             "side_effects": ["--drain clears the in-app capture buffer", "export/write options create files"],
-            "prerequisites": ["debug build with AAR installed must be running"],
+            "prerequisites": ["debug build with the core and OkHttp companion AARs must be running", "ShadowDroidCaptureInterceptor must be added to the target debug OkHttpClient; Cronet, QUIC, and other clients are not instrumented"],
             "next_commands": ["net export", "aar intercept", "watch"]
         })),
         "aar intercept" => Some(serde_json::json!({
-            "use_when": ["Need to arm or clear in-app above-TLS interception for matching flows."],
+            "use_when": ["Need to arm or clear above-TLS interception for flows seen by the optional OkHttp application interceptor."],
             "output": "intercept arm/clear JSON",
             "side_effects": ["matching in-app flows may be held until resume/drop"],
-            "prerequisites": ["debug build with AAR installed must be running"],
+            "prerequisites": ["debug build with both AARs and ShadowDroidCaptureInterceptor wired into the target OkHttpClient must be running"],
             "next_commands": ["aar agent", "aar resume <id>", "aar drop <id>"]
         })),
         "aar resume" => Some(serde_json::json!({

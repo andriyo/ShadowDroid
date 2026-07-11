@@ -159,7 +159,7 @@ async fn snapshot_cmd(
         args.compose || args.semantics || args.source_map,
     );
     if let Some(path) = args.out {
-        write_json_file(&path, &value)?;
+        crate::cmd::artifact::write_json_and_emit("layout_snapshot", &path, &value)?;
     } else {
         println!("{}", serde_json::to_string(&value)?);
     }
@@ -178,6 +178,7 @@ fn layout_snapshot_value(
         "ts": now_ms(),
         "device": serial,
         "screen_hash": screen.screen_hash.clone(),
+        "screen_hash_version": screen.screen_hash_version,
         "viewport": screen.viewport,
         "current_app": screen.current_app,
         "element_count": screen.element_count,
@@ -271,6 +272,29 @@ async fn recompositions_cmd(
     };
     let mut value = value;
     annotate_layout_sample(&mut value, &screen, Some(&target), true);
+    let available = value
+        .get("available")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(true);
+    if !available || !ok {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "layout_recompositions_unavailable",
+            "layout",
+            if args.reset {
+                "recomposition counters were not reset because Layout Inspector is unavailable"
+            } else {
+                "recomposition counters are unavailable from Layout Inspector"
+            },
+        )
+        .retryable(true)
+        .detail(value)
+        .next_actions([
+            "run `shadowdroid studio status --json` and start/install the Studio plugin if needed",
+            "attach Layout Inspector to the requested app/process, then retry",
+        ])
+        .into());
+    }
     println!("{}", serde_json::to_string(&value)?);
     Ok(())
 }
@@ -282,7 +306,16 @@ async fn source_cmd(serial: &Serial, client: &ServerClient, args: LayoutSourceAr
         && args.selector.rid.is_none()
         && args.selector.desc.is_none()
     {
-        anyhow::bail!("layout source needs --id, --draw-id, --text, --rid, or --desc");
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "layout_source_selector_required",
+            "input",
+            "layout source needs --id, --draw-id, --text, --rid, or --desc",
+        )
+        .next_actions([
+            "run `shadowdroid layout snapshot --source-map` and choose an element id/draw id",
+            "rerun `layout source` with one stable selector",
+        ])
+        .into());
     }
     let screen = client.screen().await.context("reading screen tree")?;
     let needs_element_match = args.id.is_some()
@@ -298,6 +331,29 @@ async fn source_cmd(serial: &Serial, client: &ServerClient, args: LayoutSourceAr
     } else {
         None
     };
+    if needs_element_match && element.is_none() {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "element_not_found",
+            "layout",
+            "layout source selector did not match an element on the current screen",
+        )
+        .retryable(true)
+        .detail(json!({
+            "id": args.id,
+            "text": args.selector.text,
+            "rid": args.selector.rid,
+            "desc": args.selector.desc,
+            "screen_hash": screen.screen_hash,
+            "screen_hash_version": screen.screen_hash_version,
+            "current_app": screen.current_app,
+            "top_texts": crate::fusion::top_screen_texts(&screen.elements, 12),
+        }))
+        .next_actions([
+            "inspect detail.top_texts/current_app and choose an id or selector from a fresh layout snapshot",
+            "wait for the intended screen, then retry `layout source`",
+        ])
+        .into());
+    }
     let target = LayoutStudioTarget::from_ref(
         serial,
         &screen.current_app,
@@ -331,11 +387,34 @@ async fn source_cmd(serial: &Serial, client: &ServerClient, args: LayoutSourceAr
             "schema_version": 1,
             "device": serial,
             "screen_hash": screen.screen_hash,
+            "screen_hash_version": screen.screen_hash_version,
             "matched": element,
             "source": source,
             "android_studio_layout": studio
     });
     annotate_layout_sample(&mut output, &screen, Some(&target), true);
+    let source_available = output["source"]
+        .get("available")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let sample_valid = output
+        .get("sample_valid")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !source_available || !sample_valid {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "layout_source_unavailable",
+            "layout",
+            "Android Studio did not produce a valid source mapping for the requested element",
+        )
+        .retryable(true)
+        .detail(output)
+        .next_actions([
+            "run `shadowdroid studio status --json` and attach Layout Inspector to the target process",
+            "take a fresh `layout snapshot --source-map`, choose a reported id/draw id, and retry",
+        ])
+        .into());
+    }
     println!("{}", serde_json::to_string(&output)?);
     Ok(())
 }
@@ -411,7 +490,7 @@ fn merge_studio_layout(value: &mut Value, studio: Result<Value>) {
 fn studio_layout_unavailable(reset: bool, reason: String) -> Value {
     json!({
         "type": value::LAYOUT_RECOMPOSITIONS,
-        "ok": true,
+        "ok": false,
         "available": false,
         "reset_requested": reset,
         "reason": reason
@@ -425,7 +504,7 @@ fn annotate_layout_sample(
     studio_required: bool,
 ) {
     let sample = layout_sample_value(value, screen, target, studio_required);
-    value["sample_valid"] = sample.get("valid").cloned().unwrap_or_else(|| json!(false));
+    value["sample_valid"] = sample.get("valid").cloned().unwrap_or(Value::Bool(false));
     value["sample"] = sample;
 }
 
@@ -512,6 +591,7 @@ fn layout_sample_value(
         "valid": reasons.is_empty(),
         "reasons": reasons,
         "screen_hash": screen.screen_hash,
+        "screen_hash_version": screen.screen_hash_version,
         "element_count": screen.element_count,
         "current_app": screen.current_app.clone(),
         "target": target.map(LayoutStudioTarget::to_value),
@@ -690,15 +770,6 @@ async fn write_screenshot(client: &ServerClient, out: Option<&Path>) -> Result<V
     }))
 }
 
-fn write_json_file(path: &Path, value: &Value) -> Result<()> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    std::fs::write(path, serde_json::to_vec_pretty(value)?)
-        .with_context(|| format!("writing {}", path.display()))
-}
-
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -714,6 +785,7 @@ mod tests {
     fn screen(package: &str, pid: i32, element_count: u32) -> ScreenResponse {
         ScreenResponse {
             screen_hash: "abc123".into(),
+            screen_hash_version: 2,
             viewport: Viewport { w: 1, h: 2 },
             current_app: AppRef {
                 package: Some(package.into()),

@@ -12,6 +12,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::device::adb;
@@ -108,6 +109,7 @@ pub struct ProxyConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
+    #[serde(deserialize_with = "deserialize_android_package")]
     pub package: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
@@ -345,13 +347,20 @@ pub fn project_config_path() -> Result<PathBuf> {
 /// CA and to scope `net ca *--project`.
 pub fn project_shadowdroid_dir() -> Result<PathBuf> {
     let cwd = std::env::current_dir().context("resolve current directory")?;
-    Ok(project_shadowdroid_dir_in(&cwd))
+    let user_dir = user_config_path()?
+        .parent()
+        .map(Path::to_path_buf)
+        .context("user config path has no parent")?;
+    Ok(project_shadowdroid_dir_in(&cwd, &user_dir))
 }
 
-fn project_shadowdroid_dir_in(cwd: &Path) -> PathBuf {
+fn project_shadowdroid_dir_in(cwd: &Path, user_dir: &Path) -> PathBuf {
     cwd.ancestors()
         .map(|dir| dir.join(PROJECT_CONFIG_DIR))
-        .find(|dir| dir.is_dir())
+        // `$HOME/.shadowdroid` is the user store, not a project marker. Without
+        // this exclusion every repository below `$HOME` inherits the user
+        // directory as its "project" CA location.
+        .find(|dir| dir != user_dir && dir.is_dir())
         .unwrap_or_else(|| cwd.join(PROJECT_CONFIG_DIR))
 }
 
@@ -397,17 +406,94 @@ pub fn discovered_config_paths() -> Result<Vec<PathBuf>> {
 }
 
 pub fn parse_config_file(path: &Path) -> Result<ShadowDroidConfig> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))
+    let text = std::fs::read_to_string(path).map_err(|error| {
+        crate::diagnostic::DiagnosticError::new(
+            "config_read",
+            "config",
+            format!("failed to read ShadowDroid config {}", path.display()),
+        )
+        .detail(serde_json::json!({
+            "path": path.display().to_string(),
+            "error": error.to_string(),
+        }))
+        .next_actions([
+            "shadowdroid config paths --json",
+            "check the config file permissions and retry",
+        ])
+    })?;
+    serde_json::from_str(&text).map_err(|error: serde_json::Error| {
+        crate::diagnostic::DiagnosticError::new(
+            "config_parse",
+            "config",
+            format!("invalid ShadowDroid config {}", path.display()),
+        )
+        .detail(serde_json::json!({
+            "path": path.display().to_string(),
+            "line": error.line(),
+            "column": error.column(),
+            "error": error.to_string(),
+        }))
+        .next_actions([
+            "shadowdroid config validate --json",
+            "shadowdroid config schema --json",
+        ])
+        .into()
+    })
 }
 
 pub fn write_config_file(path: &Path, config: &ShadowDroidConfig) -> Result<()> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+
     let mut text = serde_json::to_string_pretty(config)?;
     text.push('\n');
-    std::fs::write(path, text).with_context(|| format!("write {}", path.display()))
+    let existing_permissions = std::fs::metadata(path).ok().map(|meta| meta.permissions());
+
+    // Never truncate the live config before the replacement is complete. The
+    // temporary file lives in the same directory, so `persist` is a same-volume
+    // atomic rename on supported platforms. Sync both contents and directory
+    // metadata so a reported success survives a host crash as far as the OS can
+    // guarantee.
+    let mut temp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("create temporary config in {}", parent.display()))?;
+    temp.write_all(text.as_bytes())
+        .with_context(|| format!("write temporary config for {}", path.display()))?;
+    temp.flush()
+        .with_context(|| format!("flush temporary config for {}", path.display()))?;
+    if let Some(permissions) = existing_permissions {
+        temp.as_file()
+            .set_permissions(permissions)
+            .with_context(|| format!("preserve config permissions for {}", path.display()))?;
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let user_only = user_config_path().is_ok_and(|user| user == path);
+            let mode = if user_only { 0o600 } else { 0o644 };
+            temp.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(mode))
+                .with_context(|| format!("set config permissions for {}", path.display()))?;
+        }
+    }
+    temp.as_file()
+        .sync_all()
+        .with_context(|| format!("sync temporary config for {}", path.display()))?;
+    let file = temp.persist(path).map_err(|err| {
+        anyhow!(
+            "atomically replace {} with temporary config: {}",
+            path.display(),
+            err.error
+        )
+    })?;
+    file.sync_all()
+        .with_context(|| format!("sync config {}", path.display()))?;
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 fn config_paths() -> Result<Vec<PathBuf>> {
@@ -440,10 +526,166 @@ fn discover_config_paths_in(cwd: &Path, user_cfg: &Path) -> Vec<PathBuf> {
 }
 
 fn looks_like_package(value: &str) -> bool {
-    value.contains('.')
+    validate_android_package(value).is_ok()
+}
+
+/// Validate an Android application id before it can cross a device-shell
+/// boundary. User application ids contain at least two dot-separated Java
+/// identifiers; every segment starts with an ASCII letter and then contains
+/// only letters, digits, or `_`. The platform package `android` is the one
+/// intentional single-segment exception.
+pub fn validate_android_package(value: &str) -> Result<()> {
+    if value == "android" {
+        return Ok(());
+    }
+    validate_qualified_identifier(value, "Android package", true, false)
+}
+
+/// Validate a runtime permission name such as `android.permission.CAMERA` or a
+/// custom app permission. This intentionally accepts upper-case segments but
+/// rejects whitespace and every shell metacharacter.
+pub fn validate_android_permission(value: &str) -> Result<()> {
+    validate_qualified_identifier(value, "Android permission", true, true)
+}
+
+/// Validate an app-op identifier. Android accepts debug names such as `CAMERA`,
+/// public string names such as `android:camera`, and numeric operation ids.
+pub fn validate_android_app_op(value: &str) -> Result<()> {
+    if value.is_empty() || value.trim() != value {
+        return Err(invalid_identifier_error(
+            "invalid_android_app_op",
+            "Android app-op must not be empty or contain surrounding whitespace",
+            value,
+            "use an app-op such as CAMERA, android:camera, or a numeric id",
+        ));
+    }
+    if value.chars().all(|c| c.is_ascii_digit()) {
+        return Ok(());
+    }
+    if value
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
         && value
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-'))
+    {
+        return Ok(());
+    }
+    Err(invalid_identifier_error(
+        "invalid_android_app_op",
+        format!("invalid Android app-op {value:?}; expected a literal app-op token or numeric id"),
+        value,
+        "use an app-op such as CAMERA, android:camera, or a numeric id",
+    ))
+}
+
+/// Validate an app-op mode without freezing ShadowDroid to a specific Android
+/// release's enum. Safe lower-case tokens are accepted; shell separators,
+/// substitutions, quotes, and whitespace are not.
+pub fn validate_android_app_op_mode(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.trim() != value
+        || !value.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+    {
+        return Err(invalid_identifier_error(
+            "invalid_android_app_op_mode",
+            format!("invalid Android app-op mode {value:?}; expected a lower-case mode token"),
+            value,
+            "use a lower-case mode such as allow, deny, ignore, default, or foreground",
+        ));
+    }
+    Ok(())
+}
+
+/// Quote one argument for Android's POSIX-like device shell. Callers should
+/// still validate semantic identifiers first; quoting is the second barrier
+/// that keeps future grammar relaxations from becoming command injection.
+pub fn quote_device_shell_arg(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn validate_qualified_identifier(
+    value: &str,
+    kind: &str,
+    require_multiple_segments: bool,
+    allow_underscore_start: bool,
+) -> Result<()> {
+    let code = if kind == "Android package" {
+        "invalid_android_package"
+    } else {
+        "invalid_android_permission"
+    };
+    let next = if kind == "Android package" {
+        "use a literal Android package such as com.example.app"
+    } else {
+        "use a qualified permission such as android.permission.CAMERA"
+    };
+    if value.is_empty() || value.trim() != value {
+        return Err(invalid_identifier_error(
+            code,
+            format!("{kind} must not be empty or contain surrounding whitespace"),
+            value,
+            next,
+        ));
+    }
+    let segments = value.split('.').collect::<Vec<_>>();
+    if require_multiple_segments && segments.len() < 2 {
+        return Err(invalid_identifier_error(
+            code,
+            format!("invalid {kind} {value:?}; expected a qualified name"),
+            value,
+            next,
+        ));
+    }
+    for segment in segments {
+        let mut chars = segment.chars();
+        let Some(first) = chars.next() else {
+            return Err(invalid_identifier_error(
+                code,
+                format!("invalid {kind} {value:?}; name segments must not be empty"),
+                value,
+                next,
+            ));
+        };
+        if !(first.is_ascii_alphabetic() || (allow_underscore_start && first == '_'))
+            || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return Err(invalid_identifier_error(
+                code,
+                format!(
+                    "invalid {kind} {value:?}; only dot-separated ASCII identifiers are allowed"
+                ),
+                value,
+                next,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn invalid_identifier_error(
+    code: &str,
+    message: impl Into<String>,
+    value: &str,
+    next_action: &str,
+) -> anyhow::Error {
+    crate::diagnostic::DiagnosticError::new(code, "input", message)
+        .detail(serde_json::json!({"value": value}))
+        .next_actions([next_action])
+        .into()
+}
+
+fn deserialize_android_package<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    validate_android_package(&value).map_err(serde::de::Error::custom)?;
+    Ok(value)
 }
 
 fn normalize_lookup(value: &str) -> String {
@@ -513,6 +755,61 @@ mod tests {
         assert!(looks_like_package("com.livd"));
         assert!(!looks_like_package("Livd"));
         assert!(!looks_like_package("com livd"));
+        assert!(!looks_like_package("com.example;id"));
+        assert!(!looks_like_package("com.example\nother"));
+        assert!(!looks_like_package("com.$(id)"));
+        assert!(!looks_like_package("com.'example'"));
+        assert!(!looks_like_package("1com.example"));
+        assert!(!looks_like_package("com..example"));
+    }
+
+    #[test]
+    fn config_deserialization_rejects_shell_metacharacters_in_packages() {
+        for package in [
+            "com.example;id",
+            "com.example\nother",
+            "com.$(id)",
+            "com.'example'",
+            "com.\"example\"",
+        ] {
+            let value = serde_json::json!({
+                "apps": {"Example": {"package": package}}
+            });
+            let err = serde_json::from_value::<ShadowDroidConfig>(value).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid Android package"),
+                "unexpected error for {package:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_permission_appop_and_mode_tokens() {
+        assert!(validate_android_permission("android.permission.CAMERA").is_ok());
+        assert!(validate_android_permission("com.example.permission.READ_THING_2").is_ok());
+        assert!(validate_android_permission("android.permission.CAMERA;id").is_err());
+        assert!(validate_android_permission("android.permission.$(id)").is_err());
+        assert!(validate_android_permission("android.permission.CAMERA\nNEXT").is_err());
+
+        assert!(validate_android_app_op("CAMERA").is_ok());
+        assert!(validate_android_app_op("android:camera").is_ok());
+        assert!(validate_android_app_op("42").is_ok());
+        assert!(validate_android_app_op("CAMERA;id").is_err());
+        assert!(validate_android_app_op("$(id)").is_err());
+
+        assert!(validate_android_app_op_mode("foreground").is_ok());
+        assert!(validate_android_app_op_mode("allow_once").is_ok());
+        assert!(validate_android_app_op_mode("allow;id").is_err());
+        assert!(validate_android_app_op_mode("$(id)").is_err());
+    }
+
+    #[test]
+    fn shell_arguments_are_single_quoted() {
+        assert_eq!(quote_device_shell_arg("com.example"), "'com.example'");
+        assert_eq!(
+            quote_device_shell_arg("a'b;$(id)\nnext"),
+            "'a'\"'\"'b;$(id)\nnext'"
+        );
     }
 
     #[test]
@@ -535,10 +832,85 @@ mod tests {
         assert_eq!(
             paths,
             vec![
-                user_cfg.clone(),           // user config, applied first (least specific)
+                user_cfg.clone(), // user config, applied first (least specific)
                 root.join(PROJECT_CONFIG_REL),
                 b.join(PROJECT_CONFIG_REL), // a skipped (== user_cfg); nearest (b) last
             ]
+        );
+    }
+
+    #[test]
+    fn project_shadowdroid_dir_never_selects_the_user_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let repo = home.join("work/repo");
+        let user_dir = home.join(PROJECT_CONFIG_DIR);
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&user_dir).unwrap();
+
+        assert_eq!(
+            project_shadowdroid_dir_in(&repo, &user_dir),
+            repo.join(PROJECT_CONFIG_DIR)
+        );
+
+        let workspace_dir = home.join("work").join(PROJECT_CONFIG_DIR);
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        assert_eq!(project_shadowdroid_dir_in(&repo, &user_dir), workspace_dir);
+    }
+
+    #[test]
+    fn config_write_atomically_replaces_existing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(PROJECT_CONFIG_REL);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{\"device\":\"old\"}\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        let config = ShadowDroidConfig {
+            device: Some("emulator-5554".into()),
+            ..Default::default()
+        };
+
+        write_config_file(&path, &config).unwrap();
+
+        let parsed = parse_config_file(&path).unwrap();
+        assert_eq!(parsed.device.as_deref(), Some("emulator-5554"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+        }
+        let entries = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![std::ffi::OsString::from("config.json")]);
+    }
+
+    #[test]
+    fn malformed_config_reports_a_typed_location_and_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        std::fs::write(&path, "{\n  \"app\":\n}\n").unwrap();
+
+        let error = parse_config_file(&path).unwrap_err();
+        let diagnostic = error
+            .downcast_ref::<crate::diagnostic::DiagnosticError>()
+            .unwrap();
+        assert_eq!(diagnostic.code, "config_parse");
+        assert_eq!(diagnostic.stage, "config");
+        assert_eq!(diagnostic.detail["path"], path.display().to_string());
+        assert_eq!(diagnostic.detail["line"], 3);
+        assert!(diagnostic.detail["column"].as_u64().unwrap() > 0);
+        assert_eq!(
+            diagnostic.next_actions[0],
+            "shadowdroid config validate --json"
         );
     }
 
@@ -554,7 +926,10 @@ mod tests {
         for needle in GITIGNORE_LINES {
             assert!(text.contains(needle), "missing {needle}");
         }
-        assert!(!text.contains("config.json"), "config.json must stay committable");
+        assert!(
+            !text.contains("config.json"),
+            "config.json must stay committable"
+        );
 
         // Re-running adds nothing and doesn't duplicate.
         assert!(ensure_shadowdroid_gitignore(&sd).unwrap().is_empty());

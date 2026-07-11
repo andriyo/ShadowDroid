@@ -4,6 +4,7 @@ set -eu
 REPO="${SHADOWDROID_REPO:-andriyo/ShadowDroid}"
 VERSION="${SHADOWDROID_VERSION:-latest}"
 INSTALL_DIR="${SHADOWDROID_INSTALL_DIR:-$HOME/.local/bin}"
+RELEASE_BASE_URL="${SHADOWDROID_RELEASE_BASE_URL:-}"
 BIN_NAME="shadowdroid"
 UNINSTALL=0
 
@@ -26,6 +27,8 @@ Environment overrides:
   SHADOWDROID_VERSION
   SHADOWDROID_INSTALL_DIR
   SHADOWDROID_REPO
+  SHADOWDROID_RELEASE_BASE_URL  HTTPS asset base URL. Plain HTTP is accepted
+                               only for 127.0.0.1/localhost release smoke tests.
 
 Examples:
   curl --proto '=https' --tlsv1.2 -LsSf \
@@ -108,9 +111,16 @@ download() {
   url="$1"
   out="$2"
   if command -v curl >/dev/null 2>&1; then
-    curl --proto '=https' --tlsv1.2 -fsSL "$url" -o "$out"
+    case "$url" in
+      https://*) curl --proto '=https' --tlsv1.2 -fsSL "$url" -o "$out" ;;
+      http://127.0.0.1:* | http://localhost:*) curl --proto '=http' -fsSL "$url" -o "$out" ;;
+      *) die "refusing non-HTTPS release URL: $url" ;;
+    esac
   elif command -v wget >/dev/null 2>&1; then
-    wget -q "$url" -O "$out"
+    case "$url" in
+      https://* | http://127.0.0.1:* | http://localhost:*) wget -q "$url" -O "$out" ;;
+      *) die "refusing non-HTTPS release URL: $url" ;;
+    esac
   else
     die "install curl or wget first"
   fi
@@ -176,7 +186,9 @@ esac
 
 target="${arch}-${os}"
 asset="shadowdroid-${target}.tar.gz"
-if [ "$VERSION" = "latest" ]; then
+if [ -n "$RELEASE_BASE_URL" ]; then
+  base_url="${RELEASE_BASE_URL%/}"
+elif [ "$VERSION" = "latest" ]; then
   base_url="https://github.com/${REPO}/releases/latest/download"
 else
   base_url="https://github.com/${REPO}/releases/download/${VERSION}"

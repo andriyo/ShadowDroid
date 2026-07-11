@@ -87,6 +87,7 @@ pub async fn serve_client(
                     "started": state.started,
                     "ca_fingerprint": state.ca_fingerprint,
                     "flows": state.flow_count.load(Ordering::Relaxed),
+                    "dropped_flows": shared.dropped_flows.load(Ordering::Relaxed),
                     "held": held_flows.len(),
                     "held_flows": held_flows,
                     "intercepting": intercepting,
@@ -157,12 +158,7 @@ pub async fn serve_client(
         }
         "show" => {
             let id = req.get("id").and_then(Value::as_str).unwrap_or("");
-            let flow = shared
-                .held
-                .lock()
-                .unwrap()
-                .get(id)
-                .map(|h| h.meta.detail(true));
+            let flow = shared.held.lock().unwrap().get(id).map(|h| h.meta.clone());
             write_json(&mut wr, &json!({"ok": flow.is_some(), "flow": flow})).await?;
         }
         "rule_add" => {
@@ -255,7 +251,18 @@ pub async fn serve_client(
                             break; // client went away
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                        if write_json(&mut wr, &json!({
+                            "type": "warning",
+                            "stage": "net_watch",
+                            "code": "events_lagged",
+                            "dropped": dropped,
+                            "msg": "the watcher could not keep up; some live network events were skipped",
+                            "next_actions": ["use `shadowdroid net log` to recover persisted completed flows", "reduce downstream processing per event"]
+                        })).await.is_err() {
+                            break;
+                        }
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
@@ -397,6 +404,24 @@ async fn connect(serial: &Serial) -> Result<TcpStream> {
 
 /// Send one request, read one JSON response line.
 pub async fn request(serial: &Serial, req: Value) -> Result<Value> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), request_once(serial, req))
+        .await
+        .map_err(|_| {
+            crate::diagnostic::DiagnosticError::new(
+            "net_control_timeout",
+            "net",
+            "network daemon did not reply within 5 seconds",
+        )
+        .retryable(true)
+        .detail(json!({"serial": serial.as_str(), "timeout_ms": 5000}))
+        .next_actions([
+            "run `shadowdroid net status` to check the daemon",
+            "if it remains unresponsive, run `shadowdroid net stop`, then `shadowdroid net start`",
+        ])
+        })?
+}
+
+async fn request_once(serial: &Serial, req: Value) -> Result<Value> {
     let stream = connect(serial).await?;
     let (rd, mut wr) = stream.into_split();
     write_request(&mut wr, &req).await?;
@@ -411,7 +436,20 @@ pub async fn request(serial: &Serial, req: Value) -> Result<Value> {
 /// Send a streaming request (`watch`) and print each response line to stdout
 /// until EOF or Ctrl-C.
 pub async fn request_stream(serial: &Serial, req: Value) -> Result<()> {
-    let stream = connect(serial).await?;
+    let stream = tokio::time::timeout(std::time::Duration::from_secs(5), connect(serial))
+        .await
+        .map_err(|_| {
+            crate::diagnostic::DiagnosticError::new(
+                "net_control_timeout",
+                "net",
+                "network daemon connection timed out after 5 seconds",
+            )
+            .retryable(true)
+            .next_actions([
+                "run `shadowdroid net status` to check the daemon",
+                "restart the network session if it remains unresponsive",
+            ])
+        })??;
     let (rd, mut wr) = stream.into_split();
     write_request(&mut wr, &req).await?;
     let mut lines = BufReader::new(rd).lines();

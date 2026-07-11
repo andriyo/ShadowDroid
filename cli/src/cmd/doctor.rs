@@ -535,8 +535,27 @@ pub async fn run(
         report.healthy = is_healthy(&report.checks);
     }
 
+    if !report.healthy {
+        let next_actions = if fix {
+            vec!["inspect detail.checks and follow each remaining remedy"]
+        } else {
+            vec!["shadowdroid doctor --fix --json"]
+        };
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "doctor_unhealthy",
+            "doctor",
+            if fix {
+                "ShadowDroid remains unhealthy after the requested repair"
+            } else {
+                "one or more required ShadowDroid health checks failed"
+            },
+        )
+        .detail(serde_json::to_value(&report)?)
+        .next_actions(next_actions)
+        .into());
+    }
     if json {
-        println!("{}", serde_json::to_string(&report)?);
+        crate::events::emit_action("doctor", &serde_json::to_value(&report)?);
     } else {
         print_human(&report, fix);
     }
@@ -576,6 +595,10 @@ async fn apply_fix(device: Option<&str>, report: DoctorReport, force: bool) -> D
         let mut r = gather(device).await;
         r.fixed = Some(false);
         return r;
+    }
+    if classify_owners(&owners) == OwnerClass::Foreign && force {
+        eprintln!("doctor --fix --force: stopping foreign UiAutomation owners…");
+        let _ = adb::kill_all_ui_automation_owners(&serial).await;
     }
 
     // If the APK itself is wrong or missing, a still-running server pins the

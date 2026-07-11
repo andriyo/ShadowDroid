@@ -315,8 +315,8 @@ pub fn ensure_ca(ca: &CaPaths) -> Result<()> {
 /// Stable identity used to detect a changed CA on daemon reuse and to key the
 /// per-serial verify-once trust cache.
 pub fn fingerprint_of(cert_path: &Path) -> Result<String> {
-    let bytes = std::fs::read(cert_path)
-        .with_context(|| format!("read {}", cert_path.display()))?;
+    let bytes =
+        std::fs::read(cert_path).with_context(|| format!("read {}", cert_path.display()))?;
     let der = crate::net::trust::certificate_der(&bytes)?;
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -382,8 +382,7 @@ pub fn import_into(
     cert_src: &Path,
     key_src: Option<&Path>,
 ) -> Result<(CaInfo, Vec<String>)> {
-    std::fs::create_dir_all(net_dir)
-        .with_context(|| format!("create {}", net_dir.display()))?;
+    std::fs::create_dir_all(net_dir).with_context(|| format!("create {}", net_dir.display()))?;
     let cert_file = std::fs::read_to_string(cert_src)
         .with_context(|| format!("read certificate {}", cert_src.display()))?;
     let cert_blocks: Vec<PemBlock> = pem_blocks(&cert_file)
@@ -526,8 +525,7 @@ pub fn info_in(net_dir: &Path) -> Result<CaInfo> {
 /// ShadowDroid CA — the escape hatch after an import, and how a project CA is
 /// first minted (`net ca reset --project`). Returns the new [`CaInfo`].
 pub fn reset_in(net_dir: &Path) -> Result<CaInfo> {
-    std::fs::create_dir_all(net_dir)
-        .with_context(|| format!("create {}", net_dir.display()))?;
+    std::fs::create_dir_all(net_dir).with_context(|| format!("create {}", net_dir.display()))?;
     backup_in(net_dir)?;
     // Files are gone, so this regenerates + records `generated` provenance.
     generate_ca_files(net_dir)?;

@@ -5,6 +5,8 @@
 
 use crate::proto::{AppRef, Element, ImeState, ScreenResponse, Viewport};
 use serde::Serialize;
+use std::fmt;
+use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -31,6 +33,7 @@ pub enum Event {
         activity: Option<String>,
         viewport: Viewport,
         screen_hash: String,
+        screen_hash_version: u32,
         element_count: u32,
         ime: ImeState,
         elements: Vec<Element>,
@@ -42,6 +45,7 @@ pub enum Event {
         activity: Option<String>,
         viewport: Viewport,
         screen_hash: String,
+        screen_hash_version: u32,
         element_count: u32,
         ime: CompactIme,
         elements: Vec<CompactElement>,
@@ -50,6 +54,7 @@ pub enum Event {
     WatcherFired {
         name: String,
         screen_hash: String,
+        screen_hash_version: u32,
         matched: Element,
         ts: f64,
     },
@@ -269,6 +274,7 @@ pub fn screen_event(device: &str, screen: ScreenResponse, format: ScreenFormat) 
             activity,
             viewport: screen.viewport,
             screen_hash: screen.screen_hash,
+            screen_hash_version: screen.screen_hash_version,
             element_count: screen.element_count,
             ime: screen.ime,
             elements: screen.elements,
@@ -280,6 +286,7 @@ pub fn screen_event(device: &str, screen: ScreenResponse, format: ScreenFormat) 
             activity,
             viewport: screen.viewport,
             screen_hash: screen.screen_hash,
+            screen_hash_version: screen.screen_hash_version,
             element_count: screen.element_count,
             ime: CompactIme::from(screen.ime),
             elements: screen
@@ -296,10 +303,27 @@ pub fn screen_event(device: &str, screen: ScreenResponse, format: ScreenFormat) 
 /// objects. A serialization failure (practically impossible for our types)
 /// degrades to `{}` rather than panicking the process.
 pub fn emit(value: &impl Serialize) {
-    println!(
-        "{}",
-        serde_json::to_string(value).unwrap_or_else(|_| "{}".into())
+    write_stdout(
+        format_args!(
+            "{}",
+            serde_json::to_string(value).unwrap_or_else(|_| "{}".into())
+        ),
+        true,
     );
+}
+
+/// Non-panicking stdout sink used by the crate-local `print!`/`println!`
+/// macros. In particular, `BrokenPipe` is expected when an agent has already
+/// consumed enough output and closes `head`, `jq`, or another pipeline stage.
+pub fn write_stdout(args: fmt::Arguments<'_>, newline: bool) {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    if out.write_fmt(args).is_err() {
+        return;
+    }
+    if newline {
+        let _ = out.write_all(b"\n");
+    }
 }
 
 /// Crash/ANR events found by the since-last-command probe, staged for the very
@@ -343,13 +367,17 @@ pub fn attach_events_to(value: &mut serde_json::Value) {
 /// [`emit_action`] so the contract can be unit-tested without capturing stdout.
 fn action_envelope(cmd: &str, body: &serde_json::Value) -> serde_json::Value {
     let mut m = serde_json::Map::new();
-    m.insert("type".into(), "action".into());
-    m.insert("cmd".into(), cmd.into());
     if let serde_json::Value::Object(b) = body {
         for (k, v) in b {
             m.insert(k.clone(), v.clone());
         }
     }
+    // The envelope owns these keys. Force them after the merge so a nested
+    // daemon/server response cannot silently turn a success into another type,
+    // command, or semantic status.
+    m.insert("type".into(), "action".into());
+    m.insert("cmd".into(), cmd.into());
+    m.insert("ok".into(), true.into());
     attach_events(&mut m);
     serde_json::Value::Object(m)
 }
@@ -369,15 +397,23 @@ fn error_envelope(
     extra: serde_json::Value,
 ) -> serde_json::Value {
     let mut m = serde_json::Map::new();
-    m.insert("type".into(), "error".into());
-    m.insert("stage".into(), stage.into());
-    m.insert("code".into(), code.into());
-    m.insert("msg".into(), msg.into());
+    // Stable recovery contract: every failure has the same machine fields.
+    // Callers override these defaults with domain-specific evidence/actions.
+    m.insert("retryable".into(), false.into());
+    m.insert("detail".into(), serde_json::json!({}));
+    m.insert("next_actions".into(), serde_json::json!([]));
     if let serde_json::Value::Object(b) = extra {
         for (k, v) in b {
             m.insert(k, v);
         }
     }
+    // Identity/status fields are reserved and cannot be overridden by detail
+    // returned from a subsystem.
+    m.insert("type".into(), "error".into());
+    m.insert("ok".into(), false.into());
+    m.insert("stage".into(), stage.into());
+    m.insert("code".into(), code.into());
+    m.insert("msg".into(), msg.into());
     // A failed action still reports what happened around it — a tap that
     // errored with element_not_found *because the app crashed* carries the
     // crash in the same error line.
@@ -408,10 +444,29 @@ mod tests {
         let v = action_envelope("tap", &serde_json::json!({"x": 1, "matched": true}));
         assert_eq!(v["type"], "action");
         assert_eq!(v["cmd"], "tap");
+        assert_eq!(v["ok"], true);
         assert_eq!(v["x"], 1);
         assert_eq!(v["matched"], true);
         // One-shot results carry no `ts` (only streamed timeline events do).
         assert!(v.get("ts").is_none(), "action must not carry ts: {v}");
+    }
+
+    #[test]
+    fn action_body_cannot_override_reserved_envelope_fields() {
+        let _guard = ENVELOPE_TEST_LOCK.lock().unwrap();
+        let value = action_envelope(
+            "real_command",
+            &serde_json::json!({
+                "type": "error",
+                "cmd": "other_command",
+                "ok": false,
+                "payload": true,
+            }),
+        );
+        assert_eq!(value["type"], "action");
+        assert_eq!(value["cmd"], "real_command");
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["payload"], true);
     }
 
     #[test]
@@ -424,11 +479,39 @@ mod tests {
             serde_json::json!({"arg": "--x"}),
         );
         assert_eq!(v["type"], "error");
+        assert_eq!(v["ok"], false);
         assert_eq!(v["stage"], "usage");
         assert_eq!(v["code"], "usage");
         assert_eq!(v["msg"], "bad flag");
+        assert_eq!(v["retryable"], false);
+        assert!(v["detail"].is_object());
+        assert!(v["next_actions"].is_array());
         assert_eq!(v["arg"], "--x");
         assert!(v.get("ts").is_none(), "error must not carry ts: {v}");
+    }
+
+    #[test]
+    fn error_detail_cannot_override_reserved_envelope_fields() {
+        let _guard = ENVELOPE_TEST_LOCK.lock().unwrap();
+        let value = error_envelope(
+            "real_stage",
+            "real_code",
+            "real message",
+            serde_json::json!({
+                "type": "action",
+                "ok": true,
+                "stage": "other",
+                "code": "other",
+                "msg": "other",
+                "detail": {"kept": true},
+            }),
+        );
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["stage"], "real_stage");
+        assert_eq!(value["code"], "real_code");
+        assert_eq!(value["msg"], "real message");
+        assert_eq!(value["detail"]["kept"], true);
     }
 
     fn full() -> Element {

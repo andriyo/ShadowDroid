@@ -2,14 +2,14 @@
 //!
 //! Source-precedence chain (first hit wins):
 //!
-//!   1. `--apk PATH` flag                  (explicit, highest priority)
-//!   2. `SHADOWDROID_APK` env var          (same semantics as --apk)
-//!   3. Repo auto-discovery in $CWD or any ancestor:
-//!         server/app/build/outputs/apk/androidTest/debug/*-androidTest.apk
-//!         + sibling main APK at server/app/build/outputs/apk/debug/*.apk
-//!   4. Dev drop-in:  ~/.shadowdroid/apks/local/{main,test}.apk
-//!   5. Versioned cache:  ~/.shadowdroid/apks/<EXPECTED_APK_VERSION>/{main,test}.apk
-//!   6. Download from GitHub releases.
+//! 1. `--apk PATH` flag (explicit, highest priority)
+//! 2. `SHADOWDROID_APK` env var (same semantics as `--apk`)
+//! 3. Repo auto-discovery in `$CWD` or any ancestor. The test APK is under
+//!    `server/app/build/outputs/apk/androidTest/debug/`, with its sibling main
+//!    APK under `server/app/build/outputs/apk/debug/`.
+//! 4. Dev drop-in: `~/.shadowdroid/apks/local/{main,test}.apk`
+//! 5. Versioned cache: `~/.shadowdroid/apks/<EXPECTED_APK_VERSION>/{main,test}.apk`
+//! 6. Download from GitHub releases.
 //!
 //! Sources 1-4 are *developer* sources: we install them as-is, identifying
 //! re-install need by APK SHA-256 instead of versionName (so a `gradlew
@@ -20,7 +20,9 @@
 use crate::ids::Serial;
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::device::{adb, client::ServerClient, portmap};
@@ -44,6 +46,78 @@ pub const DEFAULT_PORT: u16 = 7912;
 const RELEASE_MAIN_APK_ASSET: &str = "shadowdroid-server-main.apk";
 const RELEASE_TEST_APK_ASSET: &str = "shadowdroid-server-test.apk";
 pub const INSTRUMENT_LOG_PATH: &str = "/sdcard/shadowdroid-instr.log";
+
+/// Cross-process ownership guard for lifecycle mutations on one device. The
+/// file is intentionally short-lived and carries no device data beyond a
+/// sanitized serial in its filename.
+pub struct DeviceLifecycleGuard {
+    path: PathBuf,
+}
+
+impl Drop for DeviceLifecycleGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+pub fn acquire_lifecycle_lock(serial: &Serial) -> Result<DeviceLifecycleGuard> {
+    let dir = shadowdroid_home()?.join("locks");
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let safe_serial: String = serial
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let path = dir.join(format!("device-{safe_serial}.lock"));
+
+    for _ in 0..2 {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                let _ = writeln!(file, "{}", std::process::id());
+                return Ok(DeviceLifecycleGuard { path });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(&path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age > Duration::from_secs(600));
+                if stale {
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                let owner = std::fs::read_to_string(&path)
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty());
+                return Err(crate::diagnostic::DiagnosticError::new(
+                    "device_lifecycle_busy",
+                    "device",
+                    format!("another ShadowDroid process is changing device {serial}"),
+                )
+                .retryable(true)
+                .detail(serde_json::json!({
+                    "device": serial.as_str(),
+                    "owner_pid": owner,
+                    "lock": path.display().to_string(),
+                }))
+                .next_actions(["wait for the active command to finish, then retry"])
+                .into());
+            }
+            Err(error) => return Err(error).with_context(|| format!("create {}", path.display())),
+        }
+    }
+    Err(anyhow!("could not acquire lifecycle lock for {serial}"))
+}
 
 /// Where each APK pair came from. Used for logging + to decide whether to
 /// version-check.
@@ -353,9 +427,36 @@ pub async fn ensure_forward(serial: &Serial) -> Result<u16> {
     Ok(port)
 }
 
+/// Return a client only when the already-established session is reachable.
+/// This deliberately does not allocate/reassert an adb forward, install APKs,
+/// start instrumentation, or clean up processes. Diagnostic commands use it to
+/// preserve their read-only contract.
+pub async fn probe_existing(
+    serial: &Serial,
+    any_apk_version: bool,
+) -> Result<Option<ServerClient>> {
+    let Some(host_port) = portmap::peek(serial, UI_CHANNEL) else {
+        return Ok(None);
+    };
+    let client = ServerClient::new(host_port)?;
+    match probe(&client, any_apk_version).await {
+        ProbeResult::Ready => Ok(Some(client)),
+        ProbeResult::VersionMismatch { .. } | ProbeResult::Down => Ok(None),
+    }
+}
+
 /// Make sure the device has our server running and reachable, then return
 /// a connected ServerClient ready to use.
 pub async fn ensure_ready(
+    serial: &Serial,
+    explicit_apk: Option<&Path>,
+    any_apk_version: bool,
+) -> Result<ServerClient> {
+    let _guard = acquire_lifecycle_lock(serial)?;
+    ensure_ready_locked(serial, explicit_apk, any_apk_version).await
+}
+
+async fn ensure_ready_locked(
     serial: &Serial,
     explicit_apk: Option<&Path>,
     any_apk_version: bool,
@@ -414,6 +515,25 @@ pub async fn ensure_ready_for_command(
     explicit_apk: Option<&Path>,
     any_apk_version: bool,
 ) -> Result<ServerClient> {
+    // The common path is a direct HTTP probe through the already-established
+    // forward. Avoid an ADB round-trip and lifecycle lock unless the mapping is
+    // actually absent or broken.
+    if let Some(host_port) = portmap::peek(serial, UI_CHANNEL) {
+        let client = ServerClient::new(host_port)?;
+        match probe(&client, any_apk_version).await {
+            ProbeResult::Ready => return Ok(client),
+            ProbeResult::VersionMismatch { found } => {
+                bail!(
+                    "ShadowDroid server is running version {found}, but this CLI expects \
+                     {EXPECTED_APK_VERSION}. Run `shadowdroid connect` or \
+                     `shadowdroid doctor --fix` once to upgrade/restart the server, then retry."
+                )
+            }
+            ProbeResult::Down => {}
+        }
+    }
+
+    let _guard = acquire_lifecycle_lock(serial)?;
     let host_port = ensure_forward(serial).await?;
     let client = ServerClient::new(host_port)?;
     match probe(&client, any_apk_version).await {
@@ -425,7 +545,7 @@ pub async fn ensure_ready_for_command(
                  `shadowdroid doctor --fix` once to upgrade/restart the server, then retry."
             )
         }
-        ProbeResult::Down => ensure_ready(serial, explicit_apk, any_apk_version).await,
+        ProbeResult::Down => ensure_ready_locked(serial, explicit_apk, any_apk_version).await,
     }
 }
 
@@ -585,7 +705,8 @@ async fn test_apk_changed(serial: &Serial, local_test: &Path) -> Result<bool> {
     let device_path = adb::pm_path(serial, TEST_PACKAGE)
         .await?
         .ok_or_else(|| anyhow!("{TEST_PACKAGE} not installed"))?;
-    let out = adb::shell(serial, format!("sha256sum {device_path}")).await?;
+    let device_path_arg = crate::config::quote_device_shell_arg(&device_path);
+    let out = adb::shell(serial, format!("sha256sum {device_path_arg}")).await?;
     let device_hash = out
         .split_whitespace()
         .next()

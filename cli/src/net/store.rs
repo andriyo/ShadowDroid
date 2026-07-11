@@ -6,10 +6,16 @@
 use crate::ids::Serial;
 use anyhow::{Context, Result};
 use std::io::Write;
+use std::sync::{Mutex, OnceLock};
 
 use crate::events::Event;
 use crate::net::flow::FlowRecord;
 use crate::net::{paths, Matcher};
+
+/// Cap each on-disk generation. One prior generation is retained, bounding a
+/// capture session to roughly 128 MiB even under sustained traffic.
+const SESSION_LOG_BYTES: u64 = 64 * 1024 * 1024;
+static APPEND_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 /// Append one completed flow to the session log (creating it if needed).
 pub fn append(serial: &Serial, rec: &FlowRecord) -> Result<()> {
@@ -24,8 +30,22 @@ pub fn append_event(serial: &Serial, ev: &Event) -> Result<()> {
 }
 
 fn append_line(serial: &Serial, line: &str) -> Result<()> {
+    let _guard = APPEND_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     paths::ensure_net_dir()?;
     let path = paths::session_log_path(serial)?;
+    let line_bytes = line.len() as u64 + 1;
+    if std::fs::metadata(&path)
+        .map(|metadata| metadata.len().saturating_add(line_bytes) > SESSION_LOG_BYTES)
+        .unwrap_or(false)
+    {
+        let rotated = path.with_extension("jsonl.1");
+        let _ = std::fs::remove_file(&rotated);
+        std::fs::rename(&path, &rotated)
+            .with_context(|| format!("rotate {} to {}", path.display(), rotated.display()))?;
+    }
     // 0600 on creation: the log holds full captured headers + bodies (live auth
     // tokens, cookies), so — like the CA key — it must not be world-readable.
     // `net start` clears the log each session, so a fresh file always gets these
@@ -48,11 +68,7 @@ fn append_line(serial: &Serial, line: &str) -> Result<()> {
 /// partial write) are skipped rather than failing the whole read.
 pub fn read_all(serial: &Serial) -> Result<Vec<FlowRecord>> {
     let path = paths::session_log_path(serial)?;
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let text =
-        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let text = read_generations(&path)?;
     Ok(text
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -82,6 +98,10 @@ pub fn clear(serial: &Serial) -> Result<()> {
     if path.exists() {
         std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
     }
+    let rotated = path.with_extension("jsonl.1");
+    if rotated.exists() {
+        std::fs::remove_file(&rotated).with_context(|| format!("remove {}", rotated.display()))?;
+    }
     Ok(())
 }
 
@@ -90,12 +110,21 @@ pub fn clear(serial: &Serial) -> Result<()> {
 /// matcher). Returned as raw JSON values since [Event] is serialize-only.
 pub fn read_tls_errors(serial: &Serial, host: Option<&str>) -> Result<Vec<serde_json::Value>> {
     let path = paths::session_log_path(serial)?;
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let text =
-        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let text = read_generations(&path)?;
     Ok(filter_tls_errors(&text, host))
+}
+
+fn read_generations(path: &std::path::Path) -> Result<String> {
+    let mut text = String::new();
+    for candidate in [path.with_extension("jsonl.1"), path.to_path_buf()] {
+        if candidate.exists() {
+            text.push_str(
+                &std::fs::read_to_string(&candidate)
+                    .with_context(|| format!("read {}", candidate.display()))?,
+            );
+        }
+    }
+    Ok(text)
 }
 
 /// Pure core of [read_tls_errors]: pick `tls_error` lines matching `host`. Flow

@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use crate::cmd::permissions;
 use crate::device::adb;
+use crate::events::emit_action;
 
 /// Shared CLI args for `app-install` and `app-reinstall` (wrapped by both
 /// subcommands). `reinstall` is supplied by the dispatch, not parsed here.
@@ -91,6 +92,8 @@ pub async fn run(serial: &Serial, args: &AppInstallArgs, reinstall: bool) -> Res
         .clone()
         .or_else(|| meta.as_ref().ok().map(|m| m.package.clone()))
         .ok_or_else(|| anyhow!("could not determine package from APK; pass --package <pkg>"))?;
+    crate::config::validate_android_package(&package)?;
+    let package_arg = crate::config::quote_device_shell_arg(&package);
     let activity = meta.as_ref().ok().and_then(|m| m.launch_activity.clone());
 
     let mut steps: Vec<Step> = Vec::new();
@@ -120,7 +123,7 @@ pub async fn run(serial: &Serial, args: &AppInstallArgs, reinstall: bool) -> Res
 
     // ── (clear) wipe app data ───────────────────────────────────────────────
     if args.clear {
-        match adb::shell(serial, format!("pm clear {package}")).await {
+        match adb::shell(serial, format!("pm clear {package_arg}")).await {
             Ok(o) if o.trim() == "Success" => steps.push(Step::ok("clear", "Success")),
             Ok(o) => steps.push(Step::fail("clear", o.trim().to_string())),
             Err(e) => steps.push(Step::fail("clear", e.to_string())),
@@ -144,10 +147,36 @@ pub async fn run(serial: &Serial, args: &AppInstallArgs, reinstall: bool) -> Res
             Ok(now) => {
                 let granted: Vec<&String> =
                     now.iter().filter(|(_, &g)| g).map(|(p, _)| p).collect();
-                steps.push(Step::ok(
-                    "grant",
-                    serde_json::json!({ "requested": perms, "granted": granted }),
-                ));
+                // `--grant-all` includes normal manifest permissions such as
+                // INTERNET, which never appear in the runtime readback. Only
+                // runtime permissions are postconditions in that mode. An
+                // explicit `--grant` means every named permission must appear
+                // granted, including surfacing a non-runtime/undeclared typo.
+                let expected: Vec<&String> = if args.grant_all {
+                    perms
+                        .iter()
+                        .filter(|permission| now.contains_key(*permission))
+                        .collect()
+                } else {
+                    perms.iter().collect()
+                };
+                let unmet: Vec<&String> = expected
+                    .iter()
+                    .copied()
+                    .filter(|permission| now.get(*permission) != Some(&true))
+                    .collect();
+                let detail = serde_json::json!({
+                    "requested": perms,
+                    "runtime_expected": expected,
+                    "granted": granted,
+                    "unmet": unmet,
+                    "observed": now,
+                });
+                if unmet.is_empty() {
+                    steps.push(Step::ok("grant", detail));
+                } else {
+                    steps.push(Step::fail("grant", detail));
+                }
             }
             Err(e) => steps.push(Step::fail("grant", e.to_string())),
         }
@@ -156,11 +185,14 @@ pub async fn run(serial: &Serial, args: &AppInstallArgs, reinstall: bool) -> Res
     // ── (launch) host-side via am start / monkey ────────────────────────────
     if args.launch || args.wait_front {
         let launch = match &activity {
-            Some(act) => adb::shell(serial, format!("am start -n {package}/{act}")).await,
+            Some(act) => {
+                let component = crate::config::quote_device_shell_arg(&format!("{package}/{act}"));
+                adb::shell(serial, format!("am start -n {component}")).await
+            }
             None => {
                 adb::shell(
                     serial,
-                    format!("monkey -p {package} -c android.intent.category.LAUNCHER 1"),
+                    format!("monkey -p {package_arg} -c android.intent.category.LAUNCHER 1"),
                 )
                 .await
             }
@@ -213,18 +245,31 @@ fn emit_summary(
     front_activity: Option<String>,
 ) -> Result<()> {
     let ok = steps.iter().all(|s| s.ok);
-    println!(
-        "{}",
-        serde_json::json!({
-            "type": "action",
-            "cmd": if reinstall { "app_reinstall" } else { "app_install" },
-            "package": package,
-            "apk": args.apk.display().to_string(),
-            "ok": ok,
-            "steps": steps.iter().map(Step::to_json).collect::<Vec<_>>(),
-            "front_activity": front_activity,
-        })
-    );
+    let cmd = if reinstall {
+        "app_reinstall"
+    } else {
+        "app_install"
+    };
+    let detail = serde_json::json!({
+        "package": package,
+        "apk": args.apk.display().to_string(),
+        "steps": steps.iter().map(Step::to_json).collect::<Vec<_>>(),
+        "front_activity": front_activity,
+    });
+    if !ok {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "app_install_failed",
+            "app",
+            format!("one or more {cmd} steps failed"),
+        )
+        .detail(detail)
+        .next_actions([
+            "inspect detail.steps for the first failed step",
+            "shadowdroid doctor --json",
+        ])
+        .into());
+    }
+    emit_action(cmd, &detail);
     Ok(())
 }
 

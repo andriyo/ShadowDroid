@@ -17,17 +17,12 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum PermissionDialogPolicy {
+    #[default]
     Ignore,
     Allow,
     Deny,
-}
-
-impl Default for PermissionDialogPolicy {
-    fn default() -> Self {
-        Self::Ignore
-    }
 }
 
 impl PermissionDialogPolicy {

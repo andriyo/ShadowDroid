@@ -58,7 +58,11 @@ pub async fn run(client: &ServerClient, args: &ScrollArgs) -> Result<Outcome> {
         )
         .await;
     if let Ok(resp) = server {
-        return emit_server(&selector, &resp, args.tap);
+        if resp.matched {
+            return emit_server(&selector, &resp, args.tap);
+        }
+        let screen = client.screen().await?;
+        return scroll_failure(&selector, resp.swipes, "server_no_match", &screen);
     }
 
     let swipe_dir = finger_direction(&args.direction);
@@ -75,11 +79,11 @@ pub async fn run(client: &ServerClient, args: &ScrollArgs) -> Result<Outcome> {
             return emit(&selector, true, swipes, "found", Some(&el), args.tap);
         }
         if swipes >= args.max_swipes {
-            return emit(&selector, false, swipes, "max_swipes", None, false);
+            return scroll_failure(&selector, swipes, "max_swipes", &screen);
         }
         // An unchanged hash since the previous swipe means the list won't move.
         if !last_hash.is_empty() && screen.screen_hash == last_hash {
-            return emit(&selector, false, swipes, "end_reached", None, false);
+            return scroll_failure(&selector, swipes, "end_reached", &screen);
         }
         last_hash = screen.screen_hash.clone();
 
@@ -156,6 +160,37 @@ fn emit_server(selector: &Selector, resp: &ScrollResp, tap: bool) -> Result<Outc
             "element": resp.matched.then(|| serde_json::json!({ "tap": [resp.x, resp.y] })),
         }),
     ))
+}
+
+fn scroll_failure(
+    selector: &Selector,
+    swipes: u32,
+    reason: &str,
+    screen: &crate::proto::ScreenResponse,
+) -> Result<Outcome> {
+    Err(crate::diagnostic::DiagnosticError::new(
+        "element_not_found",
+        "ui",
+        format!(
+            "scroll-to did not find {} after {swipes} swipe(s): {reason}",
+            selector.label()
+        ),
+    )
+    .retryable(true)
+    .detail(serde_json::json!({
+        "selector": selector.label(),
+        "reason": reason,
+        "swipes": swipes,
+        "screen_hash": screen.screen_hash,
+        "screen_hash_version": screen.screen_hash_version,
+        "current_app": screen.current_app,
+        "top_texts": crate::fusion::top_screen_texts(&screen.elements, 12),
+    }))
+    .next_actions([
+        "inspect detail.top_texts/current_app and confirm the expected list is visible",
+        "refine the selector or container/direction, increase --max-swipes when appropriate, then retry",
+    ])
+    .into())
 }
 
 fn emit(

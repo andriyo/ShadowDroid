@@ -8,6 +8,7 @@
 //!   - targetSdk ≥ 24: user CAs trusted **only** if the app's Network Security
 //!     Config opts in (`<debug-overrides>`/trust-anchor `user`). Debug builds
 //!     commonly do; release builds usually don't.
+//!
 //! Reading the NSC itself needs the APK; we report the heuristic verdict + what
 //! to verify rather than pulling+parsing it. (Cronet/QUIC + pinning caveats are
 //! surfaced as notes — those bypass a user-CA proxy regardless.)
@@ -60,17 +61,18 @@ pub async fn inspect(
     package: &str,
     tctx: &crate::net::trust::TrustContext,
 ) -> Result<CheckReport> {
+    crate::config::validate_android_package(package)?;
     if adb::pm_path(serial, package).await?.is_none() {
         bail!("{package} is not installed on {serial}");
     }
-    let dump = adb::shell(serial, format!("dumpsys package {package}")).await?;
+    let package_arg = crate::config::quote_device_shell_arg(package);
+    let dump = adb::shell(serial, format!("dumpsys package {package_arg}")).await?;
     let debuggable = dump.contains("DEBUGGABLE");
     let target_sdk = parse_kv_int(&dump, "targetSdk");
     let min_sdk = parse_kv_int(&dump, "minSdk");
     let version_name = adb::pm_version(serial, package).await.ok().flatten();
     let device_image = inspect_device_image(serial).await;
-    let trust =
-        crate::net::trust::evidence(serial, device_image.play_store_image, tctx).await;
+    let trust = crate::net::trust::evidence(serial, device_image.play_store_image, tctx).await;
 
     let (verdict, reason) = verdict(debuggable, target_sdk);
     let (ca_trusted_by_app, ca_trust_basis) =

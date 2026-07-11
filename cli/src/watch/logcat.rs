@@ -273,7 +273,10 @@ fn build_anr_event(line: &LogLine) -> CrashEvent {
 }
 
 fn build_java_event(lines: &[String], pid: Option<i32>) -> CrashEvent {
-    let msgs = lines.iter().map(extract_msg).collect::<Vec<_>>();
+    let msgs = lines
+        .iter()
+        .map(|line| extract_msg(line.as_str()))
+        .collect::<Vec<_>>();
     let mut thread = None;
     let mut package = None;
     let mut exception = None;
@@ -342,7 +345,10 @@ fn build_java_event(lines: &[String], pid: Option<i32>) -> CrashEvent {
 }
 
 fn build_native_event(lines: &[String], pid: Option<i32>) -> CrashEvent {
-    let msgs = lines.iter().map(extract_msg).collect::<Vec<_>>();
+    let msgs = lines
+        .iter()
+        .map(|line| extract_msg(line.as_str()))
+        .collect::<Vec<_>>();
     let mut signal = None;
     let mut signal_name = None;
     let mut thread = None;
@@ -390,10 +396,10 @@ fn build_native_event(lines: &[String], pid: Option<i32>) -> CrashEvent {
     }
 }
 
-fn extract_msg(line: &String) -> String {
+fn extract_msg(line: &str) -> String {
     LogLine::parse(line)
         .map(|l| l.msg)
-        .unwrap_or_else(|| line.clone())
+        .unwrap_or_else(|| line.to_owned())
 }
 
 async fn fetch_context(serial: &Serial) -> Vec<String> {

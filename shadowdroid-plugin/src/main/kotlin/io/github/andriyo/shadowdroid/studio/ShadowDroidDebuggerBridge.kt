@@ -40,9 +40,11 @@ import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.time.Instant
 import java.util.Base64
+import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 
 class ShadowDroidDebuggerBridge : ProjectActivity {
     override suspend fun execute(project: Project) {
@@ -58,9 +60,15 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
         private val watches = CopyOnWriteArrayList<WatchSpec>()
         private val listenedProjects = ConcurrentHashMap.newKeySet<String>()
         private val listenedSessions = ConcurrentHashMap.newKeySet<String>()
-        private val watchValues = ConcurrentHashMap<String, WatchValue>()
+        private val watchValues = SessionWatchCache<WatchValue>()
         private val objectHandles = ConcurrentHashMap<String, ObjectHandleEntry>()
         private val sessionHandleEpochs = ConcurrentHashMap<String, Int>()
+        // Weak keys avoid retaining stopped IDE sessions. Synchronization keeps
+        // an in-flight refresh on the same id until its last strong reference
+        // disappears, so cleanup cannot trigger id reassignment mid-refresh.
+        private val sessionIds = WeakHashMap<XDebugSession, String>()
+        private val sessionIdLock = Any()
+        private val nextSessionId = AtomicLong(1)
         private val lock = Any()
 
         @Volatile
@@ -135,6 +143,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
 
                     override fun sessionStopped() {
                         listenedSessions.remove(key)
+                        watchValues.stopSession(key)
                         clearSessionHandles(session)
                     }
                 }, project)
@@ -219,13 +228,17 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                         )
                         WatchValue.ok(BridgeProtocol.nowMs(), sessionInfo(sessionIndex(session), session), selected.info(), rendered)
                     }
-                    watchValues[watch.id] = value
+                    cacheWatchValue(watch, session, value)
                 } catch (t: Throwable) {
-                    watchValues[watch.id] = WatchValue.error(
-                        BridgeProtocol.nowMs(),
-                        sessionInfo(sessionIndex(session), session),
-                        null,
-                        t.message,
+                    cacheWatchValue(
+                        watch,
+                        session,
+                        WatchValue.error(
+                            BridgeProtocol.nowMs(),
+                            sessionInfo(sessionIndex(session), session),
+                            null,
+                            t.message,
+                        ),
                     )
                 }
             }
@@ -279,39 +292,58 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
         }
 
         private fun dispatch(path: String, query: Map<String, String>): Response =
-            when (path) {
-                BridgeRoutes.STATUS -> status()
-                BridgeRoutes.SESSIONS -> sessions()
-                BridgeRoutes.SESSION_CONTROL -> controlSession(query)
-                BridgeRoutes.SESSION_STACK -> currentStack(query)
-                BridgeRoutes.SESSION_THREADS -> threads(query)
-                BridgeRoutes.SESSION_VARIABLES -> variables(query)
-                BridgeRoutes.SESSION_EVALUATE -> evaluate(query)
-                BridgeRoutes.SESSION_INSPECT -> inspect(query)
-                BridgeRoutes.SESSION_COROUTINES -> coroutines(query)
-                BridgeRoutes.SESSION_COROUTINES_THREADS -> coroutineThreads(query)
-                BridgeRoutes.SESSION_COROUTINES_CONTINUATION -> coroutineContinuation(query)
-                BridgeRoutes.SESSION_COROUTINES_FLOW -> coroutineFlow(query)
-                BridgeRoutes.WATCHES -> watches(query)
-                BridgeRoutes.WATCHES_ADD -> addWatch(query)
-                BridgeRoutes.WATCHES_REMOVE -> removeWatch(query)
-                BridgeRoutes.WATCHES_CLEAR -> clearWatches()
-                BridgeRoutes.CLIENTS -> AndroidAttachBridge.clients(selectProject(query, null), query)
-                BridgeRoutes.BREAKPOINTS -> breakpoints()
-                BridgeRoutes.BREAKPOINT_LINE -> BreakpointBridge.addLine(query, selectProject(query, query[BridgeQuery.FILE]))
-                BridgeRoutes.BREAKPOINT_EXCEPTION -> BreakpointBridge.addException(query, selectProject(query, null))
-                BridgeRoutes.BREAKPOINT_METHOD -> BreakpointBridge.addMethod(query, selectProject(query, null))
-                BridgeRoutes.BREAKPOINT_FIELD -> BreakpointBridge.addField(query, selectProject(query, query[BridgeQuery.FILE]))
-                BridgeRoutes.BREAKPOINT_UPDATE -> BreakpointBridge.update(query, liveProjects(), selectProject(query, null))
-                BridgeRoutes.BREAKPOINT_REMOVE -> BreakpointBridge.remove(query, liveProjects(), selectProject(query, null))
-                BridgeRoutes.ATTACH -> AndroidAttachBridge.attach(selectProject(query, null), query)
-                BridgeRoutes.LAYOUT_SNAPSHOT -> LayoutInspectorBridge.snapshot(selectProject(query, null), query)
-                BridgeRoutes.LAYOUT_RECOMPOSITIONS -> LayoutInspectorBridge.recompositions(selectProject(query, null), query)
-                BridgeRoutes.LAYOUT_SOURCE -> LayoutInspectorBridge.source(selectProject(query, null), query)
-                else -> Response(
-                    HttpURLConnection.HTTP_NOT_FOUND,
-                    BridgeProtocol.obj("ok", false, "error", "not_found", "path", path),
-                )
+            try {
+                when (path) {
+                    BridgeRoutes.STATUS -> status()
+                    BridgeRoutes.SESSIONS -> sessions()
+                    BridgeRoutes.SESSION_CONTROL -> controlSession(query)
+                    BridgeRoutes.SESSION_STACK -> currentStack(query)
+                    BridgeRoutes.SESSION_THREADS -> threads(query)
+                    BridgeRoutes.SESSION_VARIABLES -> variables(query)
+                    BridgeRoutes.SESSION_EVALUATE -> evaluate(query)
+                    BridgeRoutes.SESSION_INSPECT -> inspect(query)
+                    BridgeRoutes.SESSION_COROUTINES -> coroutines(query)
+                    BridgeRoutes.SESSION_COROUTINES_THREADS -> coroutineThreads(query)
+                    BridgeRoutes.SESSION_COROUTINES_CONTINUATION -> coroutineContinuation(query)
+                    BridgeRoutes.SESSION_COROUTINES_FLOW -> coroutineFlow(query)
+                    BridgeRoutes.WATCHES -> watches(query)
+                    BridgeRoutes.WATCHES_ADD -> addWatch(query)
+                    BridgeRoutes.WATCHES_REMOVE -> removeWatch(query)
+                    BridgeRoutes.WATCHES_CLEAR -> clearWatches()
+                    BridgeRoutes.CLIENTS -> AndroidAttachBridge.clients(selectProject(query, null), query)
+                    BridgeRoutes.BREAKPOINTS -> breakpoints()
+                    BridgeRoutes.BREAKPOINT_LINE -> BreakpointBridge.addLine(
+                        query,
+                        selectProject(query, query[BridgeQuery.FILE], requireUnambiguous = true),
+                    )
+                    BridgeRoutes.BREAKPOINT_EXCEPTION -> BreakpointBridge.addException(
+                        query,
+                        selectProject(query, null, requireUnambiguous = true),
+                    )
+                    BridgeRoutes.BREAKPOINT_METHOD -> BreakpointBridge.addMethod(
+                        query,
+                        selectProject(query, null, requireUnambiguous = true),
+                    )
+                    BridgeRoutes.BREAKPOINT_FIELD -> BreakpointBridge.addField(
+                        query,
+                        selectProject(query, query[BridgeQuery.FILE], requireUnambiguous = true),
+                    )
+                    BridgeRoutes.BREAKPOINT_UPDATE -> BreakpointBridge.update(query, liveProjects(), selectRequestedProject(query))
+                    BridgeRoutes.BREAKPOINT_REMOVE -> BreakpointBridge.remove(query, liveProjects(), selectRequestedProject(query))
+                    BridgeRoutes.ATTACH -> AndroidAttachBridge.attach(
+                        selectProject(query, null, requireUnambiguous = true),
+                        query,
+                    )
+                    BridgeRoutes.LAYOUT_SNAPSHOT -> LayoutInspectorBridge.snapshot(selectProject(query, null), query)
+                    BridgeRoutes.LAYOUT_RECOMPOSITIONS -> LayoutInspectorBridge.recompositions(selectProject(query, null), query)
+                    BridgeRoutes.LAYOUT_SOURCE -> LayoutInspectorBridge.source(selectProject(query, null), query)
+                    else -> Response(
+                        HttpURLConnection.HTTP_NOT_FOUND,
+                        BridgeProtocol.obj("ok", false, "error", "not_found", "path", path),
+                    )
+                }
+            } catch (t: IllegalArgumentException) {
+                BridgeProtocol.bad(t)
             }
 
         private fun status(): Response {
@@ -335,7 +367,8 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
 
         private fun controlSession(query: Map<String, String>): Response {
             val action = query[BridgeQuery.ACTION] ?: return BridgeProtocol.bad("missing action")
-            val session = selectSession(query) ?: return BridgeProtocol.bad("no debugger session")
+            val session = selectSession(query, requireExplicitTarget = true)
+                ?: return BridgeProtocol.bad("no debugger session")
             return try {
                 StudioThreading.onIdeaThread {
                     when (action) {
@@ -706,27 +739,27 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
             // Scope to a project only when requested explicitly; an unscoped
             // watch is global. Defaulting to the first open project would make
             // the background refresher skip every other project's sessions.
-            val requestedProject = query[BridgeQuery.PROJECT]?.takeUnless { it.isBlank() }
-            val projectKey = if (requestedProject == null) {
-                null
-            } else {
-                liveProjects().firstOrNull { requestedProject == it.name || requestedProject == it.basePath }
-                    ?.let(::projectKey)
-                    ?: return BridgeProtocol.bad("project not found: $requestedProject")
+            val projectKey = query[BridgeQuery.PROJECT]?.let { requestedProject ->
+                val live = liveProjects()
+                val index = SelectionPolicy.projectIndex(
+                    requestedProject,
+                    live.map { ProjectSelectorValue(it.name, it.basePath) },
+                )
+                projectKey(live[index])
             }
             val name = query[BridgeQuery.NAME]?.takeUnless { it.isBlank() } ?: expression
             val watch = WatchSpec(watchId(projectKey, name, expression), projectKey, name, expression, true)
             watches.removeIf { it.id == watch.id }
             watches += watch
             installAllSessionListeners()
-            return BridgeProtocol.ok("ok", true, "watch", watchInfo(watch, null))
+            return BridgeProtocol.ok("ok", true, "watch", watchInfo(watch, null, null))
         }
 
         private fun removeWatch(query: Map<String, String>): Response {
             val id = query[BridgeQuery.ID]
             if (id.isNullOrBlank()) return BridgeProtocol.bad("missing id")
             val removed = watches.removeIf { it.id == id }
-            watchValues.remove(id)
+            watchValues.removeWatch(id)
             return BridgeProtocol.ok("ok", true, "id", id, "removed", removed)
         }
 
@@ -765,11 +798,15 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                                 renderOptions,
                                 hashSetOf(),
                             )
-                            watchValues[watch.id] = WatchValue.ok(
-                                BridgeProtocol.nowMs(),
-                                sessionInfo(sessionIndex(session), session),
-                                null,
-                                rendered,
+                            cacheWatchValue(
+                                watch,
+                                session,
+                                WatchValue.ok(
+                                    BridgeProtocol.nowMs(),
+                                    sessionInfo(sessionIndex(session), session),
+                                    null,
+                                    rendered,
+                                ),
                             )
                             rendered
                         }
@@ -777,7 +814,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                         value = BridgeProtocol.map("ok", false, "error", t.message)
                     }
                 }
-                payload += watchInfo(watch, value)
+                payload += watchInfo(watch, value, session)
             }
             return BridgeProtocol.ok(
                 "ok", true,
@@ -792,8 +829,8 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
             return BreakpointBridge.list(liveProjects())
         }
 
-        private fun watchInfo(watch: WatchSpec, value: Any?): Map<String, Any?> {
-            val cached = watchValues[watch.id]
+        private fun watchInfo(watch: WatchSpec, value: Any?, session: XDebugSession?): Map<String, Any?> {
+            val cached = session?.let { watchValues[watchCacheKey(watch, it)] }
             val effectiveValue = value ?: cached?.value
             return BridgeProtocol.map(
                 "id", watch.id,
@@ -815,13 +852,23 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                 .encodeToString(raw.toByteArray(StandardCharsets.UTF_8))
         }
 
+        private fun watchCacheKey(watch: WatchSpec, session: XDebugSession): WatchCacheKey =
+            WatchCacheKey(watch.id, sessionId(session))
+
+        private fun cacheWatchValue(watch: WatchSpec, session: XDebugSession, value: WatchValue) {
+            val result = watchValues.putIfActive(watchCacheKey(watch, session), value) {
+                watches.any { it.id == watch.id }
+            }
+            if (result == WatchCachePutResult.SESSION_STOPPED) clearSessionHandles(session)
+        }
+
         private fun handleProvider(session: XDebugSession): (ObjectReference) -> String =
             { reference -> registerObjectHandle(session, reference) }
 
         private fun registerObjectHandle(session: XDebugSession, reference: ObjectReference): String {
             val key = sessionKey(session)
             val epoch = sessionHandleEpochs[key] ?: 0
-            val handle = "obj_s${sessionIndex(session)}_e${epoch}_${reference.uniqueID()}"
+            val handle = "obj_${sessionId(session)}_e${epoch}_${reference.uniqueID()}"
             objectHandles[handle] = ObjectHandleEntry(key, epoch, reference)
             return handle
         }
@@ -855,6 +902,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
         private fun handleScope(session: XDebugSession): Map<String, Any?> =
             BridgeProtocol.map(
                 "session", sessionIndex(session),
+                "session_id", sessionId(session),
                 "suspend_epoch", sessionHandleEpochs[sessionKey(session)] ?: 0,
                 "valid_until", "resume",
             )
@@ -1015,6 +1063,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                 }
             }
             return BridgeProtocol.map(
+                "id", sessionId(session),
                 "index", index,
                 "name", session.sessionName,
                 "project", projectInfo(session.project),
@@ -1094,45 +1143,100 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
 
         private fun projectKey(project: Project): String = project.basePath ?: project.name
 
-        private fun sessionKey(session: XDebugSession): String =
-            "${projectKey(session.project)}|${session.sessionName}|${System.identityHashCode(session)}"
+        private fun sessionId(session: XDebugSession): String = synchronized(sessionIdLock) {
+            sessionIds.getOrPut(session) { "session_${nextSessionId.getAndIncrement()}" }
+        }
 
-        private fun selectSession(query: Map<String, String>): XDebugSession? {
+        private fun sessionKey(session: XDebugSession): String = sessionId(session)
+
+        private fun selectSession(
+            query: Map<String, String>,
+            requireExplicitTarget: Boolean = false,
+        ): XDebugSession? {
             val sessions = allSessions()
-            query[BridgeQuery.SESSION]?.toIntOrNull()?.let { index ->
-                if (index in sessions.indices) return sessions[index]
+            val sessionSelector = query[BridgeQuery.SESSION]
+            val deviceSelector = query[BridgeQuery.DEVICE]
+            if (requireExplicitTarget) {
+                SelectionPolicy.requireExplicitSessionTarget(sessions.size, sessionSelector, deviceSelector)
             }
-            // An explicit device selects the session on that device — and only
-            // that device, never a silent fall-through to an unrelated session.
-            // This is what makes the CLI's `--device` target the right session
-            // when several devices are debugged at once.
-            query[BridgeQuery.DEVICE]?.takeUnless { it.isBlank() }?.let { requested ->
-                return sessions.firstOrNull { deviceMatches(sessionDevice(it), requested) }
+
+            val bySession = sessionSelector?.let { selector ->
+                sessions[SelectionPolicy.sessionIndex(selector, sessions.map(::sessionId))]
             }
+            val byDevice = deviceSelector?.let { selector ->
+                val requested = selector.trim()
+                if (requested.isEmpty()) throw IllegalArgumentException("device selector is empty")
+                val matches = sessions.filter { deviceMatches(sessionDevice(it), requested) }
+                when (matches.size) {
+                    0 -> throw IllegalArgumentException("debugger session not found for device: $selector")
+                    1 -> matches.single()
+                    else -> throw IllegalArgumentException(
+                        "device selector matches multiple debugger sessions: $selector; specify session id",
+                    )
+                }
+            }
+            if (bySession != null && byDevice != null && bySession !== byDevice) {
+                throw IllegalArgumentException("session and device selectors identify different debugger sessions")
+            }
+            if (bySession != null) return bySession
+            if (byDevice != null) return byDevice
+
             for (project in liveProjects()) {
-                XDebuggerManager.getInstance(project).currentSession?.let { return it }
+                XDebuggerManager.getInstance(project).currentSession?.let { current ->
+                    if (sessions.any { it === current }) return current
+                }
             }
             return sessions.firstOrNull()
         }
 
-        private fun selectProject(query: Map<String, String>, file: String?): Project? {
-            val requested = query[BridgeQuery.PROJECT]
-            if (requested != null) {
-                for (project in liveProjects()) {
-                    if (requested == project.name || requested == project.basePath) return project
-                }
+        private fun selectProject(
+            query: Map<String, String>,
+            file: String?,
+            requireUnambiguous: Boolean = false,
+        ): Project? {
+            val live = liveProjects()
+            query[BridgeQuery.PROJECT]?.let { requested ->
+                val index = SelectionPolicy.projectIndex(
+                    requested,
+                    live.map { ProjectSelectorValue(it.name, it.basePath) },
+                )
+                return live[index]
             }
+            // File-based handlers validate their required file after project
+            // selection. Let a blank value reach that precise "missing file"
+            // error without inventing a project-target error first.
+            if (file != null && file.isBlank()) return live.firstOrNull()
             if (file != null) {
                 val normalized = File(file).absolutePath
-                for (project in liveProjects()) {
-                    val basePath = project.basePath
-                    if (basePath != null && normalized.startsWith(File(basePath).absolutePath + File.separator)) {
-                        return project
+                val matches = live.mapNotNull { project ->
+                    val basePath = project.basePath ?: return@mapNotNull null
+                    val base = File(basePath).absolutePath
+                    if (normalized == base || normalized.startsWith(base + File.separator)) {
+                        project to base.length
+                    } else {
+                        null
                     }
                 }
+                if (matches.isNotEmpty()) {
+                    // Nested projects can both contain a file. The deepest
+                    // base path is the deterministic, most-specific owner.
+                    val depth = matches.maxOf { it.second }
+                    val owners = matches.filter { it.second == depth }
+                    if (owners.size > 1) {
+                        throw IllegalArgumentException(
+                            "file belongs to multiple projects; specify project name/base path",
+                        )
+                    }
+                    return owners.single().first
+                }
             }
-            return liveProjects().firstOrNull()
+            SelectionPolicy.requireUnambiguousProjectFallback(live.size, requireUnambiguous)
+            return live.firstOrNull()
         }
+
+        /** Keep id-targeted mutations global unless the caller explicitly scopes them. */
+        private fun selectRequestedProject(query: Map<String, String>): Project? =
+            if (query.containsKey(BridgeQuery.PROJECT)) selectProject(query, null) else null
 
         private fun sessionIndex(session: XDebugSession): Int =
             allSessions().indexOfFirst { it === session }.takeIf { it >= 0 } ?: 0

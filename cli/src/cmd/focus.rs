@@ -12,6 +12,7 @@
 //!   2. target already focused → done (press `dpad_center` if `--center`).
 //!   3. else step the D-pad along the dominant axis from the focused element's
 //!      center toward the target's center, re-dump, repeat.
+//!
 //! Bounded by `--max-steps` and a no-progress guard (focus didn't move after a
 //! press → bail rather than loop).
 
@@ -99,7 +100,9 @@ pub async fn run(client: &ServerClient, args: &FocusArgs) -> Result<Outcome> {
 
         let target = match resolve_target(&selector, &screen.elements, args.exact)? {
             Some(t) => t,
-            None => return emit(&selector, false, steps, "not_found", None, false),
+            None => {
+                return focus_failure(&selector, steps, "not_found", &screen, None);
+            }
         };
 
         // The element that currently has D-pad focus. Many Compose/TV apps put the
@@ -128,13 +131,13 @@ pub async fn run(client: &ServerClient, args: &FocusArgs) -> Result<Outcome> {
         if steps > 0 && current_key == prev_focused {
             stalls += 1;
             if stalls >= MAX_STALLS {
-                return emit(&selector, false, steps, "no_progress", Some(&target), false);
+                return focus_failure(&selector, steps, "no_progress", &screen, Some(&target));
             }
         } else {
             stalls = 0;
         }
         if steps >= args.max_steps {
-            return emit(&selector, false, steps, "max_steps", Some(&target), false);
+            return focus_failure(&selector, steps, "max_steps", &screen, Some(&target));
         }
 
         let dir = direction_toward(current, &target);
@@ -143,6 +146,52 @@ pub async fn run(client: &ServerClient, args: &FocusArgs) -> Result<Outcome> {
         tokio::time::sleep(Duration::from_millis(SETTLE_MS)).await;
         steps += 1;
     }
+}
+
+fn focus_failure(
+    selector: &Selector,
+    steps: u32,
+    reason: &str,
+    screen: &crate::proto::ScreenResponse,
+    target: Option<&Element>,
+) -> Result<Outcome> {
+    let code = if reason == "not_found" {
+        "element_not_found"
+    } else {
+        "focus_unreachable"
+    };
+    let next_actions = if reason == "not_found" {
+        vec![
+            "inspect detail.top_texts/current_app and wait for the intended screen",
+            "refine the selector, then retry `ui focus`",
+        ]
+    } else {
+        vec![
+            "inspect detail.target and the currently focused element in a fresh `ui dump --full`",
+            "choose a reachable focusable selector or navigate an intermediate element before retrying",
+        ]
+    };
+    Err(crate::diagnostic::DiagnosticError::new(
+        code,
+        "ui",
+        format!(
+            "could not focus {} after {steps} D-pad step(s): {reason}",
+            selector.label()
+        ),
+    )
+    .retryable(reason == "not_found")
+    .detail(serde_json::json!({
+        "selector": selector.label(),
+        "reason": reason,
+        "steps": steps,
+        "target": target.map(candidate_json),
+        "screen_hash": screen.screen_hash,
+        "screen_hash_version": screen.screen_hash_version,
+        "current_app": screen.current_app,
+        "top_texts": crate::fusion::top_screen_texts(&screen.elements, 12),
+    }))
+    .next_actions(next_actions)
+    .into())
 }
 
 /// The element that effectively holds D-pad focus. If the `focused` node has

@@ -28,6 +28,7 @@ object StateRoutes {
         // the version on the APK can never disagree. The compiled-in constant is
         // only a fallback for the unlikely case PackageManager can't see us.
         val serverVersion = resolveServerVersion(instr)
+        val enrichmentCache = ScreenEnrichmentCache.shared(uiDevice, instr)
 
         route.get("/device") {
             val cfg = instr.targetContext.resources.configuration
@@ -52,8 +53,7 @@ object StateRoutes {
 
         route.get("/state") {
             val pkg = uiDevice.currentPackageName
-            val activity = currentFocusedActivity(uiDevice)
-            val pid = pidForPackage(uiDevice, pkg)
+            val enrichment = enrichmentCache.snapshot(pkg)
 
             val state =
                 ServerState(
@@ -63,7 +63,7 @@ object StateRoutes {
                     android_sdk = Build.VERSION.SDK_INT,
                     android_release = Build.VERSION.RELEASE ?: "",
                     viewport = Viewport(uiDevice.displayWidth, uiDevice.displayHeight),
-                    current_app = AppRef(`package` = pkg, activity = activity, pid = pid),
+                    current_app = AppRef(`package` = pkg, activity = enrichment.activity, pid = enrichment.pid),
                     is_television = isTelevision(instr),
                 )
             call.respond(state)

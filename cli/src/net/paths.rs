@@ -7,6 +7,7 @@
 //!   - `<serial>.log`   — the daemon's own stdout/stderr (diagnostics)
 //!   - `<serial>.pid`   — the daemon pid (liveness + teardown)
 //!   - `<serial>.state.json` — device networking state captured before wiring
+//!
 //! The CA is device-independent:
 //!   - `ca.crt` / `ca.key` — the ShadowDroid root CA (generated once, installed
 //!     into the device trust store).

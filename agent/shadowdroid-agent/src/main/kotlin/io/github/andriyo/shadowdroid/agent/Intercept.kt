@@ -8,8 +8,10 @@ import java.util.concurrent.TimeUnit
 
 /**
  * In-app, agent-in-the-loop interception — the same model as the host proxy
- * (`net intercept`/`resume`/`drop`), but **above TLS inside the app**, so it
- * works on cert-pinned / Cronet / QUIC stacks the proxy can't touch.
+ * (`net intercept`/`resume`/`drop`), but through a registered in-app capture
+ * provider. The current companion is an OkHttp application interceptor, so it
+ * can handle certificate-pinned OkHttp calls but not Cronet, QUIC, or arbitrary
+ * HTTP clients.
  *
  * A single matcher is armed at a time. When the HTTP hook reports a matching
  * flow at the response phase it is **held** (the app's call blocks) until the
@@ -70,7 +72,7 @@ object Intercept {
 
     fun isArmed(): Boolean = matcher != null
 
-    /** Status snapshot for `aar status`: armed matcher + currently-held flows. */
+    /** Status snapshot for `aar agent`: armed matcher + currently-held flows. */
     fun status(): JSONObject {
         val m = matcher
         val matcherJson = if (m == null) {

@@ -4,13 +4,9 @@ import io.github.andriyo.shadowdroid.agent.Capture
 import io.github.andriyo.shadowdroid.agent.CapturedFlow
 import io.github.andriyo.shadowdroid.agent.Intercept
 import okhttp3.Interceptor
-import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.Response
-import okhttp3.ResponseBody.Companion.toResponseBody
-import okio.Buffer
 import org.json.JSONObject
 import java.io.IOException
-import java.util.zip.GZIPInputStream
 
 /**
  * The single piece of in-app capture that needs the host app's cooperation:
@@ -22,18 +18,23 @@ import java.util.zip.GZIPInputStream
  *     .build()
  * ```
  *
- * Because it runs as an **application** interceptor (above the TLS/connection
- * layer), it observes the decrypted request/response regardless of certificate
- * pinning, Cronet, or QUIC — the exact traffic the host MITM proxy cannot reach.
+ * Because it runs as an **OkHttp application interceptor** (above OkHttp's
+ * TLS/connection layer), it observes decrypted OkHttp requests and responses,
+ * including certificate-pinned OkHttp traffic that a host MITM proxy cannot
+ * reach. It does not instrument other clients or stacks such as Cronet or QUIC.
  * Captured flows are buffered in [Capture] (drained by `shadowdroid aar
- * capture`); when armed via `shadowdroid aar intercept`, a matching flow is
- * held and can be mutated or dropped ([Intercept]).
+ * capture`); when armed via `shadowdroid aar intercept`, a matching OkHttp flow
+ * is held and can be mutated or dropped ([Intercept]).
  *
- * Best-effort and self-contained: any failure in capture/intercept falls back
- * to passing the original response through, so the debug hook can never break
- * the host app's networking.
+ * Capture bookkeeping is best-effort. Explicit interception actions are the
+ * only path intended to change the host call: resume may mutate the response,
+ * and drop deliberately fails it with an [IOException].
  */
 class ShadowDroidCaptureInterceptor : Interceptor {
+
+    init {
+        Capture.registerProvider(PROVIDER_NAME)
+    }
 
     override fun intercept(chain: Interceptor.Chain): Response {
         val request = chain.request()
@@ -41,8 +42,8 @@ class ShadowDroidCaptureInterceptor : Interceptor {
         val startNs = System.nanoTime()
 
         val reqType = runCatching { request.body?.contentType()?.toString() }.getOrNull()
-        val reqBody = readRequestBody(request)
-        val operationName = operationName(reqBody)
+        val reqBody = captureRequestBody(request)
+        val operationName = operationName(reqBody.text)
 
         val response = chain.proceed(request)
         val durMs = (System.nanoTime() - startNs) / 1_000_000
@@ -51,28 +52,15 @@ class ShadowDroidCaptureInterceptor : Interceptor {
         val host = url.host
         val path = url.encodedPath
         val respType = runCatching { response.body?.contentType()?.toString() }.getOrNull()
-        // As a *network* interceptor the body can still be gzip-encoded (the
-        // transparent gunzip runs above us), so decode by Content-Encoding.
-        val gzipped = response.header("Content-Encoding")?.contains("gzip", ignoreCase = true) == true
-        val respBody = if (isTextual(respType)) {
-            runCatching {
-                val peeked = response.peekBody(BODY_CAP.toLong())
-                if (gzipped) {
-                    GZIPInputStream(peeked.byteStream()).bufferedReader(Charsets.UTF_8).use { it.readText() }
-                } else {
-                    peeked.string()
-                }
-            }.getOrNull()
-        } else {
-            null
-        }
+        val respBody = readResponseBody(response, respType)
 
-        // Decide (and possibly block) only when something is armed — keeps the
-        // pure-capture path allocation-free and non-blocking.
+        // Decide (and possibly block) only when something is armed, keeping the
+        // hold machinery out of the normal capture path.
         var out = response
         var modified = false
         var finalStatus: Int? = response.code
         var finalBody = respBody
+        var finalRespType = respType
         if (Intercept.isArmed()) {
             val summary = JSONObject().apply {
                 put("id", id)
@@ -81,38 +69,41 @@ class ShadowDroidCaptureInterceptor : Interceptor {
                 put("path", path)
                 put("status", response.code)
                 put("operationName", operationName ?: JSONObject.NULL)
-                put("resp_preview", respBody?.take(PREVIEW_CAP) ?: JSONObject.NULL)
+                put("resp_preview", respBody.text?.take(PREVIEW_CAP) ?: JSONObject.NULL)
             }
             when (val action = Intercept.maybeHold(id, request.method, host, path, operationName, summary)) {
                 is Intercept.Action.Drop -> {
                     response.close()
-                    recordFlow(id, request, url, durMs, reqType, respType, reqBody, null, null, true, "dropped")
+                    recordFlow(
+                        id,
+                        request,
+                        url,
+                        durMs,
+                        reqType,
+                        respType,
+                        reqBody,
+                        respBody.copy(streamed = false),
+                        response.code,
+                        true,
+                        "dropped by ShadowDroid agent",
+                    )
                     throw IOException("dropped by ShadowDroid agent")
                 }
 
                 is Intercept.Action.Mutate -> {
-                    val newStatus = action.status ?: response.code
-                    val newBody = action.body ?: respBody.orEmpty()
-                    val mediaType = (action.contentType ?: respType ?: "application/json").toMediaTypeOrNull()
-                    out = response.newBuilder()
-                        .code(newStatus)
-                        // We hand back a plaintext body, so strip framing headers
-                        // that would make the layers above us mis-decode it.
-                        .removeHeader("Content-Encoding")
-                        .removeHeader("Content-Length")
-                        .body(newBody.toResponseBody(mediaType))
-                        .build()
-                    response.body?.close()
+                    val mutation = applyResponseMutation(response, action, respBody, respType)
+                    out = mutation.response
                     modified = true
-                    finalStatus = newStatus
-                    finalBody = newBody
+                    finalStatus = mutation.response.code
+                    finalBody = mutation.capturedBody
+                    finalRespType = mutation.responseType
                 }
 
                 Intercept.Action.PassThrough -> Unit
             }
         }
 
-        recordFlow(id, request, url, durMs, reqType, respType, reqBody, finalBody, finalStatus, modified, null)
+        recordFlow(id, request, url, durMs, reqType, finalRespType, reqBody, finalBody, finalStatus, modified, null)
         return out
     }
 
@@ -123,11 +114,11 @@ class ShadowDroidCaptureInterceptor : Interceptor {
         durMs: Long,
         reqType: String?,
         respType: String?,
-        reqBody: String?,
-        respBody: String?,
+        reqBody: BodyCapture,
+        respBody: BodyCapture,
         status: Int?,
         modified: Boolean,
-        @Suppress("UNUSED_PARAMETER") note: String?,
+        note: String?,
     ) {
         runCatching {
             Capture.record(
@@ -142,26 +133,34 @@ class ShadowDroidCaptureInterceptor : Interceptor {
                     durMs = durMs,
                     reqType = reqType,
                     respType = respType,
-                    reqLen = (reqBody?.toByteArray()?.size ?: 0).toLong(),
-                    respLen = (respBody?.toByteArray()?.size ?: 0).toLong(),
-                    reqBody = reqBody,
-                    respBody = respBody,
+                    reqLen = reqBody.originalLength,
+                    respLen = respBody.originalLength,
+                    reqBody = reqBody.text,
+                    respBody = respBody.text,
+                    reqTruncated = reqBody.truncated,
+                    respTruncated = respBody.truncated,
+                    reqStreamed = reqBody.streamed,
+                    streamed = respBody.streamed,
                     modified = modified,
+                    error = note,
                 ),
             )
         }
     }
 
-    private fun readRequestBody(request: okhttp3.Request): String? {
-        val body = request.body ?: return null
-        if (body.isOneShot() || body.isDuplex()) return null
-        if (!isTextual(runCatching { body.contentType()?.toString() }.getOrNull())) return null
+    private fun readResponseBody(response: Response, responseType: String?): BodyCapture {
+        val body = response.body ?: return metadataOnly(0)
+        val declaredLength = runCatching { body.contentLength() }.getOrDefault(-1L)
+        // Peeking a long-lived response would delay delivery until the cap is
+        // filled (or indefinitely for a quiet stream). Preserve it untouched.
+        if (isStreamingContentType(responseType)) return metadataOnly(declaredLength, streamed = true)
+        if (!isTextualContentType(responseType)) return metadataOnly(declaredLength)
         return runCatching {
-            val buffer = Buffer()
-            body.writeTo(buffer)
-            val text = buffer.readUtf8()
-            if (text.length > BODY_CAP) text.substring(0, BODY_CAP) else text
-        }.getOrNull()
+            // One extra byte distinguishes an exactly-at-cap body from a body
+            // whose total size is unknown and exceeds the capture cap.
+            val observed = response.peekBody(CAPTURE_BODY_CAP.toLong() + 1).bytes()
+            captureObservedResponse(observed, declaredLength)
+        }.getOrElse { metadataOnly(declaredLength, streamed = true) }
     }
 
     private fun operationName(reqBody: String?): String? {
@@ -174,14 +173,8 @@ class ShadowDroidCaptureInterceptor : Interceptor {
         }.getOrNull()
     }
 
-    private fun isTextual(contentType: String?): Boolean {
-        val ct = contentType?.lowercase() ?: return false
-        return TEXTUAL_HINTS.any { ct.contains(it) }
-    }
-
     private companion object {
-        const val BODY_CAP = 64 * 1024
+        const val PROVIDER_NAME = "okhttp"
         const val PREVIEW_CAP = 512
-        val TEXTUAL_HINTS = listOf("json", "text", "xml", "graphql", "x-www-form-urlencoded", "javascript")
     }
 }

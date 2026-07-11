@@ -134,7 +134,7 @@ object SystemRoutes {
             val r: ShellReq = call.receive()
             val (output, exitCode) =
                 try {
-                    runShell(instr, uiDevice, r.cmd, r.timeout_ms)
+                    runDeviceShell(instr, uiDevice, r.cmd, r.timeout_ms)
                 } catch (t: ShellTimeout) {
                     throw BadRequest("shell_timeout", t.message ?: "shell command timed out")
                 } catch (t: Throwable) {
@@ -146,7 +146,7 @@ object SystemRoutes {
 }
 
 /** Signals that a shell command outlived its timeout budget. */
-private class ShellTimeout(
+internal class ShellTimeout(
     message: String,
 ) : RuntimeException(message)
 
@@ -163,7 +163,7 @@ private const val SHELL_RC_MARKER = "__SD_RC__"
  * devices, or any failure of the Rwe path, fall back to the legacy stdout-only
  * executor (exit_code null).
  */
-private fun runShell(
+internal fun runDeviceShell(
     instr: Instrumentation,
     uiDevice: UiDevice,
     cmd: String,
@@ -238,7 +238,12 @@ private fun parseShellOutput(raw: String): Pair<String, Int?> {
     val marker = "\n$SHELL_RC_MARKER"
     val idx = raw.lastIndexOf(marker)
     if (idx < 0) return raw to null
-    val code = raw.substring(idx + marker.length).trim().removeSuffix("__").toIntOrNull()
+    val code =
+        raw
+            .substring(idx + marker.length)
+            .trim()
+            .removeSuffix("__")
+            .toIntOrNull()
     return raw.substring(0, idx) to code
 }
 

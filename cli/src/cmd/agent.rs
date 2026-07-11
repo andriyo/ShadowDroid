@@ -4,13 +4,14 @@
 //! control channel on a loopback port and logs a readiness marker. This client
 //! discovers that port from logcat, sets up `adb forward`, and exchanges one
 //! command line for one JSON response — backing the `aar capture` / `intercept`
-//! / `resume` / `drop` / `status` verbs.
+//! / `resume` / `drop` / `agent` verbs.
 //!
-//! In-app capture is **above TLS**: when the OkHttp companion interceptor is
-//! wired into the host app, this reaches the decrypted request/response of
-//! cert-pinned / Cronet / QUIC stacks the host MITM proxy can't. Captured flows
-//! share the host [FlowRecord] shape, so they feed `net export fixtures` and the
-//! `net` session store unchanged.
+//! In-app capture is available when the optional OkHttp companion interceptor
+//! is wired into the host app. It observes decrypted OkHttp calls, including
+//! certificate-pinned OkHttp traffic the host MITM proxy cannot reach. It does
+//! not instrument Cronet, QUIC, or other HTTP clients. Captured flows share the
+//! host [FlowRecord] shape, so they feed `net export fixtures` and the `net`
+//! session store unchanged.
 
 use crate::ids::Serial;
 use anyhow::{bail, Context, Result};
@@ -51,10 +52,14 @@ pub async fn discover_port(serial: &Serial) -> Result<u16> {
     let logcat = adb::shell(serial, "logcat -d -s ShadowDroidAgent:I").await?;
     match parse_agent_port(&logcat) {
         Some(p) if p > 0 => Ok(p as u16),
-        Some(_) => bail!("the in-app agent reported port=-1 (control channel failed to bind)"),
+        Some(_) => bail!(
+            "the in-app agent reported port=-1 (control channel failed to bind). Next: force-stop \
+             and relaunch the debug app; if it repeats, inspect `adb logcat -s ShadowDroidAgent`"
+        ),
         None => bail!(
-            "ShadowDroid agent not seen in logcat. Wire the AAR (`shadowdroid aar install`) \
-             and launch the app, then confirm with `adb logcat -s ShadowDroidAgent`."
+            "ShadowDroid agent not seen in logcat. Next: run `shadowdroid aar install --build`, \
+             rebuild and launch the debug app, then retry `shadowdroid aar agent`. If it is still \
+             missing, inspect `adb logcat -s ShadowDroidAgent`."
         ),
     }
 }
@@ -95,47 +100,14 @@ fn exchange(host_port: u16, command: &str) -> Result<Value> {
 
 // ── verb handlers ─────────────────────────────────────────────────────────
 
-/// `aar status` — agent info, armed matcher, held flows, capture count.
+/// `aar agent` — agent info, capture provider, armed matcher, and held flows.
 pub async fn status(serial: &Serial, json: bool) -> Result<()> {
     let resp = send(serial, "status".into()).await?;
+    ensure_agent_ok(&resp)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&resp)?);
     } else {
-        let captured = resp.get("captured").and_then(Value::as_i64).unwrap_or(0);
-        let intercept = resp.get("intercept");
-        let armed = intercept
-            .and_then(|i| i.get("armed"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let held = intercept
-            .and_then(|i| i.get("held"))
-            .and_then(Value::as_array)
-            .map(|a| a.len())
-            .unwrap_or(0);
-        println!(
-            "agent: package={}",
-            resp.get("package").and_then(Value::as_str).unwrap_or("?")
-        );
-        println!("  captured flows (buffered): {captured}");
-        println!("  intercept armed:           {armed}");
-        println!("  held flows:                {held}");
-        if let Some(arr) = intercept
-            .and_then(|i| i.get("held"))
-            .and_then(Value::as_array)
-        {
-            for h in arr {
-                println!(
-                    "    {} {} {}{}  op={}",
-                    h.get("id").and_then(Value::as_str).unwrap_or("?"),
-                    h.get("method").and_then(Value::as_str).unwrap_or("?"),
-                    h.get("host").and_then(Value::as_str).unwrap_or(""),
-                    h.get("path").and_then(Value::as_str).unwrap_or(""),
-                    h.get("operationName")
-                        .and_then(Value::as_str)
-                        .unwrap_or("-"),
-                );
-            }
-        }
+        print!("{}", render_status(&resp));
     }
     Ok(())
 }
@@ -151,6 +123,7 @@ pub async fn capture(
 ) -> Result<()> {
     let cmd = if clear { "capture --clear" } else { "capture" };
     let resp = send(serial, cmd.into()).await?;
+    ensure_agent_ok(&resp)?;
     let flows_json = resp
         .get("flows")
         .cloned()
@@ -241,15 +214,13 @@ pub async fn intercept(
         spec.insert("holdMs".into(), Value::Number(v.into()));
     }
     let resp = send(serial, format!("intercept {}", Value::Object(spec))).await?;
-    print_simple(&resp, json, "armed in-app interception");
-    Ok(())
+    print_simple(&resp, json, "armed in-app interception")
 }
 
 /// `aar intercept --clear` — disarm.
 pub async fn intercept_clear(serial: &Serial, json: bool) -> Result<()> {
     let resp = send(serial, "intercept-clear".into()).await?;
-    print_simple(&resp, json, "disarmed in-app interception");
-    Ok(())
+    print_simple(&resp, json, "disarmed in-app interception")
 }
 
 /// `aar resume <id>` — release a held flow, optionally mutating the response.
@@ -277,15 +248,13 @@ pub async fn resume(
         format!("resume {id} {}", Value::Object(action))
     };
     let resp = send(serial, cmd).await?;
-    print_simple(&resp, json, "resumed");
-    Ok(())
+    print_simple(&resp, json, "resumed")
 }
 
 /// `aar drop <id>` — fail a held flow (the app sees a connection error).
 pub async fn drop_flow(serial: &Serial, id: &str, json: bool) -> Result<()> {
     let resp = send(serial, format!("drop {id}")).await?;
-    print_simple(&resp, json, "dropped");
-    Ok(())
+    print_simple(&resp, json, "dropped")
 }
 
 /// `aar coroutines` — dump live coroutines via the in-app DebugProbes.
@@ -305,6 +274,7 @@ pub async fn coroutines(
         cmd.push_str(" --dump");
     }
     let resp = send(serial, cmd).await?;
+    ensure_agent_ok(&resp)?;
 
     // Persist the full text dump if requested, in either output mode.
     if let Some(path) = out {
@@ -415,25 +385,106 @@ fn write_jsonl(path: &PathBuf, flows: &[FlowRecord]) -> Result<()> {
     Ok(())
 }
 
-fn print_simple(resp: &Value, json: bool, action: &str) {
+fn print_simple(resp: &Value, json: bool, action: &str) -> Result<()> {
+    ensure_agent_ok(resp)?;
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(resp).unwrap_or_else(|_| resp.to_string())
         );
-    } else {
-        let ok = resp.get("ok").and_then(Value::as_bool).unwrap_or(false);
-        if ok {
-            println!("✓ {action}");
-        } else {
-            println!(
-                "✗ {action} failed: {}",
-                resp.get("error")
+    }
+    if !json {
+        println!("✓ {action}");
+    }
+    Ok(())
+}
+
+fn ensure_agent_ok(resp: &Value) -> Result<()> {
+    if resp.get("ok").and_then(Value::as_bool) == Some(true) {
+        return Ok(());
+    }
+    let error = resp
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("in-app agent command failed");
+    let next_actions = resp
+        .get("hint")
+        .and_then(Value::as_str)
+        .map(|hint| vec![hint.to_string()])
+        .unwrap_or_else(|| {
+            vec!["run `shadowdroid aar agent` and inspect the current agent state".to_string()]
+        });
+    Err(
+        crate::diagnostic::DiagnosticError::new("aar_agent_command_rejected", "aar_agent", error)
+            .detail(serde_json::json!({"agent_response": resp}))
+            .next_actions(next_actions)
+            .into(),
+    )
+}
+
+fn render_status(resp: &Value) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let capture = resp.get("capture");
+    let provider = capture
+        .and_then(|value| value.get("provider"))
+        .and_then(Value::as_str);
+    let captured = capture
+        .and_then(|value| value.get("buffered"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let intercept = resp.get("intercept");
+    let armed = intercept
+        .and_then(|value| value.get("armed"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let held_flows = intercept
+        .and_then(|value| value.get("held"))
+        .and_then(Value::as_array);
+
+    let _ = writeln!(
+        out,
+        "agent: package={}",
+        resp.get("package").and_then(Value::as_str).unwrap_or("?")
+    );
+    let _ = writeln!(
+        out,
+        "  capture provider:          {}",
+        provider.unwrap_or("MISSING")
+    );
+    let _ = writeln!(out, "  captured flows (buffered): {captured}");
+    let _ = writeln!(out, "  intercept armed:           {armed}");
+    let _ = writeln!(
+        out,
+        "  held flows:                {}",
+        held_flows.map_or(0, |flows| flows.len())
+    );
+    if provider.is_none() {
+        let hint = capture
+            .and_then(|value| value.get("missing_provider_hint"))
+            .and_then(Value::as_str)
+            .unwrap_or(
+                "add the shadowdroid-agent-okhttp AAR and ShadowDroidCaptureInterceptor to the debug OkHttpClient",
+            );
+        let _ = writeln!(out, "  next: {hint}");
+    }
+    if let Some(flows) = held_flows {
+        for held in flows {
+            let _ = writeln!(
+                out,
+                "    {} {} {}{}  op={}",
+                held.get("id").and_then(Value::as_str).unwrap_or("?"),
+                held.get("method").and_then(Value::as_str).unwrap_or("?"),
+                held.get("host").and_then(Value::as_str).unwrap_or(""),
+                held.get("path").and_then(Value::as_str).unwrap_or(""),
+                held.get("operationName")
                     .and_then(Value::as_str)
-                    .unwrap_or("unknown error")
+                    .unwrap_or("-"),
             );
         }
     }
+    out
 }
 
 #[cfg(test)]
@@ -464,6 +515,42 @@ mod tests {
     #[test]
     fn parse_agent_port_none_without_marker() {
         assert_eq!(parse_agent_port("nothing here"), None);
+    }
+
+    #[test]
+    fn status_names_missing_capture_provider_and_next_step() {
+        let status = serde_json::json!({
+            "ok": true,
+            "package": "com.example",
+            "capture": {
+                "available": false,
+                "provider": null,
+                "buffered": 0,
+                "missing_provider_hint": "wire the OkHttp companion"
+            },
+            "intercept": { "armed": false, "held": [] }
+        });
+
+        let rendered = render_status(&status);
+        assert!(rendered.contains("capture provider:          MISSING"));
+        assert!(rendered.contains("next: wire the OkHttp companion"));
+    }
+
+    #[test]
+    fn agent_error_includes_actionable_hint() {
+        let response = serde_json::json!({
+            "ok": false,
+            "error": "no capture provider",
+            "hint": "wire the OkHttp companion"
+        });
+
+        let error = ensure_agent_ok(&response).unwrap_err();
+        let diagnostic = error
+            .downcast_ref::<crate::diagnostic::DiagnosticError>()
+            .unwrap();
+        assert_eq!(diagnostic.message, "no capture provider");
+        assert_eq!(diagnostic.detail["agent_response"], response);
+        assert_eq!(diagnostic.next_actions, ["wire the OkHttp companion"]);
     }
 
     #[test]

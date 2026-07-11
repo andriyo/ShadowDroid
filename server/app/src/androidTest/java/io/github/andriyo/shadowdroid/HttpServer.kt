@@ -98,7 +98,7 @@ private fun Application.installPlugins() {
             call.respond(HttpStatusCode.BadRequest, ErrorEnvelope(ErrorBody(e.code, e.message ?: "bad request", e.detail)))
         }
         exception<NotFound> { call, e ->
-            call.respond(HttpStatusCode.NotFound, ErrorEnvelope(ErrorBody(e.code, e.message ?: "not found")))
+            call.respond(HttpStatusCode.NotFound, ErrorEnvelope(ErrorBody(e.code, e.message ?: "not found", e.detail)))
         }
         exception<Timeout> { call, e ->
             call.respond(HttpStatusCode.RequestTimeout, ErrorEnvelope(ErrorBody(e.code, e.message ?: "timed out")))
@@ -130,6 +130,7 @@ class BadRequest(
 class NotFound(
     val code: String,
     message: String,
+    val detail: Map<String, Any?>? = null,
 ) : RuntimeException(message)
 
 class Timeout(

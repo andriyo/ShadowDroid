@@ -7,7 +7,7 @@
 use anyhow::{anyhow, bail, Result};
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::config as cfg;
 use crate::config::{AppConfig, ProxyConfig, ShadowDroidConfig};
@@ -39,7 +39,7 @@ pub enum ConfigCmd {
         json: bool,
     },
     /// Create or update a user/project config file from CLI values.
-    Init(ConfigInitArgs),
+    Init(Box<ConfigInitArgs>),
     /// Parse and validate all discovered config files.
     Validate {
         /// Emit JSON instead of human text.
@@ -110,7 +110,23 @@ pub fn run(args: &ConfigArgs) -> Result<()> {
         ConfigCmd::Schema { json: as_json } => print_value(schema_value(), *as_json),
         ConfigCmd::Explain { json: as_json } => print_value(explain_value()?, *as_json),
         ConfigCmd::Init(args) => init_config(args),
-        ConfigCmd::Validate { json: as_json } => print_value(validate_value()?, *as_json),
+        ConfigCmd::Validate { json: as_json } => {
+            let report = validate_value()?;
+            if report.get("ok").and_then(Value::as_bool) != Some(true) {
+                return Err(crate::diagnostic::DiagnosticError::new(
+                    "config_invalid",
+                    "config",
+                    "one or more ShadowDroid config files are invalid",
+                )
+                .detail(report)
+                .next_actions([
+                    "fix the first entry in detail.files whose ok field is false",
+                    "rerun `shadowdroid config validate --json`",
+                ])
+                .into());
+            }
+            print_value(report, *as_json)
+        }
     }
 }
 
@@ -166,26 +182,15 @@ fn init_config(args: &ConfigInitArgs) -> Result<()> {
             if app.is_empty() || package.is_empty() {
                 bail!("--app and --package must not be empty");
             }
-            if let Some(existing) = config.apps.get(app) {
-                if existing.package != package && !args.force {
-                    bail!(
-                        "app alias `{}` already points at `{}`. Pass --force to replace it with `{}`.",
-                        app,
-                        existing.package,
-                        package
-                    );
-                }
-            }
-            config.apps.insert(
-                app.to_string(),
-                AppConfig {
-                    package: package.to_string(),
-                    project: None,
-                    run_configuration: args.run_configuration.clone(),
-                    debugger: args.debugger.clone(),
-                    debug_mode: args.debug_mode.clone(),
-                },
-            );
+            upsert_app_config(
+                &mut config,
+                app,
+                package,
+                &args.run_configuration,
+                &args.debugger,
+                &args.debug_mode,
+                args.force,
+            )?;
             changed.push(format!("apps.{app}"));
         }
         (None, Some(package)) => {
@@ -193,6 +198,7 @@ fn init_config(args: &ConfigInitArgs) -> Result<()> {
             if package.is_empty() {
                 bail!("--package must not be empty");
             }
+            cfg::validate_android_package(package)?;
             config.app = Some(package.to_string());
             changed.push("app".to_string());
         }
@@ -225,11 +231,21 @@ fn init_config(args: &ConfigInitArgs) -> Result<()> {
     if args.ca_cert.is_some() || args.ca_key.is_some() || args.ca_trusted || config.proxy.is_some()
     {
         let mut proxy: ProxyConfig = config.proxy.take().unwrap_or_default();
-        if let Some(v) = args.ca_cert.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(v) = args
+            .ca_cert
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             proxy.ca_cert = Some(v.to_string());
             changed.push("proxy.ca_cert".to_string());
         }
-        if let Some(v) = args.ca_key.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(v) = args
+            .ca_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             proxy.ca_key = Some(v.to_string());
             changed.push("proxy.ca_key".to_string());
         }
@@ -238,6 +254,21 @@ fn init_config(args: &ConfigInitArgs) -> Result<()> {
             changed.push("proxy.ca_trusted".to_string());
         }
         config.proxy = Some(proxy);
+    }
+
+    let mut validation_errors = Vec::new();
+    let mut validation_warnings = Vec::new();
+    validate_config(
+        &path,
+        &config,
+        &mut validation_errors,
+        &mut validation_warnings,
+    );
+    if !validation_errors.is_empty() {
+        bail!(
+            "refusing to write invalid config:\n{}",
+            validation_errors.join("\n")
+        );
     }
 
     cfg::write_config_file(&path, &config)?;
@@ -265,6 +296,60 @@ fn init_config(args: &ConfigInitArgs) -> Result<()> {
     print_value(value, args.json)
 }
 
+/// Update only values explicitly supplied by this invocation. In particular,
+/// re-running `config init --app ... --package ...` must not erase the alias's
+/// project/debugger/run-configuration fields.
+fn upsert_app_config(
+    config: &mut ShadowDroidConfig,
+    app: &str,
+    package: &str,
+    run_configuration: &Option<String>,
+    debugger: &Option<String>,
+    debug_mode: &Option<String>,
+    force: bool,
+) -> Result<()> {
+    cfg::validate_android_package(package)?;
+    let key = config
+        .apps
+        .keys()
+        .find(|existing| existing.eq_ignore_ascii_case(app))
+        .cloned()
+        .unwrap_or_else(|| app.to_string());
+    let entry = config.apps.entry(key).or_insert_with(|| AppConfig {
+        package: package.to_string(),
+        ..Default::default()
+    });
+    if entry.package != package && !force {
+        bail!(
+            "app alias `{}` already points at `{}`. Pass --force to replace it with `{}`.",
+            app,
+            entry.package,
+            package
+        );
+    }
+    entry.package = package.to_string();
+    let mut ignored_changes = Vec::new();
+    apply_top_level(
+        &mut entry.run_configuration,
+        run_configuration,
+        "run_configuration",
+        &mut ignored_changes,
+    );
+    apply_top_level(
+        &mut entry.debugger,
+        debugger,
+        "debugger",
+        &mut ignored_changes,
+    );
+    apply_top_level(
+        &mut entry.debug_mode,
+        debug_mode,
+        "debug_mode",
+        &mut ignored_changes,
+    );
+    Ok(())
+}
+
 fn apply_top_level(
     slot: &mut Option<String>,
     value: &Option<String>,
@@ -286,7 +371,10 @@ fn paths_value() -> Result<Value> {
         "format": "json",
         "user_config": user.display().to_string(),
         "project_config": project.display().to_string(),
-        "loaded": loaded.iter().map(display_path).collect::<Vec<_>>(),
+        "loaded": loaded
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>(),
         "precedence": [
             "~/.shadowdroid/config.json",
             ".shadowdroid/config.json from ancestors, root to current directory",
@@ -400,12 +488,39 @@ fn validate_value() -> Result<Value> {
                 }));
             }
             Err(err) => {
-                errors.push(format!("{}: {err}", path.display()));
-                files.push(json!({
-                    "path": path.display().to_string(),
-                    "ok": false,
-                    "error": err.to_string(),
-                }));
+                if let Some(diagnostic) = err
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<crate::diagnostic::DiagnosticError>())
+                {
+                    let source_error = diagnostic
+                        .detail
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&diagnostic.message);
+                    let location = match (
+                        diagnostic.detail.get("line").and_then(Value::as_u64),
+                        diagnostic.detail.get("column").and_then(Value::as_u64),
+                    ) {
+                        (Some(line), Some(column)) => format!(":{line}:{column}"),
+                        _ => String::new(),
+                    };
+                    errors.push(format!("{}{}: {}", path.display(), location, source_error));
+                    files.push(json!({
+                        "path": path.display().to_string(),
+                        "ok": false,
+                        "code": &diagnostic.code,
+                        "error": &diagnostic.message,
+                        "detail": &diagnostic.detail,
+                        "next_actions": &diagnostic.next_actions,
+                    }));
+                } else {
+                    errors.push(format!("{}: {err}", path.display()));
+                    files.push(json!({
+                        "path": path.display().to_string(),
+                        "ok": false,
+                        "error": err.to_string(),
+                    }));
+                }
             }
         }
     }
@@ -436,7 +551,7 @@ fn validate_config(
             .apps
             .iter()
             .any(|(alias, entry)| alias.eq_ignore_ascii_case(app) || entry.package == app);
-        if !configured && !looks_like_package(app) {
+        if !configured && cfg::validate_android_package(app).is_err() {
             warnings.push(format!(
                 "{}: default app `{}` is not an app alias or package; it will require device lookup",
                 path.display(),
@@ -456,9 +571,9 @@ fn validate_config(
                 "{}: apps.{alias}.package must not be empty",
                 path.display()
             ));
-        } else if !looks_like_package(&entry.package) {
-            warnings.push(format!(
-                "{}: apps.{alias}.package `{}` does not look like an Android package",
+        } else if let Err(err) = cfg::validate_android_package(&entry.package) {
+            errors.push(format!(
+                "{}: apps.{alias}.package `{}` is invalid: {err}",
                 path.display(),
                 entry.package
             ));
@@ -600,20 +715,85 @@ fn print_human(value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn display_path(path: &PathBuf) -> String {
-    path.display().to_string()
-}
-
-fn looks_like_package(value: &str) -> bool {
-    value.contains('.')
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_init_deep_merges_existing_alias_fields() {
+        let mut config = ShadowDroidConfig::default();
+        config.apps.insert(
+            "Example".into(),
+            AppConfig {
+                package: "com.example.old".into(),
+                project: Some("/work/example".into()),
+                run_configuration: Some("existing-run".into()),
+                debugger: Some("Existing Debugger".into()),
+                debug_mode: Some("mixed".into()),
+            },
+        );
+
+        upsert_app_config(
+            &mut config,
+            "example",
+            "com.example.new",
+            &Some("new-run".into()),
+            &None,
+            &None,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.apps.len(),
+            1,
+            "case-insensitive alias was duplicated"
+        );
+        let app = config.apps.get("Example").unwrap();
+        assert_eq!(app.package, "com.example.new");
+        assert_eq!(app.project.as_deref(), Some("/work/example"));
+        assert_eq!(app.run_configuration.as_deref(), Some("new-run"));
+        assert_eq!(app.debugger.as_deref(), Some("Existing Debugger"));
+        assert_eq!(app.debug_mode.as_deref(), Some("mixed"));
+    }
+
+    #[test]
+    fn app_init_rejects_injection_and_package_changes_without_force() {
+        let mut config = ShadowDroidConfig::default();
+        for package in [
+            "com.example;id",
+            "com.example\nother",
+            "com.$(id)",
+            "com.'example'",
+        ] {
+            assert!(
+                upsert_app_config(&mut config, "Example", package, &None, &None, &None, false,)
+                    .is_err(),
+                "accepted {package:?}"
+            );
+        }
+
+        upsert_app_config(
+            &mut config,
+            "Example",
+            "com.example.one",
+            &None,
+            &None,
+            &None,
+            false,
+        )
+        .unwrap();
+        assert!(upsert_app_config(
+            &mut config,
+            "Example",
+            "com.example.two",
+            &None,
+            &None,
+            &None,
+            false,
+        )
+        .is_err());
+    }
 
     #[test]
     fn debug_mode_validation_follows_the_value_enum() {
