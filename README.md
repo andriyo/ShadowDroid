@@ -398,23 +398,33 @@ Treat the process exit code as authoritative. Most one-shot commands print one
 JSON object on stdout: action success as
 `{"type":"action","ok":true,"cmd":…,…}`, a raw read such as `ui dump` as its
 payload, and failure as `{"type":"error","ok":false,"stage":…,"code":…,
-"msg":…}`. Every failure also includes `retryable`, structured `detail`, and
-`next_actions` (an empty list when no safe recovery is known); use those fields
-instead of parsing `msg`. Raw reads can omit `ok`, so exit code zero is their
-success signal.
+"msg":…}`. Every terminal JSON success and failure includes a non-empty,
+command-specific `next_actions` array; failures also include `retryable` and
+structured `detail`. Use those fields instead of parsing `msg`. Raw reads can
+omit `ok`, so exit code zero is their success signal.
 
 Streaming commands are explicit JSONL exceptions (`watch`, `log`, `net log`,
 and `debug replay`); `test` passes through the wrapped command and adds a
-ShadowDroid trailer. Some setup/report commands default to human output and
-offer `--json`. Inspect `commands --json --describe '<path>'` for the exact
-mode. Unknown-argument and missing-command errors are JSON and exit 2; a
+ShadowDroid trailer. Stream errors have the same `code`, `retryable`, `detail`,
+and non-empty `next_actions` recovery fields, while terminal stream summaries
+carry follow-up actions. Human, source, and wrapped-command pass-through output
+cannot embed the JSON field; their exact follow-ups remain available from
+`commands --json --describe '<path>'`. Interop exports such as HAR, curl, and
+fixtures write an artifact and emit a small terminal action naming its path and
+byte count. Some setup/report commands default to human output and offer
+`--json`. Unknown-argument and missing-command errors are JSON and exit 2; a
 spelling suggestion is included when one is available. Explicit `--help`
-remains human-readable. Commands that write a large `--out` artifact still
-emit one small terminal action naming the path and byte count.
+remains human-readable.
 
-Inside a running `watch` stream, `{"type":"error","stage":…,"msg":…,
-"input":…,"ts":…}` is a timeline event, not the terminal one-shot error
-envelope above. Keep consuming unless the stream ends or the task says to stop.
+Runtime actions preserve the selected `-d <serial>` and shell-quote identifiers
+copied from device/app output. If a required value is not yet known, the CLI
+emits an exact `commands --json --describe '<path>'` discovery action rather
+than a command that would immediately fail.
+
+Inside a running `watch` stream, `{"type":"error","stage":…,"code":…,"msg":…,
+"input":…,"retryable":…,"detail":…,"next_actions":[…],"ts":…}` is a
+timeline event, not the terminal one-shot error envelope above. Keep consuming
+unless the stream ends or the task says to stop.
 
 - **`events` rides any response.** When the app crashed or ANRed since your
   previous command, the next result (action *or* error) carries an `events`
@@ -576,14 +586,19 @@ restores that exact setting and reports separate raw-IP and DNS connectivity
 checks (`--canary-host` selects the neutral DNS probe).
 Beyond observing, the agent can **intercept** a flow — `net intercept` pauses
 matching requests/responses and emits them as `http_intercept` events on
-`watch`; the agent inspects with `net show`, then releases with
+`watch`; each held event includes device-scoped `net show`, `resume`, `drop`,
+and `respond` actions so the agent can decide before the hold deadline. The
+agent inspects with `net show`, then releases with
 `net resume --set-status/--body/…`, `net drop`, or `net respond` (a canned
 reply). Repeated edits can be promoted to declarative `net rule`s (map-local /
 map-remote / set-status / set-request-header / set-response-header / replace /
 block / delay) or served
 offline from a saved session with `net replay`. `net check <app>` reports
-whether a build is interceptable; `net export har|curl|fixtures` hands flows to
-other tools.
+whether a build is interceptable. `net export har|curl|fixtures` hands flows to
+other tools by writing a durable artifact and returning an actionable summary;
+HAR defaults to `shadowdroid-network.har`, curl to
+`shadowdroid-network.curl.sh`, and fixtures to `shadowdroid-fixtures` unless
+`--out` selects another path.
 
 Header rules deliberately name their phase: use `set-request-header` before
 upstream or `set-response-header` before returning to the app. The ambiguous

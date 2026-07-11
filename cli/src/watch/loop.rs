@@ -26,10 +26,13 @@ use crate::watch::{logcat, stdin};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep, MissedTickBehavior};
 
 #[derive(Debug, Clone, Copy)]
@@ -66,6 +69,7 @@ pub async fn run(cfg: WatchConfig) -> Result<()> {
     let (wake_tx, mut wake_rx) = mpsc::channel::<Wake>(128);
     let (command_tx, mut command_rx) = mpsc::channel::<String>(128);
     let (event_tx, event_rx) = mpsc::channel::<Event>(64);
+    let stopping = Arc::new(AtomicBool::new(false));
     let state = cfg
         .client
         .state()
@@ -85,17 +89,32 @@ pub async fn run(cfg: WatchConfig) -> Result<()> {
     // it is not running, emit a structured warning so an agent can decide whether
     // to run `net start` or continue UI-only.
     // println! locks stdout per line, so http/screen lines interleave cleanly.
-    spawn_event_emitter(event_rx);
+    let event_emitter = spawn_event_emitter(cfg.serial.clone(), event_rx);
+    let mut producers = Vec::new();
     if cfg.net {
-        spawn_net_events(cfg.serial.clone(), event_tx.clone());
+        producers.push(spawn_net_events(
+            cfg.serial.clone(),
+            event_tx.clone(),
+            stopping.clone(),
+        ));
     }
 
-    spawn_wake_logcat(cfg.serial.clone(), wake_tx.clone(), event_tx.clone());
+    producers.push(spawn_wake_logcat(
+        cfg.serial.clone(),
+        wake_tx.clone(),
+        event_tx.clone(),
+        stopping.clone(),
+    ));
     if cfg.detect_crashes {
-        spawn_crash_detector(cfg.serial.clone(), cfg.app_filter.clone(), event_tx.clone());
+        producers.push(spawn_crash_detector(
+            cfg.serial.clone(),
+            cfg.app_filter.clone(),
+            event_tx.clone(),
+            stopping.clone(),
+        ));
     }
     if cfg.accept_stdin {
-        spawn_stdin(command_tx.clone());
+        producers.push(spawn_stdin(command_tx.clone()));
     }
     let _ = wake_tx.send(Wake::Init).await;
 
@@ -109,6 +128,7 @@ pub async fn run(cfg: WatchConfig) -> Result<()> {
         tokio::select! {
             result = &mut ctrl_c => {
                 result.context("waiting for ctrl-c")?;
+                stopping.store(true, Ordering::Release);
                 break;
             }
             _ = poll.tick() => {
@@ -133,65 +153,150 @@ pub async fn run(cfg: WatchConfig) -> Result<()> {
         }
     }
 
+    stopping.store(true, Ordering::Release);
+    drop(wake_tx);
+    drop(command_tx);
+    shutdown_producers_and_drain(&stopping, producers, event_tx, event_emitter).await?;
+    emit_action("watch", &json!({"status": "stopped", "device": cfg.serial}));
     Ok(())
 }
 
-fn spawn_event_emitter(mut event_rx: mpsc::Receiver<Event>) {
+fn spawn_event_emitter(serial: Serial, mut event_rx: mpsc::Receiver<Event>) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(evt) = event_rx.recv().await {
-            events::emit(&evt);
+            events::emit_stream_event(&evt, serial.as_str());
         }
-    });
+    })
 }
 
-fn spawn_net_events(serial: Serial, event_tx: mpsc::Sender<Event>) {
+fn spawn_net_events(
+    serial: Serial,
+    event_tx: mpsc::Sender<Event>,
+    stopping: Arc<AtomicBool>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let req = serde_json::json!({"op": "watch", "matcher": {}});
         if let Err(err) = crate::net::control::request_stream(&serial, req).await {
+            if shutdown_in_progress(&stopping).await {
+                return;
+            }
             let _ = event_tx
                 .send(Event::Warning {
                     stage: "net_watch".to_string(),
+                    code: "net_events_unavailable".to_string(),
                     msg: format!("network events unavailable: {err}"),
-                    suggested_command: Some("shadowdroid net start".to_string()),
-                    hint: Some(
-                        "Run `shadowdroid net start` to add HTTP(S) events to this watch timeline, then restart watch; use `watch --no-net` for UI/crash-only streams."
-                            .to_string(),
-                    ),
+                    detail: serde_json::json!({"ui_and_crash_stream_continues": true}),
+                    next_actions: vec![
+                        "shadowdroid net start".to_string(),
+                        "shadowdroid watch --no-net".to_string(),
+                    ],
                     ts: now_ts(),
                 })
                 .await;
         }
-    });
+    })
 }
 
-fn spawn_crash_detector(serial: Serial, app_filter: Option<String>, event_tx: mpsc::Sender<Event>) {
+fn spawn_crash_detector(
+    serial: Serial,
+    app_filter: Option<String>,
+    event_tx: mpsc::Sender<Event>,
+    stopping: Arc<AtomicBool>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(err) = logcat::run(serial, app_filter, event_tx.clone()).await {
+            if shutdown_in_progress(&stopping).await {
+                return;
+            }
             let _ = event_tx
                 .send(Event::Error {
                     stage: "crash_detect".to_string(),
+                    code: "crash_detect_failed".to_string(),
                     msg: err.to_string(),
                     input: None,
+                    retryable: true,
+                    detail: serde_json::json!({}),
+                    next_actions: vec![
+                        "shadowdroid log --last 5m".to_string(),
+                        "shadowdroid doctor --json".to_string(),
+                    ],
                     ts: now_ts(),
                 })
                 .await;
         }
-    });
+    })
 }
 
-fn spawn_wake_logcat(serial: Serial, wake_tx: mpsc::Sender<Wake>, event_tx: mpsc::Sender<Event>) {
+fn spawn_wake_logcat(
+    serial: Serial,
+    wake_tx: mpsc::Sender<Wake>,
+    event_tx: mpsc::Sender<Event>,
+    stopping: Arc<AtomicBool>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(err) = run_wake_logcat(serial, wake_tx).await {
+            if shutdown_in_progress(&stopping).await {
+                return;
+            }
             let _ = event_tx
                 .send(Event::Error {
                     stage: "logcat_wake".to_string(),
+                    code: "logcat_wake_failed".to_string(),
                     msg: err.to_string(),
                     input: None,
+                    retryable: true,
+                    detail: serde_json::json!({}),
+                    next_actions: vec![
+                        "restart `shadowdroid watch` to restore event-driven UI wakeups"
+                            .to_string(),
+                        "shadowdroid doctor --json".to_string(),
+                    ],
                     ts: now_ts(),
                 })
                 .await;
         }
-    });
+    })
+}
+
+/// Stop every task that can still write a watch record, wait until cancellation
+/// has dropped its channel clones, then let the sole emitter consume everything
+/// already queued. Only after this returns is it safe to write the terminal
+/// `watch` action directly to stdout.
+async fn shutdown_producers_and_drain<T: Send + 'static>(
+    stopping: &AtomicBool,
+    producers: Vec<JoinHandle<()>>,
+    event_tx: mpsc::Sender<T>,
+    emitter: JoinHandle<()>,
+) -> Result<()> {
+    stopping.store(true, Ordering::Release);
+    for producer in &producers {
+        producer.abort();
+    }
+
+    let mut producer_failure = None;
+    for producer in producers {
+        if let Err(error) = producer.await {
+            if !error.is_cancelled() && producer_failure.is_none() {
+                producer_failure = Some(error);
+            }
+        }
+    }
+
+    // Closing the last sender is the emitter's drain boundary.
+    drop(event_tx);
+    emitter.await.context("watch event emitter task panicked")?;
+    if let Some(error) = producer_failure {
+        return Err(anyhow!("watch producer task failed: {error}"));
+    }
+    Ok(())
+}
+
+async fn shutdown_in_progress(stopping: &AtomicBool) -> bool {
+    // SIGINT reaches the adb logcat children and the parent at nearly the same
+    // time. Give the parent select branch one scheduler turn to mark intentional
+    // shutdown before classifying child exit as a stream failure.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    stopping.load(Ordering::Acquire)
 }
 
 async fn run_wake_logcat(serial: Serial, wake_tx: mpsc::Sender<Wake>) -> Result<()> {
@@ -245,7 +350,7 @@ fn is_ui_wake_line(line: &str) -> bool {
     .any(|key| line.contains(key))
 }
 
-fn spawn_stdin(command_tx: mpsc::Sender<String>) {
+fn spawn_stdin(command_tx: mpsc::Sender<String>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -253,7 +358,7 @@ fn spawn_stdin(command_tx: mpsc::Sender<String>) {
                 break;
             }
         }
-    });
+    })
 }
 
 async fn handle_screen_wake(
@@ -308,22 +413,42 @@ async fn handle_screen_wake(
                         Ok(DispatchOutcome::Continue) => {}
                         Ok(DispatchOutcome::ScreenOnly) => {}
                         Ok(DispatchOutcome::Quit) => return true,
-                        Err(err) => events::emit(&Event::Error {
-                            stage: "watcher".to_string(),
-                            msg: err.to_string(),
-                            input: Some(action.to_string()),
-                            ts: now_ts(),
-                        }),
+                        Err(err) => events::emit_stream_event(
+                            &Event::Error {
+                                stage: "watcher".to_string(),
+                                code: "watcher_action_failed".to_string(),
+                                msg: err.to_string(),
+                                input: Some(action.to_string()),
+                                retryable: false,
+                                detail: serde_json::json!({"watcher": hit.name}),
+                                next_actions: vec![
+                                    "inspect input and correct the watcher action".to_string(),
+                                    "shadowdroid ui dump".to_string(),
+                                ],
+                                ts: now_ts(),
+                            },
+                            cfg.serial.as_str(),
+                        ),
                     }
                 }
             }
         }
-        Err(err) => events::emit(&Event::Error {
-            stage: "screen".to_string(),
-            msg: err.to_string(),
-            input: None,
-            ts: now_ts(),
-        }),
+        Err(err) => events::emit_stream_event(
+            &Event::Error {
+                stage: "screen".to_string(),
+                code: "screen_read_failed".to_string(),
+                msg: err.to_string(),
+                input: None,
+                retryable: true,
+                detail: serde_json::json!({}),
+                next_actions: vec![
+                    "shadowdroid doctor --json".to_string(),
+                    "shadowdroid connect".to_string(),
+                ],
+                ts: now_ts(),
+            },
+            cfg.serial.as_str(),
+        ),
     }
     false
 }
@@ -338,12 +463,22 @@ async fn handle_command(
         Ok(Value::Null) => return false,
         Ok(cmd) => cmd,
         Err(err) => {
-            events::emit(&Event::Error {
-                stage: "parse".to_string(),
-                msg: err.to_string(),
-                input: Some(line.to_string()),
-                ts: now_ts(),
-            });
+            events::emit_stream_event(
+                &Event::Error {
+                    stage: "parse".to_string(),
+                    code: "watch_input_invalid".to_string(),
+                    msg: err.to_string(),
+                    input: Some(line.to_string()),
+                    retryable: false,
+                    detail: serde_json::json!({}),
+                    next_actions: vec![
+                        "correct input using the watch stdin grammar, then retry".to_string(),
+                        "shadowdroid commands --json --describe 'watch'".to_string(),
+                    ],
+                    ts: now_ts(),
+                },
+                cfg.serial.as_str(),
+            );
             return false;
         }
     };
@@ -358,12 +493,22 @@ async fn handle_command(
         }
         Ok(DispatchOutcome::Quit) => true,
         Err(err) => {
-            events::emit(&Event::Error {
-                stage: "dispatch".to_string(),
-                msg: err.to_string(),
-                input: Some(cmd.to_string()),
-                ts: now_ts(),
-            });
+            events::emit_stream_event(
+                &Event::Error {
+                    stage: "dispatch".to_string(),
+                    code: "watch_action_failed".to_string(),
+                    msg: err.to_string(),
+                    input: Some(cmd.to_string()),
+                    retryable: false,
+                    detail: serde_json::json!({}),
+                    next_actions: vec![
+                        "inspect input, correct the failed action, and retry".to_string(),
+                        "shadowdroid ui dump".to_string(),
+                    ],
+                    ts: now_ts(),
+                },
+                cfg.serial.as_str(),
+            );
             false
         }
     }
@@ -1145,9 +1290,12 @@ fn is_system_interruption(package: &str) -> bool {
 mod tests {
     use super::{
         debounce_delay_ms, selector_string_matches, should_emit_package, should_emit_screen,
-        toast_timeout_ms, Wake,
+        shutdown_producers_and_drain, toast_timeout_ms, Wake,
     };
     use serde_json::json;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc;
 
     #[test]
     fn app_filter_allows_target_package() {
@@ -1214,5 +1362,32 @@ mod tests {
             toast_timeout_ms(&json!({"cmd":"toast","timeout":1.5})).unwrap(),
             1_500
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_queued_events_before_terminal_record() {
+        let stopping = AtomicBool::new(false);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let emitter_order = order.clone();
+        let emitter = tokio::spawn(async move {
+            while event_rx.recv().await.is_some() {
+                emitter_order.lock().unwrap().push("event");
+            }
+        });
+        let producer_tx = event_tx.clone();
+        let producer = tokio::spawn(async move {
+            let _keep_channel_open = producer_tx;
+            std::future::pending::<()>().await;
+        });
+        event_tx.send(1_u8).await.unwrap();
+
+        shutdown_producers_and_drain(&stopping, vec![producer], event_tx, emitter)
+            .await
+            .unwrap();
+        order.lock().unwrap().push("terminal");
+
+        assert!(stopping.load(Ordering::Acquire));
+        assert_eq!(*order.lock().unwrap(), ["event", "terminal"]);
     }
 }

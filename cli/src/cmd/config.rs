@@ -288,7 +288,7 @@ fn init_config(args: &ConfigInitArgs) -> Result<()> {
         "changed": changed,
         "gitignore_added": gitignore_added,
         "config": config,
-        "next_commands": [
+        "next_actions": [
             "shadowdroid config validate --json",
             "shadowdroid debug auto"
         ],
@@ -655,7 +655,7 @@ fn example_config() -> Value {
 
 fn print_value(value: Value, as_json: bool) -> Result<()> {
     if as_json {
-        println!("{}", serde_json::to_string_pretty(&value)?);
+        crate::events::emit_result(&value);
     } else {
         print_human(&value)?;
     }

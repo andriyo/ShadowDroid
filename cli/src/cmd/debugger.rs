@@ -826,53 +826,60 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
         }
         DebuggerCmd::Inspect(args) => {
             if args.expression.is_none() && args.handle.is_none() {
-                serde_json::json!({
+                return Err(crate::diagnostic::DiagnosticError::new(
+                    "debug_inspect_target_required",
+                    "input",
+                    "debug inspect requires an expression or --handle",
+                )
+                .detail(serde_json::json!({
+                    "accepted": ["EXPRESSION", "--handle HANDLE"],
+                }))
+                .next_actions([
+                    "shadowdroid commands --json --describe 'debug inspect'",
+                    "shadowdroid debug variables",
+                ])
+                .into());
+            }
+            let session_s = args.session.clone();
+            let frame_s = args.frame.map(|s| s.to_string());
+            let depth_s = args.depth.to_string();
+            let max_fields_s = args.max_fields.to_string();
+            let max_array_items_s = args.max_array_items.to_string();
+            let timeout_ms_s = args.timeout_ms.to_string();
+            let params = [
+                (query::SESSION, session_s.as_deref()),
+                (query::THREAD, args.thread.as_deref()),
+                (query::FRAME, frame_s.as_deref()),
+                (query::EXPRESSION, args.expression.as_deref()),
+                (query::HANDLE, args.handle.as_deref()),
+                (query::PATH, args.path.as_deref()),
+                (query::DEPTH, Some(depth_s.as_str())),
+                (query::MAX_FIELDS, Some(max_fields_s.as_str())),
+                (query::MAX_ARRAY_ITEMS, Some(max_array_items_s.as_str())),
+                (query::TIMEOUT_MS, Some(timeout_ms_s.as_str())),
+            ];
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(args.timeout_ms as u64),
+                bridge.get(route::SESSION_INSPECT, &params),
+            )
+            .await
+            {
+                Ok(Ok(value)) => value,
+                Ok(Err(err)) => serde_json::json!({
                     "ok": false,
                     "type": "debug_inspect",
-                    "error": "missing expression or --handle",
-                })
-            } else {
-                let session_s = args.session.clone();
-                let frame_s = args.frame.map(|s| s.to_string());
-                let depth_s = args.depth.to_string();
-                let max_fields_s = args.max_fields.to_string();
-                let max_array_items_s = args.max_array_items.to_string();
-                let timeout_ms_s = args.timeout_ms.to_string();
-                let params = [
-                    (query::SESSION, session_s.as_deref()),
-                    (query::THREAD, args.thread.as_deref()),
-                    (query::FRAME, frame_s.as_deref()),
-                    (query::EXPRESSION, args.expression.as_deref()),
-                    (query::HANDLE, args.handle.as_deref()),
-                    (query::PATH, args.path.as_deref()),
-                    (query::DEPTH, Some(depth_s.as_str())),
-                    (query::MAX_FIELDS, Some(max_fields_s.as_str())),
-                    (query::MAX_ARRAY_ITEMS, Some(max_array_items_s.as_str())),
-                    (query::TIMEOUT_MS, Some(timeout_ms_s.as_str())),
-                ];
-                match tokio::time::timeout(
-                    std::time::Duration::from_millis(args.timeout_ms as u64),
-                    bridge.get(route::SESSION_INSPECT, &params),
-                )
-                .await
-                {
-                    Ok(Ok(value)) => value,
-                    Ok(Err(err)) => serde_json::json!({
-                        "ok": false,
-                        "type": "debug_inspect",
-                        "error": err.to_string(),
-                        "expression": args.expression.as_deref(),
-                        "handle": args.handle.as_deref(),
-                    }),
-                    Err(_) => serde_json::json!({
-                        "ok": false,
-                        "type": "debug_inspect",
-                        "timeout": true,
-                        "timeout_ms": args.timeout_ms,
-                        "expression": args.expression.as_deref(),
-                        "handle": args.handle.as_deref(),
-                    }),
-                }
+                    "error": err.to_string(),
+                    "expression": args.expression.as_deref(),
+                    "handle": args.handle.as_deref(),
+                }),
+                Err(_) => serde_json::json!({
+                    "ok": false,
+                    "type": "debug_inspect",
+                    "timeout": true,
+                    "timeout_ms": args.timeout_ms,
+                    "expression": args.expression.as_deref(),
+                    "handle": args.handle.as_deref(),
+                }),
             }
         }
         DebuggerCmd::Coroutines(cmd) => match cmd {
@@ -1168,7 +1175,7 @@ async fn control(
 }
 
 fn emit(value: &Value) -> Result<()> {
-    crate::events::emit(value);
+    crate::events::emit_result(value);
     Ok(())
 }
 
@@ -1280,7 +1287,7 @@ impl BridgeClient {
             }))
             .next_actions([
                 "inspect detail.bridge_reply and select a valid project/session when required",
-                "run `shadowdroid debug studio sessions` or `shadowdroid studio status --json`",
+                "run `shadowdroid debug sessions` or `shadowdroid studio status --json`",
             ])
             .into());
         }
@@ -1459,5 +1466,26 @@ mod tests {
         ));
         // no index, no device -> first session
         assert!(!selected_session_suspended(&status, None, None));
+    }
+
+    #[tokio::test]
+    async fn inspect_without_expression_or_handle_is_a_typed_failure() {
+        let command = DebuggerCmd::Inspect(InspectArgs {
+            expression: None,
+            handle: None,
+            path: None,
+            session: None,
+            thread: None,
+            frame: None,
+            depth: 1,
+            max_fields: 64,
+            max_array_items: 32,
+            timeout_ms: 100,
+        });
+        let error = run(&command, None, Some(URL)).await.unwrap_err();
+        assert_eq!(
+            crate::cli::error_code_of(&error),
+            "debug_inspect_target_required"
+        );
     }
 }

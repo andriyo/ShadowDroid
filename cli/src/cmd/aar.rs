@@ -414,7 +414,7 @@ async fn install(args: &InstallArgs, root: &Path) -> Result<()> {
     }
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        crate::events::emit_result(&report);
     } else {
         println!(
             "✓ ShadowDroid agent AAR installed into `{}` (module :{})",
@@ -559,7 +559,7 @@ pub fn inspect(root: &Path, module: Option<&str>) -> Result<StatusReport> {
 fn status(args: &TargetArgs, root: &Path) -> Result<()> {
     let report = inspect(root, args.module.as_deref())?;
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        crate::events::emit_result(&report);
     } else if report.installed {
         println!(
             "✓ agent AAR installed in `{}` (module :{})",
@@ -631,19 +631,16 @@ fn remove(args: &TargetArgs, root: &Path) -> Result<()> {
     }
 
     if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "action": "remove",
-                "app": root.display().to_string(),
-                "module": module,
-                "dependency_removed": removed_dep,
-                "okhttp_dependency_removed": removed_okhttp_dep,
-                "coroutine_probes_removed": removed_probes,
-                "aar_removed": removed_aar,
-                "okhttp_aar_removed": removed_okhttp_aar,
-            }))?
-        );
+        crate::events::emit_result(&serde_json::json!({
+            "action": "remove",
+            "app": root.display().to_string(),
+            "module": module,
+            "dependency_removed": removed_dep,
+            "okhttp_dependency_removed": removed_okhttp_dep,
+            "coroutine_probes_removed": removed_probes,
+            "aar_removed": removed_aar,
+            "okhttp_aar_removed": removed_okhttp_aar,
+        }));
     } else {
         println!(
             "✓ removed agent AAR from `{}` (module :{})",

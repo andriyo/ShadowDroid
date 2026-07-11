@@ -44,8 +44,15 @@ pub struct UpdateCheck {
     pub up_to_date: bool,
     pub install_method: InstallMethod,
     pub install_path: String,
-    pub update_command: String,
+    pub update: UpdateInstruction,
     pub release_url: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpdateInstruction {
+    pub command: String,
+    pub requires_confirmation: bool,
+    pub side_effect: &'static str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,7 +64,7 @@ struct LatestRelease {
 pub async fn cmd_update(_check: bool, json: bool) -> Result<()> {
     let check = check_latest().await?;
     if json {
-        println!("{}", serde_json::to_string(&check)?);
+        crate::events::emit_result(&check);
     } else {
         print_human(&check);
     }
@@ -80,7 +87,11 @@ async fn check_latest() -> Result<UpdateCheck> {
         latest_tag: latest.tag_name,
         install_method,
         install_path: install_path.display().to_string(),
-        update_command,
+        update: UpdateInstruction {
+            command: update_command,
+            requires_confirmation: true,
+            side_effect: "changes the installed host binary and may execute package-manager or remote installer code",
+        },
         release_url: latest.html_url,
     })
 }
@@ -118,7 +129,7 @@ fn print_human(check: &UpdateCheck) {
     );
     println!("release: {}", check.release_url);
     println!("update command:");
-    println!("  {}", check.update_command);
+    println!("  {}", check.update.command);
 }
 
 fn detect_install_method(path: &Path) -> InstallMethod {

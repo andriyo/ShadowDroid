@@ -105,7 +105,7 @@ pub async fn status(serial: &Serial, json: bool) -> Result<()> {
     let resp = send(serial, "status".into()).await?;
     ensure_agent_ok(&resp)?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&resp)?);
+        crate::events::emit_result(&resp);
     } else {
         print!("{}", render_status(&resp));
     }
@@ -149,15 +149,12 @@ pub async fn capture(
     }
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "ok": true,
-                "count": flows.len(),
-                "outputs": Value::Object(outputs),
-                "flows": flows,
-            }))?
-        );
+        crate::events::emit_result(&serde_json::json!({
+            "ok": true,
+            "count": flows.len(),
+            "outputs": Value::Object(outputs),
+            "flows": flows,
+        }));
     } else {
         println!("captured {} flow(s) from the in-app agent", flows.len());
         for f in &flows {
@@ -290,7 +287,7 @@ pub async fn coroutines(
     }
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&resp)?);
+        crate::events::emit_result(&resp);
     } else {
         print!("{}", render_coroutines(&resp, out));
     }

@@ -20,7 +20,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 use crate::device::client::{ServerClient, ServerError};
-use crate::events::{emit, emit_action, CompactElement};
+use crate::events::{emit_action, emit_result, CompactElement};
 use crate::proto::{Element, ScreenResponse};
 
 /// What a dispatch arm produced. Emission happens centrally so cross-cutting
@@ -41,7 +41,7 @@ impl Outcome {
             Outcome::Action(cmd, body) => emit_action(cmd, &body),
             Outcome::Raw(mut value) => {
                 crate::events::attach_events_to(&mut value);
-                emit(&value);
+                emit_result(&value);
             }
             Outcome::Done => {}
         }

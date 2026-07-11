@@ -84,7 +84,7 @@ pub fn record(started: Instant, result: &Result<()>) {
         return;
     }
     let mut entry = json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "ts_ms": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -95,16 +95,13 @@ pub fn record(started: Instant, result: &Result<()>) {
         "v": env!("CARGO_PKG_VERSION"),
     });
     if let Err(err) = result {
-        entry["code"] = json!(crate::cli::error_code_of(err));
-        if let Some(diagnostic) = err
-            .chain()
-            .find_map(|cause| cause.downcast_ref::<crate::diagnostic::DiagnosticError>())
-        {
-            entry["stage"] = json!(diagnostic.stage);
-            entry["retryable"] = json!(diagnostic.retryable);
-        } else {
-            entry["stage"] = json!("runtime");
-        }
+        let code = crate::cli::error_code_of(err);
+        let stage = crate::cli::error_stage_of(err);
+        entry["code"] = json!(code);
+        entry["stage"] = json!(stage);
+        entry["recovery_id"] = json!(format!("{stage}/{code}"));
+        entry["used_fallback"] = json!(crate::cli::error_uses_fallback(err));
+        entry["retryable"] = json!(crate::cli::error_retryable_of(err));
     }
     if let Err(io) = append(&entry) {
         tracing::debug!("usage log write failed: {io:#}");
@@ -114,19 +111,18 @@ pub fn record(started: Instant, result: &Result<()>) {
 /// Record a clap parse failure, which exits before the normal `run` wrapper can
 /// observe a `Result`. Only the partial command path and error category are
 /// retained; invalid argument names/values are deliberately excluded.
-pub fn record_parse_error(kind: &str, had_suggestion: bool) {
+pub fn record_parse_error(kind: &str, had_suggestion: bool, verb: Option<&str>) {
     let config = user_usage_config();
     if !enabled(&config) {
         return;
     }
-    let verb = verb_from_argv();
     let entry = json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "ts_ms": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0),
-        "verb": if verb.is_empty() { "(unparsed)" } else { verb.as_str() },
+        "verb": verb.unwrap_or("(unparsed)"),
         "ms": 0,
         "ok": false,
         "code": "usage",
@@ -134,6 +130,8 @@ pub fn record_parse_error(kind: &str, had_suggestion: bool) {
         "retryable": false,
         "parse_kind": kind,
         "had_suggestion": had_suggestion,
+        "recovery_id": format!("parse/{kind}"),
+        "used_fallback": false,
         "v": env!("CARGO_PKG_VERSION"),
     });
     if let Err(io) = append(&entry) {
@@ -144,7 +142,7 @@ pub fn record_parse_error(kind: &str, had_suggestion: bool) {
 /// The verb path ("ui tap", "net start", …) recovered by re-parsing argv with
 /// clap and walking the subcommand chain — no hand-maintained match to drift.
 /// Flag values can't be mistaken for verbs this way (unlike scanning argv).
-fn verb_from_argv() -> String {
+pub(crate) fn verb_from_argv() -> String {
     use clap::CommandFactory;
     let cmd = crate::cli::Cli::command().ignore_errors(true);
     let Ok(matches) = cmd.try_get_matches_from(std::env::args_os()) else {
@@ -224,7 +222,7 @@ pub fn run(cmd: &UsageCmd) -> Result<()> {
                     "env_override": crate::hostenv::env_truthy("SHADOWDROID_USAGE_LOG"),
                     "path": path.display().to_string(),
                     "bytes": size,
-                    "note": "local only — records verb, duration, and error code; never argument values",
+                    "note": "local only — records verb, duration, typed recovery id, and whether fallback guidance was needed; never argument values",
                 }),
             );
         }
@@ -286,7 +284,11 @@ fn report(days: u32) -> Result<()> {
     let mut by_verb: std::collections::BTreeMap<String, VerbStats> = Default::default();
     let mut by_code: std::collections::BTreeMap<String, u64> = Default::default();
     let mut by_stage: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut by_recovery: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut by_recovery_path: std::collections::BTreeMap<(String, String, bool), u64> =
+        Default::default();
     let mut by_version: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut fallback_errors = 0u64;
     let mut total = 0u64;
     let mut oldest_ms: Option<u64> = None;
 
@@ -313,7 +315,7 @@ fn report(days: u32) -> Result<()> {
             .to_string();
         *by_version.entry(version).or_insert(0) += 1;
         let ms = v.get("ms").and_then(|m| m.as_u64()).unwrap_or(0);
-        let stats = by_verb.entry(verb).or_insert(VerbStats {
+        let stats = by_verb.entry(verb.clone()).or_insert(VerbStats {
             count: 0,
             errors: 0,
             durations: Vec::new(),
@@ -334,6 +336,22 @@ fn report(days: u32) -> Result<()> {
                 .unwrap_or("runtime")
                 .to_string();
             *by_stage.entry(stage).or_insert(0) += 1;
+            let recovery_id = v
+                .get("recovery_id")
+                .and_then(|s| s.as_str())
+                .unwrap_or("legacy/unclassified")
+                .to_string();
+            *by_recovery.entry(recovery_id.clone()).or_insert(0) += 1;
+            let used_fallback = v
+                .get("used_fallback")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            *by_recovery_path
+                .entry((verb.clone(), recovery_id.clone(), used_fallback))
+                .or_insert(0) += 1;
+            if used_fallback {
+                fallback_errors += 1;
+            }
         }
     }
 
@@ -358,8 +376,6 @@ fn report(days: u32) -> Result<()> {
         .map(|(code, count)| json!({"code": code, "count": count}))
         .collect();
     codes.sort_by_key(|v| std::cmp::Reverse(v["count"].as_u64().unwrap_or(0)));
-    let recommendations = build_recommendations(&verbs, &codes);
-
     let stages: Vec<Value> = by_stage
         .into_iter()
         .map(|(stage, errors)| json!({"stage": stage, "errors": errors}))
@@ -368,6 +384,25 @@ fn report(days: u32) -> Result<()> {
         .into_iter()
         .map(|(version, count)| json!({"version": version, "count": count}))
         .collect();
+    let mut recoveries: Vec<Value> = by_recovery
+        .into_iter()
+        .map(|(recovery_id, count)| json!({"recovery_id": recovery_id, "count": count}))
+        .collect();
+    recoveries.sort_by_key(|value| std::cmp::Reverse(value["count"].as_u64().unwrap_or_default()));
+    let mut recovery_paths: Vec<Value> = by_recovery_path
+        .into_iter()
+        .map(|((verb, recovery_id, used_fallback), count)| {
+            json!({
+                "verb": verb,
+                "recovery_id": recovery_id,
+                "used_fallback": used_fallback,
+                "count": count,
+            })
+        })
+        .collect();
+    recovery_paths
+        .sort_by_key(|value| std::cmp::Reverse(value["count"].as_u64().unwrap_or_default()));
+    let recommendations = build_recommendations(&verbs, &codes, &recovery_paths);
 
     emit_action(
         "usage_report",
@@ -378,6 +413,9 @@ fn report(days: u32) -> Result<()> {
             "verbs": verbs,
             "error_codes": codes,
             "error_stages": stages,
+            "recovery_ids": recoveries,
+            "recovery_paths": recovery_paths,
+            "fallback_errors": fallback_errors,
             "versions": versions,
             "recommendations": recommendations,
             "feedback_loop": "prioritize recommendations, add a regression test, implement, then compare error rate and p95 by version",
@@ -389,8 +427,30 @@ fn report(days: u32) -> Result<()> {
 
 /// Turn observed friction into an agent-ready, evidence-backed improvement
 /// queue. This deliberately recommends work; it never edits code or sends data.
-fn build_recommendations(verbs: &[Value], codes: &[Value]) -> Vec<Value> {
+fn build_recommendations(verbs: &[Value], codes: &[Value], recovery_paths: &[Value]) -> Vec<Value> {
     let mut out = Vec::new();
+    let fallback_errors = recovery_paths
+        .iter()
+        .filter(|path| path["used_fallback"] == true)
+        .map(|path| path["count"].as_u64().unwrap_or_default())
+        .sum::<u64>();
+    if let Some(path) = recovery_paths
+        .iter()
+        .find(|path| path["used_fallback"] == true)
+    {
+        let verb = path["verb"].as_str().unwrap_or("(unknown)");
+        out.push(json!({
+            "priority": "highest",
+            "kind": "missing_typed_recovery",
+            "verb": verb,
+            "recovery_id": path["recovery_id"].clone(),
+            "evidence": {
+                "path_count": path["count"],
+                "fallback_errors": fallback_errors,
+            },
+            "next_action": format!("reproduce the fallback recovery for `{verb}`, convert it to a typed diagnostic, and add a state-specific next_actions regression"),
+        }));
+    }
     for verb in verbs {
         let count = verb.get("count").and_then(Value::as_u64).unwrap_or(0);
         let errors = verb.get("errors").and_then(Value::as_u64).unwrap_or(0);
@@ -463,9 +523,25 @@ mod tests {
             "verb": "ui dump", "count": 4, "errors": 1, "p95_ms": 1200
         })];
         let codes = vec![json!({"code": "wait_timeout", "count": 2})];
-        let result = build_recommendations(&verbs, &codes);
+        let result = build_recommendations(&verbs, &codes, &[]);
         assert!(result.iter().any(|v| v["kind"] == "reliability"));
         assert!(result.iter().any(|v| v["kind"] == "latency"));
         assert!(result.iter().any(|v| v["code"] == "wait_timeout"));
+    }
+
+    #[test]
+    fn fallback_recovery_is_the_highest_priority_self_improvement_signal() {
+        let recovery_paths = vec![json!({
+            "verb": "app install",
+            "recovery_id": "input/input_not_found",
+            "used_fallback": true,
+            "count": 3,
+        })];
+        let result = build_recommendations(&[], &[], &recovery_paths);
+        assert_eq!(result[0]["priority"], "highest");
+        assert_eq!(result[0]["kind"], "missing_typed_recovery");
+        assert_eq!(result[0]["evidence"]["fallback_errors"], 3);
+        assert_eq!(result[0]["verb"], "app install");
+        assert_eq!(result[0]["recovery_id"], "input/input_not_found");
     }
 }

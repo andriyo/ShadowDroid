@@ -10,14 +10,18 @@ use std::path::Path;
 
 pub fn write_json_and_emit(cmd: &str, path: &Path, value: &Value) -> Result<()> {
     let bytes = write_json(path, value)?;
+    let artifact = path.display().to_string();
     crate::events::emit_action(
         cmd,
         &json!({
-            "artifact": path.display().to_string(),
+            "artifact": artifact,
             "bytes": bytes,
             "artifact_type": value.get("type"),
             "schema_version": value.get("schema_version"),
-            "next_actions": [format!("read {} for the complete result", path.display())],
+            "next_actions": [format!(
+                "cat {}",
+                crate::events::shell_token(&path.display().to_string())
+            )],
         }),
     );
     Ok(())
@@ -25,6 +29,15 @@ pub fn write_json_and_emit(cmd: &str, path: &Path, value: &Value) -> Result<()> 
 
 /// Atomically replace a JSON artifact after its complete contents are synced.
 pub fn write_json(path: &Path, value: &Value) -> Result<u64> {
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    write_bytes(path, &bytes)
+}
+
+/// Atomically replace an arbitrary artifact after its complete contents are
+/// synced. JSON, HAR, shell reproducers, and other file-producing commands use
+/// the same durability and permission-preservation path.
+pub fn write_bytes(path: &Path, bytes: &[u8]) -> Result<u64> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -33,11 +46,9 @@ pub fn write_json(path: &Path, value: &Value) -> Result<u64> {
         .with_context(|| format!("creating artifact directory {}", parent.display()))?;
 
     let existing_permissions = std::fs::metadata(path).ok().map(|meta| meta.permissions());
-    let mut bytes = serde_json::to_vec_pretty(value)?;
-    bytes.push(b'\n');
     let mut temp = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("creating temporary artifact beside {}", path.display()))?;
-    temp.write_all(&bytes)
+    temp.write_all(bytes)
         .with_context(|| format!("writing temporary artifact for {}", path.display()))?;
     temp.flush()
         .with_context(|| format!("flushing temporary artifact for {}", path.display()))?;
@@ -85,5 +96,17 @@ mod tests {
                 0o640
             );
         }
+    }
+
+    #[test]
+    fn atomically_writes_non_json_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("requests.sh");
+        let bytes = write_bytes(&path, b"#!/bin/sh\ncurl https://example.com\n").unwrap();
+        assert_eq!(bytes, std::fs::metadata(&path).unwrap().len());
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "#!/bin/sh\ncurl https://example.com\n"
+        );
     }
 }

@@ -20,19 +20,25 @@
 //!    it, and a `tests/contract.rs`-style reviewer will notice if it's missing.
 //! 2. **Route it.** Add a match arm in the relevant dispatcher (`dispatch_ui`,
 //!    `dispatch_net`, …) or in `run()` for a host-only verb.
-//! 3. **Emit the result** with [`crate::events::emit_action`] — never hand-roll
-//!    `println!("{\"type\":\"action\"…")`. That keeps the one-JSON-line contract
-//!    (asserted by `cli/tests/contract.rs`). Errors propagate as `anyhow` and
-//!    surface uniformly via [`report_error`]; a structured server error should
-//!    carry a machine `code` ([`crate::device::client::ServerError`]).
-//! 4. **If it reads config defaults** (app/project/studio-url/…), wire them in
+//! 3. **Describe the agent decision.** Add the command to
+//!    `cmd/introspect/agent_metadata.rs` with non-empty `next_actions`. The live
+//!    catalog test is exhaustive, and terminal JSON emitters reuse that same
+//!    metadata as their safe fallback.
+//! 4. **Emit the result** with [`crate::events::emit_action`] (enveloped) or
+//!    [`crate::events::emit_result`] (raw terminal JSON) — never hand-roll a
+//!    JSON `println!`. That keeps one-line output and non-empty `next_actions`
+//!    enforceable. Errors propagate through [`report_error`]; expected failures
+//!    should use [`crate::diagnostic::DiagnosticError`] with a stable code and
+//!    recovery specific to the rejected state.
+//! 5. **If it reads config defaults** (app/project/studio-url/…), wire them in
 //!    `apply_config_defaults` so flags fall back to `.shadowdroid/config.json`.
-//! 5. **Match selectors** through [`crate::selector`] (host side) so `--text`
+//! 6. **Match selectors** through [`crate::selector`] (host side) so `--text`
 //!    normalization stays consistent with `ui find`/`tap`.
 
 use crate::ids::Serial;
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::error::{ContextKind, ContextValue};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -1066,10 +1072,16 @@ pub struct NetDaemonArgs {
 /// have to special-case a `try '--help'` plaintext line). `--help`/`--version`
 /// are not errors and are rendered exactly as clap would.
 fn parse_cli() -> Cli {
-    use clap::error::{ContextKind, ContextValue, ErrorKind};
-    match Cli::try_parse() {
-        Ok(cli) => cli,
+    use clap::error::ErrorKind;
+    let matches = match Cli::command().try_get_matches_from(std::env::args_os()) {
+        Ok(matches) => matches,
         Err(err) => {
+            let partial_path = crate::cmd::usage::verb_from_argv();
+            let partial_path =
+                (!partial_path.is_empty() && partial_path != "(unparsed)").then_some(partial_path);
+            if let Some(path) = &partial_path {
+                crate::events::set_current_command_path(path.clone());
+            }
             let kind = err.kind();
             // Help/version: render to stdout as usual, exit success.
             if matches!(kind, ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
@@ -1079,7 +1091,11 @@ fn parse_cli() -> Cli {
             // Bare invocation is a machine-readable usage failure. Explicit
             // `--help` remains the human help path.
             if kind == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand {
-                crate::cmd::usage::record_parse_error("MissingSubcommand", false);
+                crate::cmd::usage::record_parse_error(
+                    "MissingSubcommand",
+                    false,
+                    partial_path.as_deref(),
+                );
                 emit_error(
                     "usage",
                     "missing_subcommand",
@@ -1095,13 +1111,7 @@ fn parse_cli() -> Cli {
             }
             // A genuine usage error → structured JSON that *names* the bad flag
             // (and clap's spelling suggestion) instead of a `try '--help'` line.
-            let ctx_str = |k: ContextKind| -> Option<String> {
-                err.get(k).and_then(|v| match v {
-                    ContextValue::String(s) => Some(s.clone()),
-                    ContextValue::Strings(ss) => Some(ss.join(", ")),
-                    _ => None,
-                })
-            };
+            let ctx_str = |kind| clap_context_string(&err, kind);
             let msg = err
                 .to_string()
                 .lines()
@@ -1114,28 +1124,91 @@ fn parse_cli() -> Cli {
             if let Some(a) = ctx_str(ContextKind::InvalidArg) {
                 extra.insert("arg".into(), json!(a));
             }
-            if let Some(s) = ctx_str(ContextKind::SuggestedArg) {
-                extra.insert("suggestion".into(), json!(s));
+            let suggestion = actionable_clap_suggestion(&err);
+            if let Some((label, value)) = &suggestion {
+                extra.insert("suggestion".into(), json!(value));
+                extra.insert("suggestion_kind".into(), json!(label));
             }
-            extra.insert(
-                "hint".into(),
-                json!("run `shadowdroid <command> --help` for usage"),
-            );
-            extra.insert(
-                "next_actions".into(),
-                json!([
-                    "apply the suggested spelling when present",
-                    "run `shadowdroid commands --json --depth 2` to discover valid command paths"
-                ]),
-            );
+            if let Some(hint) = ctx_str(ContextKind::Suggested) {
+                extra.insert("hint".into(), json!(hint));
+            }
+            if let Some(values) = ctx_str(ContextKind::ValidValue) {
+                extra.insert("valid_values".into(), json!(values));
+            }
+            let mut next_actions = Vec::new();
+            if let Some((label, value)) = suggestion {
+                if label == "subcommand" {
+                    if let Some(path) = crate::events::current_command_path() {
+                        next_actions.push(format!("shadowdroid {path} {value} --help"));
+                    }
+                } else {
+                    next_actions.push(format!(
+                        "replace the rejected {label} with {value:?}, then retry"
+                    ));
+                }
+            }
+            if let Some(path) = crate::events::current_command_path() {
+                next_actions.push(format!("shadowdroid {path} --help"));
+                next_actions.push(format!("shadowdroid commands --json --describe '{path}'"));
+            } else {
+                next_actions.push("shadowdroid commands --json --depth 2".to_string());
+            }
+            extra.insert("next_actions".into(), json!(next_actions));
             crate::cmd::usage::record_parse_error(
                 &format!("{kind:?}"),
                 extra.contains_key("suggestion"),
+                partial_path.as_deref(),
             );
             emit_error("usage", "usage", &msg, serde_json::Value::Object(extra));
             std::process::exit(2);
         }
+    };
+    if let Some(path) = parsed_command_path(&matches) {
+        crate::events::set_current_command_path(path);
     }
+    Cli::from_arg_matches(&matches).unwrap_or_else(|err| {
+        // `matches` was produced by this exact derive-generated command, so a
+        // conversion failure is an internal invariant violation rather than a
+        // second user-facing parse branch.
+        panic!("validated clap matches did not convert to Cli: {err}")
+    })
+}
+
+fn clap_context_string(err: &clap::Error, kind: ContextKind) -> Option<String> {
+    err.get(kind).and_then(|value| match value {
+        ContextValue::String(value) => Some(value.clone()),
+        ContextValue::Strings(values) => Some(values.join(", ")),
+        ContextValue::StyledStr(value) => Some(value.to_string()),
+        ContextValue::StyledStrs(values) => Some(
+            values
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        _ => None,
+    })
+}
+
+fn actionable_clap_suggestion(err: &clap::Error) -> Option<(&'static str, String)> {
+    [
+        (ContextKind::SuggestedCommand, "command"),
+        (ContextKind::SuggestedSubcommand, "subcommand"),
+        (ContextKind::SuggestedArg, "argument"),
+        (ContextKind::SuggestedValue, "value"),
+    ]
+    .into_iter()
+    .find_map(|(context, label)| clap_context_string(err, context).map(|value| (label, value)))
+}
+
+fn parsed_command_path(matches: &clap::ArgMatches) -> Option<String> {
+    let mut cursor = matches;
+    let mut path = Vec::new();
+    while let Some((name, child)) = cursor.subcommand() {
+        path.push(name.to_string());
+        cursor = child;
+    }
+    (!path.is_empty()).then(|| path.join(" "))
 }
 
 /// Entry point: run the command, then (if the user opted in) append one line
@@ -2805,13 +2878,15 @@ pub fn report_error(err: &anyhow::Error) {
         .chain()
         .find_map(|e| e.downcast_ref::<crate::device::client::ServerError>())
     {
-        let retryable = se.status.is_server_error()
-            || se.status == reqwest::StatusCode::REQUEST_TIMEOUT
-            || se.status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+        let retryable = server_error_retryable(&se.code, se.status);
+        let command_path = crate::events::current_command_path();
         let mut extra = json!({
             "status": se.status.as_u16(),
             "retryable": retryable,
-            "next_actions": server_error_next_actions(&se.code),
+            "next_actions": server_error_next_actions(&se.code, command_path).unwrap_or_else(|| vec![
+                "shadowdroid collect".to_string(),
+                "shadowdroid doctor --json".to_string(),
+            ]),
         });
         if let Some(detail) = &se.detail {
             extra["detail"] = detail.clone();
@@ -2853,58 +2928,255 @@ pub fn report_error(err: &anyhow::Error) {
             ]}),
         );
     } else {
+        let class = classify_generic_error(err);
         emit_error(
-            "run",
-            "error",
+            class.stage,
+            class.code,
             &err.to_string(),
             json!({
-                "next_actions": [
-                    "run `shadowdroid doctor --json` and inspect the first unhealthy check",
-                    "run `shadowdroid commands --json --depth 2` to verify the intended command contract"
-                ]
+                "retryable": class.retryable,
+                "detail": {
+                    "used_fallback": true,
+                    "command": crate::events::current_command_path(),
+                },
+                "next_actions": generic_error_next_actions(err, class),
             }),
         );
     }
 }
 
-fn server_error_next_actions(code: &str) -> Vec<&'static str> {
+#[derive(Clone, Copy)]
+struct GenericErrorClass {
+    code: &'static str,
+    stage: &'static str,
+    retryable: bool,
+}
+
+fn classify_generic_error(err: &anyhow::Error) -> GenericErrorClass {
+    let message = format!("{err:#}").to_ascii_lowercase();
+    let io_kind = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .map(std::io::Error::kind);
+    if io_kind == Some(std::io::ErrorKind::NotFound)
+        || [
+            "apk not found:",
+            "plugin zip not found:",
+            "aar not found:",
+            "--apk path does not exist:",
+            "source file not found:",
+            "app path does not exist:",
+        ]
+        .iter()
+        .any(|marker| message.contains(marker))
+    {
+        GenericErrorClass {
+            code: "input_not_found",
+            stage: "input",
+            retryable: false,
+        }
+    } else if io_kind == Some(std::io::ErrorKind::PermissionDenied) {
+        GenericErrorClass {
+            code: "host_permission_denied",
+            stage: "host",
+            retryable: false,
+        }
+    } else if io_kind == Some(std::io::ErrorKind::TimedOut)
+        || message.contains("timed out")
+        || message.contains("timeout")
+    {
+        GenericErrorClass {
+            code: "transport_timeout",
+            stage: "transport",
+            retryable: true,
+        }
+    } else if matches!(
+        io_kind,
+        Some(
+            std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::NotConnected
+        )
+    ) || message.contains("connection refused")
+        || message.contains("connection closed")
+        || message.contains("broken pipe")
+        || message.contains("device offline")
+    {
+        GenericErrorClass {
+            code: "transport_error",
+            stage: "transport",
+            retryable: true,
+        }
+    } else if message.starts_with("invalid duration")
+        || message.starts_with("duration `")
+        || message.contains("specify an agent (")
+        || message.starts_with("unknown agent ")
+        || (message.starts_with("--")
+            && (message.contains(" requires ")
+                || message.contains(" expects ")
+                || message.contains(" must ")))
+    {
+        GenericErrorClass {
+            code: "invalid_input",
+            stage: "input",
+            retryable: false,
+        }
+    } else {
+        GenericErrorClass {
+            code: "runtime_error",
+            stage: "runtime",
+            retryable: false,
+        }
+    }
+}
+
+fn generic_error_next_actions(_err: &anyhow::Error, class: GenericErrorClass) -> Vec<String> {
+    let mut actions = match class.code {
+        "input_not_found" => vec![
+            "verify every local path or named resource passed to this command exists and is readable, then retry"
+                .to_string(),
+        ],
+        "host_permission_denied" => vec![
+            "fix the reported host file/directory permission without broadening unrelated access, then retry"
+                .to_string(),
+        ],
+        "transport_timeout" => vec![
+            "retry once; if it times out again, inspect device/server health before increasing the command timeout"
+                .to_string(),
+            "shadowdroid doctor --json".to_string(),
+        ],
+        "transport_error" => vec!["shadowdroid doctor --json".to_string()],
+        "invalid_input" => Vec::new(),
+        _ => Vec::new(),
+    };
+    if let Some(path) = crate::events::current_command_path() {
+        actions.push(format!("shadowdroid {path} --help"));
+    } else {
+        actions.push("shadowdroid commands --json --depth 2".to_string());
+    }
+    actions
+}
+
+fn server_error_retryable(code: &str, status: reqwest::StatusCode) -> bool {
+    status.is_server_error()
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || matches!(
+            code,
+            "activity_start_not_foreground"
+                | "element_not_found"
+                | "no_focused_field"
+                | "no_scrollable"
+                | "screenshot_failed"
+                | "shell_timeout"
+                | "swipe_failed"
+                | "tap_failed"
+        )
+}
+
+fn command_contract_action(command_path: Option<&str>, fallback: &str) -> String {
+    format!(
+        "shadowdroid commands --json --describe '{}'",
+        command_path.unwrap_or(fallback)
+    )
+}
+
+fn server_error_next_actions(code: &str, command_path: Option<&str>) -> Option<Vec<String>> {
+    let current_contract = |fallback: &str| command_contract_action(command_path, fallback);
     match code {
-        "element_not_found" => vec![
-            "inspect detail.top_texts and detail.closest when present",
-            "refine the selector or wait for the expected screen, then retry",
-        ],
-        "ambiguous_match" => vec![
-            "choose a candidate's unique resource id, content description, or element id",
-            "retry with the refined selector",
-        ],
-        "server_version_mismatch" | "server_unavailable" => vec![
-            "run `shadowdroid connect` to reconcile the on-device server",
-            "retry the original command",
-        ],
-        "package_not_found" => vec![
-            "check detail.package, then run `shadowdroid app current` or `shadowdroid app info <package>` to confirm the intended package",
-            "install it with `shadowdroid app install <apk>` or retry with the installed package name",
-        ],
-        "no_launch_intent" => vec![
-            "run `shadowdroid app info <package>` to confirm the package is installed",
-            "pass the intended component explicitly with `shadowdroid app start <package> --activity <activity>`",
-        ],
-        "app_stop_failed" => vec![
-            "inspect detail.exit_code, detail.output, and detail.remaining_pid to see what Android rejected or kept alive",
-            "retry `shadowdroid app stop <package>`; if the PID persists, run `shadowdroid doctor --json`",
-        ],
-        "app_clear_failed" => vec![
-            "inspect detail.exit_code and detail.output for Android's package-manager response",
-            "stop the app with `shadowdroid app stop <package>`, retry clear, or use `shadowdroid app reinstall <apk>` for a clean state",
-        ],
-        code if code.starts_with("invalid_") => vec![
-            "correct the rejected value using detail and the command help",
-            "retry the command with a literal validated value",
-        ],
-        _ => vec![
-            "inspect detail for the rejected state or input",
-            "run `shadowdroid doctor --json` if the failure persists",
-        ],
+        "element_not_found" => Some(vec![
+            "inspect detail.top_texts and detail.closest when present".to_string(),
+            "shadowdroid ui dump".to_string(),
+            current_contract("ui find"),
+        ]),
+        "ambiguous_match" => Some(vec![
+            "choose a candidate's unique resource id, content description, or element id"
+                .to_string(),
+            current_contract("ui find"),
+        ]),
+        "server_version_mismatch" | "server_unavailable" => Some(vec![
+            "shadowdroid connect".to_string(),
+            "shadowdroid doctor --fix --json".to_string(),
+        ]),
+        "package_not_found" => Some(vec![
+            "shadowdroid app current".to_string(),
+            current_contract("app info"),
+        ]),
+        "no_launch_intent" => Some(vec![
+            current_contract("app start"),
+            "shadowdroid app current".to_string(),
+        ]),
+        "app_stop_failed" => Some(vec![
+            "inspect detail.exit_code, detail.output, and detail.remaining_pid".to_string(),
+            current_contract("app stop"),
+            "shadowdroid doctor --json".to_string(),
+        ]),
+        "app_clear_failed" => Some(vec![
+            "inspect detail.exit_code and detail.output".to_string(),
+            current_contract("app clear"),
+        ]),
+        "activity_package_mismatch"
+        | "activity_start_failed"
+        | "activity_start_not_foreground"
+        | "missing_activity"
+        | "missing_package" => Some(vec![
+            "shadowdroid app current".to_string(),
+            current_contract("app start"),
+        ]),
+        "bad_direction" | "swipe_failed" => Some(vec![
+            "shadowdroid ui dump".to_string(),
+            current_contract(if code == "bad_direction" {
+                "ui swipe-ext"
+            } else {
+                "ui swipe"
+            }),
+        ]),
+        "tap_failed" => Some(vec![
+            "shadowdroid ui dump".to_string(),
+            current_contract("ui tap"),
+        ]),
+        "text_failed" | "no_focused_field" => Some(vec![
+            "shadowdroid ui dump".to_string(),
+            current_contract("ui text"),
+        ]),
+        "empty_selector" | "xpath_invalid" => Some(vec![
+            "shadowdroid ui dump".to_string(),
+            current_contract("ui find"),
+        ]),
+        "no_scrollable" => Some(vec![
+            "shadowdroid ui dump".to_string(),
+            current_contract("ui scroll-to"),
+        ]),
+        "bad_mode" | "bad_path" | "file_not_found" | "is_directory" | "not_directory"
+        | "missing_path" => Some(vec![current_contract("files ls")]),
+        "missing_key" | "unknown_key" => Some(vec![
+            current_contract("ui key"),
+            "shadowdroid ui dump".to_string(),
+        ]),
+        "bad_orientation" => Some(vec![
+            current_contract("device orientation"),
+            "shadowdroid device orientation".to_string(),
+        ]),
+        "shell_failed" => Some(vec![
+            current_contract("device shell"),
+            "shadowdroid device info".to_string(),
+        ]),
+        "shell_timeout" => Some(vec![
+            current_contract("device shell"),
+            "shadowdroid device info".to_string(),
+        ]),
+        "screenshot_failed" => Some(vec![
+            "shadowdroid doctor --json".to_string(),
+            "shadowdroid collect".to_string(),
+        ]),
+        "internal" => Some(vec![
+            "shadowdroid collect".to_string(),
+            "shadowdroid doctor --json".to_string(),
+        ]),
+        "invalid_activity" | "invalid_package" => Some(vec![current_contract("app start")]),
+        _ => None,
     }
 }
 
@@ -2932,7 +3204,70 @@ pub fn error_code_of(err: &anyhow::Error) -> String {
     {
         "screen_changed".into()
     } else {
-        "error".into()
+        classify_generic_error(err).code.into()
+    }
+}
+
+pub fn error_stage_of(err: &anyhow::Error) -> String {
+    if let Some(diagnostic) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::diagnostic::DiagnosticError>())
+    {
+        diagnostic.stage.clone()
+    } else if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::device::client::ServerError>()
+            .is_some()
+    }) {
+        "run".to_string()
+    } else {
+        classify_generic_error(err).stage.to_string()
+    }
+}
+
+pub fn error_retryable_of(err: &anyhow::Error) -> bool {
+    if let Some(diagnostic) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::diagnostic::DiagnosticError>())
+    {
+        diagnostic.retryable
+    } else if let Some(server) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::device::client::ServerError>())
+    {
+        server_error_retryable(&server.code, server.status)
+    } else if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::fusion::ScreenChanged>()
+            .is_some()
+    }) {
+        true
+    } else {
+        classify_generic_error(err).retryable
+    }
+}
+
+pub fn error_uses_fallback(err: &anyhow::Error) -> bool {
+    if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::diagnostic::DiagnosticError>()
+            .is_some()
+    }) {
+        false
+    } else if let Some(server) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::device::client::ServerError>())
+    {
+        server_error_next_actions(&server.code, crate::events::current_command_path()).is_none()
+    } else {
+        !err.chain().any(|cause| {
+            cause
+                .downcast_ref::<crate::selector::AmbiguousMatch>()
+                .is_some()
+                || cause
+                    .downcast_ref::<crate::fusion::ScreenChanged>()
+                    .is_some()
+        })
     }
 }
 
@@ -3738,38 +4073,45 @@ async fn cmd_test(
 }
 
 pub(crate) async fn resolve_serial(explicit: Option<&str>) -> Result<Serial> {
-    if let Some(s) = explicit {
-        return Ok(Serial::from(s));
-    }
-    let devices = adb::list_devices().await.context("listing devices")?;
-    match devices.len() {
-        0 => Err(crate::diagnostic::DiagnosticError::new(
-            "no_device",
-            "device",
-            "no usable Android device is attached",
-        )
-        .retryable(true)
-        .next_actions([
-            "run `shadowdroid devices` to inspect offline or unauthorized devices",
-            "start an emulator or authorize USB debugging, then retry",
-        ])
-        .into()),
-        1 => Ok(Serial::from(devices.into_iter().next().unwrap())),
-        _ => Err(crate::diagnostic::DiagnosticError::new(
-            "multiple_devices",
-            "device",
-            format!(
-                "multiple usable Android devices are attached ({})",
-                devices.len()
-            ),
-        )
-        .detail(json!({"devices": devices}))
-        .next_actions([
-            "choose a serial from detail.devices and pass `--device <serial>`",
-            "set SHADOWDROID_DEVICE or config.device for subsequent commands",
-        ])
-        .into()),
-    }
+    let serial = if let Some(s) = explicit {
+        Serial::from(s)
+    } else {
+        let devices = adb::list_devices().await.context("listing devices")?;
+        match devices.len() {
+            0 => {
+                return Err(crate::diagnostic::DiagnosticError::new(
+                    "no_device",
+                    "device",
+                    "no usable Android device is attached",
+                )
+                .retryable(true)
+                .next_actions([
+                    "run `shadowdroid devices` to inspect offline or unauthorized devices",
+                    "start an emulator or authorize USB debugging, then retry",
+                ])
+                .into())
+            }
+            1 => Serial::from(devices.into_iter().next().unwrap()),
+            _ => {
+                return Err(crate::diagnostic::DiagnosticError::new(
+                    "multiple_devices",
+                    "device",
+                    format!(
+                        "multiple usable Android devices are attached ({})",
+                        devices.len()
+                    ),
+                )
+                .detail(json!({"devices": devices}))
+                .next_actions([
+                    "choose a serial from detail.devices and pass `--device <serial>`",
+                    "set SHADOWDROID_DEVICE or config.device for subsequent commands",
+                ])
+                .into())
+            }
+        }
+    };
+    crate::events::set_current_device(serial.to_string());
+    Ok(serial)
 }
 
 #[cfg(test)]
@@ -3857,6 +4199,122 @@ mod tests {
     }
 
     #[test]
+    fn server_error_families_have_domain_specific_recovery() {
+        let cases = [
+            ("activity_start_failed", Some("app start"), "app current"),
+            ("bad_direction", Some("ui pinch"), "ui pinch"),
+            ("swipe_failed", Some("ui swipe"), "ui swipe"),
+            ("file_not_found", Some("files pull"), "files pull"),
+            ("no_focused_field", Some("ui text"), "ui text"),
+            ("no_scrollable", Some("ui scroll-to"), "ui scroll-to"),
+            ("shell_timeout", Some("device shell"), "device shell"),
+            ("screenshot_failed", Some("ui screenshot"), "doctor"),
+            ("xpath_invalid", Some("ui find"), "ui find"),
+            ("unknown_key", Some("ui key"), "ui key"),
+            ("internal", Some("ui dump"), "collect"),
+        ];
+        for (code, path, expected) in cases {
+            let actions = server_error_next_actions(code, path).unwrap().join("\n");
+            assert!(
+                actions.contains(expected),
+                "{code} recovery should mention {expected:?}: {actions}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_server_wire_error_code_has_a_named_recovery() {
+        let codes = [
+            "activity_package_mismatch",
+            "activity_start_failed",
+            "activity_start_not_foreground",
+            "ambiguous_match",
+            "app_clear_failed",
+            "app_stop_failed",
+            "bad_direction",
+            "bad_mode",
+            "bad_orientation",
+            "bad_path",
+            "element_not_found",
+            "empty_selector",
+            "file_not_found",
+            "internal",
+            "invalid_activity",
+            "invalid_package",
+            "is_directory",
+            "missing_activity",
+            "missing_key",
+            "missing_package",
+            "missing_path",
+            "no_focused_field",
+            "no_launch_intent",
+            "no_scrollable",
+            "not_directory",
+            "package_not_found",
+            "screenshot_failed",
+            "shell_failed",
+            "shell_timeout",
+            "swipe_failed",
+            "tap_failed",
+            "text_failed",
+            "unknown_key",
+            "xpath_invalid",
+        ];
+        for code in codes {
+            let actions = server_error_next_actions(code, None);
+            assert!(
+                actions.as_ref().is_some_and(|actions| !actions.is_empty()),
+                "server code {code:?} must have an explicit recovery recipe"
+            );
+        }
+        assert!(server_error_next_actions("new_unmapped_code", None).is_none());
+    }
+
+    #[test]
+    fn generic_errors_are_classified_for_the_feedback_loop() {
+        let missing = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "reading /tmp/missing",
+        ));
+        assert_eq!(classify_generic_error(&missing).code, "input_not_found");
+        assert_eq!(error_code_of(&missing), "input_not_found");
+        assert_eq!(error_stage_of(&missing), "input");
+        assert!(error_uses_fallback(&missing));
+
+        let timeout = anyhow::anyhow!("adb command timed out after 30s");
+        let class = classify_generic_error(&timeout);
+        assert_eq!(class.code, "transport_timeout");
+        assert!(class.retryable);
+
+        let duration = anyhow::anyhow!("invalid duration `later` — use forms like 30s");
+        assert_eq!(classify_generic_error(&duration).code, "invalid_input");
+
+        let checksum = anyhow::anyhow!("no checksum found for server.apk in SHA256SUMS");
+        assert_eq!(classify_generic_error(&checksum).code, "runtime_error");
+
+        let device_permission = anyhow::anyhow!("adb command failed: Permission denied");
+        assert_eq!(
+            classify_generic_error(&device_permission).code,
+            "runtime_error"
+        );
+
+        let known_server = anyhow::Error::new(crate::device::client::ServerError {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            code: "bad_direction".to_string(),
+            message: "bad direction".to_string(),
+            detail: None,
+        });
+        assert!(!error_uses_fallback(&known_server));
+        let unknown_server = anyhow::Error::new(crate::device::client::ServerError {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            code: "future_server_error".to_string(),
+            message: "new failure".to_string(),
+            detail: None,
+        });
+        assert!(error_uses_fallback(&unknown_server));
+    }
+
+    #[test]
     fn cli_defines_global_quiet_flag() {
         // Guards the `--quiet`/`-q` contract that `main` pre-scans before clap runs.
         Cli::command().debug_assert();
@@ -3874,6 +4332,16 @@ mod tests {
             quiet.get_env().is_none(),
             "SHADOWDROID_QUIET must be resolved manually, not via clap",
         );
+    }
+
+    #[test]
+    fn clap_prose_hint_is_not_advertised_as_a_replacement() {
+        let error = Cli::command()
+            .try_get_matches_from(["shadowdroid", "device", "shell", "--wat"])
+            .expect_err("--wat should be rejected as an option, not treated as a shell command");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        assert!(clap_context_string(&error, ContextKind::Suggested).is_some());
+        assert!(actionable_clap_suggestion(&error).is_none());
     }
 
     #[test]

@@ -311,7 +311,7 @@ pub async fn run(serial: &Serial, client: &ServerClient, args: DebugArgs) -> Res
         DebugCmd::Auto(args) => debug_auto(serial, client, args, studio_url.as_deref()).await,
         DebugCmd::Snapshot(args) => snapshot_cmd(serial, client, args, studio_url.as_deref()).await,
         DebugCmd::Record(args) => record_cmd(serial, client, args, studio_url.as_deref()).await,
-        DebugCmd::Replay(args) => replay_cmd(client, args).await,
+        DebugCmd::Replay(args) => replay_cmd(serial, client, args).await,
         DebugCmd::Studio(cmd) => {
             debugger::run(&cmd, Some(serial.as_str()), studio_url.as_deref()).await
         }
@@ -600,7 +600,7 @@ async fn snapshot_cmd(
     if let Some(path) = args.out {
         crate::cmd::artifact::write_json_and_emit("debug_snapshot", &path, &value)?;
     } else {
-        println!("{}", serde_json::to_string(&value)?);
+        crate::events::emit_result(&value);
     }
     Ok(())
 }
@@ -890,12 +890,20 @@ async fn record_cmd(
             "elapsed_ms": started.elapsed().as_millis() as u64,
         }),
     )?;
+    let artifact = args.out.display().to_string();
+    let replay_command = debug_replay_command(serial, &args.out, false);
+    let dry_run_command = debug_replay_command(serial, &args.out, true);
     crate::events::emit_action(
         "debug_record",
         &json!({
-            "artifact": args.out.display().to_string(),
+            "artifact": artifact,
             "elapsed_ms": started.elapsed().as_millis() as u64,
-            "next_actions": [format!("run `shadowdroid debug replay {}` to replay recorded UI actions", args.out.display())],
+            "replay": {
+                "command": replay_command,
+                "requires_confirmation": true,
+                "side_effect": "replays the recorded UI actions on the selected device",
+            },
+            "next_actions": [dry_run_command],
         }),
     );
     Ok(())
@@ -903,6 +911,7 @@ async fn record_cmd(
 
 fn spawn_logcat(serial: Serial, out: mpsc::Sender<Value>) {
     tokio::spawn(async move {
+        let recovery_actions = debug_stream_recovery_actions(&serial);
         let child = Command::new("adb")
             .args(["-s", &serial, "logcat", "-v", "threadtime", "-T", "1"])
             .stdout(Stdio::piped())
@@ -911,11 +920,32 @@ fn spawn_logcat(serial: Serial, out: mpsc::Sender<Value>) {
             .spawn();
         let Ok(mut child) = child else {
             let _ = out
-                .send(json!({"type":"error","stage":"logcat","ts":now_ms(),"msg":"failed to start adb logcat"}))
+                .send(json!({
+                    "type": "error",
+                    "stage": "logcat",
+                    "code": "logcat_start_failed",
+                    "ts": now_ms(),
+                    "msg": "failed to start adb logcat",
+                    "retryable": true,
+                    "detail": {},
+                    "next_actions": recovery_actions,
+                }))
                 .await;
             return;
         };
         let Some(stdout) = child.stdout.take() else {
+            let _ = out
+                .send(json!({
+                    "type": "error",
+                    "stage": "logcat",
+                    "code": "logcat_stdout_unavailable",
+                    "ts": now_ms(),
+                    "msg": "adb logcat did not expose stdout",
+                    "retryable": true,
+                    "detail": {},
+                    "next_actions": [recovery_actions[0].clone()],
+                }))
+                .await;
             return;
         };
         let mut lines = BufReader::new(stdout).lines();
@@ -925,6 +955,14 @@ fn spawn_logcat(serial: Serial, out: mpsc::Sender<Value>) {
                 .await;
         }
     });
+}
+
+fn debug_stream_recovery_actions(serial: &Serial) -> Vec<String> {
+    let serial = crate::events::shell_token(serial.as_str());
+    vec![
+        format!("shadowdroid -d {serial} doctor --json"),
+        format!("shadowdroid -d {serial} log --last 5m"),
+    ]
 }
 
 fn debugger_suspended(debugger: &Value) -> Option<bool> {
@@ -984,7 +1022,7 @@ fn variable_diff(before: &BTreeMap<String, Value>, after: &BTreeMap<String, Valu
     })
 }
 
-async fn replay_cmd(client: &ServerClient, args: ReplayArgs) -> Result<()> {
+async fn replay_cmd(serial: &Serial, client: &ServerClient, args: ReplayArgs) -> Result<()> {
     let file =
         File::open(&args.file).with_context(|| format!("opening {}", args.file.display()))?;
     let reader = StdBufReader::new(file);
@@ -1012,11 +1050,8 @@ async fn replay_cmd(client: &ServerClient, args: ReplayArgs) -> Result<()> {
                 serde_json::to_string(&json!({"type":"replay_plan","index":i,"event":value}))?
             );
         }
-        println!(
-            "{}",
-            serde_json::to_string(
-                &json!({"type":"replay_done","seen":seen,"replayable":actions.len()})
-            )?
+        crate::events::emit_result(
+            &json!({"type":"replay_done","seen":seen,"replayable":actions.len()}),
         );
         return Ok(());
     }
@@ -1033,11 +1068,19 @@ async fn replay_cmd(client: &ServerClient, args: ReplayArgs) -> Result<()> {
             let ok = result.is_ok();
             if let Err(err) = &result {
                 failed_actions += 1;
+                let next_actions = replay_failure_actions(serial, &args.file);
                 println!(
                     "{}",
-                    serde_json::to_string(
-                        &json!({"type":"replay_action","run":run,"index":i,"ok":false,"error":err.to_string()})
-                    )?
+                    serde_json::to_string(&json!({
+                        "type": "error",
+                        "stream": "debug_replay",
+                        "stage": crate::cli::error_stage_of(err),
+                        "code": crate::cli::error_code_of(err),
+                        "msg": err.to_string(),
+                        "retryable": crate::cli::error_retryable_of(err),
+                        "detail": {"run": run, "index": i, "event": value},
+                        "next_actions": next_actions,
+                    }))?
                 );
                 if args.stop_on_error {
                     return Err(crate::diagnostic::DiagnosticError::new(
@@ -1046,10 +1089,7 @@ async fn replay_cmd(client: &ServerClient, args: ReplayArgs) -> Result<()> {
                         format!("replay action {i} failed on run {run}: {err}"),
                     )
                     .detail(json!({"run": run, "index": i, "event": value}))
-                    .next_actions([
-                        "inspect the failed replay_action event and current screen",
-                        "correct the recording or rerun without --stop-on-error to collect all failures",
-                    ])
+                    .next_actions(replay_failure_actions(serial, &args.file))
                     .into());
                 }
             }
@@ -1075,12 +1115,27 @@ async fn replay_cmd(client: &ServerClient, args: ReplayArgs) -> Result<()> {
                         "inspect the current screen, restore the expected app state, and retry the replay",
                     ])
                 })?;
-                println!(
-                    "{}",
-                    serde_json::to_string(
-                        &json!({"type":"replay_action","run":run,"index":i,"ok":ok,"screen_hash":identity.0,"screen_hash_version":identity.1})
-                    )?
-                );
+                let observation = if ok {
+                    json!({
+                        "type": "replay_action",
+                        "run": run,
+                        "index": i,
+                        "ok": true,
+                        "screen_hash": identity.0,
+                        "screen_hash_version": identity.1,
+                    })
+                } else {
+                    json!({
+                        "type": "replay_observation",
+                        "stream": "debug_replay",
+                        "run": run,
+                        "index": i,
+                        "after_failed_action": true,
+                        "screen_hash": identity.0,
+                        "screen_hash_version": identity.1,
+                    })
+                };
+                println!("{}", serde_json::to_string(&observation)?);
                 hashes.push(identity);
             } else if ok {
                 println!(
@@ -1094,30 +1149,11 @@ async fn replay_cmd(client: &ServerClient, args: ReplayArgs) -> Result<()> {
         runs.push(hashes);
     }
 
-    if args.diff {
-        let divergences = find_divergences(&runs);
-        for d in &divergences {
+    let divergences = args.diff.then(|| find_divergences(&runs));
+    if let Some(divergences) = &divergences {
+        for d in divergences {
             println!("{}", serde_json::to_string(d)?);
         }
-        println!(
-            "{}",
-            serde_json::to_string(&json!({
-                "type":"replay_repeat_summary",
-                "repeat": repeat,
-                "actions": actions.len(),
-                "ok": failed_actions == 0,
-                "failed_actions": failed_actions,
-                "divergent_steps": divergences.len(),
-                "stable": divergences.is_empty(),
-            }))?
-        );
-    } else {
-        println!(
-            "{}",
-            serde_json::to_string(
-                &json!({"type":"replay_done","ok":failed_actions == 0,"seen":seen,"replayable":actions.len(),"repeat":repeat,"failed_actions":failed_actions})
-            )?
-        );
     }
     if failed_actions > 0 {
         return Err(crate::diagnostic::DiagnosticError::new(
@@ -1125,16 +1161,49 @@ async fn replay_cmd(client: &ServerClient, args: ReplayArgs) -> Result<()> {
             "debugger",
             format!("{failed_actions} replay action(s) failed"),
         )
-        .detail(
-            json!({"failed_actions": failed_actions, "repeat": repeat, "actions": actions.len()}),
-        )
-        .next_actions([
-            "inspect preceding replay_action errors and the current screen",
-            "repair the recording or target state, then rerun",
-        ])
+        .detail(json!({
+            "failed_actions": failed_actions,
+            "repeat": repeat,
+            "actions": actions.len(),
+            "divergent_steps": divergences.as_ref().map(Vec::len),
+        }))
+        .next_actions(replay_failure_actions(serial, &args.file))
         .into());
     }
+    if let Some(divergences) = divergences {
+        crate::events::emit_result(&json!({
+            "type":"replay_repeat_summary",
+            "repeat": repeat,
+            "actions": actions.len(),
+            "ok": true,
+            "failed_actions": 0,
+            "divergent_steps": divergences.len(),
+            "stable": divergences.is_empty(),
+        }));
+    } else {
+        crate::events::emit_result(
+            &json!({"type":"replay_done","ok":true,"seen":seen,"replayable":actions.len(),"repeat":repeat,"failed_actions":0}),
+        );
+    }
     Ok(())
+}
+
+fn replay_failure_actions(serial: &Serial, file: &Path) -> Vec<String> {
+    let device = crate::events::shell_token(serial.as_str());
+    vec![
+        format!("shadowdroid -d {device} ui dump"),
+        debug_replay_command(serial, file, true),
+        format!("shadowdroid -d {device} doctor --json"),
+    ]
+}
+
+fn debug_replay_command(serial: &Serial, file: &Path, dry_run: bool) -> String {
+    let device = crate::events::shell_token(serial.as_str());
+    let file = crate::events::shell_token(&file.display().to_string());
+    format!(
+        "shadowdroid -d {device} debug replay {file}{}",
+        if dry_run { " --dry-run" } else { "" }
+    )
 }
 
 /// Compare per-run post-action screen hashes and report each step index whose
@@ -1471,7 +1540,7 @@ async fn final_snapshot_best_effort(
                             "code": "snapshot_failed",
                             "detail": error.clone()
                         }],
-                        "next_commands": ["shadowdroid doctor", "shadowdroid collect"]
+                        "next_actions": ["shadowdroid doctor", "shadowdroid collect"]
                     },
                     "error": error,
                     "device": {
@@ -1706,7 +1775,7 @@ fn debug_sample_value(
         "current_app": screen.current_app.clone(),
         "foreground_activity": foreground_activity.clone(),
         "debugger_available": debugger.get("available").and_then(Value::as_bool).unwrap_or(false),
-        "next_commands": next_commands.into_iter().collect::<Vec<_>>(),
+        "next_actions": next_commands.into_iter().collect::<Vec<_>>(),
     })
 }
 
@@ -2067,7 +2136,7 @@ fn int_field(value: &Value, key: &str) -> Result<i32> {
 }
 
 fn emit_json(value: &Value) -> Result<()> {
-    crate::events::emit(value);
+    crate::events::emit_result(value);
     Ok(())
 }
 
@@ -2190,6 +2259,32 @@ mod tests {
         assert_eq!(
             device_artifact_name("anr", "/data/anr/traces 1.txt"),
             "anr_traces_1.txt"
+        );
+    }
+
+    #[test]
+    fn debug_stream_recovery_quotes_the_device_serial() {
+        assert_eq!(
+            debug_stream_recovery_actions(&Serial::from("emulator-5554; reboot")),
+            [
+                "shadowdroid -d 'emulator-5554; reboot' doctor --json",
+                "shadowdroid -d 'emulator-5554; reboot' log --last 5m",
+            ]
+        );
+    }
+
+    #[test]
+    fn replay_failure_recovery_is_exact_scoped_and_non_destructive() {
+        assert_eq!(
+            replay_failure_actions(
+                &Serial::from("emulator-5554; unsafe"),
+                Path::new("recording one.jsonl")
+            ),
+            [
+                "shadowdroid -d 'emulator-5554; unsafe' ui dump",
+                "shadowdroid -d 'emulator-5554; unsafe' debug replay 'recording one.jsonl' --dry-run",
+                "shadowdroid -d 'emulator-5554; unsafe' doctor --json",
+            ]
         );
     }
 }

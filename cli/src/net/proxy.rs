@@ -315,6 +315,7 @@ fn report_tls_error(ctx: &ProxyContext, host: &str, err: &std::io::Error) {
         ts: events::now_ts(),
         host: host.to_string(),
         reason: tls_failure_reason(err),
+        next_actions: crate::net::tls_error_next_actions(&ctx.serial),
     };
     let _ = crate::net::store::append_event(&ctx.serial, &ev);
     let _ = ctx.shared.events.send(Arc::new(ev));
@@ -1491,10 +1492,12 @@ async fn hold(ctx: &ProxyContext, snap: FlowRecord, phase: &'static str) -> Opti
             },
         );
     }
-    let _ = ctx
-        .shared
-        .events
-        .send(Arc::new(intercept_event(&snap, phase, cfg.hold_ms)));
+    let _ = ctx.shared.events.send(Arc::new(intercept_event(
+        &ctx.serial,
+        &snap,
+        phase,
+        cfg.hold_ms,
+    )));
 
     let decision = resolve_held(
         &ctx.shared.held,
@@ -1566,7 +1569,12 @@ pub(crate) fn release_held(
     }
 }
 
-fn intercept_event(snap: &FlowRecord, phase: &str, hold_ms: u32) -> Event {
+fn intercept_event(
+    serial: &crate::ids::Serial,
+    snap: &FlowRecord,
+    phase: &str,
+    hold_ms: u32,
+) -> Event {
     let preview = |b: &Option<String>| {
         b.as_ref().map(|s| {
             if s.chars().count() > flow::PREVIEW_CAP {
@@ -1592,6 +1600,7 @@ fn intercept_event(snap: &FlowRecord, phase: &str, hold_ms: u32) -> Event {
         hold_deadline_ms: hold_ms,
         req_preview: preview(&snap.req_body),
         resp_preview: preview(&snap.resp_body),
+        next_actions: crate::net::intercept_next_actions(serial, &snap.id),
     }
 }
 

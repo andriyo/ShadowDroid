@@ -79,7 +79,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
             while let Some(rec) = flow_rx.recv().await {
                 state.flow_count.fetch_add(1, Ordering::Relaxed);
                 let _ = store::append(&serial, &rec);
-                let _ = state.events.send(Arc::new(rec.http_event()));
+                let _ = state.events.send(Arc::new(rec.http_event(&serial)));
             }
         });
     }

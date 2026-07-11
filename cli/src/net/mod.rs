@@ -34,6 +34,42 @@ pub mod trust;
 /// Default proxy listen/forward port (device `http_proxy` → host proxy).
 pub const DEFAULT_PROXY_PORT: u16 = 8080;
 
+fn scoped_action(serial: &crate::ids::Serial, args: &str) -> String {
+    format!(
+        "shadowdroid -d {} net {args}",
+        crate::events::shell_token(serial.as_str())
+    )
+}
+
+/// Immediate decisions for a held flow. These live next to the shared network
+/// types so live proxy events and recalled session-log events cannot drift.
+pub(crate) fn intercept_next_actions(serial: &crate::ids::Serial, id: &str) -> Vec<String> {
+    let id = crate::events::shell_token(id);
+    vec![
+        scoped_action(serial, &format!("show {id} --body")),
+        scoped_action(serial, &format!("resume {id}")),
+        scoped_action(serial, &format!("drop {id}")),
+        scoped_action(serial, &format!("respond {id}")),
+    ]
+}
+
+pub(crate) fn flow_next_actions(serial: &crate::ids::Serial, id: &str) -> Vec<String> {
+    let id = crate::events::shell_token(id);
+    vec![
+        scoped_action(serial, &format!("show {id} --body")),
+        scoped_action(serial, &format!("export har {id}")),
+        scoped_action(serial, &format!("export curl {id}")),
+    ]
+}
+
+pub(crate) fn tls_error_next_actions(serial: &crate::ids::Serial) -> Vec<String> {
+    vec![
+        scoped_action(serial, "check --fresh"),
+        scoped_action(serial, "trust --auto --fresh"),
+        scoped_action(serial, "status"),
+    ]
+}
+
 /// A flow matcher — explicit, composable fields (agent-legible). All present
 /// fields must match (AND). Host/path/method are case-insensitive substring
 /// matches; status is exact. Empty matcher matches everything.
@@ -121,4 +157,33 @@ pub struct DaemonConfig {
     /// before they hit the session log or `net show`.
     #[serde(default)]
     pub redact: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn urgent_network_actions_are_exact_scoped_and_shell_safe() {
+        let serial = crate::ids::Serial::new("emulator-5554; unsafe");
+        let held = intercept_next_actions(&serial, "flow id; unsafe");
+        assert_eq!(held.len(), 4);
+        assert!(held
+            .iter()
+            .all(|action| action.starts_with("shadowdroid -d 'emulator-5554; unsafe' net ")));
+        assert!(held[0].ends_with("show 'flow id; unsafe' --body"));
+
+        let tls = tls_error_next_actions(&serial);
+        assert_eq!(
+            tls[0],
+            "shadowdroid -d 'emulator-5554; unsafe' net check --fresh"
+        );
+        assert_eq!(
+            tls[1],
+            "shadowdroid -d 'emulator-5554; unsafe' net trust --auto --fresh"
+        );
+
+        let flow = flow_next_actions(&serial, "flow id; unsafe");
+        assert!(flow[0].ends_with("show 'flow id; unsafe' --body"));
+    }
 }

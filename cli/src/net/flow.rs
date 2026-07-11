@@ -91,7 +91,7 @@ impl FlowRecord {
     }
 
     /// The compact streaming event.
-    pub fn http_event(&self) -> Event {
+    pub fn http_event(&self, serial: &crate::ids::Serial) -> Event {
         Event::Http {
             ts: self.ts,
             id: self.id.clone(),
@@ -111,6 +111,7 @@ impl FlowRecord {
             error: self.error.clone(),
             streamed: self.streamed,
             req_streamed: self.req_streamed,
+            next_actions: crate::net::flow_next_actions(serial, &self.id),
         }
     }
 

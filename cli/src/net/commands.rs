@@ -145,9 +145,23 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
             .and_then(|value| value.as_u64())
             .map(|value| value as u16)
         else {
-            bail!(
-                "the running net daemon predates automatic rewiring metadata; run `shadowdroid net stop` once, then `net start`"
-            );
+            return Err(crate::diagnostic::DiagnosticError::new(
+                "net_daemon_metadata_missing",
+                "net",
+                "the running net daemon predates automatic rewiring metadata",
+            )
+            .retryable(true)
+            .detail(json!({
+                "device": serial.as_str(),
+                "daemon_status": daemon_status,
+                "missing": "host_port",
+            }))
+            .next_actions([
+                "shadowdroid net stop".to_string(),
+                "shadowdroid net start".to_string(),
+                "shadowdroid net status".to_string(),
+            ])
+            .into());
         };
 
         // If the live daemon signs with a different CA than we just resolved
@@ -266,16 +280,31 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
         let _ = std::fs::remove_file(paths::pid_path(serial)?);
         let _ = std::fs::remove_file(paths::ctl_path(serial)?);
         let log = paths::daemon_log_path(serial)?;
-        let reason = match daemon::log_tail(&log, 10) {
-            Some(t) => format!("last log lines:\n{t}"),
-            None => format!("no output in {}", log.display()),
-        };
+        let log_tail = daemon::log_tail(&log, 10);
         remove_device_network_state(serial)?;
-        bail!(
-            "net daemon did not come up within 5s ({}). {}",
-            log.display(),
-            reason
-        );
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "net_daemon_start_timeout",
+            "net",
+            "net daemon did not become ready within 5 seconds",
+        )
+        .retryable(true)
+        .detail(json!({
+            "device": serial.as_str(),
+            "daemon_pid": daemon_pid,
+            "timeout_ms": 5_000,
+            "log": log.display().to_string(),
+            "log_tail": log_tail,
+        }))
+        .next_actions([
+            format!(
+                "tail -n 50 {}",
+                crate::events::shell_token(&log.display().to_string())
+            ),
+            "shadowdroid net start".to_string(),
+            "shadowdroid net status".to_string(),
+            "shadowdroid doctor --json".to_string(),
+        ])
+        .into());
     }
     if let Err(err) = setup_wiring(serial, port, host_port).await {
         let _ = control::request(serial, json!({"op": "stop"})).await;
@@ -295,7 +324,7 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
             "verify_upstream": verify_upstream,
             "redact": redact,
             "ca": ca_cert.display().to_string(),
-            "hint": "next: `net check <pkg>` to confirm trust; `watch` streams HTTP events alongside screen/crash events",
+            "note": "net check verifies trust for a package; watch streams HTTP events alongside screen/crash events",
         }),
     );
     Ok(())
@@ -626,17 +655,37 @@ pub async fn log(serial: &Serial, matcher: Matcher, limit: usize) -> Result<()> 
     let tls_errors = store::read_tls_errors(serial, matcher.host.as_deref())?;
     // Interleave completed flows with any TLS-handshake failures (issue #5) so a
     // "why is nothing captured?" moment shows the rejected host inline.
-    let items = merge_timeline(&flows, tls_errors, limit);
-    for v in &items {
+    let mut items = merge_timeline(serial, &flows, tls_errors, limit);
+    for v in &mut items {
+        attach_recalled_tls_actions(serial, v);
         events::emit(v);
     }
-    emit("net_log", json!({"count": items.len(), "limit": limit}));
+    let ids = items
+        .iter()
+        .filter_map(|item| item.get("id").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>();
+    emit(
+        "net_log",
+        json!({"count": items.len(), "limit": limit, "ids": ids}),
+    );
     Ok(())
+}
+
+fn attach_recalled_tls_actions(serial: &Serial, event: &mut serde_json::Value) {
+    if event.get("type").and_then(serde_json::Value::as_str) == Some("tls_error")
+        && event
+            .get("next_actions")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(Vec::is_empty)
+    {
+        event["next_actions"] = json!(crate::net::tls_error_next_actions(serial));
+    }
 }
 
 /// Merge completed flows (as `http` events) with `tls_error` markers into one
 /// list ordered by `ts`, keeping the most recent `limit` events overall.
 fn merge_timeline(
+    serial: &Serial,
     flows: &[crate::net::flow::FlowRecord],
     tls_errors: Vec<serde_json::Value>,
     limit: usize,
@@ -644,7 +693,7 @@ fn merge_timeline(
     let mut items: Vec<(f64, serde_json::Value)> =
         Vec::with_capacity(flows.len() + tls_errors.len());
     for f in flows {
-        if let Ok(v) = serde_json::to_value(f.http_event()) {
+        if let Ok(v) = serde_json::to_value(f.http_event(serial)) {
             items.push((f.ts, v));
         }
     }
@@ -668,16 +717,26 @@ pub async fn show(
     // only in the daemon — try the store first, then ask the daemon.
     if let Some(flow) = store::find_by_id(serial, id)? {
         if har {
-            println!(
-                "{}",
-                serde_json::to_string(&crate::net::export::to_har(&[flow]))?
-            );
+            events::emit_result(&json!({
+                "format": "har",
+                "id": id,
+                "held": false,
+                "har": crate::net::export::to_har(&[flow]),
+            }));
             return Ok(());
         }
         if let Some(path) = body_file {
-            return write_body_file(id, flow.resp_body.as_deref(), flow.resp_truncated, path);
+            return write_body_file(
+                id,
+                flow.resp_body.as_deref(),
+                flow.resp_truncated,
+                path,
+                false,
+            );
         }
-        println!("{}", serde_json::to_string(&flow.detail(body))?);
+        let mut detail = flow.detail(body);
+        detail["held"] = json!(false);
+        events::emit_result(&detail);
         return Ok(());
     }
     if control::is_running(serial).await {
@@ -699,10 +758,12 @@ pub async fn show(
                         ])
                     })?;
                 if har {
-                    println!(
-                        "{}",
-                        serde_json::to_string(&crate::net::export::to_har(&[flow]))?
-                    );
+                    events::emit_result(&json!({
+                        "format": "har",
+                        "id": id,
+                        "held": true,
+                        "har": crate::net::export::to_har(&[flow]),
+                    }));
                     return Ok(());
                 }
                 if let Some(path) = body_file {
@@ -711,9 +772,12 @@ pub async fn show(
                         flow.resp_body.as_deref(),
                         flow.resp_truncated,
                         path,
+                        true,
                     );
                 }
-                println!("{}", serde_json::to_string(&flow.detail(body))?);
+                let mut detail = flow.detail(body);
+                detail["held"] = json!(true);
+                events::emit_result(&detail);
                 return Ok(());
             }
         }
@@ -735,7 +799,13 @@ pub async fn show(
 /// inlining a large body in the JSON. The body is whatever was stored (up to
 /// [`crate::net::flow::BODY_CAP`]); `truncated` is surfaced so the caller knows
 /// if the response exceeded the capture cap.
-fn write_body_file(id: &str, resp_body: Option<&str>, truncated: bool, path: &Path) -> Result<()> {
+fn write_body_file(
+    id: &str,
+    resp_body: Option<&str>,
+    truncated: bool,
+    path: &Path,
+    held: bool,
+) -> Result<()> {
     let Some(b) = resp_body else {
         bail!("flow `{id}` has no captured response body (binary, empty, or non-textual content-type)");
     };
@@ -747,6 +817,7 @@ fn write_body_file(id: &str, resp_body: Option<&str>, truncated: bool, path: &Pa
             "saved_body": path.display().to_string(),
             "bytes": b.len(),
             "truncated": truncated,
+            "held": held,
         }),
     );
     Ok(())
@@ -901,18 +972,60 @@ pub async fn export(
     }
     match format {
         "curl" => {
-            for f in &flows {
-                println!("{}", crate::net::export::curl_command(f));
-            }
+            let out = out.unwrap_or_else(|| PathBuf::from("shadowdroid-network.curl.sh"));
+            let mut script = String::from("#!/bin/sh\nset -eu\n\n");
+            script.push_str(
+                &flows
+                    .iter()
+                    .map(crate::net::export::curl_command)
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            );
+            script.push('\n');
+            let bytes = crate::cmd::artifact::write_bytes(&out, script.as_bytes())?;
+            let token = crate::events::shell_token(&out.display().to_string());
+            emit(
+                "net_export",
+                json!({
+                    "format": "curl",
+                    "artifact": out.display().to_string(),
+                    "bytes": bytes,
+                    "count": flows.len(),
+                    "replay": {
+                        "command": format!("sh {token}"),
+                        "requires_confirmation": true,
+                        "side_effect": "replays captured requests and may repeat authenticated writes",
+                    },
+                    "next_actions": [
+                        format!("cat {token}"),
+                        "shadowdroid net log"
+                    ],
+                }),
+            );
         }
-        "har" => println!(
-            "{}",
-            serde_json::to_string_pretty(&crate::net::export::to_har(&flows))?
-        ),
+        "har" => {
+            let out = out.unwrap_or_else(|| PathBuf::from("shadowdroid-network.har"));
+            let bytes =
+                crate::cmd::artifact::write_json(&out, &crate::net::export::to_har(&flows))?;
+            let token = crate::events::shell_token(&out.display().to_string());
+            emit(
+                "net_export",
+                json!({
+                    "format": "har",
+                    "artifact": out.display().to_string(),
+                    "bytes": bytes,
+                    "count": flows.len(),
+                    "next_actions": [
+                        format!("jq '.log.entries | length' {token}"),
+                        "shadowdroid net log"
+                    ],
+                }),
+            );
+        }
         "fixtures" => {
             let out = out.unwrap_or_else(|| PathBuf::from("shadowdroid-fixtures"));
             let summary = crate::net::export::write_fixtures(&flows, &out)?;
-            println!("{}", serde_json::to_string(&summary)?);
+            events::emit_result(&summary);
         }
         other => bail!("unknown export format {other:?} (curl|har|fixtures)"),
     }
@@ -1176,15 +1289,34 @@ mod tests {
         ];
 
         // All three, chronological.
-        let all = merge_timeline(&flows, tls.clone(), 10);
+        let serial = Serial::new("emulator-5554");
+        let all = merge_timeline(&serial, &flows, tls.clone(), 10);
         let ts: Vec<f64> = all.iter().map(|v| v["ts"].as_f64().unwrap()).collect();
         assert_eq!(ts, [1.0, 2.0, 3.0]);
         assert_eq!(all[1]["type"], "tls_error");
 
         // limit keeps the most recent N across both kinds.
-        let last2 = merge_timeline(&flows, tls, 2);
+        let last2 = merge_timeline(&serial, &flows, tls, 2);
         let ts: Vec<f64> = last2.iter().map(|v| v["ts"].as_f64().unwrap()).collect();
         assert_eq!(ts, [2.0, 3.0]);
+    }
+
+    #[test]
+    fn recalled_legacy_tls_errors_gain_device_scoped_actions() {
+        let serial = Serial::new("emulator-5554; unsafe");
+        let mut event = json!({
+            "type": "tls_error",
+            "ts": 2.0,
+            "host": "api.example.com",
+            "reason": "rejected"
+        });
+        attach_recalled_tls_actions(&serial, &mut event);
+        let actions = event["next_actions"].as_array().unwrap();
+        assert!(!actions.is_empty());
+        assert!(actions.iter().all(|action| action
+            .as_str()
+            .unwrap()
+            .starts_with("shadowdroid -d 'emulator-5554; unsafe' net ")));
     }
 
     fn spec(kind: &str, arg: &str) -> RuleSpec {

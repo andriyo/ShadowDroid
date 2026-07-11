@@ -14,9 +14,8 @@
 //! surfaced as notes — those bypass a user-CA proxy regardless.)
 
 use crate::ids::Serial;
-use anyhow::{bail, Result};
+use anyhow::Result;
 use serde::Serialize;
-use serde_json::json;
 
 use crate::device::adb;
 
@@ -63,7 +62,25 @@ pub async fn inspect(
 ) -> Result<CheckReport> {
     crate::config::validate_android_package(package)?;
     if adb::pm_path(serial, package).await?.is_none() {
-        bail!("{package} is not installed on {serial}");
+        let device = crate::events::shell_token(serial.as_str());
+        let package_token = crate::events::shell_token(package);
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "package_not_installed",
+            "net",
+            format!("{package} is not installed on {serial}"),
+        )
+        .detail(serde_json::json!({
+            "device": serial.as_str(),
+            "package": package,
+        }))
+        .next_actions([
+            "shadowdroid commands --json --describe 'app install'".to_string(),
+            format!("shadowdroid -d {device} app current"),
+            format!(
+                "install {package_token} on the selected device, then rerun `shadowdroid -d {device} net check {package_token}`"
+            ),
+        ])
+        .into());
     }
     let package_arg = crate::config::quote_device_shell_arg(package);
     let dump = adb::shell(serial, format!("dumpsys package {package_arg}")).await?;
@@ -155,12 +172,8 @@ pub async fn run(
     tctx: &crate::net::trust::TrustContext,
 ) -> Result<()> {
     let report = inspect(serial, package, tctx).await?;
-    let mut v = serde_json::to_value(&report).unwrap_or_default();
-    if let serde_json::Value::Object(map) = &mut v {
-        map.insert("type".into(), json!("action"));
-        map.insert("cmd".into(), json!("net_check"));
-    }
-    println!("{}", serde_json::to_string(&v).unwrap());
+    let value = serde_json::to_value(&report).unwrap_or_default();
+    crate::events::emit_action("net_check", &value);
     Ok(())
 }
 

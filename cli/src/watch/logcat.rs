@@ -13,6 +13,7 @@ use crate::events::{now_ts, CausedBy, CrashEvent, Event};
 use crate::ids::Serial;
 use anyhow::{bail, Context, Result};
 use regex::Regex;
+use std::future::Future;
 use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -28,23 +29,37 @@ pub async fn run(
     app_filter: Option<String>,
     out: mpsc::Sender<Event>,
 ) -> Result<()> {
-    let (crash_tx, mut crash_rx) = mpsc::channel(256);
-    let mut worker = tokio::spawn(run_crashes(serial, app_filter, crash_tx));
+    let (crash_tx, crash_rx) = mpsc::channel(256);
+    forward_crash_events(run_crashes(serial, app_filter, crash_tx), crash_rx, out).await
+}
+
+async fn forward_crash_events<F>(
+    worker: F,
+    mut crash_rx: mpsc::Receiver<CrashEvent>,
+    out: mpsc::Sender<Event>,
+) -> Result<()>
+where
+    F: Future<Output = Result<()>>,
+{
+    tokio::pin!(worker);
     loop {
         tokio::select! {
             evt = crash_rx.recv() => {
                 if let Some(evt) = evt {
-                    let _ = out.send(Event::Crash(evt)).await;
+                    if out.send(Event::Crash(evt)).await.is_err() {
+                        return Ok(());
+                    }
                 } else {
-                    return worker.await.context("crash detector task panicked")?;
+                    return worker.await;
                 }
             }
             result = &mut worker => {
-                let run_result = result.context("crash detector task panicked")?;
                 while let Ok(evt) = crash_rx.try_recv() {
-                    let _ = out.send(Event::Crash(evt)).await;
+                    if out.send(Event::Crash(evt)).await.is_err() {
+                        return Ok(());
+                    }
                 }
-                return run_result;
+                return result;
             }
         }
     }
@@ -476,7 +491,10 @@ fn anr_header_re() -> &'static Regex {
 
 #[cfg(test)]
 mod tests {
-    use super::{package_matches_filter, CrashCollector};
+    use super::{forward_crash_events, package_matches_filter, CrashCollector};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, oneshot};
 
     #[test]
     fn parses_java_crash_block() {
@@ -535,5 +553,33 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("ANR in com.example"));
+    }
+
+    #[tokio::test]
+    async fn cancelling_forwarder_drops_the_crash_worker() {
+        struct DropProbe(Arc<AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let worker_dropped = dropped.clone();
+        let (started_tx, started_rx) = oneshot::channel();
+        let worker = async move {
+            let _probe = DropProbe(worker_dropped);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+            Ok(())
+        };
+        let (_crash_tx, crash_rx) = mpsc::channel(1);
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let forwarder = tokio::spawn(forward_crash_events(worker, crash_rx, event_tx));
+        started_rx.await.unwrap();
+
+        forwarder.abort();
+        assert!(forwarder.await.unwrap_err().is_cancelled());
+        assert!(dropped.load(Ordering::Acquire));
     }
 }

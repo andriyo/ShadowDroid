@@ -9,16 +9,19 @@
 use anyhow::Result;
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{Arg, ArgAction, Command, CommandFactory};
+use std::sync::LazyLock;
 
 use crate::cli::Cli;
 
 mod agent_metadata;
 use agent_metadata::agent_metadata;
 
+static CLI_COMMAND_TEMPLATE: LazyLock<Command> = LazyLock::new(Cli::command);
+
 pub fn run(json: bool, depth: Option<usize>, describe: Option<&str>) -> Result<()> {
-    let root = Cli::command();
+    let root = &*CLI_COMMAND_TEMPLATE;
     let catalog = if let Some(path) = describe {
-        describe_catalog(&root, path).ok_or_else(|| {
+        describe_catalog(root, path).ok_or_else(|| {
             crate::diagnostic::DiagnosticError::new(
                 "command_not_found",
                 "commands",
@@ -28,10 +31,10 @@ pub fn run(json: bool, depth: Option<usize>, describe: Option<&str>) -> Result<(
             .next_actions(["shadowdroid commands --json --depth 1"])
         })?
     } else {
-        catalog_with_depth(&root, depth)
+        catalog_with_depth(root, depth)
     };
     if json {
-        println!("{}", serde_json::to_string_pretty(&catalog)?);
+        crate::events::emit_result(&catalog);
     } else if describe.is_some() {
         print_command(&catalog["command"], 0);
     } else {
@@ -47,12 +50,13 @@ pub fn catalog(root: &Command) -> serde_json::Value {
 
 fn catalog_with_depth(root: &Command, depth: Option<usize>) -> serde_json::Value {
     serde_json::json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "name": root.get_name(),
         "version": root.get_version().unwrap_or(""),
         "about": root.get_about().map(|s| s.to_string()),
         "global_args": args(root).into_iter().filter(|arg| arg["global"] == true).collect::<Vec<_>>(),
         "commands": subcommands(root, &[], depth),
+        "next_actions": next_actions_for_path("commands"),
     })
 }
 
@@ -71,10 +75,11 @@ fn describe_catalog(root: &Command, raw_path: &str) -> Option<serde_json::Value>
     }
     parent.pop();
     Some(serde_json::json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "path": names.join(" "),
         "global_args": args(root).into_iter().filter(|arg| arg["global"] == true).collect::<Vec<_>>(),
         "command": command_json(command, &parent, Some(0)),
+        "next_actions": next_actions_for_path("commands"),
     }))
 }
 
@@ -110,7 +115,7 @@ fn command_json(
     if let Some(about) = cmd.get_about() {
         o.insert("about".into(), about.to_string().into());
     }
-    if let Some(agent) = agent_metadata(&path) {
+    if let Some(agent) = catalog_agent_metadata(&path) {
         o.insert("agent".into(), agent);
     }
     o.insert(
@@ -118,6 +123,7 @@ fn command_json(
         serde_json::json!({
             "output_mode": output_mode(&path),
             "success_condition": "process exit code 0; action envelopes also contain ok=true",
+            "next_actions": "every terminal JSON success/error contains a non-empty next_actions array; streaming events omit it until their terminal summary",
         }),
     );
     let command_args = args(cmd);
@@ -133,6 +139,236 @@ fn command_json(
         o.insert("subcommands".into(), serde_json::json!(subs));
     }
     serde_json::Value::Object(o)
+}
+
+/// Return parseable follow-up command templates for a public command path.
+///
+/// The hand-curated agent metadata is the sole source of these actions. Runtime
+/// envelopes specialize observed placeholders (or replace unresolved templates
+/// with an exact `commands --describe` action), while `commands --json` exposes
+/// the same templates for planning.
+pub(crate) fn next_actions_for_path(path: &str) -> Vec<String> {
+    let parts = path
+        .split_whitespace()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    agent_metadata(&parts)
+        .and_then(|value| value.get("next_actions").cloned())
+        .and_then(|value| value.as_array().cloned())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(normalize_next_command))
+        .collect()
+}
+
+fn catalog_agent_metadata(path: &[String]) -> Option<serde_json::Value> {
+    let mut metadata = agent_metadata(path)?;
+    let object = metadata.as_object_mut()?;
+    object.remove("next_actions");
+    object.insert(
+        "next_actions".into(),
+        serde_json::json!(next_actions_for_path(&path.join(" "))),
+    );
+    Some(metadata)
+}
+
+fn normalize_next_command(command: &str) -> String {
+    let command = command.trim();
+    let normalized = if command.starts_with("shadowdroid ") || command == "shadowdroid" {
+        command.to_string()
+    } else {
+        format!("shadowdroid {command}")
+    };
+    if normalized
+        .split_whitespace()
+        .any(|token| token.contains('|'))
+    {
+        if let Some(path) = command_path_for_invocation(&normalized) {
+            return format!("shadowdroid commands --json --describe '{path}'");
+        }
+    }
+    if !command.contains('<') {
+        if let Some(path) = incomplete_command_path(command) {
+            return format!("shadowdroid commands --json --describe '{path}'");
+        }
+    }
+    if !action_template_parses(&normalized) {
+        if let Some(path) = command_path_for_invocation(&normalized) {
+            return format!("shadowdroid commands --json --describe '{path}'");
+        }
+    }
+    normalized
+}
+
+/// A catalog hint such as bare `debug eval` or `ui tap` is a dead end: clap (or
+/// the command's semantic validator) immediately rejects it. Replace those
+/// incomplete hints with an exact, runnable describe command. Templates that
+/// already name `<placeholders>` remain templates because they tell the agent
+/// precisely which observed value must be supplied.
+fn incomplete_command_path(command: &str) -> Option<String> {
+    let command = command.strip_prefix("shadowdroid ").unwrap_or(command);
+    let tokens = command.split_whitespace().collect::<Vec<_>>();
+    let root = &*CLI_COMMAND_TEMPLATE;
+    let mut node = root;
+    let mut path = Vec::new();
+    let mut consumed = 0usize;
+    for token in &tokens {
+        let Some(child) = node.get_subcommands().find(|candidate| {
+            candidate.get_name() == *token
+                || candidate.get_all_aliases().any(|alias| alias == *token)
+        }) else {
+            break;
+        };
+        path.push(child.get_name().to_string());
+        node = child;
+        consumed += 1;
+    }
+    if path.is_empty() || consumed < tokens.len() {
+        return None;
+    }
+    let runtime_required = matches!(
+        path.join(" ").as_str(),
+        "ui tap"
+            | "ui text"
+            | "ui wait"
+            | "ui scroll-to"
+            | "layout source"
+            | "profile apply"
+            | "debug inspect"
+    );
+    let clap_required = node
+        .get_arguments()
+        .any(|argument| argument.is_required_set());
+    let needs_subcommand = node.has_subcommands();
+    (runtime_required || clap_required || needs_subcommand).then(|| path.join(" "))
+}
+
+/// Resolve the canonical public command path at the front of a suggested
+/// invocation, ignoring global `-d/--device` scoping. Used when a runtime
+/// template still has unresolved placeholders and must become an exact
+/// `commands --describe` action instead of a command that is guaranteed to
+/// fail parsing or semantic validation.
+pub(crate) fn command_path_for_invocation(command: &str) -> Option<String> {
+    let command = command.strip_prefix("shadowdroid ")?;
+    let tokens = command.split_whitespace().collect::<Vec<_>>();
+    let root = &*CLI_COMMAND_TEMPLATE;
+    let mut node = root;
+    let mut path = Vec::new();
+    let mut index = 0usize;
+    while index < tokens.len() {
+        let token = tokens[index];
+        if path.is_empty() && matches!(token, "-d" | "--device") {
+            index += 2;
+            continue;
+        }
+        let child = node.get_subcommands().find(|candidate| {
+            candidate.get_name() == token || candidate.get_all_aliases().any(|alias| alias == token)
+        });
+        let Some(child) = child else {
+            if path.is_empty() {
+                index += 1;
+                continue;
+            }
+            break;
+        };
+        path.push(child.get_name().to_string());
+        node = child;
+        index += 1;
+    }
+    (!path.is_empty()).then(|| path.join(" "))
+}
+
+fn action_template_parses(command: &str) -> bool {
+    let command = materialize_action_template(command);
+    let Some(argv) = split_shell_words(&command) else {
+        return false;
+    };
+    CLI_COMMAND_TEMPLATE
+        .clone()
+        .try_get_matches_from(argv)
+        .is_ok()
+}
+
+fn materialize_action_template(command: &str) -> String {
+    let mut output = String::with_capacity(command.len());
+    let mut chars = command.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '<' {
+            output.push(ch);
+            continue;
+        }
+        let mut name = String::new();
+        let mut closed = false;
+        for next in chars.by_ref() {
+            if next == '>' {
+                closed = true;
+                break;
+            }
+            name.push(next);
+        }
+        if !closed {
+            output.push('<');
+            output.push_str(&name);
+            break;
+        }
+        let replacement = match name.as_str() {
+            "pkg" | "app" => "com.example.app",
+            "id" | "n" | "frame" => "1",
+            "op" => "CAMERA",
+            "mode" => "allow",
+            "permission" => "android.permission.CAMERA",
+            "remote" | "remote-dir" => "/sdcard/example",
+            "local" | "before" | "after" => "/tmp/example",
+            "label" | "text" | "value" => "Example",
+            "cmd" | "command" => "true",
+            "recommended verb" => "ui dump",
+            _ => "example",
+        };
+        output.push_str(replacement);
+    }
+    output
+}
+
+fn split_shell_words(command: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in command.chars() {
+        if escaped {
+            word.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quote != Some('\'') {
+            escaped = true;
+            continue;
+        }
+        if matches!(ch, '\'' | '"') {
+            if quote == Some(ch) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(ch);
+            } else {
+                word.push(ch);
+            }
+            continue;
+        }
+        if ch.is_whitespace() && quote.is_none() {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+        } else {
+            word.push(ch);
+        }
+    }
+    if escaped || quote.is_some() {
+        return None;
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    (!words.is_empty()).then_some(words)
 }
 fn args(cmd: &Command) -> Vec<serde_json::Value> {
     cmd.get_arguments()
@@ -319,7 +555,7 @@ fn output_mode(path: &[String]) -> &'static str {
         "test" => "passthrough_with_json_trailer",
         "ui gen" => "source_text",
         "skill" => "source_text_or_json_action",
-        "net export" => "selected_format",
+        "net export" => "json_action_with_artifact",
         "update" | "init" | "doctor" | "commands" => "human_or_json",
         _ if matches!(
             path.first().map(String::as_str),
@@ -396,6 +632,38 @@ mod tests {
         }
     }
 
+    fn collect_commands_with_invalid_next_action_templates(
+        commands: &[Value],
+        prefix: &mut Vec<String>,
+        missing: &mut Vec<String>,
+    ) {
+        for command in commands {
+            if let Some(name) = command["name"].as_str() {
+                prefix.push(name.to_string());
+                let actions = command["agent"]["next_actions"].as_array();
+                if !actions.is_some_and(|actions| {
+                    !actions.is_empty()
+                        && actions
+                            .iter()
+                            .all(|action| action.as_str().is_some_and(action_template_parses))
+                }) {
+                    missing.push(prefix.join(" "));
+                }
+                if command["agent"].get("next_commands").is_some() {
+                    missing.push(format!("{} (legacy next_commands)", prefix.join(" ")));
+                }
+                if let Some(subcommands) = command["subcommands"].as_array() {
+                    collect_commands_with_invalid_next_action_templates(
+                        subcommands,
+                        prefix,
+                        missing,
+                    );
+                }
+                prefix.pop();
+            }
+        }
+    }
+
     #[test]
     fn catalog_avoids_duplicate_summary_and_has_contract() {
         let root = Cli::command();
@@ -414,6 +682,12 @@ mod tests {
             .unwrap();
         assert!(watch.get("summary").is_none());
         assert_eq!(watch["contract"]["output_mode"], "jsonl");
+
+        let net_export = find_command(commands, &["net", "export"]).unwrap();
+        assert_eq!(
+            net_export["contract"]["output_mode"],
+            "json_action_with_artifact"
+        );
     }
 
     #[test]
@@ -546,6 +820,73 @@ mod tests {
     }
 
     #[test]
+    fn every_public_command_advertises_parseable_next_action_templates() {
+        let catalog = catalog(&Cli::command());
+        assert_eq!(catalog["schema_version"], 3);
+        assert!(catalog["next_actions"]
+            .as_array()
+            .is_some_and(|actions| !actions.is_empty()));
+        let mut missing = Vec::new();
+        collect_commands_with_invalid_next_action_templates(
+            catalog["commands"].as_array().unwrap(),
+            &mut Vec::new(),
+            &mut missing,
+        );
+        assert!(
+            missing.is_empty(),
+            "public commands with missing or invalid next_action templates: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn incomplete_bare_hints_become_exact_discovery_commands() {
+        assert_eq!(
+            normalize_next_command("ui tap"),
+            "shadowdroid commands --json --describe 'ui tap'"
+        );
+        assert_eq!(
+            normalize_next_command("debug eval"),
+            "shadowdroid commands --json --describe 'debug eval'"
+        );
+        assert_eq!(
+            normalize_next_command("debug inspect"),
+            "shadowdroid commands --json --describe 'debug inspect'"
+        );
+        assert_eq!(
+            normalize_next_command("ui scroll-to"),
+            "shadowdroid commands --json --describe 'ui scroll-to'"
+        );
+        assert_eq!(
+            normalize_next_command("ui tap --id <id>"),
+            "shadowdroid ui tap --id <id>"
+        );
+        assert_eq!(
+            normalize_next_command("ui text --id <id>"),
+            "shadowdroid commands --json --describe 'ui text'"
+        );
+        assert_eq!(
+            normalize_next_command("app current"),
+            "shadowdroid app current"
+        );
+        assert_eq!(
+            normalize_next_command("appops set <pkg> <op> <mode> --scope uid|package"),
+            "shadowdroid commands --json --describe 'appops set'"
+        );
+    }
+
+    #[test]
+    fn action_template_validation_checks_the_complete_clap_invocation() {
+        assert!(action_template_parses("shadowdroid app start <pkg>"));
+        assert!(action_template_parses(
+            "shadowdroid commands --json --describe '<recommended verb>'"
+        ));
+        assert!(!action_template_parses(
+            "shadowdroid debug sessions --definitely-invalid"
+        ));
+        assert!(!action_template_parses("shadowdroid net export"));
+    }
+
+    #[test]
     fn catalog_exposes_agent_decision_hints_for_common_tool_choices() {
         let root = Cli::command();
         let catalog = catalog(&root);
@@ -610,11 +951,11 @@ mod tests {
                 .as_str()
                 .unwrap_or("")
                 .contains("Compose recomposition")));
-        assert!(recompositions["agent"]["next_commands"]
+        assert!(recompositions["agent"]["next_actions"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|value| value.as_str() == Some("layout recompositions --reset")));
+            .any(|value| value.as_str() == Some("shadowdroid layout recompositions --reset")));
     }
 
     #[test]

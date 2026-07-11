@@ -187,7 +187,7 @@ pub async fn run(
             crate::net::store::read_filtered(serial, &crate::net::Matcher::default(), 200)
         {
             for f in flows.iter().rev() {
-                let evt = f.http_event();
+                let evt = f.http_event(serial);
                 let v = serde_json::to_value(&evt).unwrap_or_default();
                 let status = v.get("status").and_then(|s| s.as_u64()).unwrap_or(0);
                 let ok = v.get("ok").and_then(|o| o.as_bool()).unwrap_or(true);

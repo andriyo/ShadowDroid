@@ -7,7 +7,34 @@ use crate::proto::{AppRef, Element, ImeState, ScreenResponse, Viewport};
 use serde::Serialize;
 use std::fmt;
 use std::io::Write;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const MAX_NEXT_ACTIONS: usize = 5;
+
+/// Canonical clap command path for this one-shot CLI process (`ui dump`,
+/// `app start`, …). Set once immediately after successful parsing so every
+/// terminal emitter can attach the same catalog-backed decision guidance.
+static CURRENT_COMMAND_PATH: OnceLock<String> = OnceLock::new();
+static CURRENT_DEVICE: OnceLock<String> = OnceLock::new();
+
+pub fn set_current_command_path(path: String) {
+    let _ = CURRENT_COMMAND_PATH.set(path);
+}
+
+pub fn current_command_path() -> Option<&'static str> {
+    CURRENT_COMMAND_PATH.get().map(String::as_str)
+}
+
+pub fn set_current_device(device: String) {
+    if !device.is_empty() {
+        let _ = CURRENT_DEVICE.set(device);
+    }
+}
+
+fn current_device() -> Option<&'static str> {
+    CURRENT_DEVICE.get().map(String::as_str)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum ScreenFormat {
@@ -60,18 +87,21 @@ pub enum Event {
     },
     Error {
         stage: String,
+        code: String,
         msg: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         input: Option<String>,
+        retryable: bool,
+        detail: serde_json::Value,
+        next_actions: Vec<String>,
         ts: f64,
     },
     Warning {
         stage: String,
+        code: String,
         msg: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        suggested_command: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        hint: Option<String>,
+        detail: serde_json::Value,
+        next_actions: Vec<String>,
         ts: f64,
     },
     /// A completed HTTP(S) transaction through the `net` proxy. Compact by
@@ -108,6 +138,7 @@ pub enum Event {
         /// Request body was streamed upstream (oversized upload), not captured.
         #[serde(default, skip_serializing_if = "is_false")]
         req_streamed: bool,
+        next_actions: Vec<String>,
     },
     /// A flow paused by `net intercept`, awaiting the agent's `net
     /// resume`/`drop`/`respond`. Held until acted on or `hold_deadline_ms`.
@@ -133,6 +164,7 @@ pub enum Event {
         req_preview: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         resp_preview: Option<String>,
+        next_actions: Vec<String>,
     },
     /// A TLS handshake the proxy could not complete after presenting a minted
     /// leaf for `host` — almost always the app rejecting the MITM CA (untrusted),
@@ -143,6 +175,7 @@ pub enum Event {
         ts: f64,
         host: String,
         reason: String,
+        next_actions: Vec<String>,
     },
 }
 
@@ -312,6 +345,44 @@ pub fn emit(value: &impl Serialize) {
     );
 }
 
+/// Emit one in-stream record while safely applying the stream's device to any
+/// recovery commands already present on the event. Unlike [`emit_result`], this
+/// does not add terminal/catalog fallbacks to ordinary timeline data.
+pub fn emit_stream_event(value: &impl Serialize, device: &str) {
+    emit(&stream_event_value(value, device));
+}
+
+fn stream_event_value(value: &impl Serialize, device: &str) -> serde_json::Value {
+    let mut value = serde_json::to_value(value).unwrap_or_else(|_| serde_json::json!({}));
+    if let serde_json::Value::Object(map) = &mut value {
+        let mut context = map.clone();
+        context.insert("device".into(), serde_json::json!(device));
+        if let Some(actions) = map
+            .get("next_actions")
+            .and_then(serde_json::Value::as_array)
+        {
+            let actions = actions
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(|action| executable_action(action, &context))
+                .collect::<Vec<_>>();
+            map.insert("next_actions".into(), serde_json::json!(actions));
+        }
+    }
+    value
+}
+
+/// Emit a terminal JSON object and guarantee a non-empty `next_actions` list.
+/// Use [`emit`] instead for individual JSONL stream events; their terminal
+/// action summary carries the follow-up guidance once the stream ends.
+pub fn emit_result(value: &impl Serialize) {
+    let mut value = serde_json::to_value(value).unwrap_or_else(|_| serde_json::json!({}));
+    if let serde_json::Value::Object(map) = &mut value {
+        attach_next_actions(map);
+    }
+    emit(&value);
+}
+
 /// Non-panicking stdout sink used by the crate-local `print!`/`println!`
 /// macros. In particular, `BrokenPipe` is expected when an agent has already
 /// consumed enough output and closes `head`, `jq`, or another pipeline stage.
@@ -379,6 +450,7 @@ fn action_envelope(cmd: &str, body: &serde_json::Value) -> serde_json::Value {
     m.insert("cmd".into(), cmd.into());
     m.insert("ok".into(), true.into());
     attach_events(&mut m);
+    attach_next_actions(&mut m);
     serde_json::Value::Object(m)
 }
 
@@ -418,7 +490,620 @@ fn error_envelope(
     // errored with element_not_found *because the app crashed* carries the
     // crash in the same error line.
     attach_events(&mut m);
+    attach_next_actions(&mut m);
     serde_json::Value::Object(m)
+}
+
+fn attach_next_actions(map: &mut serde_json::Map<String, serde_json::Value>) {
+    let mut actions = map
+        .get("next_actions")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|action| !action.is_empty())
+        .map(|action| executable_action(action, map))
+        .collect::<Vec<_>>();
+
+    let command_path = effective_command_path(map);
+    let mut fallbacks = domain_guidance(command_path, map);
+    let dynamic_actions = dynamic_next_actions(command_path, map);
+    let has_dynamic_actions = !dynamic_actions.is_empty();
+    fallbacks.extend(dynamic_actions);
+    if !has_dynamic_actions {
+        fallbacks.extend(
+            command_path
+                .map(crate::cmd::introspect::next_actions_for_path)
+                .unwrap_or_default(),
+        );
+    }
+    for action in fallbacks {
+        let action = executable_action(&action, map);
+        if !actions.contains(&action) {
+            actions.push(action);
+        }
+        if actions.len() == MAX_NEXT_ACTIONS {
+            break;
+        }
+    }
+
+    if actions.is_empty() {
+        actions.push(match command_path {
+            Some(path) => format!("shadowdroid commands --json --describe '{path}'"),
+            None => "shadowdroid commands --json --depth 1".to_string(),
+        });
+    }
+    actions.truncate(MAX_NEXT_ACTIONS);
+    map.insert("next_actions".into(), serde_json::json!(actions));
+}
+
+/// Interactive commands executed inside `watch` still use the public command
+/// contracts for the operation they performed. The process-level path remains
+/// `watch`, so recover the canonical leaf from the action envelope's `cmd`.
+fn effective_command_path(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Option<&'static str> {
+    let current = current_command_path();
+    if current != Some("watch") {
+        return current;
+    }
+    map.get("cmd")
+        .and_then(serde_json::Value::as_str)
+        .and_then(watch_action_command_path)
+        .or(current)
+}
+
+fn watch_action_command_path(cmd: &str) -> Option<&'static str> {
+    match cmd {
+        "tap" | "tap_and_wait" | "tap_text" | "tap_rid" | "tap_desc" | "tap_text_and_wait"
+        | "tap_rid_and_wait" | "tap_desc_and_wait" | "xpath_tap" => Some("ui tap"),
+        "double_tap" => Some("ui double-tap"),
+        "long_tap" => Some("ui long-tap"),
+        "swipe" | "swipe_and_wait" => Some("ui swipe"),
+        "drag" | "drag_and_wait" => Some("ui drag"),
+        "swipe_ext" | "swipe_ext_and_wait" => Some("ui swipe-ext"),
+        "key" => Some("ui key"),
+        "text" => Some("ui text"),
+        "xpath" => Some("ui find"),
+        "toast" => Some("ui toast"),
+        "wait_for" | "wait_activity" => Some("ui wait"),
+        "launch" => Some("app start"),
+        "stop" => Some("app stop"),
+        "app_clear" => Some("app clear"),
+        "app_wait" => Some("app wait"),
+        "app_info" => Some("app info"),
+        "screenshot" => Some("ui screenshot"),
+        "shell" => Some("device shell"),
+        "screen_on" | "wakeup" => Some("device wake"),
+        "screen_off" => Some("device sleep"),
+        "unlock" => Some("device unlock"),
+        "orientation" | "set_orientation" => Some("device orientation"),
+        "clipboard" | "set_clipboard" => Some("device clipboard"),
+        "open_notification" => Some("device notifications"),
+        "open_quick_settings" => Some("device quick-settings"),
+        "open_url" => Some("device open-url"),
+        "push" => Some("files push"),
+        "pull" => Some("files pull"),
+        "watch" | "quit" | "add_watcher" | "remove_watcher" | "list_watchers"
+        | "clear_watchers" | "permission_dialogs" => Some("watch"),
+        _ => None,
+    }
+}
+
+fn domain_guidance(
+    command_path: Option<&str>,
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<String> {
+    fn strings(value: Option<&serde_json::Value>) -> Vec<String> {
+        match value {
+            Some(serde_json::Value::String(value)) if !value.trim().is_empty() => {
+                vec![value.trim().to_string()]
+            }
+            Some(serde_json::Value::Array(values)) => values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    let mut guidance = Vec::new();
+    for key in ["next", "hints", "guidance", "suggested_actions"] {
+        guidance.extend(strings(map.get(key)));
+    }
+    guidance.extend(strings(
+        map.get("ime").and_then(|ime| ime.get("suggested_actions")),
+    ));
+    guidance.extend(strings(
+        map.get("sample")
+            .and_then(|sample| sample.get("next_actions")),
+    ));
+    guidance.extend(strings(map.get("recommended_command")));
+    guidance.extend(strings(
+        map.get("trust")
+            .and_then(|trust| trust.get("recommended_command")),
+    ));
+    if command_path == Some("ui audit") {
+        guidance.extend(strings(map.get("recommendation")));
+    }
+    guidance
+}
+
+fn dynamic_next_actions(
+    command_path: Option<&str>,
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<String> {
+    if let Some(mut screen) = map
+        .get("screen")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+    {
+        if !screen.contains_key("device") {
+            if let Some(device) =
+                observed_value(map, "device").or_else(|| current_device().map(str::to_owned))
+            {
+                screen.insert("device".into(), serde_json::json!(device));
+            }
+        }
+        let actions = screen_element_actions(&screen);
+        if !actions.is_empty() {
+            return actions;
+        }
+    }
+    match command_path {
+        Some("devices") => {
+            let actions = map
+                .get("devices")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|device| {
+                    device.get("state").and_then(serde_json::Value::as_str) == Some("device")
+                })
+                .filter_map(|device| device.get("serial").and_then(serde_json::Value::as_str))
+                .take(3)
+                .map(|serial| format!("shadowdroid -d {} connect", shell_token(serial)))
+                .collect::<Vec<_>>();
+            if actions.is_empty() {
+                vec!["adb devices -l".to_string()]
+            } else {
+                actions
+            }
+        }
+        Some("doctor") if map.get("healthy").and_then(serde_json::Value::as_bool) == Some(true) => {
+            vec![
+                "shadowdroid app current".to_string(),
+                "shadowdroid ui dump".to_string(),
+            ]
+        }
+        Some("update")
+            if map.get("up_to_date").and_then(serde_json::Value::as_bool) == Some(false) =>
+        {
+            vec![
+                "review release_url and update.command, then obtain approval before executing the host-changing update".to_string(),
+                "shadowdroid commands --json --describe 'update'".to_string(),
+            ]
+        }
+        Some("usage report") => {
+            let mut actions = map
+                .get("recommendations")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|recommendation| {
+                    recommendation
+                        .get("next_action")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .map(str::to_owned)
+                .take(3)
+                .collect::<Vec<_>>();
+            actions.push("shadowdroid usage report --days 7".to_string());
+            actions
+        }
+        Some("watch")
+            if map.get("status").and_then(serde_json::Value::as_str) == Some("stopped") =>
+        {
+            vec![
+                "shadowdroid watch".to_string(),
+                "shadowdroid ui dump".to_string(),
+                "shadowdroid why".to_string(),
+            ]
+        }
+        Some("ui dump") => screen_element_actions(map),
+        Some("ui find" | "ui wait") => element_actions(map),
+        Some("net status") => {
+            let running = map.get("running").and_then(serde_json::Value::as_bool);
+            let wired = map
+                .get("pointed_at_proxy")
+                .and_then(serde_json::Value::as_bool);
+            if running == Some(true) && wired == Some(true) {
+                vec![
+                    "shadowdroid watch".to_string(),
+                    "shadowdroid net log".to_string(),
+                    "shadowdroid net stop".to_string(),
+                ]
+            } else if running == Some(true) {
+                vec![
+                    "shadowdroid net stop".to_string(),
+                    "shadowdroid net start".to_string(),
+                    "shadowdroid doctor --json".to_string(),
+                ]
+            } else {
+                vec!["shadowdroid net start".to_string()]
+            }
+        }
+        Some("net start") => {
+            let mut actions = map
+                .get("apps")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .take(2)
+                .map(|package| format!("shadowdroid net check {}", shell_token(package)))
+                .collect::<Vec<_>>();
+            actions.extend([
+                "shadowdroid watch".to_string(),
+                "shadowdroid net status".to_string(),
+            ]);
+            actions
+        }
+        Some("net log") => map
+            .get("ids")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .take(3)
+            .map(|id| format!("shadowdroid net show {} --body", shell_token(id)))
+            .collect(),
+        Some("net show") => map
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(|id| {
+                if map.get("held").and_then(serde_json::Value::as_bool) == Some(true) {
+                    vec![
+                        format!("shadowdroid net resume {}", shell_token(id)),
+                        format!("shadowdroid net drop {}", shell_token(id)),
+                    ]
+                } else {
+                    vec![
+                        format!("shadowdroid net export har {}", shell_token(id)),
+                        format!("shadowdroid net export curl {}", shell_token(id)),
+                    ]
+                }
+            })
+            .unwrap_or_default(),
+        Some("net rule add") => map
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(|id| {
+                vec![
+                    format!("shadowdroid net rule rm {}", shell_token(id)),
+                    "shadowdroid net rule list".to_string(),
+                    "shadowdroid watch".to_string(),
+                ]
+            })
+            .unwrap_or_default(),
+        Some("debug sessions") => debugger_session_actions(map),
+        Some("debug clients") => debugger_client_actions(map),
+        _ => Vec::new(),
+    }
+}
+
+fn screen_element_actions(map: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
+    let Some(elements) = map.get("elements").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    let mut actions = Vec::new();
+    let mut used_ids = std::collections::BTreeSet::new();
+
+    // Inputs come first: tapping a text field is not the real task, and treating
+    // any node with center coordinates as clickable can activate the wrong
+    // parent. Spell out the one value the caller must choose while preserving
+    // the observed id/hash/device in the command template.
+    for element in elements.iter().filter_map(serde_json::Value::as_object) {
+        if element.get("input").and_then(serde_json::Value::as_bool) != Some(true) {
+            continue;
+        }
+        if let Some(action) = input_element_action(map, element) {
+            if let Some(id) = element.get("id").and_then(serde_json::Value::as_u64) {
+                used_ids.insert(id);
+            }
+            actions.push(action);
+            break;
+        }
+    }
+
+    for element in elements.iter().filter_map(serde_json::Value::as_object) {
+        let Some(id) = element.get("id").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        if used_ids.contains(&id)
+            || element.get("input").and_then(serde_json::Value::as_bool) == Some(true)
+            || element
+                .get("clickable")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+        {
+            continue;
+        }
+        if let Some(action) = clickable_element_action(map, element) {
+            actions.push(action);
+            used_ids.insert(id);
+        }
+        if actions.len() >= 3 {
+            break;
+        }
+    }
+
+    if actions.is_empty() {
+        actions.extend([
+            "shadowdroid ui audit".to_string(),
+            "shadowdroid layout snapshot".to_string(),
+        ]);
+    }
+    actions
+}
+
+fn element_actions(map: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
+    let Some(element) = map.get("element").and_then(serde_json::Value::as_object) else {
+        return Vec::new();
+    };
+    if element.get("input").and_then(serde_json::Value::as_bool) == Some(true) {
+        return input_element_action(map, element).into_iter().collect();
+    }
+    clickable_element_action(map, element).into_iter().collect()
+}
+
+fn clickable_element_action(
+    map: &serde_json::Map<String, serde_json::Value>,
+    element: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    if element
+        .get("clickable")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return None;
+    }
+    let id = element.get("id").and_then(serde_json::Value::as_u64)?;
+    let mut command = format!("shadowdroid ui tap --id {id}");
+    if let Some(hash) = map.get("screen_hash").and_then(serde_json::Value::as_str) {
+        command.push_str(&format!(" --if-screen {}", shell_token(hash)));
+    }
+    command.push_str(" --observe");
+    Some(command)
+}
+
+fn input_element_action(
+    map: &serde_json::Map<String, serde_json::Value>,
+    element: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    let id = element.get("id").and_then(serde_json::Value::as_u64)?;
+    let mut command = format!("shadowdroid ui text VALUE --id {id}");
+    if let Some(hash) = map.get("screen_hash").and_then(serde_json::Value::as_str) {
+        command.push_str(&format!(" --if-screen {}", shell_token(hash)));
+    }
+    command.push_str(" --observe");
+    let command = specialize_action(&command, map);
+    Some(format!(
+        "replace VALUE with the intended text, then run `{command}`"
+    ))
+}
+
+fn debugger_session_actions(map: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
+    let Some(sessions) = map.get("sessions").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    let preferred_device =
+        observed_value(map, "device").or_else(|| current_device().map(str::to_owned));
+    let sessions = sessions
+        .iter()
+        .filter_map(serde_json::Value::as_object)
+        .collect::<Vec<_>>();
+    let suspended = |session: &&serde_json::Map<String, serde_json::Value>| {
+        session
+            .get("suspended")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    };
+    let selected = if let Some(device) = preferred_device.as_deref() {
+        let matching = sessions
+            .iter()
+            .copied()
+            .filter(|session| debugger_device_matches(session, device))
+            .collect::<Vec<_>>();
+        let matching_suspended = matching
+            .iter()
+            .copied()
+            .filter(|session| {
+                session
+                    .get("suspended")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+            })
+            .collect::<Vec<_>>();
+        if matching_suspended.len() == 1 {
+            matching_suspended.first().copied()
+        } else if matching.len() == 1 {
+            matching.first().copied()
+        } else {
+            None
+        }
+    } else {
+        let suspended_sessions = sessions
+            .iter()
+            .copied()
+            .filter(suspended)
+            .collect::<Vec<_>>();
+        if suspended_sessions.len() == 1 {
+            suspended_sessions.first().copied()
+        } else if sessions.len() == 1 {
+            sessions.first().copied()
+        } else {
+            None
+        }
+    };
+    let Some(session) = selected else {
+        return Vec::new();
+    };
+    let Some(id) = session.get("id").and_then(serde_json::Value::as_str) else {
+        return Vec::new();
+    };
+    if session
+        .get("suspended")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        vec![
+            format!("shadowdroid debug stack --session {}", shell_token(id)),
+            format!("shadowdroid debug variables --session {}", shell_token(id)),
+            format!("shadowdroid debug resume --session {}", shell_token(id)),
+        ]
+    } else {
+        vec![format!(
+            "shadowdroid debug pause --session {}",
+            shell_token(id)
+        )]
+    }
+}
+
+fn debugger_client_actions(map: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
+    let Some(clients) = map.get("clients").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    let clients = clients
+        .iter()
+        .filter_map(serde_json::Value::as_object)
+        .collect::<Vec<_>>();
+    if clients.is_empty() {
+        return Vec::new();
+    }
+    let preferred_package =
+        observed_value(map, "package").or_else(|| observed_value(map, "requested_app"));
+    let preferred_device =
+        observed_value(map, "device").or_else(|| current_device().map(str::to_owned));
+    let matching = clients
+        .iter()
+        .copied()
+        .filter(|client| {
+            preferred_package.as_deref().is_none_or(|package| {
+                client.get("package").and_then(serde_json::Value::as_str) == Some(package)
+            })
+        })
+        .filter(|client| {
+            preferred_device
+                .as_deref()
+                .is_none_or(|device| debugger_device_matches(client, device))
+        })
+        .collect::<Vec<_>>();
+    let [client] = matching.as_slice() else {
+        return Vec::new();
+    };
+    let Some(package) = client.get("package").and_then(serde_json::Value::as_str) else {
+        return Vec::new();
+    };
+    let mut command = format!(
+        "shadowdroid debug attach --package {}",
+        shell_token(package)
+    );
+    if let Some(pid) = client.get("pid").and_then(serde_json::Value::as_i64) {
+        command.push_str(&format!(" --pid {pid}"));
+    }
+    vec![command]
+}
+
+fn debugger_device_matches(
+    value: &serde_json::Map<String, serde_json::Value>,
+    preferred: &str,
+) -> bool {
+    let Some(device) = value.get("device").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    ["serial", "avd", "avd_name"]
+        .into_iter()
+        .filter_map(|key| device.get(key).and_then(serde_json::Value::as_str))
+        .any(|candidate| candidate == preferred)
+}
+
+/// Fill safe, already-observed identifiers into catalog command templates.
+/// Unknown values stay as explicit `<placeholder>` tokens rather than guessing.
+fn specialize_action(template: &str, map: &serde_json::Map<String, serde_json::Value>) -> String {
+    const PLACEHOLDERS: &[(&str, &[&str])] = &[
+        ("<pkg>", &["package", "app"]),
+        ("<package>", &["package", "app"]),
+        ("<app>", &["package", "app"]),
+        ("<id>", &["id"]),
+        ("<session>", &["session"]),
+        ("<permission>", &["permission"]),
+        ("<op>", &["op"]),
+        ("<mode>", &["mode"]),
+        ("<device>", &["device"]),
+        ("<remote>", &["remote"]),
+        ("<local>", &["local"]),
+    ];
+    let mut action = template.to_string();
+    for (placeholder, keys) in PLACEHOLDERS {
+        let Some(value) = keys.iter().find_map(|key| observed_value(map, key)) else {
+            continue;
+        };
+        action = action.replace(placeholder, &shell_token(&value));
+    }
+    if let Some(device) = observed_value(map, "device")
+        .or_else(|| observed_value(map, "target"))
+        .or_else(|| current_device().map(str::to_owned))
+    {
+        if let Some(command) = action.strip_prefix("shadowdroid ") {
+            if !command.starts_with("-d ") && !command.starts_with("--device ") {
+                action = format!("shadowdroid -d {} {command}", shell_token(&device));
+            }
+        }
+    }
+    action
+}
+
+fn executable_action(template: &str, map: &serde_json::Map<String, serde_json::Value>) -> String {
+    let action = specialize_action(template, map);
+    if action.starts_with("shadowdroid ") && action.contains('<') {
+        if let Some(path) = crate::cmd::introspect::command_path_for_invocation(&action) {
+            let discovery = format!("shadowdroid commands --json --describe '{path}'");
+            return specialize_action(&discovery, map);
+        }
+    }
+    action
+}
+
+fn observed_value(map: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    fn scalar(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::String(value) if !value.is_empty() => Some(value.clone()),
+            serde_json::Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        }
+    }
+
+    map.get(key)
+        .and_then(scalar)
+        .or_else(|| map.get("detail")?.get(key).and_then(scalar))
+        .or_else(|| map.get("current_app")?.get(key).and_then(scalar))
+        .or_else(|| map.get("install_report")?.get(key).and_then(scalar))
+}
+
+pub(crate) fn shell_token(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || "._:/@+-=".contains(ch))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
 }
 
 /// Emit one `{"type":"error","stage":…,"code":…,"msg":…, …extra}` line on
@@ -447,6 +1132,9 @@ mod tests {
         assert_eq!(v["ok"], true);
         assert_eq!(v["x"], 1);
         assert_eq!(v["matched"], true);
+        assert!(v["next_actions"]
+            .as_array()
+            .is_some_and(|actions| !actions.is_empty()));
         // One-shot results carry no `ts` (only streamed timeline events do).
         assert!(v.get("ts").is_none(), "action must not carry ts: {v}");
     }
@@ -486,6 +1174,7 @@ mod tests {
         assert_eq!(v["retryable"], false);
         assert!(v["detail"].is_object());
         assert!(v["next_actions"].is_array());
+        assert!(!v["next_actions"].as_array().unwrap().is_empty());
         assert_eq!(v["arg"], "--x");
         assert!(v.get("ts").is_none(), "error must not carry ts: {v}");
     }
@@ -584,5 +1273,374 @@ mod tests {
         // The actionable bits survive.
         assert!(json.contains("\"clickable\":true"), "{json}");
         assert!(json.contains("\"tap\":[2,2]"), "{json}");
+    }
+
+    #[test]
+    fn dynamic_values_are_shell_quoted_and_device_scoped() {
+        let map = serde_json::json!({
+            "device": "emulator-5554; unsafe",
+            "package": "com.example; unsafe",
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert_eq!(
+            specialize_action("shadowdroid app start <pkg>", &map),
+            "shadowdroid -d 'emulator-5554; unsafe' app start 'com.example; unsafe'"
+        );
+    }
+
+    #[test]
+    fn unresolved_runtime_templates_become_exact_discovery_commands() {
+        let map = serde_json::json!({"device": "emulator-5554"})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            executable_action("shadowdroid ui tap --id <id>", &map),
+            "shadowdroid -d emulator-5554 commands --json --describe 'ui tap'"
+        );
+
+        let map = serde_json::json!({"device": "emulator-5554", "package": "com.example"})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            executable_action("shadowdroid app start <pkg>", &map),
+            "shadowdroid -d emulator-5554 app start com.example"
+        );
+    }
+
+    #[test]
+    fn devices_offer_one_exact_connect_per_online_serial() {
+        let map = serde_json::json!({
+            "devices": [
+                {"serial":"emulator-5554","state":"device"},
+                {"serial":"offline-1","state":"offline"}
+            ]
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert_eq!(
+            dynamic_next_actions(Some("devices"), &map),
+            ["shadowdroid -d emulator-5554 connect"]
+        );
+    }
+
+    #[test]
+    fn matched_clickable_element_becomes_guarded_observed_tap() {
+        let map = serde_json::json!({
+            "screen_hash": "abc123",
+            "element": {"id": 7, "clickable": true}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert_eq!(
+            element_actions(&map),
+            ["shadowdroid ui tap --id 7 --if-screen abc123 --observe"]
+        );
+    }
+
+    #[test]
+    fn input_elements_get_text_guidance_and_coordinate_only_labels_are_not_tapped() {
+        let map = serde_json::json!({
+            "device": "emulator-5554",
+            "screen_hash": "screen-1",
+            "elements": [
+                {"id": 1, "input": true, "tap": [10, 10]},
+                {"id": 2, "tap": [20, 20]},
+                {"id": 4, "input": true, "clickable": true, "tap": [25, 25]},
+                {"id": 3, "clickable": true, "tap": [30, 30]}
+            ]
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let actions = screen_element_actions(&map);
+        assert_eq!(actions.len(), 2, "{actions:?}");
+        assert!(actions[0].contains(
+            "shadowdroid -d emulator-5554 ui text VALUE --id 1 --if-screen screen-1 --observe"
+        ));
+        assert_eq!(
+            actions[1],
+            "shadowdroid ui tap --id 3 --if-screen screen-1 --observe"
+        );
+        assert!(actions.iter().all(|action| !action.contains("--id 2")));
+        assert!(actions.iter().all(|action| !action.contains("--id 4")));
+    }
+
+    #[test]
+    fn matched_input_prefers_text_over_tap() {
+        let map = serde_json::json!({
+            "device": "emulator-5554",
+            "screen_hash": "screen-2",
+            "element": {"id": 9, "input": true, "clickable": true, "tap": [4, 4]}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let actions = element_actions(&map);
+        assert_eq!(actions.len(), 1);
+        assert!(actions[0].contains("ui text VALUE --id 9"), "{actions:?}");
+        assert!(!actions[0].contains("ui tap"), "{actions:?}");
+    }
+
+    #[test]
+    fn observed_action_uses_embedded_screen_instead_of_redundant_dump() {
+        let map = serde_json::json!({
+            "device": "emulator-5554",
+            "screen": {
+                "screen_hash": "after-action",
+                "elements": [{"id": 9, "clickable": true}]
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert_eq!(
+            dynamic_next_actions(Some("ui tap"), &map),
+            ["shadowdroid ui tap --id 9 --if-screen after-action --observe"]
+        );
+    }
+
+    #[test]
+    fn debugger_sessions_follow_selected_device_and_suspension_state() {
+        let map = serde_json::json!({
+            "device": "emulator-5556",
+            "sessions": [
+                {"id":"wrong", "suspended":true, "device":{"serial":"emulator-5554"}},
+                {"id":"selected", "suspended":true, "device":{"serial":"emulator-5556"}}
+            ]
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let actions = debugger_session_actions(&map);
+        assert!(actions.iter().all(|action| action.contains("selected")));
+        assert!(actions.iter().any(|action| action.contains("debug stack")));
+
+        let running = serde_json::json!({
+            "device": "emulator-5556",
+            "sessions": [
+                {"id":"running", "suspended":false, "device":{"serial":"emulator-5556"}}
+            ]
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert_eq!(
+            debugger_session_actions(&running),
+            ["shadowdroid debug pause --session running"]
+        );
+    }
+
+    #[test]
+    fn debugger_clients_require_one_app_and_device_match() {
+        let map = serde_json::json!({
+            "device": "emulator-5556",
+            "current_app": {"package":"com.target"},
+            "clients": [
+                {"package":"com.other", "pid":11, "device":{"serial":"emulator-5556"}},
+                {"package":"com.target", "pid":22, "device":{"serial":"emulator-5556"}},
+                {"package":"com.target", "pid":33, "device":{"serial":"emulator-5554"}}
+            ]
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert_eq!(
+            debugger_client_actions(&map),
+            ["shadowdroid debug attach --package com.target --pid 22"]
+        );
+
+        let ambiguous = serde_json::json!({
+            "clients": [
+                {"package":"com.one", "pid":1},
+                {"package":"com.two", "pid":2}
+            ]
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(debugger_client_actions(&ambiguous).is_empty());
+    }
+
+    #[test]
+    fn running_but_miswired_proxy_gets_repair_actions() {
+        let map = serde_json::json!({
+            "running": true,
+            "pointed_at_proxy": false
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert_eq!(
+            dynamic_next_actions(Some("net status"), &map),
+            [
+                "shadowdroid net stop",
+                "shadowdroid net start",
+                "shadowdroid doctor --json"
+            ]
+        );
+    }
+
+    #[test]
+    fn net_start_uses_configured_apps_not_free_form_hint_text() {
+        let map = serde_json::json!({
+            "device": "emulator-5554",
+            "apps": ["com.example.app"],
+            "hint": "next: `net check <pkg>` to confirm trust"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert_eq!(
+            dynamic_next_actions(Some("net start"), &map),
+            [
+                "shadowdroid net check com.example.app",
+                "shadowdroid watch",
+                "shadowdroid net status"
+            ]
+        );
+        assert!(domain_guidance(Some("net start"), &map).is_empty());
+    }
+
+    #[test]
+    fn usage_report_surfaces_its_highest_priority_improvement() {
+        let map = serde_json::json!({
+            "recommendations": [{
+                "priority": "highest",
+                "next_action": "convert ui dump fallback errors to a typed diagnostic"
+            }]
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert_eq!(
+            dynamic_next_actions(Some("usage report"), &map),
+            [
+                "convert ui dump fallback errors to a typed diagnostic",
+                "shadowdroid usage report --days 7"
+            ]
+        );
+    }
+
+    #[test]
+    fn update_check_never_promotes_the_mutating_installer_command() {
+        let map = serde_json::json!({
+            "up_to_date": false,
+            "release_url": "https://github.com/example/release",
+            "update": {
+                "command": "curl https://example/installer.sh | sh",
+                "requires_confirmation": true
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let actions = dynamic_next_actions(Some("update"), &map);
+        assert!(actions.iter().all(|action| !action.contains("| sh")));
+        assert!(actions.iter().any(|action| action.contains("approval")));
+    }
+
+    #[test]
+    fn watch_action_ids_map_to_public_command_contracts() {
+        let cases = [
+            ("tap_and_wait", "ui tap"),
+            ("text", "ui text"),
+            ("launch", "app start"),
+            ("shell", "device shell"),
+            ("push", "files push"),
+            ("wait_for", "ui wait"),
+        ];
+        for (cmd, path) in cases {
+            assert_eq!(watch_action_command_path(cmd), Some(path), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn domain_specific_guidance_precedes_catalog_fallbacks() {
+        let mut map = serde_json::json!({
+            "hints": ["shadowdroid log --last 5m"],
+            "next_actions": []
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        attach_next_actions(&mut map);
+        assert_eq!(map["next_actions"][0], "shadowdroid log --last 5m");
+    }
+
+    #[test]
+    fn stream_errors_carry_the_same_recovery_primitives() {
+        let value = serde_json::to_value(Event::Error {
+            stage: "screen".into(),
+            code: "screen_read_failed".into(),
+            msg: "connection closed".into(),
+            input: None,
+            retryable: true,
+            detail: serde_json::json!({"attempt": 1}),
+            next_actions: vec!["shadowdroid doctor --json".into()],
+            ts: 1.0,
+        })
+        .unwrap();
+        assert_eq!(value["code"], "screen_read_failed");
+        assert_eq!(value["retryable"], true);
+        assert!(value["detail"].is_object());
+        assert!(!value["next_actions"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stream_recovery_actions_are_device_scoped_and_quoted() {
+        let event = Event::Warning {
+            stage: "net_watch".into(),
+            code: "net_events_unavailable".into(),
+            msg: "not running".into(),
+            detail: serde_json::json!({}),
+            next_actions: vec!["shadowdroid net start".into()],
+            ts: 1.0,
+        };
+        let value = stream_event_value(&event, "emulator-5554; unsafe");
+        assert_eq!(
+            value["next_actions"],
+            serde_json::json!(["shadowdroid -d 'emulator-5554; unsafe' net start"])
+        );
+    }
+
+    #[test]
+    fn held_flow_and_tls_events_expose_immediate_recovery() {
+        let held = serde_json::to_value(Event::HttpIntercept {
+            ts: 1.0,
+            id: "f1".into(),
+            phase: "response".into(),
+            method: "GET".into(),
+            scheme: "https".into(),
+            host: "api.example.com".into(),
+            path: "/v1".into(),
+            status: Some(200),
+            req_type: None,
+            req_len: 0,
+            resp_type: Some("application/json".into()),
+            resp_len: 2,
+            hold_deadline_ms: 30_000,
+            req_preview: None,
+            resp_preview: Some("{}".into()),
+            next_actions: vec!["shadowdroid net resume f1".into()],
+        })
+        .unwrap();
+        assert_eq!(held["type"], "http_intercept");
+        assert_eq!(held["next_actions"][0], "shadowdroid net resume f1");
+
+        let tls = serde_json::to_value(Event::TlsError {
+            ts: 2.0,
+            host: "api.example.com".into(),
+            reason: "certificate rejected".into(),
+            next_actions: vec!["shadowdroid net check com.example".into()],
+        })
+        .unwrap();
+        assert_eq!(tls["type"], "tls_error");
+        assert!(!tls["next_actions"].as_array().unwrap().is_empty());
     }
 }

@@ -364,7 +364,7 @@ fn print_init_human(
 async fn status(explicit_studio: Option<&Path>, json: bool) -> Result<()> {
     let report = status_report(explicit_studio)?;
     if json {
-        crate::events::emit(&report);
+        crate::events::emit_result(&report);
     } else {
         print_status_human(&report);
     }
@@ -402,7 +402,7 @@ async fn install(
 ) -> Result<()> {
     let report = install_report(explicit_studio, explicit_plugin).await?;
     if json {
-        crate::events::emit(&report);
+        crate::events::emit_result(&report);
     } else {
         print_install_human(&report);
     }

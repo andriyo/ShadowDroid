@@ -161,7 +161,7 @@ async fn snapshot_cmd(
     if let Some(path) = args.out {
         crate::cmd::artifact::write_json_and_emit("layout_snapshot", &path, &value)?;
     } else {
-        println!("{}", serde_json::to_string(&value)?);
+        crate::events::emit_result(&value);
     }
     Ok(())
 }
@@ -226,23 +226,20 @@ fn diff_cmd(args: LayoutDiffArgs) -> Result<()> {
         }
     }
 
-    println!(
-        "{}",
-        serde_json::to_string(&json!({
-            "type": "layout_diff",
-            "schema_version": 1,
-            "before": args.before,
-            "after": args.after,
-            "counts": {
-                "added": added.len(),
-                "removed": removed.len(),
-                "changed": changed.len(),
-            },
-            "added": added,
-            "removed": removed,
-            "changed": changed,
-        }))?
-    );
+    crate::events::emit_result(&json!({
+        "type": "layout_diff",
+        "schema_version": 1,
+        "before": args.before,
+        "after": args.after,
+        "counts": {
+            "added": added.len(),
+            "removed": removed.len(),
+            "changed": changed.len(),
+        },
+        "added": added,
+        "removed": removed,
+        "changed": changed,
+    }));
     Ok(())
 }
 
@@ -295,7 +292,7 @@ async fn recompositions_cmd(
         ])
         .into());
     }
-    println!("{}", serde_json::to_string(&value)?);
+    crate::events::emit_result(&value);
     Ok(())
 }
 
@@ -415,7 +412,7 @@ async fn source_cmd(serial: &Serial, client: &ServerClient, args: LayoutSourceAr
         ])
         .into());
     }
-    println!("{}", serde_json::to_string(&output)?);
+    crate::events::emit_result(&output);
     Ok(())
 }
 
@@ -596,7 +593,7 @@ fn layout_sample_value(
         "current_app": screen.current_app.clone(),
         "target": target.map(LayoutStudioTarget::to_value),
         "studio_required": studio_required,
-        "next_commands": next_commands.into_iter().collect::<Vec<_>>(),
+        "next_actions": next_commands.into_iter().collect::<Vec<_>>(),
     })
 }
 

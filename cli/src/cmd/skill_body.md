@@ -43,21 +43,29 @@ Espresso/UI Automator run and reconnect afterward, or `disconnect` explicitly.
 
 Treat stdout as data and the process exit code as authoritative:
 
-- Action success: one object with `type:"action"`, `ok:true`, and `cmd`.
+- Action success: one object with `type:"action"`, `ok:true`, `cmd`, and a
+  non-empty `next_actions` array.
 - Raw reads such as `ui dump`: the requested payload directly; exit code zero
-  is success even when the payload has no action envelope.
+  is success even when the payload has no action envelope. Terminal JSON reads
+  also include non-empty `next_actions`.
 - Failure: one object with `type:"error"`, `ok:false`, `stage`, `code`, and
-  `msg`, plus `retryable`, structured `detail`, and `next_actions` (empty when
-  no safe recovery is known).
+  `msg`, plus `retryable`, structured `detail`, and non-empty `next_actions`.
 - `watch`, `log`, `net log`, and `debug replay` are JSONL streams. `test`
-  passes through the wrapped command's streams and adds its own trailer.
+  passes through the wrapped command's streams and adds its own trailer. Stream
+  errors carry `code`, `retryable`, `detail`, and `next_actions`; terminal
+  summaries also carry `next_actions`.
+- HAR, curl, fixtures, and other large interop exports write an artifact and
+  return a small terminal JSON summary with its path, byte count, and actions.
 - A few setup/report commands default to human output; request their `--json`
   mode when offered. Check `commands --json --describe ...` for the exact mode.
 
 Within a running `watch` stream, a `type:"error"` record is a timestamped
-timeline event (`stage`, `msg`, optional `input`, `ts`), not the one-shot error
-envelope above. Continue consuming it unless the stream ends or the task says
-to stop.
+timeline event (`stage`, `code`, `msg`, optional `input`, `retryable`, `detail`,
+`next_actions`, `ts`), not the one-shot error envelope above. Continue consuming
+it unless the stream ends or the task says to stop.
+Completed `http`, held `http_intercept`, and `tls_error` events also carry exact,
+device-scoped `next_actions`; act on a held flow before its
+`hold_deadline_ms` rather than waiting for the stream to finish.
 
 Example typed failure:
 
@@ -79,7 +87,11 @@ Example typed failure:
 ```
 
 Branch on `ok`/`code`, inspect `detail`, and follow the most relevant
-`next_actions` entry. Do not parse `msg` to recover state. Unknown-argument
+`next_actions` entry. Actions derived from live results retain the selected
+`-d <serial>` and safely quote observed identifiers. When a required value is
+not known, ShadowDroid points to the exact `commands --describe` contract
+instead of emitting a command that is guaranteed to fail. Do not parse `msg`
+to recover state. Unknown-argument
 failures are JSON on stdout and exit 2; a spelling suggestion is included when
 Clap can determine one. ShadowDroid operational logs go to stderr; `--quiet`
 or `SHADOWDROID_QUIET=1` suppresses them.

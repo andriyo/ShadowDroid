@@ -54,6 +54,23 @@ pub struct DeviceLifecycleGuard {
     path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessLiveness {
+    Alive,
+    Dead,
+    Unknown,
+}
+
+impl ProcessLiveness {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Alive => "alive",
+            Self::Dead => "dead",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 impl Drop for DeviceLifecycleGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
@@ -82,23 +99,48 @@ pub fn acquire_lifecycle_lock(serial: &Serial) -> Result<DeviceLifecycleGuard> {
             .open(&path)
         {
             Ok(mut file) => {
-                let _ = writeln!(file, "{}", std::process::id());
+                if let Err(error) =
+                    write_lock_pid(&mut file, std::process::id()).and_then(|()| file.sync_all())
+                {
+                    drop(file);
+                    let cleanup_error = std::fs::remove_file(&path)
+                        .err()
+                        .map(|error| error.to_string());
+                    return Err(crate::diagnostic::DiagnosticError::new(
+                        "device_lifecycle_lock_write_failed",
+                        "device",
+                        format!("could not record ownership of the lifecycle lock for {serial}"),
+                    )
+                    .retryable(true)
+                    .detail(serde_json::json!({
+                        "device": serial.as_str(),
+                        "lock": path.display().to_string(),
+                        "error": error.to_string(),
+                        "cleanup_error": cleanup_error,
+                    }))
+                    .next_actions([
+                        "retry the lifecycle command",
+                        "inspect detail.lock only if the retry reports device_lifecycle_busy",
+                    ])
+                    .into());
+                }
                 return Ok(DeviceLifecycleGuard { path });
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = std::fs::metadata(&path)
-                    .and_then(|metadata| metadata.modified())
-                    .ok()
-                    .and_then(|modified| modified.elapsed().ok())
-                    .is_some_and(|age| age > Duration::from_secs(600));
-                if stale {
-                    let _ = std::fs::remove_file(&path);
-                    continue;
-                }
                 let owner = std::fs::read_to_string(&path)
                     .ok()
                     .map(|value| value.trim().to_string())
                     .filter(|value| !value.is_empty());
+                let age = std::fs::metadata(&path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok());
+                let owner_pid = owner.as_deref().and_then(|value| value.parse::<u32>().ok());
+                let liveness = owner_pid.map(shadowdroid_process_liveness);
+                if should_reclaim_lifecycle_lock(owner_pid, liveness, age) {
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
                 return Err(crate::diagnostic::DiagnosticError::new(
                     "device_lifecycle_busy",
                     "device",
@@ -108,15 +150,104 @@ pub fn acquire_lifecycle_lock(serial: &Serial) -> Result<DeviceLifecycleGuard> {
                 .detail(serde_json::json!({
                     "device": serial.as_str(),
                     "owner_pid": owner,
+                    "owner_liveness": liveness.map(ProcessLiveness::as_str),
+                    "age_ms": age.map(|age| age.as_millis() as u64),
                     "lock": path.display().to_string(),
                 }))
-                .next_actions(["wait for the active command to finish, then retry"])
+                .next_actions([
+                    "wait for the active ShadowDroid lifecycle command to finish, then retry",
+                    "inspect detail.owner_pid only if the lock remains after that process exits",
+                ])
                 .into());
             }
             Err(error) => return Err(error).with_context(|| format!("create {}", path.display())),
         }
     }
     Err(anyhow!("could not acquire lifecycle lock for {serial}"))
+}
+
+fn write_lock_pid(writer: &mut impl Write, pid: u32) -> std::io::Result<()> {
+    writeln!(writer, "{pid}")
+}
+
+fn should_reclaim_lifecycle_lock(
+    owner_pid: Option<u32>,
+    liveness: Option<ProcessLiveness>,
+    age: Option<Duration>,
+) -> bool {
+    const LOCK_EXPIRY: Duration = Duration::from_secs(600);
+    const INCOMPLETE_WRITE_GRACE: Duration = Duration::from_secs(1);
+
+    match (owner_pid, liveness) {
+        // A confirmed live owner always wins over the age heuristic. Long
+        // installs and slow downloads are valid lifecycle operations.
+        (Some(_), Some(ProcessLiveness::Alive)) => false,
+        (Some(_), Some(ProcessLiveness::Dead)) => true,
+        // Failure to inspect a valid PID is not evidence that it is dead. Age
+        // remains the bounded recovery mechanism for an unverifiable lock.
+        (Some(_), Some(ProcessLiveness::Unknown) | None) => {
+            age.is_some_and(|age| age > LOCK_EXPIRY)
+        }
+        // A contender can observe create_new before the owner PID is durable.
+        // Give that write a grace period, then reclaim empty/malformed locks.
+        (None, _) => age.is_some_and(|age| age > INCOMPLETE_WRITE_GRACE),
+    }
+}
+
+fn shadowdroid_process_liveness(pid: u32) -> ProcessLiveness {
+    #[cfg(unix)]
+    {
+        let output = match std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .output()
+        {
+            Ok(output) => output,
+            Err(_) => return ProcessLiveness::Unknown,
+        };
+        if !output.status.success() {
+            return if output.status.code() == Some(1) {
+                ProcessLiveness::Dead
+            } else {
+                ProcessLiveness::Unknown
+            };
+        }
+        match String::from_utf8(output.stdout) {
+            Ok(command) if command.to_ascii_lowercase().contains("shadowdroid") => {
+                ProcessLiveness::Alive
+            }
+            Ok(_) => ProcessLiveness::Dead,
+            Err(_) => ProcessLiveness::Unknown,
+        }
+    }
+    #[cfg(windows)]
+    {
+        let output = match std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+        {
+            Ok(output) => output,
+            Err(_) => return ProcessLiveness::Unknown,
+        };
+        if !output.status.success() {
+            return ProcessLiveness::Unknown;
+        }
+        match String::from_utf8(output.stdout) {
+            Ok(output)
+                if output.to_ascii_lowercase().contains("shadowdroid")
+                    && output.contains(&pid.to_string()) =>
+            {
+                ProcessLiveness::Alive
+            }
+            Ok(output) if output.contains(&pid.to_string()) => ProcessLiveness::Dead,
+            Ok(_) => ProcessLiveness::Dead,
+            Err(_) => ProcessLiveness::Unknown,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        ProcessLiveness::Unknown
+    }
 }
 
 /// Where each APK pair came from. Used for logging + to decide whether to
@@ -369,11 +500,33 @@ fn pair_from_path(p: &Path) -> Result<(PathBuf, PathBuf)> {
             }
         }
     }
-    bail!(
-        "could not find sibling main APK for {}. \
-         Pass a directory containing both APKs, or symlink/copy the main APK next to the test APK.",
-        p.display()
+    Err(crate::diagnostic::DiagnosticError::new(
+        "apk_pair_incomplete",
+        "install",
+        format!(
+            "could not resolve a main/test APK pair from {}",
+            p.display()
+        ),
     )
+    .detail(serde_json::json!({
+        "provided": p.display().to_string(),
+        "expected": "a test/androidTest APK path, or a directory containing both main and test APKs",
+        "parent": parent.display().to_string(),
+        "searched": candidates.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+    }))
+    .next_actions([
+        format!(
+            "shadowdroid --apk {} connect",
+            crate::events::shell_token(&parent.display().to_string())
+        ),
+        format!(
+            "find {} -maxdepth 3 -name '*.apk' -print",
+            crate::events::shell_token(&parent.display().to_string())
+        ),
+        "pass the test/androidTest APK file, or stage both main and test APKs in one directory"
+            .to_string(),
+    ])
+    .into())
 }
 
 fn first_apk(dir: &Path) -> Result<Option<PathBuf>> {
@@ -523,11 +676,7 @@ pub async fn ensure_ready_for_command(
         match probe(&client, any_apk_version).await {
             ProbeResult::Ready => return Ok(client),
             ProbeResult::VersionMismatch { found } => {
-                bail!(
-                    "ShadowDroid server is running version {found}, but this CLI expects \
-                     {EXPECTED_APK_VERSION}. Run `shadowdroid connect` or \
-                     `shadowdroid doctor --fix` once to upgrade/restart the server, then retry."
-                )
+                return Err(running_version_mismatch_error(&found));
             }
             ProbeResult::Down => {}
         }
@@ -538,15 +687,25 @@ pub async fn ensure_ready_for_command(
     let client = ServerClient::new(host_port)?;
     match probe(&client, any_apk_version).await {
         ProbeResult::Ready => Ok(client),
-        ProbeResult::VersionMismatch { found } => {
-            bail!(
-                "ShadowDroid server is running version {found}, but this CLI expects \
-                 {EXPECTED_APK_VERSION}. Run `shadowdroid connect` or \
-                 `shadowdroid doctor --fix` once to upgrade/restart the server, then retry."
-            )
-        }
+        ProbeResult::VersionMismatch { found } => Err(running_version_mismatch_error(&found)),
         ProbeResult::Down => ensure_ready_locked(serial, explicit_apk, any_apk_version).await,
     }
+}
+
+fn running_version_mismatch_error(found: &str) -> anyhow::Error {
+    crate::diagnostic::DiagnosticError::new(
+        "server_version_mismatch",
+        "connect",
+        format!(
+            "ShadowDroid server is running version {found}, but this CLI expects {EXPECTED_APK_VERSION}"
+        ),
+    )
+    .detail(serde_json::json!({
+        "found": found,
+        "expected": EXPECTED_APK_VERSION,
+    }))
+    .next_actions(["shadowdroid connect", "shadowdroid doctor --fix --json"])
+    .into()
 }
 
 /// Best-effort version probe used by `connect` to report when it reconciled a
@@ -655,17 +814,24 @@ async fn verify_installed_version(
 /// cached/release artifact (plain `disconnect` + `connect` does not).
 fn mislabeled_apk_error(source: ApkSource, found: Option<&str>) -> anyhow::Error {
     let found = found.unwrap_or("(none)");
-    anyhow!(
-        "installed {APP_PACKAGE} reports versionName {found}, but this shadowdroid \
-         (v{EXPECTED_APK_VERSION}) expects a server APK labeled {EXPECTED_APK_VERSION}.\n\
-         The {source} APK looks mislabeled — its versionName is wrong, so reinstalling \
-         it can't resolve the mismatch.\n\n\
-         To use it anyway, bypass the version check (set once so every command honors it):\n\
-         \x20\x20export SHADOWDROID_ANY_APK_VERSION=1     # or pass --any-apk-version per command\n\n\
-         Or install a known-good local build instead:\n\
-         \x20\x20shadowdroid connect --apk <path-to-test-apk>",
-        source = source.label(),
+    crate::diagnostic::DiagnosticError::new(
+        "apk_version_mismatch",
+        "connect",
+        format!(
+            "installed {APP_PACKAGE} reports versionName {found}, but this CLI expects {EXPECTED_APK_VERSION}"
+        ),
     )
+    .detail(serde_json::json!({
+        "source": source.label(),
+        "found": found,
+        "expected": EXPECTED_APK_VERSION,
+        "package": APP_PACKAGE,
+    }))
+    .next_actions([
+        "shadowdroid connect --apk <path-to-known-good-test-apk>",
+        "use --any-apk-version only after verifying that the local APK is intentionally compatible",
+    ])
+    .into()
 }
 
 /// Install the main + test APKs, recovering from a signature mismatch. When the
@@ -778,24 +944,23 @@ async fn wait_for_server(
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     }
     if let Some(found) = last_mismatch {
-        bail!(
-            "server stayed on version {found}; this shadowdroid (v{EXPECTED_APK_VERSION}) expects \
-             {EXPECTED_APK_VERSION}. ShadowDroid stopped the stale process and retried, but the \
-             reachable server still reports {found} — usually an installed server APK labeled with \
-             the wrong version.\n\n\
-             Bypass the version check (set once so every command honors it):\n\
-             \x20\x20export SHADOWDROID_ANY_APK_VERSION=1     # or pass --any-apk-version per command\n\n\
-             Or install a known-good local build instead:\n\
-             \x20\x20shadowdroid disconnect && shadowdroid connect --apk <path-to-test-apk>"
-        );
+        return Err(running_version_mismatch_error(&found));
     }
     if let Some(hint) = ui_automation_failure_hint(serial).await {
         bail!("server did not become ready within 10s after `am instrument`.\n{hint}")
     }
-    bail!(
-        "server did not become ready within 10s after `am instrument`. \
-           Check the on-device log: `adb shell cat {INSTRUMENT_LOG_PATH}`"
+    Err(crate::diagnostic::DiagnosticError::new(
+        "server_unavailable",
+        "connect",
+        "server did not become ready within 10s after am instrument",
     )
+    .retryable(true)
+    .detail(serde_json::json!({"instrument_log": INSTRUMENT_LOG_PATH}))
+    .next_actions([
+        format!("adb shell cat {INSTRUMENT_LOG_PATH}"),
+        "shadowdroid doctor --fix --json".to_string(),
+    ])
+    .into())
 }
 
 async fn ui_automation_failure_hint(serial: &Serial) -> Option<String> {
@@ -837,13 +1002,100 @@ mod tests {
 
     #[test]
     fn mislabeled_apk_error_names_the_bypass() {
-        let msg = mislabeled_apk_error(ApkSource::GithubRelease, Some("0.3.1")).to_string();
-        // The actionable bits the issue asked for: the offending version, the env
-        // var, the flag, and the --apk escape hatch.
-        assert!(msg.contains("0.3.1"), "{msg}");
-        assert!(msg.contains(EXPECTED_APK_VERSION), "{msg}");
-        assert!(msg.contains("SHADOWDROID_ANY_APK_VERSION"), "{msg}");
-        assert!(msg.contains("--any-apk-version"), "{msg}");
-        assert!(msg.contains("--apk"), "{msg}");
+        let error = mislabeled_apk_error(ApkSource::GithubRelease, Some("0.3.1"));
+        let diagnostic = error
+            .downcast_ref::<crate::diagnostic::DiagnosticError>()
+            .expect("version mismatch should stay machine-actionable");
+        assert_eq!(diagnostic.code, "apk_version_mismatch");
+        assert_eq!(diagnostic.detail["found"], "0.3.1");
+        assert_eq!(diagnostic.detail["expected"], EXPECTED_APK_VERSION);
+        assert!(diagnostic
+            .next_actions
+            .iter()
+            .any(|action| action.contains("--any-apk-version")));
+        assert!(diagnostic
+            .next_actions
+            .iter()
+            .any(|action| action.contains("--apk")));
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn lifecycle_lock_owner_check_distinguishes_live_and_dead_processes() {
+        assert_eq!(
+            shadowdroid_process_liveness(std::process::id()),
+            ProcessLiveness::Alive
+        );
+        assert_eq!(
+            shadowdroid_process_liveness(u32::MAX),
+            ProcessLiveness::Dead
+        );
+    }
+
+    #[test]
+    fn lifecycle_reclaim_policy_preserves_live_and_unverifiable_owners() {
+        let old = Some(Duration::from_secs(601));
+        let fresh = Some(Duration::from_secs(2));
+
+        assert!(!should_reclaim_lifecycle_lock(
+            Some(10),
+            Some(ProcessLiveness::Alive),
+            old,
+        ));
+        assert!(should_reclaim_lifecycle_lock(
+            Some(10),
+            Some(ProcessLiveness::Dead),
+            fresh,
+        ));
+        assert!(!should_reclaim_lifecycle_lock(
+            Some(10),
+            Some(ProcessLiveness::Unknown),
+            fresh,
+        ));
+        assert!(should_reclaim_lifecycle_lock(
+            Some(10),
+            Some(ProcessLiveness::Unknown),
+            old,
+        ));
+        assert!(!should_reclaim_lifecycle_lock(
+            None,
+            None,
+            Some(Duration::from_millis(900)),
+        ));
+        assert!(should_reclaim_lifecycle_lock(None, None, fresh));
+    }
+
+    #[test]
+    fn lifecycle_pid_write_failures_are_not_ignored() {
+        struct FailingWriter;
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("disk full"))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let error = write_lock_pid(&mut FailingWriter, 42).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "disk full");
+    }
+
+    #[test]
+    fn main_apk_passed_as_single_file_points_to_the_pair_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("shadowdroid-server-main.apk");
+        std::fs::write(&main, b"main").unwrap();
+
+        let error = pair_from_path(&main).unwrap_err();
+        let diagnostic = error
+            .downcast_ref::<crate::diagnostic::DiagnosticError>()
+            .expect("incomplete pair should be typed");
+        assert_eq!(diagnostic.code, "apk_pair_incomplete");
+        assert!(diagnostic.next_actions.iter().any(|action| {
+            action == &format!("shadowdroid --apk {} connect", dir.path().display())
+        }));
     }
 }

@@ -507,6 +507,7 @@ mod tests {
             ts: 1.0,
             host: "appconfigs.disney-plus.net".into(),
             reason: "rejected".into(),
+            next_actions: vec!["shadowdroid net check --fresh".into()],
         };
         // Relayed to watch (previously the catch-all dropped everything non-HTTP).
         assert!(event_matches(&ev, &Matcher::default()));
