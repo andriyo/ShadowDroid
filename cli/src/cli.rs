@@ -768,6 +768,13 @@ pub enum NetCmd {
         /// Also remove the ShadowDroid CA from the device trust store.
         #[arg(long)]
         revoke_ca: bool,
+        /// Neutral hostname used to verify DNS after teardown.
+        #[arg(
+            long,
+            env = "SHADOWDROID_NET_CANARY_HOST",
+            default_value = "example.com"
+        )]
+        canary_host: String,
     },
     /// Proxy + device-wiring status (running? pointed at us? held flows).
     Status,
@@ -1962,7 +1969,10 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
             )
             .await
         }
-        NetCmd::Stop { revoke_ca } => nc::stop(serial, *revoke_ca).await,
+        NetCmd::Stop {
+            revoke_ca,
+            canary_host,
+        } => nc::stop(serial, *revoke_ca, canary_host).await,
         NetCmd::Status => nc::status(serial).await,
         NetCmd::Log {
             host,

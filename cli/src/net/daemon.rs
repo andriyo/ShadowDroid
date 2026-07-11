@@ -55,6 +55,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
 
     let state = Arc::new(DaemonState {
         port: cfg.port,
+        host_port: cfg.host_port,
         started: events::now_ts(),
         flow_count: AtomicU64::new(0),
         events: event_tx,

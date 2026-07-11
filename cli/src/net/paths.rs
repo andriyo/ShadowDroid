@@ -6,6 +6,7 @@
 //!   - `<serial>.jsonl` — the session event log (backs `net log`)
 //!   - `<serial>.log`   — the daemon's own stdout/stderr (diagnostics)
 //!   - `<serial>.pid`   — the daemon pid (liveness + teardown)
+//!   - `<serial>.state.json` — device networking state captured before wiring
 //! The CA is device-independent:
 //!   - `ca.crt` / `ca.key` — the ShadowDroid root CA (generated once, installed
 //!     into the device trust store).
@@ -62,6 +63,13 @@ pub fn daemon_log_path(serial: &Serial) -> Result<PathBuf> {
 
 pub fn pid_path(serial: &Serial) -> Result<PathBuf> {
     Ok(net_dir()?.join(format!("{}.pid", sanitize(serial))))
+}
+
+/// Device networking state captured immediately before `net start` changes it.
+/// `net stop` consumes this file only after a successful restore, so a crashed
+/// daemon or interrupted teardown can be recovered by a later invocation.
+pub fn device_state_path(serial: &Serial) -> Result<PathBuf> {
+    Ok(net_dir()?.join(format!("{}.state.json", sanitize(serial))))
 }
 
 /// Make a serial safe as a filename component (`emulator-5554`, an IP:port, a

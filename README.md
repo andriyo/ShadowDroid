@@ -466,6 +466,10 @@ UI/crash-only (`watch --no-net`).
 external mitmproxy. `net start` spawns the proxy, wires the device through
 `adb reverse` and proxy settings, and decrypted HTTP(S) transactions then stream
 as `http` events on the same timeline as `screen` when `watch` is running.
+The pre-existing device proxy setting is persisted before wiring; a repeated
+`net start` repairs wiring to an already-running daemon, while `net stop`
+restores that exact setting and reports separate raw-IP and DNS connectivity
+checks (`--canary-host` selects the neutral DNS probe).
 Beyond observing, the agent can **intercept** a flow — `net intercept` pauses
 matching requests/responses and emits them as `http_intercept` events on
 `watch`; the agent inspects with `net show`, then releases with

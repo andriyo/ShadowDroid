@@ -948,8 +948,8 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "net stop" => Some(serde_json::json!({
             "use_when": ["Need to tear down proxy wiring after network testing or restore normal device connectivity."],
-            "output": "proxy stop JSON",
-            "side_effects": ["stops proxy daemon", "clears device global http_proxy", "removes adb reverse; --revoke-ca removes trust when possible"],
+            "output": "proxy stop JSON with exact proxy-state restoration plus raw-IP and DNS checks",
+            "side_effects": ["stops proxy daemon", "restores the device global http_proxy value captured by net start", "removes adb reverse; --revoke-ca removes trust when possible"],
             "next_commands": ["net status", "doctor --fix"]
         })),
         "net status" => Some(serde_json::json!({

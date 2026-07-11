@@ -29,6 +29,10 @@ use crate::net::{paths, Matcher, Mutation, RuleSpec};
 /// In-daemon state the control handlers read/mutate.
 pub struct DaemonState {
     pub port: u16,
+    /// Host-side listener target for `adb reverse tcp:<port> tcp:<host_port>`.
+    /// Exposed by status so a repeated `net start` can repair wiring after a
+    /// device reboot without restarting the daemon or discarding its rules.
+    pub host_port: u16,
     pub started: f64,
     pub flow_count: AtomicU64,
     /// Live event fan-out to `watch` subscribers. `Arc` so the broadcast value
@@ -75,6 +79,7 @@ pub async fn serve_client(
                     "ok": true,
                     "running": true,
                     "port": state.port,
+                    "host_port": state.host_port,
                     "started": state.started,
                     "flows": state.flow_count.load(Ordering::Relaxed),
                     "held": held_flows.len(),

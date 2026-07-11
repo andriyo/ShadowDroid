@@ -4,6 +4,7 @@
 
 use crate::ids::Serial;
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
@@ -45,6 +46,36 @@ pub struct StartOpts {
     pub redact: bool,
 }
 
+const NETWORK_STATE_SCHEMA: u32 = 1;
+const RAW_IP_CANARY: &str = "8.8.8.8";
+
+/// The device-side state ShadowDroid owns for one proxy session. Persist this
+/// before wiring so `net stop` can recover after either process crashes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeviceNetworkState {
+    schema_version: u32,
+    serial: String,
+    /// `None` means the setting did not exist (`settings get` returned null).
+    prior_http_proxy: Option<String>,
+    device_port: u16,
+    host_port: u16,
+    captured_at: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PingCheck {
+    host: String,
+    resolved: bool,
+    reachable: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ConnectivityCheck {
+    raw_ip: PingCheck,
+    dns: PingCheck,
+    connectivity_restored: bool,
+}
+
 pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
     let StartOpts {
         port,
@@ -55,9 +86,81 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
         verify_upstream,
         redact,
     } = opts;
+    // A live daemon may outlive the device-side reverse/proxy settings (most
+    // commonly after a device reboot). Reuse its actual ports and repair the
+    // wiring idempotently instead of forcing stop/start and losing rules.
+    if control::is_running(serial).await {
+        let daemon_status = control::request(serial, json!({"op": "status"})).await?;
+        let daemon_port = daemon_status
+            .get("port")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as u16)
+            .unwrap_or(port);
+        let Some(host_port) = daemon_status
+            .get("host_port")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as u16)
+        else {
+            bail!(
+                "the running net daemon predates automatic rewiring metadata; run `shadowdroid net stop` once, then `net start`"
+            );
+        };
+
+        let state_existed = load_device_network_state(serial)?.is_some();
+        if !state_existed {
+            // Compatibility path for a daemon started by an older CLI. If the
+            // device still points at that daemon, its true prior value is no
+            // longer knowable; absence is the safest teardown default.
+            let current = read_http_proxy(serial).await?;
+            let prior = if proxy_points_at(&current, daemon_port) {
+                None
+            } else {
+                current
+            };
+            save_device_network_state(&DeviceNetworkState {
+                schema_version: NETWORK_STATE_SCHEMA,
+                serial: serial.to_string(),
+                prior_http_proxy: prior,
+                device_port: daemon_port,
+                host_port,
+                captured_at: events::now_ts(),
+            })?;
+        }
+        setup_wiring(serial, daemon_port, host_port).await?;
+        emit(
+            "net_start",
+            json!({
+                "device": serial,
+                "port": daemon_port,
+                "host_port": host_port,
+                "already_running": true,
+                "rewired": true,
+                "rules_preserved": true,
+                "state_recovered": !state_existed,
+            }),
+        );
+        return Ok(());
+    }
+
+    // A dead daemon can leave its state file and wiring behind. Restore it
+    // before starting a genuinely new session so the new snapshot is truthful.
+    if let Some(stale) = load_device_network_state(serial)? {
+        restore_network_state(serial, &stale).await?;
+        remove_device_network_state(serial)?;
+    }
+
     // Host loopback port is per-serial so concurrent daemons for different
     // devices don't fight over one port; the device-facing `port` stays stable.
     let host_port = crate::device::portmap::free_loopback_port()?;
+    let device_state = DeviceNetworkState {
+        schema_version: NETWORK_STATE_SCHEMA,
+        serial: serial.to_string(),
+        prior_http_proxy: read_http_proxy(serial).await?,
+        device_port: port,
+        host_port,
+        captured_at: events::now_ts(),
+    };
+    save_device_network_state(&device_state)?;
     let cfg = DaemonConfig {
         serial: serial.clone(),
         port,
@@ -70,38 +173,55 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
     };
 
     if foreground {
-        setup_wiring(serial, port, host_port).await?;
+        if let Err(err) = setup_wiring(serial, port, host_port).await {
+            restore_and_consume_network_state(serial, &device_state).await?;
+            return Err(err);
+        }
         emit(
             "net_start",
             json!({"device": serial, "port": port, "mode": "foreground"}),
         );
         let r = daemon::run(cfg).await;
-        let _ = teardown_wiring(serial, port).await;
-        return r;
+        let restore = restore_and_consume_network_state(serial, &device_state).await;
+        r?;
+        restore?;
+        return Ok(());
     }
 
-    if control::is_running(serial).await {
-        bail!("net proxy already running for {serial}. Run `net stop` first.");
-    }
-    daemon::spawn(&cfg)?;
+    let daemon_pid = match daemon::spawn(&cfg) {
+        Ok(pid) => pid,
+        Err(err) => {
+            remove_device_network_state(serial)?;
+            return Err(err);
+        }
+    };
     if !daemon::await_ready(serial, 5000).await {
+        kill_pid(daemon_pid);
+        let _ = std::fs::remove_file(paths::pid_path(serial)?);
+        let _ = std::fs::remove_file(paths::ctl_path(serial)?);
         let log = paths::daemon_log_path(serial)?;
         let reason = match daemon::log_tail(&log, 10) {
             Some(t) => format!("last log lines:\n{t}"),
             None => format!("no output in {}", log.display()),
         };
+        remove_device_network_state(serial)?;
         bail!(
             "net daemon did not come up within 5s ({}). {}",
             log.display(),
             reason
         );
     }
-    setup_wiring(serial, port, host_port).await?;
+    if let Err(err) = setup_wiring(serial, port, host_port).await {
+        let _ = control::request(serial, json!({"op": "stop"})).await;
+        restore_and_consume_network_state(serial, &device_state).await?;
+        return Err(err);
+    }
     emit(
         "net_start",
         json!({
             "device": serial,
             "port": port,
+            "host_port": host_port,
             "proxy": format!("localhost:{port}"),
             "apps": apps,
             "anticache": anticache,
@@ -115,27 +235,68 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
     Ok(())
 }
 
-pub async fn stop(serial: &Serial, revoke_ca: bool) -> Result<()> {
-    // Learn the port from a live daemon (falls back to default for teardown).
-    let port = control::request(serial, json!({"op": "status"}))
-        .await
-        .ok()
-        .and_then(|v| v.get("port").and_then(|p| p.as_u64()))
-        .map(|p| p as u16);
+pub async fn stop(serial: &Serial, revoke_ca: bool, canary_host: &str) -> Result<()> {
+    let state = load_device_network_state(serial)?;
+    let daemon_status = control::request(serial, json!({"op": "status"})).await.ok();
+    let pid = control::daemon_pid(serial);
+    let initial_http_proxy = read_http_proxy(serial).await?;
+    let dangling_legacy_proxy = daemon_status.is_none()
+        && pid.is_none()
+        && state.is_none()
+        && initial_http_proxy
+            .as_deref()
+            .is_some_and(|value| value.starts_with("localhost:"));
+    let already_stopped =
+        daemon_status.is_none() && pid.is_none() && state.is_none() && !dangling_legacy_proxy;
 
-    let stopped = match control::request(serial, json!({"op": "stop"})).await {
-        Ok(_) => true,
-        Err(_) => {
-            // Socket unreachable — kill a possibly-wedged daemon by pid.
-            if let Some(pid) = control::daemon_pid(serial) {
-                kill_pid(pid);
-            }
-            false
-        }
+    let stopped = if daemon_status.is_some() {
+        control::request(serial, json!({"op": "stop"}))
+            .await
+            .is_ok()
+    } else if let Some(pid) = pid {
+        // Socket unreachable — kill a possibly-wedged daemon by pid.
+        kill_pid(pid);
+        true
+    } else {
+        false
     };
 
-    let p = port.unwrap_or(crate::net::DEFAULT_PROXY_PORT);
-    let _ = teardown_wiring(serial, p).await;
+    let mut warnings = Vec::<String>::new();
+    let (http_proxy_restored, adb_reverse_removed, prior_http_proxy) = if let Some(state) = &state {
+        restore_network_state(serial, state).await?;
+        remove_device_network_state(serial)?;
+        (true, true, state.prior_http_proxy.clone())
+    } else if daemon_status.is_some() || pid.is_some() || dangling_legacy_proxy {
+        // Compatibility cleanup for an old daemon that has no persisted
+        // state. Be explicit that exact restoration was impossible.
+        let port = daemon_status
+            .as_ref()
+            .and_then(|value| value.get("port"))
+            .and_then(|value| value.as_u64())
+            .map(|value| value as u16)
+            .unwrap_or(crate::net::DEFAULT_PROXY_PORT);
+        legacy_teardown_wiring(serial, port).await?;
+        warnings.push(
+            "no pre-proxy state was available; cleared http_proxy using the legacy :0 fallback"
+                .into(),
+        );
+        (false, true, None)
+    } else {
+        // Idempotent already-stopped path: do not overwrite a proxy setting
+        // owned by the user or another tool.
+        (false, false, read_http_proxy(serial).await?)
+    };
+
+    let connectivity = connectivity_check(serial, canary_host).await;
+    let connectivity_restored = connectivity.connectivity_restored;
+    let raw_ip_check = serde_json::to_value(&connectivity.raw_ip)?;
+    let dns_check = serde_json::to_value(&connectivity.dns)?;
+    if !connectivity.connectivity_restored {
+        warnings.push(format!(
+            "device connectivity is degraded after proxy teardown (raw IP reachable: {}, DNS resolved: {}); run `shadowdroid doctor --fix` or repair the device network before continuing",
+            connectivity.raw_ip.reachable, connectivity.dns.resolved
+        ));
+    }
 
     let ca_removed = if revoke_ca {
         crate::net::trust::remove(serial).await.unwrap_or(false)
@@ -148,9 +309,18 @@ pub async fn stop(serial: &Serial, revoke_ca: bool) -> Result<()> {
         json!({
             "device": serial,
             "stopped": stopped,
-            "http_proxy_cleared": true,
+            "already_stopped": already_stopped,
+            "http_proxy_restored": http_proxy_restored,
+            "prior_http_proxy": prior_http_proxy,
+            "current_http_proxy": read_http_proxy(serial).await?,
+            "adb_reverse_removed": adb_reverse_removed,
+            "raw_ip_check": raw_ip_check,
+            "dns_check": dns_check,
+            "connectivity_restored": connectivity_restored,
+            "connectivity": connectivity,
             "revoke_ca": revoke_ca,
             "ca_removed": ca_removed,
+            "warnings": warnings,
         }),
     );
     Ok(())
@@ -208,12 +378,135 @@ async fn setup_wiring(serial: &Serial, port: u16, host_port: u16) -> Result<()> 
     Ok(())
 }
 
-/// Undo [setup_wiring]. Best-effort: clearing a dangling proxy is exactly what
-/// `doctor --fix` also does, so failures here aren't fatal.
-async fn teardown_wiring(serial: &Serial, port: u16) -> Result<()> {
-    let _ = adb::shell(serial, "settings put global http_proxy :0").await;
-    let _ = adb::reverse_remove(serial, port).await;
+async fn read_http_proxy(serial: &Serial) -> Result<Option<String>> {
+    let raw = adb::shell(serial, "settings get global http_proxy").await?;
+    Ok(parse_http_proxy(&raw))
+}
+
+fn parse_http_proxy(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    (!value.is_empty() && value != "null").then(|| value.to_string())
+}
+
+fn proxy_points_at(value: &Option<String>, port: u16) -> bool {
+    value.as_deref().is_some_and(|proxy| {
+        proxy == format!("localhost:{port}")
+            || proxy == format!("127.0.0.1:{port}")
+            || proxy == format!("[::1]:{port}")
+    })
+}
+
+fn device_shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+async fn restore_http_proxy(serial: &Serial, prior: &Option<String>) -> Result<()> {
+    let command = match prior {
+        Some(value) => format!(
+            "settings put global http_proxy {}",
+            device_shell_quote(value)
+        ),
+        None => "settings delete global http_proxy".to_string(),
+    };
+    adb::shell(serial, command).await?;
     Ok(())
+}
+
+async fn restore_network_state(serial: &Serial, state: &DeviceNetworkState) -> Result<()> {
+    // Remove the tunnel first so no app can send new traffic through it while
+    // the original proxy setting is being restored.
+    let _ = adb::reverse_remove(serial, state.device_port).await;
+    restore_http_proxy(serial, &state.prior_http_proxy).await
+}
+
+async fn restore_and_consume_network_state(
+    serial: &Serial,
+    state: &DeviceNetworkState,
+) -> Result<()> {
+    restore_network_state(serial, state).await?;
+    remove_device_network_state(serial)
+}
+
+async fn legacy_teardown_wiring(serial: &Serial, port: u16) -> Result<()> {
+    let _ = adb::reverse_remove(serial, port).await;
+    adb::shell(serial, "settings put global http_proxy :0").await?;
+    Ok(())
+}
+
+fn load_device_network_state(serial: &Serial) -> Result<Option<DeviceNetworkState>> {
+    let path = paths::device_state_path(serial)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    let state: DeviceNetworkState =
+        serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+    if state.schema_version != NETWORK_STATE_SCHEMA || state.serial != serial.as_str() {
+        bail!("invalid device network state in {}", path.display());
+    }
+    Ok(Some(state))
+}
+
+fn save_device_network_state(state: &DeviceNetworkState) -> Result<()> {
+    paths::ensure_net_dir()?;
+    let serial = Serial::from(state.serial.clone());
+    let path = paths::device_state_path(&serial)?;
+    let tmp = path.with_extension("state.json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(state)?)
+        .with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("install {}", path.display()))?;
+    Ok(())
+}
+
+fn remove_device_network_state(serial: &Serial) -> Result<()> {
+    let path = paths::device_state_path(serial)?;
+    if path.exists() {
+        std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
+async fn connectivity_check(serial: &Serial, canary_host: &str) -> ConnectivityCheck {
+    let raw_ip = ping_check(serial, RAW_IP_CANARY).await;
+    let dns = ping_check(serial, canary_host).await;
+    ConnectivityCheck {
+        connectivity_restored: raw_ip.reachable && dns.resolved,
+        raw_ip,
+        dns,
+    }
+}
+
+async fn ping_check(serial: &Serial, host: &str) -> PingCheck {
+    const EXIT_MARKER: &str = "__shadowdroid_ping_exit__:";
+    let command = format!(
+        "ping -c 1 -W 2 {} 2>&1; echo {EXIT_MARKER}$?",
+        device_shell_quote(host)
+    );
+    let output = adb::shell(serial, command).await.unwrap_or_default();
+    parse_ping_check(host, &output)
+}
+
+fn parse_ping_check(host: &str, output: &str) -> PingCheck {
+    const EXIT_MARKER: &str = "__shadowdroid_ping_exit__:";
+    let exit = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(EXIT_MARKER))
+        .and_then(|value| value.parse::<i32>().ok());
+    let lower = output.to_lowercase();
+    let name_error = [
+        "unknown host",
+        "bad address",
+        "name or service not known",
+        "temporary failure in name resolution",
+        "ping: not found",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    PingCheck {
+        host: host.to_string(),
+        resolved: exit.is_some() && !name_error,
+        reachable: exit == Some(0),
+    }
 }
 
 // ── observe (task 8) ──────────────────────────────────────────
@@ -698,5 +991,42 @@ mod tests {
         let m = matcher_from_url_glob("*.example.com");
         assert_eq!(m.host.as_deref(), Some(".example.com"));
         assert_eq!(m.path, None);
+    }
+
+    #[test]
+    fn proxy_state_preserves_absent_disabled_and_custom_values() {
+        assert_eq!(parse_http_proxy("null\n"), None);
+        assert_eq!(parse_http_proxy("  \n"), None);
+        assert_eq!(parse_http_proxy(":0\n").as_deref(), Some(":0"));
+        assert_eq!(
+            parse_http_proxy("proxy.example:3128\n").as_deref(),
+            Some("proxy.example:3128")
+        );
+        assert!(proxy_points_at(&Some("localhost:8080".into()), 8080));
+        assert!(!proxy_points_at(&Some("proxy.example:8080".into()), 8080));
+    }
+
+    #[test]
+    fn ping_result_separates_dns_resolution_from_reachability() {
+        let ok = parse_ping_check(
+            "example.com",
+            "64 bytes from 93.184.216.34\n__shadowdroid_ping_exit__:0\n",
+        );
+        assert!(ok.resolved);
+        assert!(ok.reachable);
+
+        let blocked_icmp = parse_ping_check(
+            "example.com",
+            "PING example.com (93.184.216.34)\n__shadowdroid_ping_exit__:1\n",
+        );
+        assert!(blocked_icmp.resolved);
+        assert!(!blocked_icmp.reachable);
+
+        let dns_failure = parse_ping_check(
+            "example.com",
+            "ping: unknown host example.com\n__shadowdroid_ping_exit__:2\n",
+        );
+        assert!(!dns_failure.resolved);
+        assert!(!dns_failure.reachable);
     }
 }
