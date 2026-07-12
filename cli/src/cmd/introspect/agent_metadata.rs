@@ -21,8 +21,8 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             ]
         })),
         "devices" => Some(serde_json::json!({
-            "use_when": ["Need to choose an adb serial or verify whether any emulator/device is attached before running device-backed commands."],
-            "output": "device list JSON/action output",
+            "use_when": ["Need to inspect attached emulator/device state without triggering configured target startup."],
+            "output": "device list JSON/action output including stable AVD name and build characteristics when available",
             "side_effects": ["none"],
             "next_actions": ["connect", "doctor", "app current"]
         })),
@@ -84,7 +84,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         "connect" => Some(serde_json::json!({
             "use_when": ["Need to install/start the ShadowDroid server and establish the host-device control pipe."],
             "output": "connected action JSON with device/server/app state and UiAutomation advisory",
-            "side_effects": ["installs/restarts the server APK", "creates adb forwards", "disables the stylus handwriting tutorial"],
+            "side_effects": ["may reuse or start an explicitly opted-in AVD target", "claims configured AVD ownership for the current project", "installs/restarts the server APK", "creates adb forwards", "disables the stylus handwriting tutorial"],
             "next_actions": ["ui dump", "doctor --json", "watch"]
         })),
         "disconnect" => Some(serde_json::json!({
@@ -114,7 +114,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "config" => Some(serde_json::json!({
             "use_when": [
-                "Repeated app, package, device, project, or debugger parameters would cost tokens across commands.",
+                "Repeated app, package, project, debugger, or named mobile/TV device-target parameters would cost tokens across commands.",
                 "A malformed discovered config blocks normal commands and you need a recovery path; config paths/schema/validate still run before the normal config load."
             ],
             "output": "json for schema/paths/validate when --json is passed",
@@ -128,19 +128,19 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "next_actions": ["config schema --json", "config validate --json", "config init"]
         })),
         "config schema" => Some(serde_json::json!({
-            "use_when": ["Need the supported .shadowdroid/config.json shape (incl. the proxy block: ca_cert/ca_key/ca_trusted) before generating or editing config."],
+            "use_when": ["Need the supported .shadowdroid/config.json shape, including named AVD/physical targets and proxy defaults, before generating or editing config."],
             "output": "machine-readable config schema and example when --json is passed",
             "side_effects": ["none"],
             "next_actions": ["config init --project", "config validate --json"]
         })),
         "config explain" => Some(serde_json::json!({
-            "use_when": ["Need agent-facing guidance for app aliases, default package/device/project values, and config precedence."],
+            "use_when": ["Need agent-facing guidance for app aliases, named device targets, default package/project values, and config precedence."],
             "output": "config usage explanation; --json for structured guidance",
             "side_effects": ["none"],
             "next_actions": ["config paths --json", "config init", "commands --json"]
         })),
         "config init" => Some(serde_json::json!({
-            "use_when": ["Need to create or update project/user defaults for app package, device, Android Studio, debugger, or run configuration."],
+            "use_when": ["Need to create or update project/user defaults for app package, named AVD/physical target, Android Studio, debugger, or run configuration."],
             "output": "config write report; --json for changed fields and target path",
             "side_effects": ["writes .shadowdroid/config.json (project, + .shadowdroid/.gitignore for CA secrets) or ~/.shadowdroid/config.json with --user"],
             "next_actions": ["config validate --json", "debug auto", "app current"]

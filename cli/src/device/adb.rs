@@ -494,7 +494,8 @@ pub async fn ps_ui_automation_owners(serial: impl Into<String>) -> Result<String
 }
 
 /// A small map of device facts (`android_release`, `android_sdk`,
-/// `device_model`, `device_manufacturer`) parsed from `getprop`. Shared by
+/// `device_model`, `device_manufacturer`, plus emulator/form-factor identity)
+/// parsed from `getprop`. Shared by
 /// crash events ([crate::watch]) and `collect`. Best-effort: missing props are
 /// simply omitted.
 pub async fn device_info(serial: impl Into<String>) -> serde_json::Value {
@@ -504,6 +505,8 @@ pub async fn device_info(serial: impl Into<String>) -> serde_json::Value {
         ("ro.build.version.sdk", "android_sdk"),
         ("ro.product.model", "device_model"),
         ("ro.product.manufacturer", "device_manufacturer"),
+        ("ro.boot.qemu.avd_name", "avd"),
+        ("ro.build.characteristics", "build_characteristics"),
     ];
     let mut info = serde_json::Map::new();
     for line in out.lines() {

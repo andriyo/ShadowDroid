@@ -81,3 +81,95 @@ fn malformed_config_does_not_block_config_recovery_commands() {
     assert_eq!(error["stage"], "config");
     assert_eq!(error["detail"]["line"], 3);
 }
+
+#[test]
+fn config_init_writes_and_validates_project_device_targets() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let init = run(
+        &home,
+        &project,
+        &[
+            "config",
+            "init",
+            "--project",
+            "--app",
+            "Mobile",
+            "--package",
+            "com.example.mobile",
+            "--app-target",
+            "mobile",
+            "--default-target",
+            "mobile",
+            "--target-name",
+            "mobile",
+            "--target-avd",
+            "Project_Pixel_9",
+            "--target-start",
+            "if-needed",
+            "--target-form-factor",
+            "mobile",
+            "--target-boot-timeout",
+            "240",
+            "--json",
+        ],
+    );
+    let value = json(&init);
+    assert!(init.status.success(), "{value}");
+    assert_eq!(value["config"]["default_target"], "mobile");
+    assert_eq!(value["config"]["apps"]["Mobile"]["target"], "mobile");
+    assert_eq!(
+        value["config"]["targets"]["mobile"]["avd"],
+        "Project_Pixel_9"
+    );
+    assert_eq!(value["config"]["targets"]["mobile"]["start"], "if-needed");
+    assert_eq!(
+        value["config"]["targets"]["mobile"]["boot_timeout_seconds"],
+        240
+    );
+
+    let validate = run(&home, &project, &["config", "validate", "--json"]);
+    assert!(validate.status.success(), "{}", json(&validate));
+}
+
+#[test]
+fn missing_named_avd_is_not_misreported_as_an_adb_serial() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let init = run(
+        &home,
+        &project,
+        &[
+            "config",
+            "init",
+            "--project",
+            "--default-target",
+            "mobile",
+            "--target-name",
+            "mobile",
+            "--target-avd",
+            "Definitely_Not_A_Real_AVD",
+            "--json",
+        ],
+    );
+    assert!(init.status.success(), "{}", json(&init));
+
+    let connect = run(&home, &project, &["connect"]);
+    let error = json(&connect);
+    assert!(!connect.status.success(), "{error}");
+    assert_eq!(error["code"], "target_avd_not_running");
+    assert_eq!(error["detail"]["target_name"], "mobile");
+    assert!(error["next_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|action| !action.as_str().unwrap_or("").contains("-d mobile")));
+}

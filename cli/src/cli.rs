@@ -76,6 +76,17 @@ pub struct Cli {
     #[arg(short, long, global = true, env = "SHADOWDROID_DEVICE")]
     pub device: Option<String>,
 
+    /// Named project device target (for example `mobile` or `tv`). Resolves a
+    /// configured stable AVD name or physical serial. An explicit --device
+    /// takes precedence.
+    #[arg(long, global = true, env = "SHADOWDROID_TARGET")]
+    pub target: Option<String>,
+
+    /// Reassign an AVD target currently claimed by another project. This is an
+    /// explicit isolation override and has no effect on direct --device use.
+    #[arg(long, global = true)]
+    pub takeover: bool,
+
     /// Local APK to install instead of normal APK resolution. Can be either:
     ///   • a path to the test APK (e.g., app-debug-androidTest.apk); the
     ///     sibling main APK is auto-discovered in the same directory tree
@@ -950,6 +961,15 @@ pub enum NetCmd {
     Daemon(NetDaemonArgs),
 }
 
+impl NetCmd {
+    fn allows_target_start(&self) -> bool {
+        matches!(
+            self,
+            Self::Check { .. } | Self::Trust { .. } | Self::Start { .. } | Self::Replay { .. }
+        )
+    }
+}
+
 #[derive(Subcommand)]
 pub enum NetCaCmd {
     /// Install a user-provided CA as the proxy's signing CA (replaces the
@@ -1211,6 +1231,96 @@ fn parsed_command_path(matches: &clap::ArgMatches) -> Option<String> {
     (!path.is_empty()).then(|| path.join(" "))
 }
 
+/// Lazy device selection keeps passive/host-only commands from starting an
+/// emulator. Explicit `--device` wins; otherwise a requested/implicit named
+/// target wins over the legacy config.device/sole-attached fallback.
+struct DeviceSelection {
+    explicit_device: Option<String>,
+    requested_target: Option<String>,
+    takeover: bool,
+}
+
+impl DeviceSelection {
+    fn target_name<'a>(&'a self, config: &'a ShadowDroidConfig) -> Option<&'a str> {
+        self.requested_target
+            .as_deref()
+            .or_else(|| config.implicit_target())
+    }
+
+    async fn resolve(&self, config: &ShadowDroidConfig) -> Result<Serial> {
+        if let Some(device) = self.explicit_device.as_deref() {
+            return resolve_serial(Some(device)).await;
+        }
+        if let Some(target) = self.target_name(config) {
+            let serial = crate::device::target::resolve(config, target, self.takeover).await?;
+            crate::events::set_current_device(serial.to_string());
+            return Ok(serial);
+        }
+        resolve_serial(config.device.as_deref()).await
+    }
+
+    async fn resolve_existing(&self, config: &ShadowDroidConfig) -> Result<Serial> {
+        if let Some(device) = self.explicit_device.as_deref() {
+            return resolve_serial(Some(device)).await;
+        }
+        if let Some(target) = self.target_name(config) {
+            let serial =
+                crate::device::target::resolve_existing(config, target, self.takeover).await?;
+            crate::events::set_current_device(serial.to_string());
+            return Ok(serial);
+        }
+        resolve_serial(config.device.as_deref()).await
+    }
+
+    /// Preserve doctor's inventory-first behavior for direct/legacy serials;
+    /// only named targets need lifecycle resolution and optional startup.
+    async fn doctor_device(&self, config: &ShadowDroidConfig) -> Result<Option<String>> {
+        if let Some(device) = self.explicit_device.clone() {
+            return Ok(Some(device));
+        }
+        if let Some(name) = self.target_name(config) {
+            if let Some((_, target)) = config.target(name) {
+                if let Some(serial) = target.serial.clone() {
+                    return Ok(Some(serial));
+                }
+            }
+            return self
+                .resolve(config)
+                .await
+                .map(|serial| Some(serial.to_string()));
+        }
+        Ok(config.device.clone())
+    }
+
+    /// Android Studio's bridge accepts either a serial or AVD name. Returning
+    /// the stable binding avoids starting an emulator for host-only reads.
+    fn debugger_filter(&self, config: &ShadowDroidConfig) -> Result<Option<String>> {
+        if let Some(device) = self.explicit_device.clone() {
+            return Ok(Some(device));
+        }
+        if let Some(name) = self.target_name(config) {
+            let Some((_, target)) = config.target(name) else {
+                return Err(crate::diagnostic::DiagnosticError::new(
+                    "target_not_configured",
+                    "device_target",
+                    format!("device target `{name}` is not configured"),
+                )
+                .detail(json!({
+                    "target_name": name,
+                    "available_targets": config.targets.keys().collect::<Vec<_>>(),
+                }))
+                .next_actions([
+                    "run `shadowdroid config schema --json` to inspect the targets shape",
+                    "fix the target reference and run `shadowdroid config validate --json`",
+                ])
+                .into());
+            };
+            return Ok(target.serial.clone().or_else(|| target.avd.clone()));
+        }
+        Ok(config.device.clone())
+    }
+}
+
 /// Entry point: run the command, then (if the user opted in) append one line
 /// to the local usage log — verb, duration, outcome. The log write can never
 /// fail the command.
@@ -1242,7 +1352,11 @@ async fn run_inner() -> Result<()> {
     }
 
     let config = ShadowDroidConfig::load()?;
-    let device = cli.device.or_else(|| config.device.clone());
+    let selection = DeviceSelection {
+        explicit_device: cli.device.clone(),
+        requested_target: cli.target.clone(),
+        takeover: cli.takeover,
+    };
     let apk = cli.apk;
     let project = cli
         .project_root
@@ -1260,7 +1374,7 @@ async fn run_inner() -> Result<()> {
     // its own best-effort bring-up so it can degrade; perm/appops/profile and
     // `app install`/`reinstall` are pure host-side `adb`.
     match &cmd {
-        Cmd::Devices => return cmd_devices().await,
+        Cmd::Devices => return cmd_devices(&config).await,
         Cmd::Init(args) => return crate::cmd::studio::run_init(args).await,
         Cmd::Update { .. }
         | Cmd::Commands { .. }
@@ -1273,22 +1387,42 @@ async fn run_inner() -> Result<()> {
         // `aar` install/status/remove are host-only (Gradle + filesystem); the
         // capture/intercept/resume/drop/agent verbs talk to the running in-app
         // agent and resolve a device serial internally.
-        Cmd::Aar(c) => return crate::cmd::aar::run(c, project.as_deref(), device.as_deref()).await,
+        Cmd::Aar(c) => {
+            let serial = if c.requires_device() {
+                Some(selection.resolve(&config).await?)
+            } else {
+                None
+            };
+            return crate::cmd::aar::run(
+                c,
+                project.as_deref(),
+                serial.as_ref().map(Serial::as_str),
+            )
+            .await;
+        }
         Cmd::Debug(args) if args.is_host_only() => {
             // Host-only debugger commands skip device resolution / ensure_ready,
-            // but still honor an explicit --device to pick the matching session.
-            return crate::cmd::debug::run_host_only(args, device.as_deref()).await;
+            // but still honor an explicit device/target to pick the matching
+            // session. Resolve only here so passive commands stay passive even
+            // when a target reference needs repair.
+            let debugger_device = selection.debugger_filter(&config)?;
+            return crate::cmd::debug::run_host_only(args, debugger_device.as_deref()).await;
         }
         Cmd::Connect => {
-            return cmd_connect(device.as_deref(), apk.as_deref(), any_apk_version).await;
+            let serial = selection.resolve(&config).await?;
+            return cmd_connect(&serial, apk.as_deref(), any_apk_version).await;
         }
-        Cmd::Disconnect => return cmd_disconnect(device.as_deref()).await,
+        Cmd::Disconnect => {
+            let serial = selection.resolve_existing(&config).await?;
+            return cmd_disconnect(&serial).await;
+        }
         Cmd::Test {
             no_reconnect,
             command,
         } => {
+            let serial = selection.resolve(&config).await?;
             return cmd_test(
-                device.as_deref(),
+                &serial,
                 apk.as_deref(),
                 any_apk_version,
                 !*no_reconnect,
@@ -1302,8 +1436,9 @@ async fn run_inner() -> Result<()> {
             force,
             json,
         } => {
+            let doctor_device = selection.doctor_device(&config).await?;
             return crate::cmd::doctor::run(
-                device.as_deref(),
+                doctor_device.as_deref(),
                 *fix,
                 *force,
                 *json,
@@ -1318,7 +1453,7 @@ async fn run_inner() -> Result<()> {
             out,
             no_screenshot,
         } => {
-            let serial = resolve_serial(device.as_deref()).await?;
+            let serial = selection.resolve(&config).await?;
             let app = resolve_app_package(&config, Some(&serial), app.clone()).await?;
             return crate::cmd::collect::run(&serial, app, out.clone(), !*no_screenshot).await;
         }
@@ -1326,31 +1461,31 @@ async fn run_inner() -> Result<()> {
         // `why`'s screen section) — they must work when the server is down,
         // since "the server is down" is exactly when you need them.
         Cmd::Log(args) => {
-            let serial = resolve_serial(device.as_deref()).await?;
+            let serial = selection.resolve(&config).await?;
             return crate::cmd::log::run(&serial, &config, project.as_deref(), args).await;
         }
         Cmd::Why(args) => {
-            let serial = resolve_serial(device.as_deref()).await?;
+            let serial = selection.resolve(&config).await?;
             return crate::cmd::why::run(&serial, &config, project.as_deref(), args).await;
         }
         Cmd::Perm(c) => {
-            let serial = resolve_serial(device.as_deref()).await?;
+            let serial = selection.resolve(&config).await?;
             return dispatch_perm(c, &serial).await;
         }
         Cmd::Appops(c) => {
-            let serial = resolve_serial(device.as_deref()).await?;
+            let serial = selection.resolve(&config).await?;
             return dispatch_appops(c, &serial).await;
         }
         Cmd::Profile(c) => {
-            let serial = resolve_serial(device.as_deref()).await?;
+            let serial = selection.resolve(&config).await?;
             return dispatch_profile(c, &serial).await;
         }
         Cmd::App(AppCmd::Install(a)) => {
-            let serial = resolve_serial(device.as_deref()).await?;
+            let serial = selection.resolve(&config).await?;
             return crate::cmd::app_install::run(&serial, a, false).await;
         }
         Cmd::App(AppCmd::Reinstall(a)) => {
-            let serial = resolve_serial(device.as_deref()).await?;
+            let serial = selection.resolve(&config).await?;
             return crate::cmd::app_install::run(&serial, a, true).await;
         }
         // `net` is host-only: the proxy is a host-side daemon driven over adb.
@@ -1367,19 +1502,27 @@ async fn run_inner() -> Result<()> {
             // a serial is used only to enrich the "restart the running proxy"
             // hint, so resolve it best-effort rather than failing without one.
             if matches!(c, NetCmd::Ca(_)) {
-                let serial = resolve_serial(device.as_deref())
+                let direct = selection
+                    .explicit_device
+                    .as_deref()
+                    .or(config.device.as_deref());
+                let serial = resolve_serial(direct)
                     .await
                     .unwrap_or_else(|_| Serial::new(""));
                 return dispatch_net(c, &serial, &config).await;
             }
-            let serial = resolve_serial(device.as_deref()).await?;
+            let serial = if c.allows_target_start() {
+                selection.resolve(&config).await?
+            } else {
+                selection.resolve_existing(&config).await?
+            };
             return dispatch_net(c, &serial, &config).await;
         }
         _ => {}
     }
 
     // ── Phase 2: server-backed commands share one bring-up ──
-    let serial = resolve_serial(device.as_deref()).await?;
+    let serial = selection.resolve(&config).await?;
     let client =
         installer::ensure_ready_for_command(&serial, apk.as_deref(), any_apk_version).await?;
 
@@ -3854,7 +3997,7 @@ fn unix_ms() -> u64 {
 /// unauthorized, or no-perm devices can't be queried over `getprop`, so they
 /// report `serial` + `state` only (and are still listed, unlike `connect`'s
 /// actionable-only view).
-async fn cmd_devices() -> Result<()> {
+async fn cmd_devices(config: &ShadowDroidConfig) -> Result<()> {
     let pairs = adb::list_devices_with_state().await?;
     let mut devices = Vec::with_capacity(pairs.len());
     for (serial, state) in pairs {
@@ -3867,6 +4010,19 @@ async fn cmd_devices() -> Result<()> {
                     obj.insert(k, v);
                 }
             }
+        }
+        let avd = obj.get("avd").and_then(serde_json::Value::as_str);
+        let configured_targets = config
+            .targets
+            .iter()
+            .filter(|(_, target)| {
+                target.serial.as_deref() == Some(serial.as_str())
+                    || avd.is_some_and(|avd| target.avd.as_deref() == Some(avd))
+            })
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        if !configured_targets.is_empty() {
+            obj.insert("configured_targets".into(), json!(configured_targets));
         }
         devices.push(serde_json::Value::Object(obj));
     }
@@ -3897,21 +4053,20 @@ fn ui_automation_advisory() -> serde_json::Value {
 }
 
 async fn cmd_connect(
-    device: Option<&str>,
+    serial: &Serial,
     apk: Option<&std::path::Path>,
     any_apk_version: bool,
 ) -> Result<()> {
-    let serial = resolve_serial(device).await?;
-    let before_version = installer::running_server_version(&serial)
+    let before_version = installer::running_server_version(serial)
         .await
         .ok()
         .flatten();
-    let client = installer::ensure_ready(&serial, apk, any_apk_version).await?;
+    let client = installer::ensure_ready(serial, apk, any_apk_version).await?;
     // Device prep: disable the Android 14+ stylus-handwriting tutorial that
     // otherwise hijacks the first text-field focus and breaks `text` input.
     // Best-effort + idempotent; surfaced in the output rather than done silently.
     let stylus_tutorial_disabled =
-        crate::cmd::device_profile::disable_stylus_tutorial(&serial).await;
+        crate::cmd::device_profile::disable_stylus_tutorial(serial).await;
     let state = client.state().await?;
     let mut out = json!({
         "status": "connected",
@@ -3947,10 +4102,9 @@ async fn cmd_connect(
     Ok(())
 }
 
-async fn cmd_disconnect(device: Option<&str>) -> Result<()> {
-    let serial = resolve_serial(device).await?;
-    let _guard = installer::acquire_lifecycle_lock(&serial)?;
-    free_ui_automation_slot(&serial).await?;
+async fn cmd_disconnect(serial: &Serial) -> Result<()> {
+    let _guard = installer::acquire_lifecycle_lock(serial)?;
+    free_ui_automation_slot(serial).await?;
     emit_action(
         "disconnect",
         &json!({"status": "disconnected", "device": serial}),
@@ -3980,16 +4134,15 @@ async fn free_ui_automation_slot(serial: &Serial) -> Result<()> {
 /// `reconnect` is false). A failed child flows through the structured error
 /// boundary while preserving the child's status code for CI and agents.
 async fn cmd_test(
-    device: Option<&str>,
+    serial: &Serial,
     apk: Option<&std::path::Path>,
     any_apk_version: bool,
     reconnect: bool,
     command: Vec<String>,
 ) -> Result<()> {
-    let serial = resolve_serial(device).await?;
     {
-        let _guard = installer::acquire_lifecycle_lock(&serial)?;
-        free_ui_automation_slot(&serial)
+        let _guard = installer::acquire_lifecycle_lock(serial)?;
+        free_ui_automation_slot(serial)
             .await
             .context("freeing the UiAutomation slot before the test run")?;
     }
@@ -4005,7 +4158,7 @@ async fn cmd_test(
     let exit_code = status.code();
 
     let reconnect_result = if reconnect {
-        Some(installer::ensure_ready(&serial, apk, any_apk_version).await)
+        Some(installer::ensure_ready(serial, apk, any_apk_version).await)
     } else {
         None
     };
@@ -4118,6 +4271,59 @@ pub(crate) async fn resolve_serial(explicit: Option<&str>) -> Result<Serial> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn device_selection_precedence_and_host_filter_use_stable_target_identity() {
+        let mut config = ShadowDroidConfig {
+            device: Some("legacy-serial".into()),
+            default_target: Some("mobile".into()),
+            ..Default::default()
+        };
+        config.targets.insert(
+            "mobile".into(),
+            crate::config::DeviceTargetConfig {
+                avd: Some("Project_Pixel_9".into()),
+                ..Default::default()
+            },
+        );
+        let target = DeviceSelection {
+            explicit_device: None,
+            requested_target: None,
+            takeover: false,
+        };
+        assert_eq!(
+            target.debugger_filter(&config).unwrap().as_deref(),
+            Some("Project_Pixel_9")
+        );
+
+        let explicit = DeviceSelection {
+            explicit_device: Some("emulator-7777".into()),
+            requested_target: Some("mobile".into()),
+            takeover: false,
+        };
+        assert_eq!(
+            explicit.debugger_filter(&config).unwrap().as_deref(),
+            Some("emulator-7777")
+        );
+    }
+
+    #[test]
+    fn host_only_target_selection_rejects_unknown_target() {
+        let config = ShadowDroidConfig {
+            default_target: Some("missing".into()),
+            ..Default::default()
+        };
+        let selection = DeviceSelection {
+            explicit_device: None,
+            requested_target: None,
+            takeover: false,
+        };
+        let error = selection.debugger_filter(&config).unwrap_err();
+        let diagnostic = error
+            .downcast_ref::<crate::diagnostic::DiagnosticError>()
+            .unwrap();
+        assert_eq!(diagnostic.code, "target_not_configured");
+    }
 
     #[test]
     fn push_mode_parses_as_octal() {

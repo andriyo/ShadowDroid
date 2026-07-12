@@ -88,6 +88,27 @@ fn help_exits_zero_and_is_not_an_error_envelope() {
 }
 
 #[test]
+fn help_exposes_named_target_and_takeover_controls() {
+    let (out, code) = run(&["connect", "--help"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("--target <TARGET>"), "{out}");
+    assert!(out.contains("--takeover"), "{out}");
+}
+
+#[test]
+fn config_schema_describes_stable_device_targets() {
+    let (out, code) = run(&["config", "schema", "--json"]);
+    let value = one_json_line(&out);
+    assert_eq!(code, 0, "{value}");
+    assert_eq!(
+        value["target_entry"]["start"]["enum"],
+        serde_json::json!(["never", "if-needed"])
+    );
+    assert_eq!(value["fields"]["targets"]["type"], "object");
+    assert_eq!(value["app_entry"]["target"]["type"], "string");
+}
+
+#[test]
 fn commands_json_is_one_valid_json_object() {
     let (out, code) = run(&["commands", "--json"]);
     let v: serde_json::Value =

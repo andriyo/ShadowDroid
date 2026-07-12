@@ -285,13 +285,16 @@ directory's ancestors, with the nearest project file winning.
 
 ```bash
 shadowdroid config schema --json
-shadowdroid config init --project --app Livd --package com.livd --project-path /Users/you/Work/Livd --json
+shadowdroid config init --project --app Livd --package com.livd --app-target mobile \
+  --default-target mobile --target-name mobile --target-avd Livd_Pixel_9_API_36 \
+  --target-start if-needed --target-form-factor mobile \
+  --project-path /Users/you/Work/Livd --json
 shadowdroid config validate --json
 ```
 
 ```json
 {
-  "device": "emulator-5554",
+  "default_target": "mobile",
   "app": "Livd",
   "project": "/Users/you/Work/Livd",
   "proxy": {
@@ -303,11 +306,44 @@ shadowdroid config validate --json
     "Livd": {
       "package": "com.livd",
       "run_configuration": "app",
-      "debugger": "Android Debugger"
+      "debugger": "Android Debugger",
+      "target": "mobile"
+    }
+  },
+  "targets": {
+    "mobile": {
+      "avd": "Livd_Pixel_9_API_36",
+      "start": "if-needed",
+      "form_factor": "mobile"
+    },
+    "tv": {
+      "avd": "Livd_TV_API_35",
+      "start": "if-needed",
+      "form_factor": "tv"
     }
   }
 }
 ```
+
+Named targets make multi-project and mobile/TV work deterministic. ShadowDroid
+matches a running emulator by its stable AVD name, discovers its current adb
+serial, and reuses it. If none is running, `start: "if-needed"` opts into
+starting that existing AVD and waiting for Android to finish booting; the
+default policy is `never`. ShadowDroid never silently creates an AVD. Physical
+devices use a target entry with `"serial": "..."` and are never auto-started.
+
+Use `shadowdroid --target tv connect` to override `default_target`; explicit
+`-d/--device` has highest precedence. `shadowdroid devices` stays passive and
+includes the AVD name when Android exposes it. AVD claims under
+`~/.shadowdroid/targets/claims/` prevent two projects from silently sharing one
+emulator—and therefore its accounts, proxy, and single UiAutomation slot. Use
+`--takeover` only for an intentional reassignment. Startup uses the Android SDK
+emulator found via `ANDROID_SDK_ROOT` / `ANDROID_HOME` / PATH; set
+`SHADOWDROID_EMULATOR` for an explicit executable.
+
+AVD names are host configuration. Commit target bindings only when the team
+standardizes those names; otherwise define `targets` in the user config and
+keep only the project's `default_target` / app `target` roles in project config.
 
 The `project` path matters for debugging: `why` and `log` use it to map crash
 stack frames back to files in your source tree (`project_frames`), so the agent
@@ -812,7 +848,9 @@ those sections report `available:false` and everything else keeps working.
 
 **Which devices work? Emulators? Android TV?**
 Real devices and emulators with USB debugging, plus Android TV / leanback, which
-is focus + D-pad driven via `ui focus` and `ui key dpad_*`.
+is focus + D-pad driven via `ui focus` and `ui key dpad_*`. Projects can bind
+stable AVD/physical devices to named targets such as `mobile` and `tv`; opted-in
+AVD targets are automatically reused or started for device-backed commands.
 
 **Which agents can use it?**
 Any agent that can run a shell command and read JSON. One-command skill install

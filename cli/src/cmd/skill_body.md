@@ -26,13 +26,22 @@ agent hints (`use_when`, side effects, prerequisites, and next commands). Omit
 ```bash
 shadowdroid devices
 shadowdroid -d emulator-5554 connect
+shadowdroid --target mobile connect
+shadowdroid --target tv ui dump
 shadowdroid -d emulator-5554 doctor --json
 shadowdroid -d emulator-5554 ui dump
 ```
 
-Do not silently choose between several attached devices. Read `devices`, pick
-by `serial`, then pass global `-d <serial>` or store it in config. If no device
-is attached, ask the user before starting an emulator.
+Prefer a project-configured named target (`--target mobile`, `--target tv`, or
+`default_target`) over persisting an ephemeral `emulator-5554` serial. A target
+reuses a running emulator by stable AVD name and may start it only when its
+config explicitly says `start: "if-needed"`. Otherwise, do not silently choose
+between attached devices or start an emulator: read `devices`, pass global
+`-d <serial>`, or ask the user.
+
+An explicit `-d/--device` overrides target selection. If an AVD is claimed by
+another project, preserve isolation; use `--takeover` only when reassignment is
+intentional and the user has put that AVD in scope.
 
 `connect` may install/restart the version-matched instrumentation APKs, create
 an adb forward, and claim Android's single `UiAutomation` slot. Use

@@ -29,6 +29,11 @@ pub const PROJECT_CONFIG_REL: &str = ".shadowdroid/config.json";
 pub struct ShadowDroidConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<String>,
+    /// Default named device target. A target resolves to either a stable AVD
+    /// name or a physical-device serial; unlike `device`, an AVD target can be
+    /// started on demand and does not persist an ephemeral emulator serial.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_target: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -56,6 +61,9 @@ pub struct ShadowDroidConfig {
     pub proxy: Option<ProxyConfig>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub apps: BTreeMap<String, AppConfig>,
+    /// Project/user-defined device targets such as `mobile` and `tv`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub targets: BTreeMap<String, DeviceTargetConfig>,
 
     #[serde(skip)]
     pub sources: Vec<PathBuf>,
@@ -119,6 +127,49 @@ pub struct AppConfig {
     pub debugger: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub debug_mode: Option<String>,
+    /// Named device target for this app alias. It becomes the implicit target
+    /// when the alias is also the config's default `app`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceTargetConfig {
+    /// Stable Android Virtual Device name (`emulator -list-avds`). Mutually
+    /// exclusive with `serial`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avd: Option<String>,
+    /// Stable physical/remote adb serial. Mutually exclusive with `avd` and is
+    /// never auto-started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
+    /// `never` (default) or `if-needed`. Auto-start is deliberately opt-in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<TargetStartPolicy>,
+    /// Optional target assertion checked after resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form_factor: Option<TargetFormFactor>,
+    /// Start the AVD without loading a snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cold_boot: Option<bool>,
+    /// Maximum time to wait for an AVD to become adb-online and finish booting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_timeout_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum TargetStartPolicy {
+    Never,
+    IfNeeded,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum TargetFormFactor {
+    Mobile,
+    Tv,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -150,6 +201,24 @@ impl ShadowDroidConfig {
 
     pub fn default_app(&self) -> Option<String> {
         self.app.clone()
+    }
+
+    /// Resolve the implicit named target. An app-alias target is more specific
+    /// than the top-level default because it lets one project model mobile/TV
+    /// variants without guessing from Gradle flavor names.
+    pub fn implicit_target(&self) -> Option<&str> {
+        self.app
+            .as_deref()
+            .and_then(|app| self.app_config(app))
+            .and_then(|entry| entry.target.as_deref())
+            .or(self.default_target.as_deref())
+    }
+
+    pub fn target(&self, name: &str) -> Option<(&str, &DeviceTargetConfig)> {
+        self.targets
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+            .map(|(name, target)| (name.as_str(), target))
     }
 
     pub fn configured_package_for(&self, name_or_package: &str) -> Option<String> {
@@ -290,6 +359,7 @@ impl ShadowDroidConfig {
 
     fn merge(&mut self, other: ShadowDroidConfig) {
         self.device = other.device.or(self.device.take());
+        self.default_target = other.default_target.or(self.default_target.take());
         self.app = other.app.or(self.app.take());
         self.project = other.project.or(self.project.take());
         self.studio_url = other.studio_url.or(self.studio_url.take());
@@ -301,6 +371,7 @@ impl ShadowDroidConfig {
         self.usage_log = other.usage_log.or(self.usage_log.take());
         self.proxy = merge_proxy(self.proxy.take(), other.proxy);
         self.apps.extend(other.apps);
+        self.targets.extend(other.targets);
     }
 }
 
@@ -715,6 +786,7 @@ mod tests {
     fn project_config_overrides_user_config_and_merges_apps() {
         let mut user = ShadowDroidConfig {
             device: Some("emulator-1".into()),
+            default_target: Some("fallback".into()),
             app: Some("old".into()),
             ..Default::default()
         };
@@ -727,6 +799,7 @@ mod tests {
         );
         let mut project = ShadowDroidConfig {
             app: Some("Livd".into()),
+            default_target: Some("mobile".into()),
             project: Some("/work/Livd".into()),
             ..Default::default()
         };
@@ -734,6 +807,22 @@ mod tests {
             "Livd".into(),
             AppConfig {
                 package: "com.livd".into(),
+                target: Some("tv".into()),
+                ..Default::default()
+            },
+        );
+        project.targets.insert(
+            "mobile".into(),
+            DeviceTargetConfig {
+                avd: Some("Livd_Pixel".into()),
+                ..Default::default()
+            },
+        );
+        project.targets.insert(
+            "tv".into(),
+            DeviceTargetConfig {
+                avd: Some("Livd_TV".into()),
+                form_factor: Some(TargetFormFactor::Tv),
                 ..Default::default()
             },
         );
@@ -742,6 +831,13 @@ mod tests {
 
         assert_eq!(user.device.as_deref(), Some("emulator-1"));
         assert_eq!(user.app.as_deref(), Some("Livd"));
+        assert_eq!(user.default_target.as_deref(), Some("mobile"));
+        assert_eq!(user.implicit_target(), Some("tv"));
+        assert_eq!(
+            user.target("TV")
+                .and_then(|(_, target)| target.avd.as_deref()),
+            Some("Livd_TV")
+        );
         assert_eq!(
             user.default_project_for(Some("Livd")).as_deref(),
             Some("/work/Livd")

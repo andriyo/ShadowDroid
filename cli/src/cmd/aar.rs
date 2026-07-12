@@ -74,6 +74,12 @@ pub enum AarCmd {
     Coroutines(CoroutinesArgs),
 }
 
+impl AarCmd {
+    pub(crate) fn requires_device(&self) -> bool {
+        !matches!(self, Self::Install(_) | Self::Status(_) | Self::Remove(_))
+    }
+}
+
 #[derive(Args)]
 pub struct CoroutinesArgs {
     /// Include the full DebugProbes text dump (job hierarchy + stack traces).

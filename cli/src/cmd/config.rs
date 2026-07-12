@@ -10,7 +10,9 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 use crate::config as cfg;
-use crate::config::{AppConfig, ProxyConfig, ShadowDroidConfig};
+use crate::config::{
+    AppConfig, ProxyConfig, ShadowDroidConfig, TargetFormFactor, TargetStartPolicy,
+};
 
 #[derive(Args, Debug)]
 pub struct ConfigArgs {
@@ -65,6 +67,43 @@ pub struct ConfigInitArgs {
     /// Default ADB serial.
     #[arg(long)]
     pub device: Option<String>,
+    /// Default named target used when --device/--target are absent.
+    #[arg(long, value_name = "NAME")]
+    pub default_target: Option<String>,
+    /// Target entry to create/update. Pair with --target-avd or --target-serial.
+    #[arg(long, value_name = "NAME")]
+    pub target_name: Option<String>,
+    /// Stable AVD name for --target-name.
+    #[arg(
+        long,
+        value_name = "AVD",
+        requires = "target_name",
+        conflicts_with = "target_serial"
+    )]
+    pub target_avd: Option<String>,
+    /// Stable physical/remote adb serial for --target-name.
+    #[arg(
+        long,
+        value_name = "SERIAL",
+        requires = "target_name",
+        conflicts_with = "target_avd"
+    )]
+    pub target_serial: Option<String>,
+    /// Target startup policy. `if-needed` is valid only for AVD targets.
+    #[arg(long, value_enum, requires = "target_name")]
+    pub target_start: Option<TargetStartPolicy>,
+    /// Assert the resolved target is a mobile or TV device.
+    #[arg(long, value_enum, requires = "target_name")]
+    pub target_form_factor: Option<TargetFormFactor>,
+    /// Cold-boot the AVD when ShadowDroid starts it.
+    #[arg(long, requires = "target_name")]
+    pub target_cold_boot: bool,
+    /// AVD boot timeout in seconds (10..=900).
+    #[arg(long, requires = "target_name", value_name = "SECONDS")]
+    pub target_boot_timeout: Option<u64>,
+    /// Named target for --app. The alias must be created in the same command or already exist.
+    #[arg(long, requires = "app", value_name = "NAME")]
+    pub app_target: Option<String>,
     /// Default Android Studio project name or absolute path.
     #[arg(long, value_name = "PATH_OR_NAME")]
     pub project_path: Option<String>,
@@ -146,6 +185,12 @@ fn init_config(args: &ConfigInitArgs) -> Result<()> {
 
     apply_top_level(&mut config.device, &args.device, "device", &mut changed);
     apply_top_level(
+        &mut config.default_target,
+        &args.default_target,
+        "default_target",
+        &mut changed,
+    );
+    apply_top_level(
         &mut config.studio_url,
         &args.studio_url,
         "studio_url",
@@ -186,9 +231,12 @@ fn init_config(args: &ConfigInitArgs) -> Result<()> {
                 &mut config,
                 app,
                 package,
-                &args.run_configuration,
-                &args.debugger,
-                &args.debug_mode,
+                AppConfigUpdate {
+                    run_configuration: &args.run_configuration,
+                    debugger: &args.debugger,
+                    debug_mode: &args.debug_mode,
+                    target: &args.app_target,
+                },
                 args.force,
             )?;
             changed.push(format!("apps.{app}"));
@@ -203,6 +251,84 @@ fn init_config(args: &ConfigInitArgs) -> Result<()> {
             changed.push("app".to_string());
         }
         _ => {}
+    }
+
+    if args.package.is_none() {
+        if let (Some(app), Some(target)) = (args.app.as_deref(), args.app_target.as_deref()) {
+            let (_, entry) = config
+                .apps
+                .iter_mut()
+                .find(|(alias, _)| alias.eq_ignore_ascii_case(app.trim()))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "app alias `{}` does not exist; pass --package to create it",
+                        app.trim()
+                    )
+                })?;
+            entry.target = Some(target.trim().to_string());
+            changed.push(format!("apps.{}.target", app.trim()));
+        }
+    }
+
+    if let Some(name) = args
+        .target_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        let key = config
+            .targets
+            .keys()
+            .find(|existing| existing.eq_ignore_ascii_case(name))
+            .cloned()
+            .unwrap_or_else(|| name.to_string());
+        let entry = config.targets.entry(key).or_default();
+        if let Some(avd) = args
+            .target_avd
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            if entry.serial.is_some() && !args.force {
+                bail!(
+                    "target `{name}` is serial-bound; pass --force to replace it with AVD `{avd}`"
+                );
+            }
+            entry.serial = None;
+            entry.avd = Some(avd.to_string());
+            changed.push(format!("targets.{name}.avd"));
+        }
+        if let Some(serial) = args
+            .target_serial
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            if entry.avd.is_some() && !args.force {
+                bail!("target `{name}` is AVD-bound; pass --force to replace it with serial `{serial}`");
+            }
+            entry.avd = None;
+            entry.serial = Some(serial.to_string());
+            changed.push(format!("targets.{name}.serial"));
+        }
+        if let Some(start) = args.target_start {
+            entry.start = Some(start);
+            changed.push(format!("targets.{name}.start"));
+        }
+        if let Some(form_factor) = args.target_form_factor {
+            entry.form_factor = Some(form_factor);
+            changed.push(format!("targets.{name}.form_factor"));
+        }
+        if args.target_cold_boot {
+            entry.cold_boot = Some(true);
+            changed.push(format!("targets.{name}.cold_boot"));
+        }
+        if let Some(timeout) = args.target_boot_timeout {
+            entry.boot_timeout_seconds = Some(timeout);
+            changed.push(format!("targets.{name}.boot_timeout_seconds"));
+        }
+    } else if args.target_name.is_some() {
+        bail!("--target-name must not be empty");
     }
 
     if args.app.is_none() {
@@ -299,13 +425,18 @@ fn init_config(args: &ConfigInitArgs) -> Result<()> {
 /// Update only values explicitly supplied by this invocation. In particular,
 /// re-running `config init --app ... --package ...` must not erase the alias's
 /// project/debugger/run-configuration fields.
+struct AppConfigUpdate<'a> {
+    run_configuration: &'a Option<String>,
+    debugger: &'a Option<String>,
+    debug_mode: &'a Option<String>,
+    target: &'a Option<String>,
+}
+
 fn upsert_app_config(
     config: &mut ShadowDroidConfig,
     app: &str,
     package: &str,
-    run_configuration: &Option<String>,
-    debugger: &Option<String>,
-    debug_mode: &Option<String>,
+    update: AppConfigUpdate<'_>,
     force: bool,
 ) -> Result<()> {
     cfg::validate_android_package(package)?;
@@ -331,20 +462,26 @@ fn upsert_app_config(
     let mut ignored_changes = Vec::new();
     apply_top_level(
         &mut entry.run_configuration,
-        run_configuration,
+        update.run_configuration,
         "run_configuration",
         &mut ignored_changes,
     );
     apply_top_level(
         &mut entry.debugger,
-        debugger,
+        update.debugger,
         "debugger",
         &mut ignored_changes,
     );
     apply_top_level(
         &mut entry.debug_mode,
-        debug_mode,
+        update.debug_mode,
         "debug_mode",
+        &mut ignored_changes,
+    );
+    apply_top_level(
+        &mut entry.target,
+        update.target,
+        "target",
         &mut ignored_changes,
     );
     Ok(())
@@ -396,7 +533,8 @@ fn schema_value() -> Value {
             "explicit CLI flags"
         ],
         "fields": {
-            "device": {"type": "string", "optional": true, "description": "Default ADB serial."},
+            "device": {"type": "string", "optional": true, "description": "Legacy/direct default ADB serial. Prefer default_target + targets for emulator projects."},
+            "default_target": {"type": "string", "optional": true, "description": "Default named device target. An app alias target takes precedence when that alias is the default app."},
             "app": {"type": "string", "optional": true, "description": "Default app alias, package, or installed app name."},
             "project": {"type": "string", "optional": true, "description": "Android Studio project name or absolute project path."},
             "studio_url": {"type": "string", "optional": true, "description": "Android Studio debugger bridge URL."},
@@ -417,6 +555,12 @@ fn schema_value() -> Value {
                 "optional": true,
                 "description": "Map of app aliases to package/debugger defaults.",
                 "additional_properties": {"$ref": "#/app_entry"}
+            },
+            "targets": {
+                "type": "object",
+                "optional": true,
+                "description": "Named project device targets. Each binds exactly one stable AVD name or physical adb serial.",
+                "additional_properties": {"$ref": "#/target_entry"}
             }
         },
         "proxy_entry": {
@@ -436,14 +580,23 @@ fn schema_value() -> Value {
             "project": {"type": "string", "optional": true, "description": "Project override for this app."},
             "run_configuration": {"type": "string", "optional": true, "description": "Run configuration override for this app."},
             "debugger": {"type": "string", "optional": true, "description": "Debugger override for this app."},
-            "debug_mode": {"type": "string", "optional": true, "enum": ["auto", "java", "native", "mixed"], "description": "Debugger mode override for this app."}
+            "debug_mode": {"type": "string", "optional": true, "enum": ["auto", "java", "native", "mixed"], "description": "Debugger mode override for this app."},
+            "target": {"type": "string", "optional": true, "description": "Named device target for this app alias. Used implicitly when this alias is the default app."}
+        },
+        "target_entry": {
+            "avd": {"type": "string", "optional": true, "description": "Stable Android Virtual Device name from emulator -list-avds. Mutually exclusive with serial."},
+            "serial": {"type": "string", "optional": true, "description": "Stable physical/remote adb serial. Mutually exclusive with avd and never auto-started."},
+            "start": {"type": "string", "optional": true, "enum": ["never", "if-needed"], "default": "never", "description": "Whether ShadowDroid may start a missing AVD. Automatic startup is opt-in."},
+            "form_factor": {"type": "string", "optional": true, "enum": ["mobile", "tv"], "description": "Post-resolution device assertion."},
+            "cold_boot": {"type": "boolean", "optional": true, "description": "Start the AVD without loading a snapshot."},
+            "boot_timeout_seconds": {"type": "integer", "optional": true, "minimum": 10, "maximum": 900, "default": 180, "description": "Maximum AVD boot wait."}
         },
         "example": example_config(),
         "recommended_agent_flow": [
             "shadowdroid config schema --json",
-            "shadowdroid config init --project --app Example --package com.example.app --project-path /path/to/project",
+            "shadowdroid config init --project --app Example --package com.example.app --default-target mobile --target-name mobile --target-avd Project_Pixel_9 --target-start if-needed --target-form-factor mobile --project-path /path/to/project",
             "shadowdroid config validate --json",
-            "shadowdroid debug auto"
+            "shadowdroid connect"
         ]
     })
 }
@@ -457,9 +610,18 @@ fn explain_value() -> Result<Value> {
         "safe_generation": "Prefer config init for simple files. If writing JSON directly, run config validate --json before relying on it.",
         "minimal_project_config": {
             "app": "Example",
+            "default_target": "mobile",
             "apps": {
                 "Example": {
-                    "package": "com.example.app"
+                    "package": "com.example.app",
+                    "target": "mobile"
+                }
+            },
+            "targets": {
+                "mobile": {
+                    "avd": "Project_Pixel_9",
+                    "start": "if-needed",
+                    "form_factor": "mobile"
                 }
             }
         }
@@ -526,7 +688,9 @@ fn validate_value() -> Result<Value> {
     }
 
     let merged = if errors.is_empty() {
-        Some(ShadowDroidConfig::load()?)
+        let merged = ShadowDroidConfig::load()?;
+        validate_target_references(&merged, &mut errors);
+        Some(merged)
     } else {
         None
     };
@@ -582,8 +746,32 @@ fn validate_config(
             validate_debug_mode(path, &format!("apps.{alias}.debug_mode"), mode, errors);
         }
     }
+    for (name, target) in &config.targets {
+        if let Err(error) = crate::device::target::validate_definition(name, target) {
+            errors.push(format!("{}: {error}", path.display()));
+        }
+    }
     if let Some(proxy) = &config.proxy {
         validate_proxy(path, proxy, errors);
+    }
+}
+
+fn validate_target_references(config: &ShadowDroidConfig, errors: &mut Vec<String>) {
+    if let Some(name) = config.default_target.as_deref() {
+        if config.target(name).is_none() {
+            errors.push(format!(
+                "merged config: default_target `{name}` is not present in targets"
+            ));
+        }
+    }
+    for (alias, app) in &config.apps {
+        if let Some(name) = app.target.as_deref() {
+            if config.target(name).is_none() {
+                errors.push(format!(
+                    "merged config: apps.{alias}.target `{name}` is not present in targets"
+                ));
+            }
+        }
     }
 }
 
@@ -640,14 +828,27 @@ fn validate_debug_mode(path: &Path, field: &str, mode: &str, errors: &mut Vec<St
 
 fn example_config() -> Value {
     json!({
-        "device": "emulator-5554",
+        "default_target": "mobile",
         "app": "Example",
         "project": "/path/to/android/project",
         "apps": {
             "Example": {
                 "package": "com.example.app",
                 "run_configuration": "app",
-                "debugger": "Android Debugger"
+                "debugger": "Android Debugger",
+                "target": "mobile"
+            }
+        },
+        "targets": {
+            "mobile": {
+                "avd": "Project_Pixel_9_API_36",
+                "start": "if-needed",
+                "form_factor": "mobile"
+            },
+            "tv": {
+                "avd": "Project_TV_API_35",
+                "start": "if-needed",
+                "form_factor": "tv"
             }
         }
     })
@@ -730,6 +931,7 @@ mod tests {
                 run_configuration: Some("existing-run".into()),
                 debugger: Some("Existing Debugger".into()),
                 debug_mode: Some("mixed".into()),
+                target: Some("mobile".into()),
             },
         );
 
@@ -737,9 +939,12 @@ mod tests {
             &mut config,
             "example",
             "com.example.new",
-            &Some("new-run".into()),
-            &None,
-            &None,
+            AppConfigUpdate {
+                run_configuration: &Some("new-run".into()),
+                debugger: &None,
+                debug_mode: &None,
+                target: &None,
+            },
             true,
         )
         .unwrap();
@@ -755,6 +960,7 @@ mod tests {
         assert_eq!(app.run_configuration.as_deref(), Some("new-run"));
         assert_eq!(app.debugger.as_deref(), Some("Existing Debugger"));
         assert_eq!(app.debug_mode.as_deref(), Some("mixed"));
+        assert_eq!(app.target.as_deref(), Some("mobile"));
     }
 
     #[test]
@@ -767,8 +973,19 @@ mod tests {
             "com.'example'",
         ] {
             assert!(
-                upsert_app_config(&mut config, "Example", package, &None, &None, &None, false,)
-                    .is_err(),
+                upsert_app_config(
+                    &mut config,
+                    "Example",
+                    package,
+                    AppConfigUpdate {
+                        run_configuration: &None,
+                        debugger: &None,
+                        debug_mode: &None,
+                        target: &None,
+                    },
+                    false,
+                )
+                .is_err(),
                 "accepted {package:?}"
             );
         }
@@ -777,9 +994,12 @@ mod tests {
             &mut config,
             "Example",
             "com.example.one",
-            &None,
-            &None,
-            &None,
+            AppConfigUpdate {
+                run_configuration: &None,
+                debugger: &None,
+                debug_mode: &None,
+                target: &None,
+            },
             false,
         )
         .unwrap();
@@ -787,9 +1007,12 @@ mod tests {
             &mut config,
             "Example",
             "com.example.two",
-            &None,
-            &None,
-            &None,
+            AppConfigUpdate {
+                run_configuration: &None,
+                debugger: &None,
+                debug_mode: &None,
+                target: &None,
+            },
             false,
         )
         .is_err());
