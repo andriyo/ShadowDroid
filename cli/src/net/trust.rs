@@ -15,9 +15,9 @@
 //! `subject_hash_old` (the filename Android keys CAs by).
 
 use crate::ids::Serial;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 
 use crate::device::adb;
@@ -32,7 +32,7 @@ const TMP_CA: &str = "/data/local/tmp/shadowdroid-ca.pem";
 /// trust store: which CA to install/verify, its fingerprint, and whether an
 /// assertion (`proxy.ca_trusted`) or the verify-once cache lets us skip the
 /// device round-trips.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TrustContext {
     pub ca: CaPaths,
     /// SHA-256 of the resolved CA cert (empty if the cert doesn't exist yet).
@@ -41,6 +41,7 @@ pub struct TrustContext {
     pub asserted: bool,
     /// `--fresh`: ignore the assertion and cache; probe/install for real.
     pub fresh: bool,
+    _ca_lease: Option<crate::net::ca::CaReadLease>,
 }
 
 impl TrustContext {
@@ -52,19 +53,31 @@ impl TrustContext {
         fresh: bool,
     ) -> Result<Self> {
         let ca = crate::net::ca::resolve_ca(config, Some(serial))?;
-        let fingerprint = crate::net::ca::fingerprint_of(&ca.cert).unwrap_or_default();
         let asserted = !fresh
             && config
                 .proxy
                 .as_ref()
                 .and_then(|p| p.ca_trusted)
                 .unwrap_or(false);
-        Ok(Self {
+        let mut context = Self {
             ca,
-            fingerprint,
+            fingerprint: String::new(),
             asserted,
             fresh,
-        })
+            _ca_lease: None,
+        };
+        if context.ca.cert.is_file() && context.ca.key.is_file() {
+            context.refresh_ca_lease()?;
+        }
+        Ok(context)
+    }
+
+    pub fn refresh_ca_lease(&mut self) -> Result<()> {
+        let lease = crate::net::ca::read_lease(&self.ca)?;
+        let fingerprint = crate::net::ca::fingerprint_of(&self.ca.cert)?;
+        self._ca_lease = Some(lease);
+        self.fingerprint = fingerprint;
+        Ok(())
     }
 }
 
@@ -166,17 +179,17 @@ pub async fn run(
     }
 
     // Verify-once cache: a prior verification of this exact CA on this device.
-    if !tctx.fresh {
-        if let Some(entry) = read_trust_cache(serial, &tctx.fingerprint) {
-            emit(json!({
-                "installed": true,
-                "store": entry.store,
-                "basis": "cached",
-                "ca": tctx.ca.cert.display().to_string(),
-                "note": "already trusted (verified earlier; cached). Re-run with --fresh to reinstall and re-verify.",
-            }));
-            return Ok(());
-        }
+    if !tctx.fresh
+        && let Some(entry) = read_trust_cache(serial, &tctx.fingerprint)
+    {
+        emit(json!({
+            "installed": true,
+            "store": entry.store,
+            "basis": "cached",
+            "ca": tctx.ca.cert.display().to_string(),
+            "note": "already trusted (verified earlier; cached). Re-run with --fresh to reinstall and re-verify.",
+        }));
+        return Ok(());
     }
 
     if ui {
@@ -544,8 +557,8 @@ fn emit(body: Value) {
 #[cfg(test)]
 mod tests {
     use super::{
-        certificates_match, classify_cert_listing, read_trust_cache_at, write_trust_cache_at,
-        CertStatus,
+        CertStatus, certificates_match, classify_cert_listing, read_trust_cache_at,
+        write_trust_cache_at,
     };
     use crate::ids::Serial;
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};

@@ -219,11 +219,7 @@ fn direction_toward(focused: Option<&Element>, target: &Element) -> &'static str
     let dx = tx - fx;
     let dy = ty - fy;
     if dx.abs() >= dy.abs() {
-        if dx >= 0 {
-            "dpad_right"
-        } else {
-            "dpad_left"
-        }
+        if dx >= 0 { "dpad_right" } else { "dpad_left" }
     } else if dy >= 0 {
         "dpad_down"
     } else {

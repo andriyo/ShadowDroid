@@ -9,7 +9,7 @@
 //! config — most importantly a per-project proxy CA (`ca.{crt,key}`, git-ignored)
 //! that the `net` MITM proxy signs with. See [crate::net::ca].
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -438,7 +438,7 @@ fn project_shadowdroid_dir_in(cwd: &Path, user_dir: &Path) -> PathBuf {
 /// The `.gitignore` entries that keep proxy CA secrets — and the `.bak` backups
 /// `net ca import`/`reset` leave behind — out of version control, while leaving
 /// `config.json` committable.
-pub const GITIGNORE_LINES: &[&str] = &["ca.crt", "ca.key", "ca.*.bak", "ca.source"];
+pub const GITIGNORE_LINES: &[&str] = &["ca.crt", "ca.key", "ca.*.bak", "ca.source", ".ca.lock"];
 
 /// Idempotently ensure `<dir>/.gitignore` ignores the proxy CA material. Creates
 /// `dir` and the file as needed, appends only the missing lines, and never lists
@@ -446,7 +446,13 @@ pub const GITIGNORE_LINES: &[&str] = &["ca.crt", "ca.key", "ca.*.bak", "ca.sourc
 pub fn ensure_shadowdroid_gitignore(dir: &Path) -> Result<Vec<String>> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join(".gitignore");
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read {}", path.display()));
+        }
+    };
     let present: std::collections::HashSet<&str> = existing.lines().map(str::trim).collect();
     let missing: Vec<&str> = GITIGNORE_LINES
         .iter()
@@ -769,10 +775,10 @@ fn normalize_lookup(value: &str) -> String {
 
 pub fn expand_config_path(value: &Option<String>) -> Option<PathBuf> {
     value.as_deref().map(|raw| {
-        if let Some(rest) = raw.strip_prefix("~/") {
-            if let Ok(home) = home_dir() {
-                return home.join(rest);
-            }
+        if let Some(rest) = raw.strip_prefix("~/")
+            && let Ok(home) = home_dir()
+        {
+            return home.join(rest);
         }
         Path::new(raw).to_path_buf()
     })

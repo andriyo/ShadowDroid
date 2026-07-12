@@ -11,7 +11,7 @@ use crate::ids::Serial;
 use crate::proto::{AppRef, Element, ScreenResponse};
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -522,17 +522,17 @@ fn layout_sample_value(
         next_commands.insert("shadowdroid ui dump".into());
     }
     if let Some(target) = target {
-        if let Some(expected) = target.package.as_deref() {
-            if screen.current_app.package.as_deref() != Some(expected) {
-                reasons.push(json!({
+        if let Some(expected) = target.package.as_deref()
+            && screen.current_app.package.as_deref() != Some(expected)
+        {
+            reasons.push(json!({
                     "code": "foreground_app_mismatch",
                     "expected_package": expected,
                     "actual_package": screen.current_app.package.clone(),
                     "detail": "The sampled UI is not from the package selected for the Layout Inspector target"
                 }));
-                next_commands.insert(format!("shadowdroid app start {expected}"));
-                next_commands.insert(format!("shadowdroid ui wait --pkg {expected}"));
-            }
+            next_commands.insert(format!("shadowdroid app start {expected}"));
+            next_commands.insert(format!("shadowdroid ui wait --pkg {expected}"));
         }
         if let Some(expected) = target.pid.as_deref() {
             let actual = screen.current_app.pid.map(|pid| pid.to_string());

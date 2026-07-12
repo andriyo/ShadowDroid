@@ -14,7 +14,7 @@
 //! tested without a device.
 
 use crate::proto::Element;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// An element a test would realistically act on or assert against.
 fn is_interactive(el: &Element) -> bool {
@@ -277,10 +277,12 @@ mod tests {
         assert_eq!(v["stable"], 1);
         assert_eq!(v["weak_count"], 1);
         assert_eq!(v["untargetable_count"], 1);
-        assert!(v["recommendation"]
-            .as_str()
-            .unwrap()
-            .contains("stable selector"));
+        assert!(
+            v["recommendation"]
+                .as_str()
+                .unwrap()
+                .contains("stable selector")
+        );
     }
 
     #[test]

@@ -4,9 +4,9 @@
 //! shape as a discoverable CLI surface so agents can generate, validate, and
 //! inspect config without reading Rust source.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use clap::{Args, Subcommand};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 
 use crate::config as cfg;
@@ -253,21 +253,21 @@ fn init_config(args: &ConfigInitArgs) -> Result<()> {
         _ => {}
     }
 
-    if args.package.is_none() {
-        if let (Some(app), Some(target)) = (args.app.as_deref(), args.app_target.as_deref()) {
-            let (_, entry) = config
-                .apps
-                .iter_mut()
-                .find(|(alias, _)| alias.eq_ignore_ascii_case(app.trim()))
-                .ok_or_else(|| {
-                    anyhow!(
-                        "app alias `{}` does not exist; pass --package to create it",
-                        app.trim()
-                    )
-                })?;
-            entry.target = Some(target.trim().to_string());
-            changed.push(format!("apps.{}.target", app.trim()));
-        }
+    if args.package.is_none()
+        && let (Some(app), Some(target)) = (args.app.as_deref(), args.app_target.as_deref())
+    {
+        let (_, entry) = config
+            .apps
+            .iter_mut()
+            .find(|(alias, _)| alias.eq_ignore_ascii_case(app.trim()))
+            .ok_or_else(|| {
+                anyhow!(
+                    "app alias `{}` does not exist; pass --package to create it",
+                    app.trim()
+                )
+            })?;
+        entry.target = Some(target.trim().to_string());
+        changed.push(format!("apps.{}.target", app.trim()));
     }
 
     if let Some(name) = args
@@ -305,7 +305,9 @@ fn init_config(args: &ConfigInitArgs) -> Result<()> {
             .filter(|v| !v.is_empty())
         {
             if entry.avd.is_some() && !args.force {
-                bail!("target `{name}` is AVD-bound; pass --force to replace it with serial `{serial}`");
+                bail!(
+                    "target `{name}` is AVD-bound; pass --force to replace it with serial `{serial}`"
+                );
             }
             entry.avd = None;
             entry.serial = Some(serial.to_string());
@@ -735,12 +737,15 @@ fn validate_config(
                 "{}: apps.{alias}.package must not be empty",
                 path.display()
             ));
-        } else if let Err(err) = cfg::validate_android_package(&entry.package) {
-            errors.push(format!(
-                "{}: apps.{alias}.package `{}` is invalid: {err}",
-                path.display(),
-                entry.package
-            ));
+        } else {
+            let validation = cfg::validate_android_package(&entry.package);
+            if let Err(err) = validation {
+                errors.push(format!(
+                    "{}: apps.{alias}.package `{}` is invalid: {err}",
+                    path.display(),
+                    entry.package
+                ));
+            }
         }
         if let Some(mode) = entry.debug_mode.as_deref() {
             validate_debug_mode(path, &format!("apps.{alias}.debug_mode"), mode, errors);
@@ -757,20 +762,20 @@ fn validate_config(
 }
 
 fn validate_target_references(config: &ShadowDroidConfig, errors: &mut Vec<String>) {
-    if let Some(name) = config.default_target.as_deref() {
-        if config.target(name).is_none() {
-            errors.push(format!(
-                "merged config: default_target `{name}` is not present in targets"
-            ));
-        }
+    if let Some(name) = config.default_target.as_deref()
+        && config.target(name).is_none()
+    {
+        errors.push(format!(
+            "merged config: default_target `{name}` is not present in targets"
+        ));
     }
     for (alias, app) in &config.apps {
-        if let Some(name) = app.target.as_deref() {
-            if config.target(name).is_none() {
-                errors.push(format!(
-                    "merged config: apps.{alias}.target `{name}` is not present in targets"
-                ));
-            }
+        if let Some(name) = app.target.as_deref()
+            && config.target(name).is_none()
+        {
+            errors.push(format!(
+                "merged config: apps.{alias}.target `{name}` is not present in targets"
+            ));
         }
     }
 }
@@ -803,13 +808,13 @@ fn validate_proxy(path: &Path, proxy: &ProxyConfig, errors: &mut Vec<String>) {
         )),
         _ => {}
     }
-    if let Some(store) = proxy.trust_store.as_deref() {
-        if !matches!(store, "system" | "user" | "ui") {
-            errors.push(format!(
-                "{}: proxy.trust_store must be one of system, user, ui (got {store:?})",
-                path.display()
-            ));
-        }
+    if let Some(store) = proxy.trust_store.as_deref()
+        && !matches!(store, "system" | "user" | "ui")
+    {
+        errors.push(format!(
+            "{}: proxy.trust_store must be one of system, user, ui (got {store:?})",
+            path.display()
+        ));
     }
     if proxy.port == Some(0) {
         errors.push(format!("{}: proxy.port must not be 0", path.display()));
@@ -1003,19 +1008,21 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(upsert_app_config(
-            &mut config,
-            "Example",
-            "com.example.two",
-            AppConfigUpdate {
-                run_configuration: &None,
-                debugger: &None,
-                debug_mode: &None,
-                target: &None,
-            },
-            false,
-        )
-        .is_err());
+        assert!(
+            upsert_app_config(
+                &mut config,
+                "Example",
+                "com.example.two",
+                AppConfigUpdate {
+                    run_configuration: &None,
+                    debugger: &None,
+                    debug_mode: &None,
+                    target: &None,
+                },
+                false,
+            )
+            .is_err()
+        );
     }
 
     #[test]

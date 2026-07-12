@@ -17,7 +17,7 @@
 //! SDK build-tools). `--package` overrides the package when aapt2 is absent.
 
 use crate::ids::Serial;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -146,7 +146,7 @@ pub async fn run(serial: &Serial, args: &AppInstallArgs, reinstall: bool) -> Res
         match permissions::grant_quiet(serial, &package, &perms).await {
             Ok(now) => {
                 let granted: Vec<&String> =
-                    now.iter().filter(|(_, &g)| g).map(|(p, _)| p).collect();
+                    now.iter().filter(|&(_, &g)| g).map(|(p, _)| p).collect();
                 // `--grant-all` includes normal manifest permissions such as
                 // INTERNET, which never appear in the runtime readback. Only
                 // runtime permissions are postconditions in that mode. An
@@ -225,10 +225,10 @@ async fn wait_front(serial: &Serial, package: &str, timeout_ms: u32) -> (bool, O
     let prefix = format!("{package}/");
     loop {
         let fg = adb::foreground_activity(serial).await;
-        if let Some(fg) = &fg {
-            if fg.starts_with(&prefix) {
-                return (true, Some(fg.clone()));
-            }
+        if let Some(fg) = &fg
+            && fg.starts_with(&prefix)
+        {
+            return (true, Some(fg.clone()));
         }
         if Instant::now() >= deadline {
             return (false, fg);

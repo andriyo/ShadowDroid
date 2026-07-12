@@ -1,0 +1,52 @@
+name: Rust security audit
+
+on:
+  pull_request:
+    paths:
+      - "cli/Cargo.toml"
+      - "cli/Cargo.lock"
+      - "cli/.cargo/audit.toml"
+      - ".github/workflows/rust-security-audit.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "cli/Cargo.toml"
+      - "cli/Cargo.lock"
+      - "cli/.cargo/audit.toml"
+      - ".github/workflows/rust-security-audit.yml"
+  schedule:
+    - cron: "17 9 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-security-audit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    name: Cargo audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.97.0 --profile minimal
+
+      - name: Install cargo-audit
+        run: cargo +1.97.0 install --locked cargo-audit --version 0.22.2
+
+      - name: Enforce temporary advisory exception expiry
+        run: |
+          if [[ "$(date -u +%F)" > "2026-10-10" ]]; then
+            echo "::error::Review or remove the expired RUSTSEC-2023-0071 exception"
+            exit 1
+          fi
+
+      - name: Audit locked dependencies
+        working-directory: cli
+        run: cargo +1.97.0 audit

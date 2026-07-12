@@ -13,7 +13,7 @@
 //! the app's application module. The CLI surface is deliberately small and
 //! scriptable so an AI agent can use it efficiently (`--json` everywhere).
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
 use serde::Serialize;
 use std::fs;
@@ -23,7 +23,8 @@ use std::process::Command;
 
 use crate::hostenv::{env_truthy, shadowdroid_home};
 use crate::release::{
-    checksum_for, download_file, download_text, release_base_url, verify_sha256, CHECKSUMS_ASSET,
+    CHECKSUMS_ASSET, checksum_for, download_text, download_verified_file, release_base_url,
+    release_client, verify_sha256,
 };
 
 /// Release asset name (matches the `release.yml` staging step).
@@ -585,7 +586,9 @@ fn status(args: &TargetArgs, root: &Path) -> Result<()> {
             );
         } else {
             println!("  network capture: unavailable (core AAR has no HTTP capture provider)");
-            println!("  next: rerun `shadowdroid aar install --okhttp`, add ShadowDroidCaptureInterceptor(), rebuild, and relaunch");
+            println!(
+                "  next: rerun `shadowdroid aar install --okhttp`, add ShadowDroidCaptureInterceptor(), rebuild, and relaunch"
+            );
         }
     } else {
         println!(
@@ -715,10 +718,10 @@ fn detect_app_module(root: &Path) -> Result<String> {
         if let Some(rest) = line.strip_prefix("include(") {
             // include(":androidApp")  /  include(":foo:bar")
             for raw in rest.split(',') {
-                if let Some(path) = raw.split('"').nth(1) {
-                    if let Some(m) = path.strip_prefix(':') {
-                        candidates.push(m.to_string());
-                    }
+                if let Some(path) = raw.split('"').nth(1)
+                    && let Some(m) = path.strip_prefix(':')
+                {
+                    candidates.push(m.to_string());
                 }
             }
         }
@@ -726,15 +729,14 @@ fn detect_app_module(root: &Path) -> Result<String> {
 
     for module in &candidates {
         let gradle = module_build_gradle(root, module);
-        if let Ok(gradle) = gradle {
-            if let Ok(content) = fs::read_to_string(&gradle) {
-                // Match the Android application plugin specifically — not the
-                // bare Gradle `application` plugin used by JVM modules.
-                if content.contains("com.android.application")
-                    || content.contains("androidApplication")
-                {
-                    return Ok(module.clone());
-                }
+        if let Ok(gradle) = gradle
+            && let Ok(content) = fs::read_to_string(&gradle)
+        {
+            // Match the Android application plugin specifically — not the
+            // bare Gradle `application` plugin used by JVM modules.
+            if content.contains("com.android.application") || content.contains("androidApplication")
+            {
+                return Ok(module.clone());
             }
         }
     }
@@ -1042,29 +1044,18 @@ async fn download_release_aar(asset: &str) -> Result<PathBuf> {
     let aar_url = format!("{base}/{asset}");
     let sums_url = format!("{base}/{CHECKSUMS_ASSET}");
 
-    let checksums = download_text(&sums_url)
+    let client = release_client()?;
+    let checksums = download_text(&client, &sums_url)
         .await
         .with_context(|| format!("download {CHECKSUMS_ASSET} from {base}"))?;
     let expected = checksum_for(&checksums, asset)
         .ok_or_else(|| anyhow!("no checksum for {asset} in {CHECKSUMS_ASSET} at {base}"))?;
 
     let dest = cache_dir.join(asset);
-    let temp_path = tempfile::NamedTempFile::new_in(&cache_dir)
-        .with_context(|| format!("create temporary download in {}", cache_dir.display()))?
-        .into_temp_path();
-    download_file(&aar_url, &temp_path)
+    let receipt = download_verified_file(&client, &aar_url, &dest, &expected)
         .await
-        .with_context(|| format!("download {asset}"))?;
-    verify_sha256(&temp_path, &expected).with_context(|| format!("verify {asset}"))?;
-    fs::File::open(&temp_path)
-        .with_context(|| format!("open downloaded {asset} for sync"))?
-        .sync_all()
-        .with_context(|| format!("sync downloaded {asset}"))?;
-    temp_path
-        .persist(&dest)
-        .map_err(|error| error.error)
-        .with_context(|| format!("atomically cache {asset} at {}", dest.display()))?;
-    write_checksum_sidecar(&dest, &expected)?;
+        .with_context(|| format!("download and verify {asset}"))?;
+    write_checksum_sidecar(&dest, &receipt.sha256)?;
     Ok(dest)
 }
 
@@ -1105,11 +1096,7 @@ fn versioned_cache_dir() -> Result<PathBuf> {
 }
 
 fn yes_no(b: bool) -> &'static str {
-    if b {
-        "present"
-    } else {
-        "missing"
-    }
+    if b { "present" } else { "missing" }
 }
 
 #[cfg(test)]
@@ -1143,9 +1130,11 @@ mod tests {
         assert!(core_removed.contains(APP_OKHTTP_AAR_RELPATH));
 
         assert!(unwire_dependency(&gradle, OKHTTP_DEP_MARKER, OKHTTP_AAR_ASSET).unwrap());
-        assert!(!fs::read_to_string(&gradle)
-            .unwrap()
-            .contains(APP_OKHTTP_AAR_RELPATH));
+        assert!(
+            !fs::read_to_string(&gradle)
+                .unwrap()
+                .contains(APP_OKHTTP_AAR_RELPATH)
+        );
     }
 
     #[test]

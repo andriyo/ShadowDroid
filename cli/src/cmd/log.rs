@@ -17,7 +17,7 @@
 //! are dropped — except crash blocks, which carry their package name and are
 //! matched by it. The summary reports the pid set used.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::json;
 
 use crate::config::ShadowDroidConfig;
@@ -166,16 +166,14 @@ pub async fn fetch_snapshot(
             1 => {
                 if let Some(package) = package {
                     let mut cols = line.split_whitespace();
-                    if let (Some(pid), Some(name)) = (cols.next(), cols.next()) {
-                        if name == package
+                    if let (Some(pid), Some(name)) = (cols.next(), cols.next())
+                        && (name == package
                             || name
                                 .strip_prefix(package)
-                                .is_some_and(|s| s.starts_with(':'))
-                        {
-                            if let Ok(pid) = pid.parse() {
-                                pids.push(pid);
-                            }
-                        }
+                                .is_some_and(|s| s.starts_with(':')))
+                        && let Ok(pid) = pid.parse()
+                    {
+                        pids.push(pid);
                     }
                 }
             }
@@ -265,10 +263,10 @@ pub async fn run(
                 continue;
             }
         }
-        if let Some(min) = min_rank {
-            if level_rank(&line.level) < min {
-                continue;
-            }
+        if let Some(min) = min_rank
+            && level_rank(&line.level) < min
+        {
+            continue;
         }
         if !args.tag.is_empty()
             && !args.tag.iter().any(|t| {
@@ -279,10 +277,11 @@ pub async fn run(
         {
             continue;
         }
-        if let Some(re) = &grep {
-            if !re.is_match(&line.msg) && !re.is_match(&line.tag) {
-                continue;
-            }
+        if let Some(re) = &grep
+            && !re.is_match(&line.msg)
+            && !re.is_match(&line.tag)
+        {
+            continue;
         }
         // Crash-block constituents are represented by the parsed crash event;
         // don't pay for them twice.
@@ -295,14 +294,15 @@ pub async fn run(
             continue;
         }
         // Dedup: consecutive identical (level, tag, msg) collapse.
-        if !args.no_dedup {
-            if let Some(last) = entries.last_mut() {
-                if last.level == line.level && last.tag == line.tag && last.msg == line.msg {
-                    last.repeat = Some(last.repeat.unwrap_or(1) + 1);
-                    last.ts = line.ts; // keep the newest timestamp
-                    continue;
-                }
-            }
+        if !args.no_dedup
+            && let Some(last) = entries.last_mut()
+            && last.level == line.level
+            && last.tag == line.tag
+            && last.msg == line.msg
+        {
+            last.repeat = Some(last.repeat.unwrap_or(1) + 1);
+            last.ts = line.ts; // keep the newest timestamp
+            continue;
         }
         entries.push(LogEntry {
             kind: "log",

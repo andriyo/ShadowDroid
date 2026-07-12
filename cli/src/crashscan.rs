@@ -23,10 +23,10 @@
 use crate::device::adb;
 use crate::events::CrashEvent;
 use crate::ids::Serial;
-use crate::watch::logcat::{package_matches_filter, CrashCollector, LogLine};
+use crate::watch::logcat::{CrashCollector, LogLine, package_matches_filter};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -166,10 +166,10 @@ pub fn scan_lines<'a>(lines: impl Iterator<Item = &'a str>, package: Option<&str
 
     let mut push = |events: Vec<CrashEvent>| {
         for event in events {
-            if let (Some(filter), Some(pkg)) = (package, event.package.as_deref()) {
-                if !package_matches_filter(pkg, filter) {
-                    continue;
-                }
+            if let (Some(filter), Some(pkg)) = (package, event.package.as_deref())
+                && !package_matches_filter(pkg, filter)
+            {
+                continue;
             }
             // The event's own raw block carries the exact device-clock time of
             // the crash — the surrounding dump position does not (a block can
@@ -192,11 +192,11 @@ pub fn scan_lines<'a>(lines: impl Iterator<Item = &'a str>, package: Option<&str
     };
 
     for line in lines {
-        if now_raw.is_none() {
-            if let Some(now) = line.trim().strip_prefix(NOW_MARKER) {
-                now_raw = Some(now.trim().to_string());
-                continue;
-            }
+        if now_raw.is_none()
+            && let Some(now) = line.trim().strip_prefix(NOW_MARKER)
+        {
+            now_raw = Some(now.trim().to_string());
+            continue;
         }
         push(collector.handle_line(line));
     }

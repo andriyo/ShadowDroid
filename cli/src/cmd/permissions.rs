@@ -115,7 +115,7 @@ pub async fn list(serial: &Serial, package: &str) -> Result<()> {
 pub async fn reset(serial: &Serial, package: &str) -> Result<()> {
     let package_arg = checked_package_arg(package)?;
     let before = runtime_perms(serial, package).await?;
-    let granted: Vec<&String> = before.iter().filter(|(_, &g)| g).map(|(p, _)| p).collect();
+    let granted: Vec<&String> = before.iter().filter(|&(_, &g)| g).map(|(p, _)| p).collect();
     for p in &granted {
         validate_android_permission(p)
             .with_context(|| format!("invalid permission returned for {package:?}: {p:?}"))?;
@@ -253,10 +253,10 @@ impl AppOpObservation {
         if states.contains_key(requested) {
             return Some(requested.to_string());
         }
-        if let Some(canonical) = canonical_appop_name(requested) {
-            if states.contains_key(&canonical) {
-                return Some(canonical);
-            }
+        if let Some(canonical) = canonical_appop_name(requested)
+            && states.contains_key(&canonical)
+        {
+            return Some(canonical);
         }
         // Numeric ids are rendered back by Android as their debug name. A
         // scoped observation groups UID/package rows first, so one remaining
@@ -449,10 +449,10 @@ fn parse_runtime_perms(dumpsys: &str) -> BTreeMap<String, bool> {
             continue;
         }
         // Perm line: "android.permission.CAMERA: granted=true, flags=[ ... ]"
-        if let Some((perm, rest)) = t.split_once(": granted=") {
-            if !perm.is_empty() {
-                map.insert(perm.to_string(), rest.starts_with("true"));
-            }
+        if let Some((perm, rest)) = t.split_once(": granted=")
+            && !perm.is_empty()
+        {
+            map.insert(perm.to_string(), rest.starts_with("true"));
         }
     }
     map

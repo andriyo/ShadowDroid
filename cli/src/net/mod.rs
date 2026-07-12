@@ -34,6 +34,22 @@ pub mod trust;
 /// Default proxy listen/forward port (device `http_proxy` → host proxy).
 pub const DEFAULT_PROXY_PORT: u16 = 8080;
 
+/// Cross-process identity for one daemon startup attempt. The timestamp keeps
+/// different CLI processes distinct while pid + counter cover clock ties and
+/// multiple attempts within one process without adding a randomness dependency.
+pub(crate) fn new_startup_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{:x}-{nanos:x}-{sequence:x}", std::process::id())
+}
+
 fn scoped_action(serial: &crate::ids::Serial, args: &str) -> String {
     format!(
         "shadowdroid -d {} net {args}",
@@ -131,6 +147,11 @@ pub struct RuleSpec {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DaemonConfig {
     pub serial: crate::ids::Serial,
+    /// Unique identity for this exact startup attempt. Readiness checks compare
+    /// it with daemon status so a stale control socket cannot satisfy a new
+    /// `net start`.
+    #[serde(default)]
+    pub startup_id: String,
     /// Resolved signing-CA certificate + key the daemon loads (never generates).
     /// Resolved in the config-aware parent (`net start`) so the daemon can stay
     /// config-independent. See [crate::net::ca::resolve_ca].
@@ -168,9 +189,10 @@ mod tests {
         let serial = crate::ids::Serial::new("emulator-5554; unsafe");
         let held = intercept_next_actions(&serial, "flow id; unsafe");
         assert_eq!(held.len(), 4);
-        assert!(held
-            .iter()
-            .all(|action| action.starts_with("shadowdroid -d 'emulator-5554; unsafe' net ")));
+        assert!(
+            held.iter()
+                .all(|action| action.starts_with("shadowdroid -d 'emulator-5554; unsafe' net "))
+        );
         assert!(held[0].ends_with("show 'flow id; unsafe' --body"));
 
         let tls = tls_error_next_actions(&serial);
@@ -185,5 +207,14 @@ mod tests {
 
         let flow = flow_next_actions(&serial, "flow id; unsafe");
         assert!(flow[0].ends_with("show 'flow id; unsafe' --body"));
+    }
+
+    #[test]
+    fn startup_ids_are_nonempty_and_unique_within_a_process() {
+        let first = new_startup_id();
+        let second = new_startup_id();
+        assert!(!first.is_empty());
+        assert_ne!(first, second);
+        assert!(first.starts_with(&format!("{:x}-", std::process::id())));
     }
 }

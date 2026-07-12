@@ -304,9 +304,10 @@ mod tests {
         let set = WatcherSet::default();
         set.set_permission_dialog_policy(PermissionDialogPolicy::Deny);
 
-        assert!(set
-            .matches("permission", &[element_with_rid("permission_allow_button")])
-            .is_empty());
+        assert!(
+            set.matches("permission", &[element_with_rid("permission_allow_button")])
+                .is_empty()
+        );
     }
 
     #[test]
@@ -315,8 +316,9 @@ mod tests {
         set.set_permission_dialog_policy(PermissionDialogPolicy::Allow);
         set.set_permission_dialog_policy(PermissionDialogPolicy::Ignore);
 
-        assert!(set
-            .matches("permission", &[element_with_rid("permission_allow_button")])
-            .is_empty());
+        assert!(
+            set.matches("permission", &[element_with_rid("permission_allow_button")])
+                .is_empty()
+        );
     }
 }

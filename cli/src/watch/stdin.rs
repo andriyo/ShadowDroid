@@ -7,7 +7,7 @@
 //! Keeps the watch stream's historical shorthand grammar so existing piped
 //! scripts and generated agent integrations keep working.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
 
 pub fn parse_command(line: &str) -> Result<Value> {

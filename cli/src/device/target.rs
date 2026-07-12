@@ -12,11 +12,10 @@ use crate::config::{
 };
 use crate::device::{adb, installer};
 use crate::hostenv::{home_dir, shadowdroid_home};
-use crate::ids::Serial;
-use anyhow::{anyhow, Context, Result};
-use futures::future::join_all;
+use crate::ids::{Serial, stable_file_component};
+use anyhow::{Context, Result, anyhow};
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -134,12 +133,12 @@ pub fn validate_definition(name: &str, target: &DeviceTargetConfig) -> Result<()
             anyhow::bail!("targets.{name}.cold_boot is only valid for an AVD target");
         }
     }
-    if let Some(timeout) = target.boot_timeout_seconds {
-        if !(MIN_BOOT_TIMEOUT_SECONDS..=MAX_BOOT_TIMEOUT_SECONDS).contains(&timeout) {
-            anyhow::bail!(
-                "targets.{name}.boot_timeout_seconds must be between {MIN_BOOT_TIMEOUT_SECONDS} and {MAX_BOOT_TIMEOUT_SECONDS}"
-            );
-        }
+    if let Some(timeout) = target.boot_timeout_seconds
+        && !(MIN_BOOT_TIMEOUT_SECONDS..=MAX_BOOT_TIMEOUT_SECONDS).contains(&timeout)
+    {
+        anyhow::bail!(
+            "targets.{name}.boot_timeout_seconds must be between {MIN_BOOT_TIMEOUT_SECONDS} and {MAX_BOOT_TIMEOUT_SECONDS}"
+        );
     }
     Ok(())
 }
@@ -400,31 +399,31 @@ async fn wait_for_boot(
             }
         }
 
-        if let Some(running) = child.as_mut() {
-            if let Some(status) = running.try_wait().context("checking emulator process")? {
-                if !status.success() {
-                    return Err(crate::diagnostic::DiagnosticError::new(
-                        "target_avd_start_failed",
-                        "device_target",
-                        format!("emulator process for AVD `{avd}` exited with {status}"),
-                    )
-                    .retryable(true)
-                    .detail(serde_json::json!({
-                        "target_name": target_name,
-                        "avd": avd,
-                        "status": status.code(),
-                        "log": log_path.map(|path| path.display().to_string()),
-                    }))
-                    .next_actions([
-                        "inspect detail.log for the emulator startup error",
-                        "start the AVD once from Android Studio Device Manager, then retry",
-                    ])
-                    .into());
-                }
-                // Some emulator launchers hand off to another process. A zero
-                // exit is not a failure; keep waiting for adb discovery.
-                child = None;
+        if let Some(running) = child.as_mut()
+            && let Some(status) = running.try_wait().context("checking emulator process")?
+        {
+            if !status.success() {
+                return Err(crate::diagnostic::DiagnosticError::new(
+                    "target_avd_start_failed",
+                    "device_target",
+                    format!("emulator process for AVD `{avd}` exited with {status}"),
+                )
+                .retryable(true)
+                .detail(serde_json::json!({
+                    "target_name": target_name,
+                    "avd": avd,
+                    "status": status.code(),
+                    "log": log_path.map(|path| path.display().to_string()),
+                }))
+                .next_actions([
+                    "inspect detail.log for the emulator startup error",
+                    "start the AVD once from Android Studio Device Manager, then retry",
+                ])
+                .into());
             }
+            // Some emulator launchers hand off to another process. A zero
+            // exit is not a failure; keep waiting for adb discovery.
+            child = None;
         }
 
         if started.elapsed() >= timeout {
@@ -605,7 +604,7 @@ async fn list_available_avds(emulator: &Path) -> Result<Vec<String>> {
                 "install Android Emulator from Android Studio SDK Manager",
                 "set ANDROID_SDK_ROOT or SHADOWDROID_EMULATOR to the emulator executable",
             ])
-            .into())
+            .into());
         }
         Err(_) => {
             return Err(crate::diagnostic::DiagnosticError::new(
@@ -619,7 +618,7 @@ async fn list_available_avds(emulator: &Path) -> Result<Vec<String>> {
                 "retry after Android Studio and SDK updates finish",
                 "run the emulator executable with -list-avds to diagnose it directly",
             ])
-            .into())
+            .into());
         }
     };
     if !output.status.success() {
@@ -795,26 +794,6 @@ fn write_owner(writer: &mut impl Write, owner: &AvdOwner) -> Result<()> {
     serde_json::to_writer_pretty(&mut *writer, owner)?;
     writeln!(writer)?;
     Ok(())
-}
-
-fn stable_file_component(value: &str) -> String {
-    let prefix = value
-        .chars()
-        .take(40)
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    let digest = Sha256::digest(value.as_bytes());
-    let suffix = digest[..8]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("{prefix}-{suffix}")
 }
 
 #[cfg(test)]

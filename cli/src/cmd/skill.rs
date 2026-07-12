@@ -17,9 +17,9 @@
 //! upgrade — rewriting unmodified ones in place while leaving hand-edited ones
 //! alone.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::CommandFactory;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -178,15 +178,15 @@ fn install_note(agent: &str, scope: SkillScope, install: bool) -> Option<&'stati
         ("codex", SkillScope::User) => Some(
             "Codex user skill installed. Codex detects changes automatically; restart if it does not appear in /skills.",
         ),
-        ("gemini", SkillScope::User) => Some(
-            "Gemini CLI user skill installed. Use `/skills reload` or restart Gemini CLI.",
-        ),
-        ("antigravity", SkillScope::User) => Some(
-            "Antigravity global skill installed. Use `/skills` to verify discovery.",
-        ),
-        ("claude-code", SkillScope::Project) => Some(
-            "Claude Code project skill installed relative to the current directory.",
-        ),
+        ("gemini", SkillScope::User) => {
+            Some("Gemini CLI user skill installed. Use `/skills reload` or restart Gemini CLI.")
+        }
+        ("antigravity", SkillScope::User) => {
+            Some("Antigravity global skill installed. Use `/skills` to verify discovery.")
+        }
+        ("claude-code", SkillScope::Project) => {
+            Some("Claude Code project skill installed relative to the current directory.")
+        }
         (_, SkillScope::Project) => Some(
             "Shared project skill installed under .agents/skills; Codex, Cursor, Gemini CLI, and Antigravity can discover it.",
         ),

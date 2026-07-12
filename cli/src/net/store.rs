@@ -5,12 +5,17 @@
 
 use crate::ids::Serial;
 use anyhow::{Context, Result};
-use std::io::Write;
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, VecDeque};
+use std::fs::File;
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::path::Path;
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::events::Event;
 use crate::net::flow::FlowRecord;
-use crate::net::{paths, Matcher};
+use crate::net::{Matcher, paths};
 
 /// Cap each on-disk generation. One prior generation is retained, bounding a
 /// capture session to roughly 128 MiB even under sustained traffic.
@@ -23,8 +28,8 @@ pub fn append(serial: &Serial, rec: &FlowRecord) -> Result<()> {
 }
 
 /// Append a non-flow [Event] (currently only `tls_error`) as its own JSON line.
-/// `read_all`/`net show` parse lines as [FlowRecord] and skip these; they're
-/// picked back out by [read_tls_errors] for `net log`.
+/// Flow-only readers skip these; [`read_recent_timeline`] interleaves them with
+/// compact HTTP events for `net log`.
 pub fn append_event(serial: &Serial, ev: &Event) -> Result<()> {
     append_line(serial, &serde_json::to_string(ev)?)
 }
@@ -36,12 +41,16 @@ fn append_line(serial: &Serial, line: &str) -> Result<()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     paths::ensure_net_dir()?;
     let path = paths::session_log_path(serial)?;
-    let line_bytes = line.len() as u64 + 1;
+    let _file_lock = acquire_log_lock(&path)?;
+    secure_existing_log(&path)?;
+    let line_bytes = u64::try_from(line.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
     if std::fs::metadata(&path)
         .map(|metadata| metadata.len().saturating_add(line_bytes) > SESSION_LOG_BYTES)
         .unwrap_or(false)
     {
-        let rotated = path.with_extension("jsonl.1");
+        let rotated = path.with_added_extension("1");
         let _ = std::fs::remove_file(&rotated);
         std::fs::rename(&path, &rotated)
             .with_context(|| format!("rotate {} to {}", path.display(), rotated.display()))?;
@@ -60,115 +69,619 @@ fn append_line(serial: &Serial, line: &str) -> Result<()> {
     let mut f = opts
         .open(&path)
         .with_context(|| format!("open {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Tighten legacy logs too; OpenOptions::mode only affects creation.
+        let mut permissions = f.metadata()?.permissions();
+        if permissions.mode() & 0o777 != 0o600 {
+            permissions.set_mode(0o600);
+            f.set_permissions(permissions)
+                .with_context(|| format!("secure {}", path.display()))?;
+        }
+    }
     writeln!(f, "{line}").with_context(|| format!("append {}", path.display()))?;
     Ok(())
 }
 
-/// All flows in the session log, oldest first. Lines that fail to parse (e.g. a
-/// partial write) are skipped rather than failing the whole read.
-pub fn read_all(serial: &Serial) -> Result<Vec<FlowRecord>> {
-    let path = paths::session_log_path(serial)?;
-    let text = read_generations(&path)?;
-    Ok(text
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<FlowRecord>(l).ok())
-        .collect())
-}
-
-/// The last `limit` flows matching `m`, oldest first.
-pub fn read_filtered(serial: &Serial, m: &Matcher, limit: usize) -> Result<Vec<FlowRecord>> {
-    let mut all = read_all(serial)?;
-    all.retain(|f| f.matches(m));
-    let n = all.len();
-    if n > limit {
-        all = all.split_off(n - limit);
+#[cfg(unix)]
+fn secure_existing_log(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| format!("stat {}", path.display())),
+    };
+    let mut permissions = metadata.permissions();
+    if permissions.mode() & 0o777 != 0o600 {
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(path, permissions)
+            .with_context(|| format!("secure {}", path.display()))?;
     }
-    Ok(all)
+    Ok(())
 }
 
-/// Most recent flow with this id (ids can repeat across daemon runs).
+#[cfg(not(unix))]
+fn secure_existing_log(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn acquire_log_lock(path: &Path) -> Result<File> {
+    acquire_log_lock_mode(path, true)
+}
+
+fn acquire_log_read_lock(path: &Path) -> Result<File> {
+    acquire_log_lock_mode(path, false)
+}
+
+fn acquire_log_lock_mode(path: &Path, exclusive: bool) -> Result<File> {
+    let lock_path = path.with_added_extension("lock");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("open {}", lock_path.display()))?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let result = if exclusive {
+            lock.try_lock()
+        } else {
+            lock.try_lock_shared()
+        };
+        match result {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::WouldBlock,
+                    "timed out waiting for session-log lock",
+                ))
+                .with_context(|| format!("lock {}", lock_path.display()));
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error).with_context(|| format!("lock {}", lock_path.display()));
+            }
+        }
+    }
+    Ok(lock)
+}
+
+enum StoredLine {
+    Flow(serde_json::Value),
+    TlsError(serde_json::Value),
+}
+
+/// Visit valid records across the rotated generation and then the current one.
+/// Only one line is resident at a time; malformed/partial lines and unrelated
+/// event kinds are skipped so one interrupted append never poisons recall.
+fn visit_records(path: &Path, mut visit: impl FnMut(StoredLine)) -> Result<()> {
+    // Snapshot both generation handles while rotation is excluded, then drop
+    // the shared lock before parsing potentially large logs. Open handles keep
+    // referring to the same inodes even if a writer rotates paths afterward.
+    let files = open_generation_snapshot(path)?;
+    for (candidate, file, length) in files {
+        let mut reader = BufReader::new(file.take(length));
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let bytes = reader
+                .read_line(&mut line)
+                .with_context(|| format!("read {}", candidate.display()))?;
+            if bytes == 0 {
+                break;
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+                continue;
+            };
+            if value.get("type").and_then(serde_json::Value::as_str) == Some("tls_error") {
+                visit(StoredLine::TlsError(value));
+            } else {
+                visit(StoredLine::Flow(value));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn open_generation_snapshot(path: &Path) -> Result<Vec<(std::path::PathBuf, File, u64)>> {
+    if path.parent().is_some_and(|parent| !parent.exists()) {
+        return Ok(Vec::new());
+    }
+    let _read_lock = acquire_log_read_lock(path)?;
+    let mut files = Vec::new();
+    for candidate in [path.with_added_extension("1"), path.to_path_buf()] {
+        match File::open(&candidate) {
+            Ok(file) => {
+                let length = file
+                    .metadata()
+                    .with_context(|| format!("stat {}", candidate.display()))?
+                    .len();
+                files.push((candidate, file, length));
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("open {}", candidate.display()));
+            }
+        }
+    }
+    Ok(files)
+}
+
+fn read_all_from(path: &Path) -> Result<Vec<FlowRecord>> {
+    let mut flows = Vec::new();
+    visit_records(path, |record| {
+        if let StoredLine::Flow(value) = record
+            && let Ok(flow) = serde_json::from_value::<FlowRecord>(value)
+        {
+            flows.push(flow);
+        }
+    })?;
+    Ok(flows)
+}
+
+/// All flows in the session log, oldest first. Records are decoded one line at
+/// a time, avoiding a second allocation for the complete pair of generations.
+pub fn read_all(serial: &Serial) -> Result<Vec<FlowRecord>> {
+    read_all_from(&paths::session_log_path(serial)?)
+}
+
+/// The last `limit` flows matching `m`, oldest first. Retained for the bounded
+/// diagnostic snapshot used by `why`; `net log` uses [`read_recent_timeline`]
+/// so HTTP and TLS records share one combined limit and one disk pass.
+pub fn read_filtered(serial: &Serial, m: &Matcher, limit: usize) -> Result<Vec<FlowRecord>> {
+    let path = paths::session_log_path(serial)?;
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut recent = VecDeque::new();
+    visit_records(&path, |record| {
+        if let StoredLine::Flow(value) = record
+            && let Ok(flow) = serde_json::from_value::<FlowRecord>(value)
+            && flow.matches(m)
+        {
+            recent.push_back(flow);
+            if recent.len() > limit {
+                recent.pop_front();
+            }
+        }
+    })?;
+    Ok(recent.into_iter().collect())
+}
+
+fn find_by_id_from(path: &Path, id: &str) -> Result<Option<FlowRecord>> {
+    let mut found = None;
+    visit_records(path, |record| {
+        if let StoredLine::Flow(value) = record
+            && let Ok(flow) = serde_json::from_value::<FlowRecord>(value)
+            && flow.id == id
+        {
+            found = Some(flow);
+        }
+    })?;
+    Ok(found)
+}
+
+/// Most recent flow with this id (ids can repeat across daemon runs). The scan
+/// keeps only the latest match instead of materializing every stored flow.
 pub fn find_by_id(serial: &Serial, id: &str) -> Result<Option<FlowRecord>> {
-    Ok(read_all(serial)?.into_iter().rev().find(|f| f.id == id))
+    find_by_id_from(&paths::session_log_path(serial)?, id)
+}
+
+struct RankedEvent {
+    ts: f64,
+    /// Preserve the prior stable merge's tie order: HTTP events were inserted
+    /// before TLS events, and append order broke ties within each kind.
+    kind: u8,
+    sequence: u64,
+    value: serde_json::Value,
+}
+
+impl PartialEq for RankedEvent {
+    fn eq(&self, other: &Self) -> bool {
+        self.ts.total_cmp(&other.ts) == Ordering::Equal
+            && self.kind == other.kind
+            && self.sequence == other.sequence
+    }
+}
+
+impl Eq for RankedEvent {}
+
+impl PartialOrd for RankedEvent {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedEvent {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.ts
+            .total_cmp(&other.ts)
+            .then_with(|| self.kind.cmp(&other.kind))
+            .then_with(|| self.sequence.cmp(&other.sequence))
+    }
+}
+
+fn tls_host_matches(value: &serde_json::Value, host: Option<&str>) -> bool {
+    host.is_none_or(|needle| {
+        value
+            .get("host")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|candidate| candidate.to_lowercase().contains(&needle.to_lowercase()))
+    })
+}
+
+fn read_recent_timeline_from(
+    path: &Path,
+    serial: &Serial,
+    matcher: &Matcher,
+    limit: usize,
+) -> Result<Vec<serde_json::Value>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut recent = BinaryHeap::<Reverse<RankedEvent>>::new();
+    let mut sequence = 0_u64;
+    visit_records(path, |record| {
+        let entry = match record {
+            StoredLine::Flow(value) => serde_json::from_value::<FlowRecord>(value)
+                .ok()
+                .filter(|flow| flow.matches(matcher))
+                .and_then(|flow| {
+                    let ts = flow.ts;
+                    serde_json::to_value(flow.http_event(serial))
+                        .ok()
+                        .map(|value| RankedEvent {
+                            ts,
+                            kind: 0,
+                            sequence,
+                            value,
+                        })
+                }),
+            StoredLine::TlsError(value) if tls_host_matches(&value, matcher.host.as_deref()) => {
+                Some(RankedEvent {
+                    ts: value
+                        .get("ts")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0),
+                    kind: 1,
+                    sequence,
+                    value,
+                })
+            }
+            StoredLine::TlsError(_) => None,
+        };
+        sequence = sequence.saturating_add(1);
+        if let Some(entry) = entry {
+            recent.push(Reverse(entry));
+            if recent.len() > limit {
+                recent.pop();
+            }
+        }
+    })?;
+
+    let mut recent = recent
+        .into_iter()
+        .map(|Reverse(entry)| entry)
+        .collect::<Vec<_>>();
+    recent.sort_unstable();
+    Ok(recent.into_iter().map(|entry| entry.value).collect())
+}
+
+/// Most recent matching HTTP and TLS-error events, ordered chronologically.
+/// Both generations are scanned once and only `limit` compact events are kept;
+/// full captured request/response bodies are dropped immediately after a flow
+/// is converted to its public HTTP event.
+pub fn read_recent_timeline(
+    serial: &Serial,
+    matcher: &Matcher,
+    limit: usize,
+) -> Result<Vec<serde_json::Value>> {
+    read_recent_timeline_from(&paths::session_log_path(serial)?, serial, matcher, limit)
 }
 
 /// Drop the session log (called on `net start` so each session is fresh).
 pub fn clear(serial: &Serial) -> Result<()> {
+    paths::ensure_net_dir()?;
     let path = paths::session_log_path(serial)?;
+    let _file_lock = acquire_log_lock(&path)?;
     if path.exists() {
         std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
     }
-    let rotated = path.with_extension("jsonl.1");
+    let rotated = path.with_added_extension("1");
     if rotated.exists() {
         std::fs::remove_file(&rotated).with_context(|| format!("remove {}", rotated.display()))?;
     }
     Ok(())
 }
 
-/// `tls_error` events from the session log (in log order), optionally limited to
-/// hosts containing `host` (case-insensitive substring, matching the flow
-/// matcher). Returned as raw JSON values since [Event] is serialize-only.
-pub fn read_tls_errors(serial: &Serial, host: Option<&str>) -> Result<Vec<serde_json::Value>> {
-    let path = paths::session_log_path(serial)?;
-    let text = read_generations(&path)?;
-    Ok(filter_tls_errors(&text, host))
-}
-
-fn read_generations(path: &std::path::Path) -> Result<String> {
-    let mut text = String::new();
-    for candidate in [path.with_extension("jsonl.1"), path.to_path_buf()] {
-        if candidate.exists() {
-            text.push_str(
-                &std::fs::read_to_string(&candidate)
-                    .with_context(|| format!("read {}", candidate.display()))?,
-            );
-        }
+fn read_tls_errors_from(
+    path: &Path,
+    host: Option<&str>,
+    limit: usize,
+) -> Result<Vec<serde_json::Value>> {
+    if limit == 0 {
+        return Ok(Vec::new());
     }
-    Ok(text)
+    let mut errors = VecDeque::new();
+    visit_records(path, |record| {
+        if let StoredLine::TlsError(value) = record
+            && tls_host_matches(&value, host)
+        {
+            errors.push_back(value);
+            if errors.len() > limit {
+                errors.pop_front();
+            }
+        }
+    })?;
+    Ok(errors.into_iter().collect())
 }
 
-/// Pure core of [read_tls_errors]: pick `tls_error` lines matching `host`. Flow
-/// lines have no top-level `type` key, so they're excluded.
-fn filter_tls_errors(text: &str, host: Option<&str>) -> Vec<serde_json::Value> {
-    text.lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("tls_error"))
-        .filter(|v| match host {
-            Some(h) => v
-                .get("host")
-                .and_then(|x| x.as_str())
-                .map(|hn| hn.to_lowercase().contains(&h.to_lowercase()))
-                .unwrap_or(false),
-            None => true,
-        })
-        .collect()
+/// The last `limit` TLS-error events in log order, optionally restricted to
+/// hosts containing `host` (case-insensitive substring). Returned as raw JSON
+/// values since [Event] is serialize-only.
+pub fn read_tls_errors(
+    serial: &Serial,
+    host: Option<&str>,
+    limit: usize,
+) -> Result<Vec<serde_json::Value>> {
+    read_tls_errors_from(&paths::session_log_path(serial)?, host, limit)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::filter_tls_errors;
+    use super::{
+        acquire_log_lock, acquire_log_read_lock, find_by_id_from, read_all_from,
+        read_recent_timeline_from, read_tls_errors_from, secure_existing_log,
+    };
+    use crate::ids::Serial;
+    use crate::net::Matcher;
+    use crate::net::flow::FlowRecord;
+    use serde_json::json;
+    use std::path::Path;
 
     #[test]
-    fn filter_tls_errors_picks_events_and_skips_flows() {
-        // A flow line (no top-level `type`) interleaved with two tls_error lines.
-        let log = concat!(
-            r#"{"id":"f1","ts":1.0,"method":"GET","scheme":"https","host":"api.example.com","path":"/x","req_len":0,"resp_len":0}"#,
-            "\n",
-            r#"{"type":"tls_error","ts":2.0,"host":"api.example.com","reason":"rejected"}"#,
-            "\n",
-            r#"{"type":"tls_error","ts":3.0,"host":"cdn.other.net","reason":"rejected"}"#,
-            "\n",
+    fn log_lock_serializes_separate_file_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.jsonl");
+        let first = acquire_log_read_lock(&path).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let contender_path = path.clone();
+        let contender = std::thread::spawn(move || {
+            let lock = acquire_log_lock(&contender_path).unwrap();
+            sender.send(()).unwrap();
+            drop(lock);
+        });
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "second file handle must wait for the OS lock"
         );
-        // No filter: both tls_errors, no flow.
-        let all = filter_tls_errors(log, None);
-        assert_eq!(all.len(), 2);
-        assert!(all.iter().all(|v| v["type"] == "tls_error"));
-        // Host filter is a case-insensitive substring.
-        let one = filter_tls_errors(log, Some("EXAMPLE"));
-        assert_eq!(one.len(), 1);
-        assert_eq!(one[0]["host"], "api.example.com");
-        // Malformed lines are skipped, not fatal.
-        assert!(filter_tls_errors("not json\n\n", None).is_empty());
+        drop(first);
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        contender.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_log_permissions_are_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.jsonl");
+        std::fs::write(&path, "secret\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        secure_existing_log(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    fn flow(id: &str, ts: f64, host: &str, path: &str) -> FlowRecord {
+        FlowRecord {
+            id: id.into(),
+            ts,
+            method: "GET".into(),
+            scheme: "https".into(),
+            host: host.into(),
+            path: path.into(),
+            status: Some(500),
+            req_body: Some("large private request body".into()),
+            resp_body: Some("large private response body".into()),
+            ..Default::default()
+        }
+    }
+
+    fn line(value: impl serde::Serialize) -> String {
+        serde_json::to_string(&value).unwrap()
+    }
+
+    fn write_lines(path: &Path, lines: &[String], trailing_newline: bool) {
+        let mut text = lines.join("\n");
+        if trailing_newline {
+            text.push('\n');
+        }
+        std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn generations_stream_oldest_first_without_joining_boundary_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.jsonl");
+        let rotated = path.with_added_extension("1");
+        // A valid final line without `\n` must not be concatenated with the
+        // first current-generation line (the old whole-file reader did that).
+        write_lines(
+            &rotated,
+            &[line(flow("old", 1.0, "old.example", "/"))],
+            false,
+        );
+        write_lines(
+            &path,
+            &[
+                "malformed partial json".into(),
+                line(json!({"type":"tls_error","ts":2.0,"host":"api.example"})),
+                line(flow("new", 3.0, "new.example", "/")),
+                String::new(),
+            ],
+            true,
+        );
+
+        let flows = read_all_from(&path).unwrap();
+        assert_eq!(
+            flows
+                .iter()
+                .map(|flow| flow.id.as_str())
+                .collect::<Vec<_>>(),
+            ["old", "new"]
+        );
+    }
+
+    #[test]
+    fn missing_log_parent_is_an_empty_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-created/device.jsonl");
+        assert!(read_all_from(&path).unwrap().is_empty());
+        assert!(!path.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn recent_timeline_is_combined_bounded_matched_and_compact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.jsonl");
+        let mut excluded = flow("excluded", 100.0, "api.example.com", "/drop");
+        excluded.method = "POST".into();
+        write_lines(
+            &path,
+            &[
+                line(flow("old", 10.0, "api.example.com", "/keep")),
+                line(json!({
+                    "type":"tls_error",
+                    "ts":30.0,
+                    "host":"API.EXAMPLE.COM",
+                    "reason":"rejected"
+                })),
+                line(flow("new", 20.0, "api.example.com", "/keep")),
+                line(excluded),
+                line(json!({"type":"tls_error","ts":200.0,"host":"other.example"})),
+                "not json".into(),
+            ],
+            true,
+        );
+        let serial = Serial::new("emulator-5554");
+        let matcher = Matcher {
+            host: Some("example.com".into()),
+            path: Some("/keep".into()),
+            method: Some("get".into()),
+            status: Some(500),
+        };
+
+        // The TLS event ignores path/method/status (which do not exist during a
+        // handshake) but shares the final two-event limit with matching flows.
+        let recent = read_recent_timeline_from(&path, &serial, &matcher, 2).unwrap();
+        let ts = recent
+            .iter()
+            .map(|value| value["ts"].as_f64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ts, [20.0, 30.0]);
+        assert_eq!(recent[0]["type"], "http");
+        assert_eq!(recent[0]["id"], "new");
+        assert_eq!(recent[1]["type"], "tls_error");
+        assert!(recent[0].get("req_body").is_none());
+        assert!(recent[0].get("resp_body").is_none());
+        assert!(
+            read_recent_timeline_from(&path, &serial, &matcher, 0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn recent_timeline_orders_by_timestamp_and_stably_breaks_ties() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.jsonl");
+        write_lines(
+            &path,
+            &[
+                line(flow("late-append-old-ts", 1.0, "api.example", "/")),
+                line(json!({"type":"tls_error","ts":5.0,"host":"api.example"})),
+                line(flow("same-ts", 5.0, "api.example", "/")),
+                line(flow("latest", 9.0, "api.example", "/")),
+            ],
+            true,
+        );
+        let serial = Serial::new("emulator-5554");
+        let timeline = read_recent_timeline_from(&path, &serial, &Matcher::default(), 3).unwrap();
+
+        assert_eq!(
+            timeline
+                .iter()
+                .map(|value| value["ts"].as_f64().unwrap())
+                .collect::<Vec<_>>(),
+            [5.0, 5.0, 9.0]
+        );
+        // Matches the old stable merge: equal-ts HTTP records precede TLS.
+        assert_eq!(timeline[0]["type"], "http");
+        assert_eq!(timeline[1]["type"], "tls_error");
+    }
+
+    #[test]
+    fn find_by_id_keeps_only_the_latest_generation_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.jsonl");
+        let rotated = path.with_added_extension("1");
+        write_lines(
+            &rotated,
+            &[line(flow("duplicate", 1.0, "old.example", "/old"))],
+            true,
+        );
+        write_lines(
+            &path,
+            &[
+                line(json!({"type":"tls_error","ts":2.0,"host":"api.example"})),
+                line(flow("duplicate", 3.0, "new.example", "/new")),
+            ],
+            true,
+        );
+
+        let found = find_by_id_from(&path, "duplicate").unwrap().unwrap();
+        assert_eq!(found.host, "new.example");
+        assert_eq!(found.path, "/new");
+        assert!(find_by_id_from(&path, "missing").unwrap().is_none());
+
+        let missing_path = dir.path().join("missing.jsonl");
+        assert!(read_all_from(&missing_path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tls_error_recall_is_host_filtered_and_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.jsonl");
+        write_lines(
+            &path,
+            &[
+                line(json!({"type":"tls_error","ts":1.0,"host":"api.example.com"})),
+                line(json!({"type":"tls_error","ts":2.0,"host":"other.test"})),
+                line(json!({"type":"tls_error","ts":3.0,"host":"CDN.EXAMPLE.COM"})),
+                line(flow("flow", 4.0, "api.example.com", "/")),
+            ],
+            true,
+        );
+
+        let recent = read_tls_errors_from(&path, Some("example.com"), 1).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0]["ts"], 3.0);
+        assert!(read_tls_errors_from(&path, None, 0).unwrap().is_empty());
     }
 }

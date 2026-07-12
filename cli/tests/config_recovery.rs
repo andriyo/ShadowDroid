@@ -68,10 +68,12 @@ fn malformed_config_does_not_block_config_recovery_commands() {
     assert_eq!(validate_json["detail"]["files"][0]["ok"], false);
     assert_eq!(validate_json["detail"]["files"][0]["code"], "config_parse");
     assert_eq!(validate_json["detail"]["files"][0]["detail"]["line"], 3);
-    assert!(validate_json["detail"]["errors"][0]
-        .as_str()
-        .unwrap()
-        .contains(":3:"));
+    assert!(
+        validate_json["detail"]["errors"][0]
+            .as_str()
+            .unwrap()
+            .contains(":3:")
+    );
 
     // Normal commands still fail closed and preserve the typed parse location.
     let devices = run(&home, &project, &["devices"]);
@@ -167,9 +169,11 @@ fn missing_named_avd_is_not_misreported_as_an_adb_serial() {
     assert!(!connect.status.success(), "{error}");
     assert_eq!(error["code"], "target_avd_not_running");
     assert_eq!(error["detail"]["target_name"], "mobile");
-    assert!(error["next_actions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|action| !action.as_str().unwrap_or("").contains("-d mobile")));
+    assert!(
+        error["next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| !action.as_str().unwrap_or("").contains("-d mobile"))
+    );
 }

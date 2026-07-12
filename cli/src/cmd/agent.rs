@@ -14,7 +14,7 @@
 //! session store unchanged.
 
 use crate::ids::Serial;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
@@ -34,7 +34,7 @@ const MARKER: &str = "shadowdroid-agent-ready";
 /// Parse the agent's control port from a logcat dump — the `port=N` field of
 /// the most recent readiness marker. `Some(-1)` means the channel failed to
 /// bind; `None` means no marker was seen.
-fn parse_agent_port(logcat: &str) -> Option<i32> {
+fn parse_agent_port(logcat: &str) -> Option<i64> {
     logcat
         .lines()
         .rev()
@@ -42,7 +42,7 @@ fn parse_agent_port(logcat: &str) -> Option<i32> {
         .find_map(|l| {
             l.split_whitespace().find_map(|tok| {
                 tok.strip_prefix("port=")
-                    .and_then(|n| n.parse::<i32>().ok())
+                    .and_then(|n| n.parse::<i64>().ok())
             })
         })
 }
@@ -51,11 +51,11 @@ fn parse_agent_port(logcat: &str) -> Option<i32> {
 pub async fn discover_port(serial: &Serial) -> Result<u16> {
     let logcat = adb::shell(serial, "logcat -d -s ShadowDroidAgent:I").await?;
     match parse_agent_port(&logcat) {
-        Some(p) if p > 0 => Ok(p as u16),
-        Some(_) => bail!(
+        Some(-1) => bail!(
             "the in-app agent reported port=-1 (control channel failed to bind). Next: force-stop \
              and relaunch the debug app; if it repeats, inspect `adb logcat -s ShadowDroidAgent`"
         ),
+        Some(port) => checked_agent_port(port),
         None => bail!(
             "ShadowDroid agent not seen in logcat. Next: run `shadowdroid aar install --build`, \
              rebuild and launch the debug app, then retry `shadowdroid aar agent`. If it is still \
@@ -64,13 +64,32 @@ pub async fn discover_port(serial: &Serial) -> Result<u16> {
     }
 }
 
+fn checked_agent_port(value: i64) -> Result<u16> {
+    match u16::try_from(value) {
+        Ok(port) if port != 0 => Ok(port),
+        _ => Err(crate::diagnostic::DiagnosticError::new(
+            "agent_invalid_port",
+            "agent",
+            format!("the in-app agent reported invalid control port {value}; expected 1..=65535"),
+        )
+        .detail(serde_json::json!({"reported_port": value, "valid_range": [1, u16::MAX]}))
+        .next_actions([
+            "force-stop and relaunch the debug app, then retry",
+            "inspect `adb logcat -s ShadowDroidAgent` if the invalid marker repeats",
+        ])
+        .into()),
+    }
+}
+
 /// Send one command line; return the parsed single-line JSON response.
 pub async fn send(serial: &Serial, command: String) -> Result<Value> {
     let agent_port = discover_port(serial).await?;
     // A per-call ephemeral host port (torn down right after) so two sessions
     // talking to in-app agents on different devices don't share a forward.
-    let host_port = portmap::free_loopback_port()?;
+    let allocation = portmap::reserve_loopback_port()?;
+    let host_port = allocation.port();
     adb::forward(serial, host_port, agent_port).await?;
+    drop(allocation);
     let exchanged = tokio::task::spawn_blocking(move || exchange(host_port, &command))
         .await
         .context("agent exchange task panicked")?;
@@ -507,6 +526,22 @@ mod tests {
     fn parse_agent_port_flags_bind_failure() {
         let logcat = "I ShadowDroidAgent: shadowdroid-agent-ready port=-1";
         assert_eq!(parse_agent_port(logcat), Some(-1));
+    }
+
+    #[test]
+    fn agent_ports_are_checked_before_narrowing() {
+        assert_eq!(checked_agent_port(65_535).unwrap(), 65_535);
+        for port in [0, 65_536, i64::MAX] {
+            let error = checked_agent_port(port).unwrap_err();
+            assert_eq!(crate::cli::error_code_of(&error), "agent_invalid_port");
+            assert_eq!(
+                error
+                    .downcast_ref::<crate::diagnostic::DiagnosticError>()
+                    .unwrap()
+                    .detail["reported_port"],
+                port
+            );
+        }
     }
 
     #[test]

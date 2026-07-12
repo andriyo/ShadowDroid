@@ -14,9 +14,9 @@ use crate::device::client::ServerClient;
 use crate::events::CrashEvent;
 use crate::ids::Serial;
 use crate::watch::logcat;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader as StdBufReader, Write};
@@ -483,24 +483,23 @@ async fn resolve_auto_app(
     let mut resolved = config.resolve_app(Some(serial), requested).await?;
     let mut app_label = None;
 
-    if resolved.package.is_none() {
-        if let Some(input) = resolved.input.clone() {
-            if let Some((package, label)) = resolve_app_by_label(serial, client, &input).await? {
-                resolved.package = Some(package);
-                resolved.source = "installed_app_label_match".into();
-                app_label = Some(label);
-            }
-        }
+    if resolved.package.is_none()
+        && let Some(input) = resolved.input.clone()
+        && let Some((package, label)) = resolve_app_by_label(serial, client, &input).await?
+    {
+        resolved.package = Some(package);
+        resolved.source = "installed_app_label_match".into();
+        app_label = Some(label);
     }
 
-    if resolved.package.is_none() && resolved.input.is_none() {
-        if let Ok(current) = client.app_current().await {
-            if let Some(package) = current.package {
-                app_label = client.app_info(&package).await.ok().map(|info| info.label);
-                resolved.package = Some(package);
-                resolved.source = "foreground_app".into();
-            }
-        }
+    if resolved.package.is_none()
+        && resolved.input.is_none()
+        && let Ok(current) = client.app_current().await
+        && let Some(package) = current.package
+    {
+        app_label = client.app_info(&package).await.ok().map(|info| info.label);
+        resolved.package = Some(package);
+        resolved.source = "foreground_app".into();
     }
 
     Ok((resolved, app_label))
@@ -793,10 +792,10 @@ async fn record_cmd(
     let mut stop = Box::pin(tokio::signal::ctrl_c());
 
     loop {
-        if let Some(duration_ms) = args.duration_ms {
-            if started.elapsed() >= Duration::from_millis(duration_ms) {
-                break;
-            }
+        if let Some(duration_ms) = args.duration_ms
+            && started.elapsed() >= Duration::from_millis(duration_ms)
+        {
+            break;
         }
         tokio::select! {
             _ = &mut stop => break,
@@ -882,12 +881,13 @@ async fn record_cmd(
         }
     }
 
+    let elapsed_ms = duration_millis(started.elapsed())?;
     write_event(
         &mut out,
         &json!({
             "type": "record_stop",
             "ts": now_ms(),
-            "elapsed_ms": started.elapsed().as_millis() as u64,
+            "elapsed_ms": elapsed_ms,
         }),
     )?;
     let artifact = args.out.display().to_string();
@@ -897,7 +897,7 @@ async fn record_cmd(
         "debug_record",
         &json!({
             "artifact": artifact,
-            "elapsed_ms": started.elapsed().as_millis() as u64,
+            "elapsed_ms": elapsed_ms,
             "replay": {
                 "command": replay_command,
                 "requires_confirmation": true,
@@ -1422,6 +1422,7 @@ async fn run_until_crash(
 
     loop {
         if Instant::now() >= deadline {
+            let elapsed_ms = duration_millis(started.elapsed())?;
             let (snapshot, snapshot_error) = final_snapshot_best_effort(
                 serial, client, &args.app, studio_url, args.depth, args.logs,
             )
@@ -1431,7 +1432,7 @@ async fn run_until_crash(
                 "schema_version": 1,
                 "ok": false,
                 "timeout": true,
-                "elapsed_ms": started.elapsed().as_millis() as u64,
+                "elapsed_ms": elapsed_ms,
                 "studio": {
                     "resume": resume,
                 },
@@ -1463,6 +1464,7 @@ async fn run_until_crash(
 
         match tokio::time::timeout(Duration::from_millis(100), crash_rx.recv()).await {
             Ok(Some(crash)) => {
+                let elapsed_ms = duration_millis(started.elapsed())?;
                 let (snapshot, snapshot_error) = final_snapshot_best_effort(
                     serial, client, &args.app, studio_url, args.depth, args.logs,
                 )
@@ -1489,7 +1491,7 @@ async fn run_until_crash(
                     "schema_version": 1,
                     "ok": true,
                     "timeout": false,
-                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                    "elapsed_ms": elapsed_ms,
                     "app": {
                         "requested": args.app.clone(),
                         "package": crash.package.clone(),
@@ -1734,18 +1736,18 @@ fn debug_sample_value(
         next_commands.insert("shadowdroid doctor --fix".into());
         next_commands.insert("shadowdroid ui dump".into());
     }
-    if let Some(expected) = args.app.as_deref() {
-        if screen.current_app.package.as_deref() != Some(expected) {
-            reasons.push(json!({
-                "code": "foreground_app_mismatch",
-                "expected_package": expected,
-                "actual_package": screen.current_app.package.clone(),
-                "foreground_activity": foreground_activity,
-                "detail": "The sampled UI is not from the requested app package"
-            }));
-            next_commands.insert(format!("shadowdroid app start {expected}"));
-            next_commands.insert(format!("shadowdroid ui wait --pkg {expected}"));
-        }
+    if let Some(expected) = args.app.as_deref()
+        && screen.current_app.package.as_deref() != Some(expected)
+    {
+        reasons.push(json!({
+            "code": "foreground_app_mismatch",
+            "expected_package": expected,
+            "actual_package": screen.current_app.package.clone(),
+            "foreground_activity": foreground_activity,
+            "detail": "The sampled UI is not from the requested app package"
+        }));
+        next_commands.insert(format!("shadowdroid app start {expected}"));
+        next_commands.insert(format!("shadowdroid ui wait --pkg {expected}"));
     }
     if !debugger
         .get("available")
@@ -2021,8 +2023,9 @@ async fn collect_matching_device_files(
             }
             for remote in paths {
                 let name = device_artifact_name(prefix, &remote);
-                match adb::pull(serial, &remote).await {
-                    Ok(bytes) => bundle.write_bytes(&name, &bytes),
+                let local = bundle.dir.join(&name);
+                match adb::pull_to_path(serial, &remote, &local).await {
+                    Ok(_) => bundle.captured.push(name),
                     Err(pull_err) => match adb::shell(
                         serial,
                         format!("cat {}", crate::config::quote_device_shell_arg(&remote)),
@@ -2102,14 +2105,11 @@ async fn perform_action(client: &ServerClient, value: &Value) -> Result<()> {
             let (Some(from), Some(to)) = (from, to) else {
                 anyhow::bail!("{cmd} event needs from/to arrays");
             };
-            let x1 = from.first().and_then(Value::as_i64).unwrap_or(0) as i32;
-            let y1 = from.get(1).and_then(Value::as_i64).unwrap_or(0) as i32;
-            let x2 = to.first().and_then(Value::as_i64).unwrap_or(0) as i32;
-            let y2 = to.get(1).and_then(Value::as_i64).unwrap_or(0) as i32;
-            let duration_ms = value
-                .get("duration_ms")
-                .and_then(Value::as_u64)
-                .unwrap_or(200) as u32;
+            let x1 = array_i32_field(from, 0, "from[0]")?;
+            let y1 = array_i32_field(from, 1, "from[1]")?;
+            let x2 = array_i32_field(to, 0, "to[0]")?;
+            let y2 = array_i32_field(to, 1, "to[1]")?;
+            let duration_ms = u32_field_or(value, "duration_ms", 200)?;
             if cmd == "drag" {
                 client.drag(x1, y1, x2, y2, duration_ms).await
             } else {
@@ -2128,11 +2128,51 @@ async fn perform_action(client: &ServerClient, value: &Value) -> Result<()> {
 }
 
 fn int_field(value: &Value, key: &str) -> Result<i32> {
-    value
-        .get(key)
-        .and_then(Value::as_i64)
-        .map(|v| v as i32)
-        .with_context(|| format!("event needs integer {key}"))
+    checked_i32_value(value.get(key), key)
+}
+
+fn array_i32_field(values: &[Value], index: usize, field: &str) -> Result<i32> {
+    checked_i32_value(values.get(index), field)
+}
+
+fn checked_i32_value(value: Option<&Value>, field: &str) -> Result<i32> {
+    let Some(value) = value else {
+        return Err(replay_numeric_error(field, None, "a signed 32-bit integer"));
+    };
+    let Some(raw) = value.as_i64() else {
+        return Err(replay_numeric_error(
+            field,
+            Some(value),
+            "a signed 32-bit integer",
+        ));
+    };
+    i32::try_from(raw)
+        .map_err(|_| replay_numeric_error(field, Some(value), "a signed 32-bit integer"))
+}
+
+fn u32_field_or(value: &Value, field: &str, default: u32) -> Result<u32> {
+    let Some(value) = value.get(field) else {
+        return Ok(default);
+    };
+    let Some(raw) = value.as_u64() else {
+        return Err(replay_numeric_error(
+            field,
+            Some(value),
+            "an unsigned 32-bit integer",
+        ));
+    };
+    u32::try_from(raw)
+        .map_err(|_| replay_numeric_error(field, Some(value), "an unsigned 32-bit integer"))
+}
+
+fn replay_numeric_error(field: &str, value: Option<&Value>, expected: &str) -> anyhow::Error {
+    crate::diagnostic::DiagnosticError::new(
+        "debug_replay_invalid_action",
+        "debugger",
+        format!("invalid replay action field `{field}`; expected {expected}"),
+    )
+    .detail(json!({"field": field, "value": value, "expected": expected}))
+    .into()
 }
 
 fn emit_json(value: &Value) -> Result<()> {
@@ -2164,9 +2204,10 @@ async fn write_screenshot(
     std::fs::create_dir_all(&base).with_context(|| format!("creating {}", base.display()))?;
     let path = base.join(format!("{prefix}-{}-{}.png", now_ms(), &hash[..12]));
     std::fs::write(&path, &bytes).with_context(|| format!("writing {}", path.display()))?;
+    let byte_len = u64::try_from(bytes.len()).context("screenshot byte length exceeds u64")?;
     Ok(json!({
         "path": path.display().to_string(),
-        "bytes": bytes.len() as u64,
+        "bytes": byte_len,
         "hash": hash,
         "hash_algorithm": "blake3",
     }))
@@ -2186,8 +2227,12 @@ fn stable_hash(value: &Value) -> String {
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+fn duration_millis(duration: Duration) -> Result<u64> {
+    u64::try_from(duration.as_millis()).context("duration in milliseconds exceeds u64")
 }
 
 #[cfg(test)]
@@ -2248,6 +2293,34 @@ mod tests {
         assert_eq!(location["file"], "MainActivity.kt");
         assert_eq!(location["line"], 42);
         assert!(java_stack_location(0, "java.lang.Thread.sleep(Native Method)").is_none());
+    }
+
+    #[test]
+    fn replay_numeric_fields_reject_values_that_would_wrap() {
+        assert_eq!(int_field(&json!({"x": i32::MAX}), "x").unwrap(), i32::MAX);
+
+        let error = int_field(&json!({"x": i64::from(i32::MAX) + 1}), "x").unwrap_err();
+        assert_eq!(
+            crate::cli::error_code_of(&error),
+            "debug_replay_invalid_action"
+        );
+
+        let error = u32_field_or(
+            &json!({"duration_ms": u64::from(u32::MAX) + 1}),
+            "duration_ms",
+            200,
+        )
+        .unwrap_err();
+        assert_eq!(
+            crate::cli::error_code_of(&error),
+            "debug_replay_invalid_action"
+        );
+    }
+
+    #[test]
+    fn duration_milliseconds_are_checked() {
+        assert_eq!(duration_millis(Duration::from_millis(42)).unwrap(), 42);
+        assert!(duration_millis(Duration::MAX).is_err());
     }
 
     #[test]

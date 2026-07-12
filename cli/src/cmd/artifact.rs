@@ -4,7 +4,7 @@
 //! the potentially large payload lives at the requested path.
 
 use anyhow::{Context, Result};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::Write;
 use std::path::Path;
 

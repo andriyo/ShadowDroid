@@ -52,9 +52,11 @@ fn unknown_flag_is_a_structured_usage_error() {
         "one-shot error must not carry ts: {v}"
     );
     assert_eq!(code, 2, "usage errors exit 2");
-    assert!(v["next_actions"]
-        .as_array()
-        .is_some_and(|actions| !actions.is_empty()));
+    assert!(
+        v["next_actions"]
+            .as_array()
+            .is_some_and(|actions| !actions.is_empty())
+    );
 }
 
 #[test]
@@ -71,9 +73,11 @@ fn bare_invocation_is_a_structured_discovery_error() {
     let value = one_json_line(&out);
     assert_eq!(value["type"], "error", "{value}");
     assert_eq!(value["code"], "missing_subcommand", "{value}");
-    assert!(value["next_actions"]
-        .as_array()
-        .is_some_and(|actions| !actions.is_empty()));
+    assert!(
+        value["next_actions"]
+            .as_array()
+            .is_some_and(|actions| !actions.is_empty())
+    );
     assert_eq!(code, 2);
 }
 
@@ -115,9 +119,11 @@ fn commands_json_is_one_valid_json_object() {
         serde_json::from_str(out.trim()).expect("commands --json is valid JSON");
     assert!(v.is_object(), "catalog is a JSON object");
     assert_eq!(v["schema_version"], 3);
-    assert!(v["next_actions"]
-        .as_array()
-        .is_some_and(|actions| !actions.is_empty()));
+    assert!(
+        v["next_actions"]
+            .as_array()
+            .is_some_and(|actions| !actions.is_empty())
+    );
     assert_eq!(code, 0);
 }
 
@@ -153,9 +159,11 @@ fn config_paths_json_is_valid_json() {
             .is_some_and(|p| p.ends_with(".shadowdroid/config.json")),
         "project_config should be the folder form: {v}"
     );
-    assert!(v["next_actions"]
-        .as_array()
-        .is_some_and(|actions| !actions.is_empty()));
+    assert!(
+        v["next_actions"]
+            .as_array()
+            .is_some_and(|actions| !actions.is_empty())
+    );
 }
 
 #[test]
@@ -165,12 +173,16 @@ fn missing_required_argument_points_to_the_exact_command_contract() {
     assert_eq!(code, 2);
     assert_eq!(value["code"], "usage");
     let actions = value["next_actions"].as_array().unwrap();
-    assert!(actions
-        .iter()
-        .any(|action| action == "shadowdroid layout diff --help"));
-    assert!(actions
-        .iter()
-        .any(|action| action == "shadowdroid commands --json --describe 'layout diff'"));
+    assert!(
+        actions
+            .iter()
+            .any(|action| action == "shadowdroid layout diff --help")
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|action| action == "shadowdroid commands --json --describe 'layout diff'")
+    );
 }
 
 #[test]
@@ -179,9 +191,11 @@ fn host_action_success_has_nonempty_next_actions() {
     let value = one_json_line(&out);
     assert_eq!(code, 0);
     assert_eq!(value["type"], "action");
-    assert!(value["next_actions"]
-        .as_array()
-        .is_some_and(|actions| !actions.is_empty()));
+    assert!(
+        value["next_actions"]
+            .as_array()
+            .is_some_and(|actions| !actions.is_empty())
+    );
 }
 
 #[test]

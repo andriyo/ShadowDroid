@@ -45,11 +45,11 @@ mod net;
 mod proto;
 mod release;
 mod selector;
+mod transfer;
 mod update;
 mod watch;
 
-#[tokio::main]
-async fn main() {
+fn main() {
     // `--quiet`/`-q` (or SHADOWDROID_QUIET) suppresses our own operational logs so
     // stdout stays clean JSON even under `2>&1`. It's read here, ahead of clap,
     // because tracing is initialized before argument dispatch. An explicit
@@ -68,11 +68,50 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build ShadowDroid async runtime");
+    let outcome = runtime.block_on(cli::run());
+
     // A failed command prints one `{"type":"error",…}` line on stdout (not
     // anyhow's `Error: …` on stderr) so the JSON contract holds for failures too.
-    if let Err(err) = cli::run().await {
+    let failure = outcome.err().map(|err| {
         let exit_code = cli::process_exit_code_of(&err).unwrap_or(1);
         cli::report_error(&err);
+        (exit_code, err)
+    });
+
+    // Tokio cannot cancel native spawn_blocking work. A timed-out ADB call may
+    // still be wedged even when a best-effort caller deliberately swallowed the
+    // error. Bound runtime teardown so successful commands cannot hang forever.
+    runtime.shutdown_timeout(std::time::Duration::from_millis(500));
+    if let Some((exit_code, _error)) = failure {
         std::process::exit(exit_code);
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    #[test]
+    fn runtime_shutdown_does_not_wait_forever_for_blocking_work() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        runtime.spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        runtime.shutdown_timeout(std::time::Duration::from_millis(20));
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        release_tx.send(()).unwrap();
     }
 }

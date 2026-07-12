@@ -1,0 +1,8 @@
+[advisories]
+# Temporary exception, expires 2026-10-11.
+# RUSTSEC-2023-0071 affects non-constant-time RSA private-key operations. ShadowDroid
+# only uses adb_client's host ADB-server APIs; it never invokes adb_client's
+# direct-device authentication path that performs the affected RSA operation.
+# Remove this exception when adb_client offers an RSA-free server-only feature
+# or rsa publishes a compatible patched release.
+ignore = ["RUSTSEC-2023-0071"]

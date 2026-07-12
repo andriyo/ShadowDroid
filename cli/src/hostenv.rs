@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 /// The user's home directory: `$HOME`, then `%USERPROFILE%` (Windows).
 pub fn home_dir() -> Result<PathBuf> {
@@ -31,14 +31,17 @@ pub fn shadowdroid_home() -> Result<PathBuf> {
 /// (case-insensitive, trimmed); unset or anything else (including `0`/`no`/
 /// `off`) is false.
 pub fn env_truthy(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+    let value = std::env::var(name).ok();
+    env_value_truthy(value.as_deref())
+}
+
+fn env_value_truthy(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 #[cfg(test)]
@@ -47,17 +50,12 @@ mod tests {
 
     #[test]
     fn env_truthy_accepts_common_spellings() {
-        // Unique var name keeps this independent of other (parallel) tests.
-        let key = "SHADOWDROID_TEST_ENV_TRUTHY";
-        for v in ["1", "true", "TRUE", "yes", " on ", "On"] {
-            std::env::set_var(key, v);
-            assert!(env_truthy(key), "{v:?} should be truthy");
+        for value in ["1", "true", "TRUE", "yes", " on ", "On"] {
+            assert!(env_value_truthy(Some(value)), "{value:?} should be truthy");
         }
-        for v in ["0", "false", "no", "off", "", "banana"] {
-            std::env::set_var(key, v);
-            assert!(!env_truthy(key), "{v:?} should be falsy");
+        for value in ["0", "false", "no", "off", "", "banana"] {
+            assert!(!env_value_truthy(Some(value)), "{value:?} should be falsy");
         }
-        std::env::remove_var(key);
-        assert!(!env_truthy(key), "unset should be falsy");
+        assert!(!env_value_truthy(None), "unset should be falsy");
     }
 }

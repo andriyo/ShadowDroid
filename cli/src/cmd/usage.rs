@@ -12,9 +12,9 @@
 //! user config) or per-invocation with SHADOWDROID_USAGE_LOG=1.
 
 use anyhow::{Context, Result};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::config::{self, ShadowDroidConfig};
@@ -22,16 +22,6 @@ use crate::events::emit_action;
 
 /// Rotate at ~5 MiB: usage.jsonl → usage.jsonl.1 (one generation kept).
 const ROTATE_BYTES: u64 = 5 * 1024 * 1024;
-
-struct LockCleanup(Option<PathBuf>);
-
-impl Drop for LockCleanup {
-    fn drop(&mut self) {
-        if let Some(path) = self.0.take() {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
 
 #[derive(clap::Subcommand)]
 pub enum UsageCmd {
@@ -87,10 +77,10 @@ pub fn record(started: Instant, result: &Result<()>) {
         "schema_version": 3,
         "ts_ms": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
+            .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
             .unwrap_or(0),
         "verb": verb,
-        "ms": started.elapsed().as_millis() as u64,
+        "ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         "ok": result.is_ok(),
         "v": env!("CARGO_PKG_VERSION"),
     });
@@ -120,7 +110,7 @@ pub fn record_parse_error(kind: &str, had_suggestion: bool, verb: Option<&str>) 
         "schema_version": 3,
         "ts_ms": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
+            .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
             .unwrap_or(0),
         "verb": verb.unwrap_or("(unparsed)"),
         "ms": 0,
@@ -159,41 +149,41 @@ pub(crate) fn verb_from_argv() -> String {
 
 fn append(entry: &Value) -> Result<()> {
     let path = usage_log_path()?;
+    // Serialize the tiny rotate+append transaction across processes with the
+    // standard library's OS-backed file lock. Locks are released automatically
+    // on process death, so no stale lockfile reclamation heuristic is needed.
+    let _rotation_lock = acquire_usage_lock(&path)?;
+    append_locked(&path, entry)
+}
+
+fn acquire_usage_lock(path: &Path) -> Result<std::fs::File> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // Only the process that wins the short-lived cross-process lock rotates.
-    // Other concurrent invocations can still safely O_APPEND their one line.
     let lock_path = path.with_extension("lock");
-    let mut rotation_lock = std::fs::OpenOptions::new()
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
-        .create_new(true)
-        .open(&lock_path)
-        .ok();
-    if rotation_lock.is_none()
-        && std::fs::metadata(&lock_path)
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(|modified| modified.elapsed().ok())
-            .is_some_and(|age| age > std::time::Duration::from_secs(60))
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    lock.lock()?;
+    Ok(lock)
+}
+
+fn append_locked(path: &Path, entry: &Value) -> Result<()> {
+    if std::fs::metadata(path)
+        .map(|m| m.len() > ROTATE_BYTES)
+        .unwrap_or(false)
     {
-        let _ = std::fs::remove_file(&lock_path);
-        rotation_lock = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-            .ok();
-    }
-    let owns_rotation_lock = rotation_lock.is_some();
-    let _cleanup = LockCleanup(owns_rotation_lock.then(|| lock_path.clone()));
-    if rotation_lock.is_some()
-        && std::fs::metadata(&path)
-            .map(|m| m.len() > ROTATE_BYTES)
-            .unwrap_or(false)
-    {
-        let rotated = path.with_extension("jsonl.1");
-        let _ = std::fs::remove_file(&rotated);
-        let _ = std::fs::rename(&path, rotated);
+        let rotated = path.with_added_extension("1");
+        match std::fs::remove_file(&rotated) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("remove rotated usage log"),
+        }
+        std::fs::rename(path, &rotated)
+            .with_context(|| format!("rotate {} to {}", path.display(), rotated.display()))?;
     }
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true);
@@ -202,9 +192,8 @@ fn append(entry: &Value) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(&path)?;
+    let mut file = options.open(path)?;
     writeln!(file, "{entry}")?;
-    drop(rotation_lock);
     Ok(())
 }
 
@@ -231,8 +220,9 @@ pub fn run(cmd: &UsageCmd) -> Result<()> {
         UsageCmd::Report { days } => report(*days)?,
         UsageCmd::Clear => {
             let path = usage_log_path()?;
-            let existed = std::fs::remove_file(&path).is_ok();
-            let _ = std::fs::remove_file(path.with_extension("jsonl.1"));
+            let _rotation_lock = acquire_usage_lock(&path)?;
+            let existed = remove_if_exists(&path)?;
+            remove_if_exists(&path.with_added_extension("1"))?;
             emit_action(
                 "usage_clear",
                 &json!({"path": path.display().to_string(), "removed": existed}),
@@ -240,6 +230,14 @@ pub fn run(cmd: &UsageCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn remove_if_exists(path: &Path) -> Result<bool> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
 }
 
 /// Flip `usage_log` in the *user* config file only — never a project file, so
@@ -266,14 +264,15 @@ fn set_enabled(value: bool) -> Result<()> {
 
 fn report(days: u32) -> Result<()> {
     let path = usage_log_path()?;
+    let _rotation_lock = acquire_usage_lock(&path)?;
     let cutoff_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
-        .saturating_sub(days as u64 * 86_400_000);
+        .saturating_sub(u64::from(days) * 86_400_000);
 
     // Read current + one rotated generation.
-    let mut text = std::fs::read_to_string(path.with_extension("jsonl.1")).unwrap_or_default();
+    let mut text = std::fs::read_to_string(path.with_added_extension("1")).unwrap_or_default();
     text.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
 
     struct VerbStats {
@@ -508,6 +507,30 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_lock_serializes_append_and_clear_transactions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.jsonl");
+        let first = acquire_usage_lock(&path).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let contender_path = path.clone();
+        let contender = std::thread::spawn(move || {
+            let lock = acquire_usage_lock(&contender_path).unwrap();
+            sender.send(()).unwrap();
+            drop(lock);
+        });
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
+        drop(first);
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        contender.join().unwrap();
+    }
 
     #[test]
     fn percentile_math_holds() {

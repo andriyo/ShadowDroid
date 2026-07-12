@@ -86,12 +86,16 @@ fn project_scope_uses_claude_native_and_shared_agent_skills_paths() {
     assert!(output.status.success(), "{value}");
     assert_eq!(value["path"], ".claude/skills/shadowdroid/SKILL.md");
 
-    assert!(project
-        .join(".agents/skills/shadowdroid/SKILL.md")
-        .is_file());
-    assert!(project
-        .join(".claude/skills/shadowdroid/SKILL.md")
-        .is_file());
+    assert!(
+        project
+            .join(".agents/skills/shadowdroid/SKILL.md")
+            .is_file()
+    );
+    assert!(
+        project
+            .join(".claude/skills/shadowdroid/SKILL.md")
+            .is_file()
+    );
     assert!(!project.join("AGENTS.md").exists());
 }
 

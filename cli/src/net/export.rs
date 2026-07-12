@@ -6,7 +6,7 @@
 //! `operationName` so same-endpoint operations don't collide.
 
 use anyhow::{Context, Result};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 
 use crate::net::flow::FlowRecord;

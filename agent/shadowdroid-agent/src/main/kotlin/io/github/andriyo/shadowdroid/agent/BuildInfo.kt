@@ -5,5 +5,5 @@ package io.github.andriyo.shadowdroid.agent
  * version stamps listed in ShadowDroid-docs/release.md.
  */
 internal object BuildInfo {
-    const val VERSION = "0.11.1"
+    const val VERSION = "0.12.0"
 }

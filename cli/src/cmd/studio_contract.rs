@@ -6,7 +6,6 @@
 
 pub(crate) const DEFAULT_URL: &str = "http://127.0.0.1:50576";
 pub(crate) const REGISTRY_FILE: &str = "studio-debugger.json";
-pub(crate) const REGISTRY_PATH: &str = ".shadowdroid/studio-debugger.json";
 
 pub(crate) mod route {
     pub(crate) const STATUS: &str = "/v1/status";

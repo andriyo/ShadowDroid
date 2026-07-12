@@ -10,6 +10,7 @@
 //! without ceremony.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::ops::Deref;
 
@@ -68,8 +69,55 @@ impl From<&Serial> for String {
     }
 }
 
+/// A readable, bounded, collision-resistant filename component for external
+/// identifiers such as device serials and AVD names. Replacing punctuation
+/// alone is not injective (`a:b` and `a/b` both become `a_b`), so every prefix
+/// carries a short digest of the original value.
+pub(crate) fn stable_file_component(value: &str) -> String {
+    let mut prefix = value
+        .chars()
+        .take(40)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if prefix.is_empty() {
+        prefix.push('_');
+    }
+    let digest = Sha256::digest(value.as_bytes());
+    use std::fmt::Write as _;
+    for byte in &digest[..8] {
+        let _ = write!(prefix, "{byte:02x}");
+    }
+    let split = prefix.len() - 16;
+    prefix.insert(split, '-');
+    prefix
+}
+
 impl PartialEq<str> for Serial {
     fn eq(&self, other: &str) -> bool {
         self.0 == other
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stable_file_component;
+
+    #[test]
+    fn stable_components_are_safe_bounded_and_collision_resistant() {
+        let name = stable_file_component("Pixel/9; $(unsafe)");
+        assert!(!name.contains('/'));
+        assert!(!name.contains(';'));
+        assert!(name.len() <= 57);
+        assert_ne!(
+            stable_file_component("device:5555"),
+            stable_file_component("device/5555")
+        );
+        assert_eq!(name, stable_file_component("Pixel/9; $(unsafe)"));
     }
 }

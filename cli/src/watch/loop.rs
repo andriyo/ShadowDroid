@@ -18,22 +18,23 @@
 //! to wait behind every queued wake.
 
 use crate::device::client::ServerClient;
-use crate::events::{self, emit_action, now_ts, Event, ScreenFormat};
+use crate::events::{self, Event, ScreenFormat, emit_action, now_ts};
 use crate::ids::Serial;
 use crate::proto::{AppRef, Element, SelectorQuery};
 use crate::watch::watcher::{PermissionDialogPolicy, WatcherRule, WatcherSet};
 use crate::watch::{logcat, stdin};
-use anyhow::{anyhow, bail, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, anyhow, bail};
+use serde_json::{Value, json};
+use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::{interval, sleep, MissedTickBehavior};
+use tokio::time::{MissedTickBehavior, interval, sleep};
 
 #[derive(Debug, Clone, Copy)]
 pub enum Wake {
@@ -275,10 +276,11 @@ async fn shutdown_producers_and_drain<T: Send + 'static>(
 
     let mut producer_failure = None;
     for producer in producers {
-        if let Err(error) = producer.await {
-            if !error.is_cancelled() && producer_failure.is_none() {
-                producer_failure = Some(error);
-            }
+        if let Err(error) = producer.await
+            && !error.is_cancelled()
+            && producer_failure.is_none()
+        {
+            producer_failure = Some(error);
         }
     }
 
@@ -807,10 +809,7 @@ async fn dispatch_command(
             let local = req_str(cmd, "local")?;
             let remote = req_str(cmd, "remote")?;
             let mode = opt_u32(cmd, "mode")?;
-            let bytes = tokio::fs::read(local)
-                .await
-                .with_context(|| format!("reading {local}"))?;
-            let r = cfg.client.push_file(remote, bytes, mode).await?;
+            let r = cfg.client.push_file(remote, Path::new(local), mode).await?;
             if mode.is_some_and(|requested| requested != r.mode) {
                 return Err(crate::diagnostic::DiagnosticError::new(
                     "file_mode_postcondition_failed",
@@ -838,13 +837,12 @@ async fn dispatch_command(
         "pull" => {
             let remote = req_str(cmd, "remote")?;
             let local = req_str(cmd, "local")?;
-            let bytes = cfg.client.pull_file(remote).await?;
-            tokio::fs::write(local, &bytes)
-                .await
-                .with_context(|| format!("writing {local}"))?;
+            let response = cfg.client.pull_file_response(remote).await?;
+            let receipt =
+                crate::transfer::response_to_path_atomic(response, Path::new(local), None).await?;
             emit_action(
                 "pull",
-                &json!({"remote":remote, "local":local, "bytes":bytes.len() as u64}),
+                &json!({"remote":remote, "local":local, "bytes":receipt.bytes}),
             );
         }
         "wait_for" => {
@@ -896,13 +894,13 @@ async fn dispatch_tap(
     action_cmd: &str,
 ) -> Result<TapOutcome> {
     if let Some(id) = opt_u32(cmd, "id")? {
-        if let Some(expected_hash) = cmd.get("screen_hash").and_then(Value::as_str) {
-            if state.last_hash.as_deref() != Some(expected_hash) {
-                bail!(
-                    "stale screen id {id}: expected screen_hash {expected_hash}, current cached screen_hash {:?}",
-                    state.last_hash
-                );
-            }
+        if let Some(expected_hash) = cmd.get("screen_hash").and_then(Value::as_str)
+            && state.last_hash.as_deref() != Some(expected_hash)
+        {
+            bail!(
+                "stale screen id {id}: expected screen_hash {expected_hash}, current cached screen_hash {:?}",
+                state.last_hash
+            );
         }
         let r = cfg
             .client
@@ -952,16 +950,16 @@ async fn wait_after_action(
 
     loop {
         let screen = cfg.client.screen().await?;
-        if let Some(filter) = &cfg.app_filter {
-            if !should_emit_package(Some(filter.as_str()), screen.current_app.package.as_deref()) {
-                if std::time::Instant::now() >= deadline {
-                    bail!(
-                        "{action_cmd} timed out after {timeout}ms because the foreground app stayed outside the watch app filter; inspect `screen` or change the filter"
-                    );
-                }
-                sleep(Duration::from_millis(poll_ms as u64)).await;
-                continue;
+        if let Some(filter) = &cfg.app_filter
+            && !should_emit_package(Some(filter.as_str()), screen.current_app.package.as_deref())
+        {
+            if std::time::Instant::now() >= deadline {
+                bail!(
+                    "{action_cmd} timed out after {timeout}ms because the foreground app stayed outside the watch app filter; inspect `screen` or change the filter"
+                );
             }
+            sleep(Duration::from_millis(poll_ms as u64)).await;
+            continue;
         }
 
         let query_matched = wait_query_matches(cmd, &screen.current_app, &screen.elements);
@@ -1063,15 +1061,15 @@ async fn wait_for(
 }
 
 fn wait_query_matches(cmd: &Value, app: &AppRef, elements: &[Element]) -> bool {
-    if let Some(package) = cmd.get("package").and_then(Value::as_str) {
-        if !app.package.as_deref().unwrap_or("").contains(package) {
-            return false;
-        }
+    if let Some(package) = cmd.get("package").and_then(Value::as_str)
+        && !app.package.as_deref().unwrap_or("").contains(package)
+    {
+        return false;
     }
-    if let Some(activity) = cmd.get("activity").and_then(Value::as_str) {
-        if !app.activity.as_deref().unwrap_or("").contains(activity) {
-            return false;
-        }
+    if let Some(activity) = cmd.get("activity").and_then(Value::as_str)
+        && !app.activity.as_deref().unwrap_or("").contains(activity)
+    {
+        return false;
     }
     let text = cmd.get("text").and_then(Value::as_str);
     let rid = cmd.get("rid").and_then(Value::as_str);
@@ -1289,8 +1287,8 @@ fn is_system_interruption(package: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        debounce_delay_ms, selector_string_matches, should_emit_package, should_emit_screen,
-        shutdown_producers_and_drain, toast_timeout_ms, Wake,
+        Wake, debounce_delay_ms, selector_string_matches, should_emit_package, should_emit_screen,
+        shutdown_producers_and_drain, toast_timeout_ms,
     };
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, Ordering};

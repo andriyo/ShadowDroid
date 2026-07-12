@@ -21,7 +21,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cmd::studio;
 use crate::device::adb;
-use crate::device::client::ServerClient;
 use crate::device::installer::{
     self, APP_PACKAGE, DEFAULT_PORT, EXPECTED_APK_VERSION, INSTRUMENT_LOG_PATH, TEST_PACKAGE,
 };
@@ -252,32 +251,19 @@ async fn apk_check(serial: &Serial) -> Check {
     }
 }
 
-/// Sets up the (idempotent) port forward, then probes `/v1/state` once. Returns
+/// Probes the already-established forward without mutating lifecycle state.
+/// Returns
 /// `(check, reachable)` where `reachable` means the server answered at all
 /// (regardless of version). A not-yet-started server is a `warn`, not a `fail` —
 /// `shadowdroid connect` is the normal way to start it.
 async fn server_check(serial: &Serial) -> (Check, bool) {
-    // The forward is required to reach the device server and is idempotent. The
-    // host port is per-serial (see installer::ensure_forward) so doctor probes
-    // the same loopback port the rest of the CLI uses for this device.
-    let Ok(host_port) = installer::ensure_forward(serial).await else {
+    let Ok(Some(client)) = installer::probe_existing(serial, true).await else {
         return (
             Check {
                 code: "server",
-                status: Status::Fail,
-                detail: "could not set up the adb forward to the device server".into(),
-                remedy: None,
-            },
-            false,
-        );
-    };
-    let Ok(client) = ServerClient::new(host_port) else {
-        return (
-            Check {
-                code: "server",
-                status: Status::Fail,
-                detail: "could not build HTTP client for localhost port".into(),
-                remedy: None,
+                status: Status::Warn,
+                detail: "no reachable server on the existing adb forward".into(),
+                remedy: Some("run `shadowdroid connect` to establish or repair the server".into()),
             },
             false,
         );
@@ -289,7 +275,10 @@ async fn server_check(serial: &Serial) -> (Check, bool) {
                 status: Status::Ok,
                 detail: format!(
                     "reachable on :{DEFAULT_PORT} (server {}, UIA {}, Android {}/SDK {})",
-                    state.server_version, state.ui_automator_version, state.android_release, state.android_sdk
+                    state.server_version,
+                    state.ui_automator_version,
+                    state.android_release,
+                    state.android_sdk
                 ),
                 remedy: None,
             },
@@ -406,7 +395,7 @@ async fn clock_check(serial: &Serial) -> Check {
                 status: Status::Warn,
                 detail: format!("could not read device clock: {e}"),
                 remedy: None,
-            }
+            };
         }
     };
     let Ok(device) = raw.trim().parse::<i64>() else {
@@ -504,33 +493,36 @@ pub async fn run(
     // wiring status (the same thing `aar status` reports). Source-side and
     // read-only — independent of the device, sits outside the fix flow.
     if let Some(project) = project {
-        let check =
-            match crate::cmd::aar::inspect(project, None) {
-                Ok(s) if s.installed => Check {
-                    code: "agent",
-                    status: Status::Ok,
-                    detail: format!("in-app debug agent wired into :{} ({})", s.module, s.app),
-                    remedy: None,
-                },
-                Ok(s) => Check {
-                    code: "agent",
-                    status: Status::Warn,
-                    detail: format!(
+        let check = match crate::cmd::aar::inspect(project, None) {
+            Ok(s) if s.installed => Check {
+                code: "agent",
+                status: Status::Ok,
+                detail: format!("in-app debug agent wired into :{} ({})", s.module, s.app),
+                remedy: None,
+            },
+            Ok(s) => Check {
+                code: "agent",
+                status: Status::Warn,
+                detail: format!(
                     "in-app debug agent not installed in {} (module :{}): dependency {}, aar {}",
                     s.app,
                     s.module,
-                    if s.dependency_present { "present" } else { "missing" },
+                    if s.dependency_present {
+                        "present"
+                    } else {
+                        "missing"
+                    },
                     if s.aar_present { "present" } else { "missing" },
                 ),
-                    remedy: Some("shadowdroid aar install".to_string()),
-                },
-                Err(e) => Check {
-                    code: "agent",
-                    status: Status::Warn,
-                    detail: format!("agent status for {}: {e}", project.display()),
-                    remedy: None,
-                },
-            };
+                remedy: Some("shadowdroid aar install".to_string()),
+            },
+            Err(e) => Check {
+                code: "agent",
+                status: Status::Warn,
+                detail: format!("agent status for {}: {e}", project.display()),
+                remedy: None,
+            },
+        };
         report.checks.push(check);
         report.healthy = is_healthy(&report.checks);
     }
@@ -779,10 +771,10 @@ fn print_human(report: &DoctorReport, fix: bool) {
         println!("{} [{}] {}", c.status.glyph(), c.code, c.detail);
         // Show the remedy for anything not OK — including issues that survived
         // a --fix run, so the user sees what's left to do manually.
-        if c.status != Status::Ok {
-            if let Some(remedy) = &c.remedy {
-                println!("    → {remedy}");
-            }
+        if c.status != Status::Ok
+            && let Some(remedy) = &c.remedy
+        {
+            println!("    → {remedy}");
         }
     }
     let fixable_remaining = report

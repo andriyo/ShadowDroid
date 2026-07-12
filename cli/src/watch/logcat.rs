@@ -9,9 +9,9 @@
 //! and `adb shell getprop` for device info, then emit a `crash` event.
 
 use crate::device::adb;
-use crate::events::{now_ts, CausedBy, CrashEvent, Event};
+use crate::events::{CausedBy, CrashEvent, Event, now_ts};
 use crate::ids::Serial;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use regex::Regex;
 use std::future::Future;
 use std::process::Stdio;
@@ -127,10 +127,10 @@ async fn emit_if_matches(
     out: &mpsc::Sender<CrashEvent>,
     mut evt: CrashEvent,
 ) {
-    if let (Some(filter), Some(package)) = (app_filter, &evt.package) {
-        if !package_matches_filter(package, filter) {
-            return;
-        }
+    if let (Some(filter), Some(package)) = (app_filter, &evt.package)
+        && !package_matches_filter(package, filter)
+    {
+        return;
     }
     evt.context = fetch_context(serial).await;
     evt.device_info = fetch_device_info(serial).await;
@@ -309,14 +309,14 @@ fn build_java_event(lines: &[String], pid: Option<i32>) -> CrashEvent {
             continue;
         }
         if let Some(caps) = java_caused_by_re().captures(&msg) {
-            if let Some(cause_text) = caps.get(1) {
-                if let Some(ex_caps) = java_exception_re().captures(cause_text.as_str()) {
-                    caused_by.push(CausedBy {
-                        exception: ex_caps.get(1).map(|m| m.as_str()).unwrap_or("").to_string(),
-                        message: ex_caps.get(2).map(|m| m.as_str().to_string()),
-                        stack: Vec::new(),
-                    });
-                }
+            if let Some(cause_text) = caps.get(1)
+                && let Some(ex_caps) = java_exception_re().captures(cause_text.as_str())
+            {
+                caused_by.push(CausedBy {
+                    exception: ex_caps.get(1).map(|m| m.as_str()).unwrap_or("").to_string(),
+                    message: ex_caps.get(2).map(|m| m.as_str().to_string()),
+                    stack: Vec::new(),
+                });
             }
             continue;
         }
@@ -332,11 +332,11 @@ fn build_java_event(lines: &[String], pid: Option<i32>) -> CrashEvent {
             }
             continue;
         }
-        if exception.is_none() {
-            if let Some(caps) = java_exception_re().captures(&msg) {
-                exception = caps.get(1).map(|m| m.as_str().to_string());
-                message = caps.get(2).map(|m| m.as_str().to_string());
-            }
+        if exception.is_none()
+            && let Some(caps) = java_exception_re().captures(&msg)
+        {
+            exception = caps.get(1).map(|m| m.as_str().to_string());
+            message = caps.get(2).map(|m| m.as_str().to_string());
         }
     }
 
@@ -491,9 +491,9 @@ fn anr_header_re() -> &'static Regex {
 
 #[cfg(test)]
 mod tests {
-    use super::{forward_crash_events, package_matches_filter, CrashCollector};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use super::{CrashCollector, forward_crash_events, package_matches_filter};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::{mpsc, oneshot};
 
     #[test]
@@ -548,11 +548,13 @@ mod tests {
         assert_eq!(events[0].kind, "anr");
         assert_eq!(events[0].package.as_deref(), Some("com.example"));
         assert_eq!(events[0].pid, None);
-        assert!(events[0]
-            .message
-            .as_deref()
-            .unwrap_or_default()
-            .contains("ANR in com.example"));
+        assert!(
+            events[0]
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("ANR in com.example")
+        );
     }
 
     #[tokio::test]

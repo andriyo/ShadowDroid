@@ -12,8 +12,8 @@
 //!   - `ca.crt` / `ca.key` — the ShadowDroid root CA (generated once, installed
 //!     into the device trust store).
 
-use crate::ids::Serial;
-use anyhow::{anyhow, Result};
+use crate::ids::{Serial, stable_file_component};
+use anyhow::{Result, anyhow};
 use std::path::PathBuf;
 
 fn home() -> Result<PathBuf> {
@@ -45,6 +45,14 @@ pub const CA_KEY_FILE: &str = "ca.key";
 /// info` report where the CA came from.
 pub const CA_SOURCE_FILE: &str = "ca.source";
 
+fn serial_path(serial: &Serial, suffix: &str) -> Result<PathBuf> {
+    let dir = net_dir()?;
+    Ok(dir.join(format!(
+        "{}.{suffix}",
+        stable_file_component(serial.as_str())
+    )))
+}
+
 pub fn ca_cert_path() -> Result<PathBuf> {
     Ok(net_dir()?.join(CA_CERT_FILE))
 }
@@ -59,61 +67,45 @@ pub fn ca_key_path() -> Result<PathBuf> {
 /// state); never in the project folder — trust is a `(CA, device)` fact, not a
 /// project fact.
 pub fn trust_cache_path(serial: &Serial) -> Result<PathBuf> {
-    Ok(net_dir()?.join(format!("{}.trust.json", sanitize(serial))))
+    serial_path(serial, "trust.json")
 }
 
 /// The control endpoint file — stores the daemon's loopback-TCP control port.
 /// (TCP rather than a Unix socket so `net` builds + runs on Windows too.)
 pub fn ctl_path(serial: &Serial) -> Result<PathBuf> {
-    Ok(net_dir()?.join(format!("{}.ctl", sanitize(serial))))
+    serial_path(serial, "ctl")
 }
 
 pub fn session_log_path(serial: &Serial) -> Result<PathBuf> {
-    Ok(net_dir()?.join(format!("{}.jsonl", sanitize(serial))))
+    serial_path(serial, "jsonl")
 }
 
 pub fn daemon_log_path(serial: &Serial) -> Result<PathBuf> {
-    Ok(net_dir()?.join(format!("{}.log", sanitize(serial))))
+    serial_path(serial, "log")
 }
 
 pub fn pid_path(serial: &Serial) -> Result<PathBuf> {
-    Ok(net_dir()?.join(format!("{}.pid", sanitize(serial))))
+    serial_path(serial, "pid")
 }
 
 /// Device networking state captured immediately before `net start` changes it.
 /// `net stop` consumes this file only after a successful restore, so a crashed
 /// daemon or interrupted teardown can be recovered by a later invocation.
 pub fn device_state_path(serial: &Serial) -> Result<PathBuf> {
-    Ok(net_dir()?.join(format!("{}.state.json", sanitize(serial))))
-}
-
-/// Make a serial safe as a filename component (`emulator-5554`, an IP:port, a
-/// USB serial). Keeps alphanumerics, `-`, `_`; everything else → `_`.
-fn sanitize(serial: &Serial) -> String {
-    serial
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    serial_path(serial, "state.json")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize;
+    use super::{ctl_path, pid_path};
     use crate::ids::Serial;
 
     #[test]
-    fn sanitizes_serials() {
-        assert_eq!(sanitize(&Serial::from("emulator-5554")), "emulator-5554");
-        assert_eq!(
-            sanitize(&Serial::from("192.168.1.5:5555")),
-            "192_168_1_5_5555"
-        );
-        assert_eq!(sanitize(&Serial::from("R5CT80ABCDE")), "R5CT80ABCDE");
+    fn serial_paths_are_safe_and_collision_resistant() {
+        let colon = ctl_path(&Serial::from("device:5555")).unwrap();
+        let slash = ctl_path(&Serial::from("device/5555")).unwrap();
+        assert_ne!(colon, slash);
+        assert_ne!(colon, pid_path(&Serial::from("device:5555")).unwrap());
+        assert!(!colon.file_name().unwrap().to_string_lossy().contains(':'));
     }
 }

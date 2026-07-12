@@ -17,10 +17,10 @@
 //! emit exactly once.
 
 use anyhow::Result;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::device::client::{ServerClient, ServerError};
-use crate::events::{emit_action, emit_result, CompactElement};
+use crate::events::{CompactElement, emit_action, emit_result};
 use crate::proto::{Element, ScreenResponse};
 
 /// What a dispatch arm produced. Emission happens centrally so cross-cutting
@@ -70,7 +70,9 @@ pub struct FusionArgs {
 /// caller can re-plan without another read; rendered by `report_error` as
 /// code=screen_changed with the compact screen in `detail`.
 #[derive(Debug, thiserror::Error)]
-#[error("screen changed since your last read (expected hash {expected}, now {actual}) — not acting; re-plan from detail.screen")]
+#[error(
+    "screen changed since your last read (expected hash {expected}, now {actual}) — not acting; re-plan from detail.screen"
+)]
 pub struct ScreenChanged {
     pub expected: String,
     pub actual: String,
@@ -171,12 +173,13 @@ pub fn compact_screen_value(screen: &ScreenResponse) -> Value {
 pub fn top_screen_texts(elements: &[Element], n: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for el in elements {
-        if let Some(t) = el.text.as_deref().map(str::trim) {
-            if !t.is_empty() && !out.iter().any(|x| x == t) {
-                out.push(t.to_string());
-                if out.len() >= n {
-                    break;
-                }
+        if let Some(t) = el.text.as_deref().map(str::trim)
+            && !t.is_empty()
+            && !out.iter().any(|x| x == t)
+        {
+            out.push(t.to_string());
+            if out.len() >= n {
+                break;
             }
         }
     }

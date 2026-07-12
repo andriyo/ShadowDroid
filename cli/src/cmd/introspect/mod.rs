@@ -182,20 +182,19 @@ fn normalize_next_command(command: &str) -> String {
     if normalized
         .split_whitespace()
         .any(|token| token.contains('|'))
+        && let Some(path) = command_path_for_invocation(&normalized)
     {
-        if let Some(path) = command_path_for_invocation(&normalized) {
-            return format!("shadowdroid commands --json --describe '{path}'");
-        }
+        return format!("shadowdroid commands --json --describe '{path}'");
     }
-    if !command.contains('<') {
-        if let Some(path) = incomplete_command_path(command) {
-            return format!("shadowdroid commands --json --describe '{path}'");
-        }
+    if !command.contains('<')
+        && let Some(path) = incomplete_command_path(command)
+    {
+        return format!("shadowdroid commands --json --describe '{path}'");
     }
-    if !action_template_parses(&normalized) {
-        if let Some(path) = command_path_for_invocation(&normalized) {
-            return format!("shadowdroid commands --json --describe '{path}'");
-        }
+    if !action_template_parses(&normalized)
+        && let Some(path) = command_path_for_invocation(&normalized)
+    {
+        return format!("shadowdroid commands --json --describe '{path}'");
     }
     normalized
 }
@@ -695,14 +694,18 @@ mod tests {
         let root = Cli::command();
         let compact = catalog_with_depth(&root, Some(1));
         let commands = compact["commands"].as_array().unwrap();
-        assert!(commands
-            .iter()
-            .all(|command| command.get("subcommands").is_none()));
-        assert!(compact["global_args"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|arg| arg["long"] == "device" && arg["short"] == "d"));
+        assert!(
+            commands
+                .iter()
+                .all(|command| command.get("subcommands").is_none())
+        );
+        assert!(
+            compact["global_args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|arg| arg["long"] == "device" && arg["short"] == "d")
+        );
 
         let described = describe_catalog(&root, "watch").unwrap();
         let permission_policy = described["command"]["args"]
@@ -715,10 +718,12 @@ mod tests {
             permission_policy["possible_values"],
             serde_json::json!(["ignore", "allow", "deny"])
         );
-        assert!(!permission_policy["default_values"]
-            .as_array()
-            .unwrap()
-            .is_empty());
+        assert!(
+            !permission_policy["default_values"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -732,11 +737,13 @@ mod tests {
             .iter()
             .find(|arg| arg["long"] == "depth")
             .unwrap();
-        assert!(depth["conflicts_with"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|id| id == "describe"));
+        assert!(
+            depth["conflicts_with"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|id| id == "describe")
+        );
 
         let init = describe_catalog(&root, "config init").unwrap();
         let user = init["command"]["args"]
@@ -745,11 +752,13 @@ mod tests {
             .iter()
             .find(|arg| arg["long"] == "user")
             .unwrap();
-        assert!(user["conflicts_with"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|id| id == "project"));
+        assert!(
+            user["conflicts_with"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|id| id == "project")
+        );
 
         let wait = describe_catalog(&root, "debug continue-until").unwrap();
         let file = wait["command"]["args"]
@@ -823,9 +832,11 @@ mod tests {
     fn every_public_command_advertises_parseable_next_action_templates() {
         let catalog = catalog(&Cli::command());
         assert_eq!(catalog["schema_version"], 3);
-        assert!(catalog["next_actions"]
-            .as_array()
-            .is_some_and(|actions| !actions.is_empty()));
+        assert!(
+            catalog["next_actions"]
+                .as_array()
+                .is_some_and(|actions| !actions.is_empty())
+        );
         let mut missing = Vec::new();
         collect_commands_with_invalid_next_action_templates(
             catalog["commands"].as_array().unwrap(),
@@ -896,16 +907,20 @@ mod tests {
             .iter()
             .find(|command| command["name"] == "watch")
             .unwrap();
-        assert!(watch["agent"]["use_when"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value.as_str().unwrap_or("").contains("HTTP(S) traffic")));
-        assert!(watch["args"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|arg| arg["long"] == "no-net"));
+        assert!(
+            watch["agent"]["use_when"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.as_str().unwrap_or("").contains("HTTP(S) traffic"))
+        );
+        assert!(
+            watch["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|arg| arg["long"] == "no-net")
+        );
 
         let ui = commands
             .iter()
@@ -943,19 +958,23 @@ mod tests {
             .iter()
             .find(|command| command["name"] == "recompositions")
             .unwrap();
-        assert!(recompositions["agent"]["use_when"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value
-                .as_str()
-                .unwrap_or("")
-                .contains("Compose recomposition")));
-        assert!(recompositions["agent"]["next_actions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value.as_str() == Some("shadowdroid layout recompositions --reset")));
+        assert!(
+            recompositions["agent"]["use_when"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("Compose recomposition"))
+        );
+        assert!(
+            recompositions["agent"]["next_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.as_str() == Some("shadowdroid layout recompositions --reset"))
+        );
     }
 
     #[test]
@@ -967,10 +986,12 @@ mod tests {
             .iter()
             .find(|command| command["name"] == "net")
             .unwrap();
-        assert!(!net["subcommands"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|command| command["name"] == "watch"));
+        assert!(
+            !net["subcommands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|command| command["name"] == "watch")
+        );
     }
 }

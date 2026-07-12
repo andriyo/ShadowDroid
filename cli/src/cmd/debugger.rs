@@ -3,13 +3,14 @@
 //! These commands talk to the ShadowDroid Android Studio plugin over its local
 //! loopback HTTP bridge. They do not need the on-device ShadowDroid server.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::cmd::studio_contract::{self, query, route, session_action};
+use crate::hostenv::shadowdroid_home;
 
 const DEFAULT_BRIDGE_TIMEOUT_MS: u64 = 10_000;
 
@@ -803,7 +804,7 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
                 (query::TIMEOUT_MS, Some(timeout_ms_s.as_str())),
             ];
             match tokio::time::timeout(
-                std::time::Duration::from_millis(args.timeout_ms as u64),
+                std::time::Duration::from_millis(u64::from(args.timeout_ms)),
                 bridge.get(route::SESSION_EVALUATE, &params),
             )
             .await
@@ -859,7 +860,7 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
                 (query::TIMEOUT_MS, Some(timeout_ms_s.as_str())),
             ];
             match tokio::time::timeout(
-                std::time::Duration::from_millis(args.timeout_ms as u64),
+                std::time::Duration::from_millis(u64::from(args.timeout_ms)),
                 bridge.get(route::SESSION_INSPECT, &params),
             )
             .await
@@ -1052,7 +1053,7 @@ async fn continue_until(bridge: &BridgeClient, args: &ContinueUntilArgs) -> Resu
                 )
                 .await?;
             let location_matches = match (&canonical_file, args.line) {
-                (Some(file), Some(line)) => stack_top_matches(&stack, file, line),
+                (Some(file), Some(line)) => stack_top_matches(&stack, file, line)?,
                 _ => true,
             };
             let condition_matches = match &args.condition {
@@ -1129,24 +1130,53 @@ fn session_matches_device(session: &Value, device: &str) -> bool {
     serial == Some(device) || avd == Some(device)
 }
 
-fn stack_top_matches(stack: &Value, file: &str, line: u32) -> bool {
+fn stack_top_matches(stack: &Value, file: &str, line: u32) -> Result<bool> {
     let Some(frame) = stack
         .get("frames")
         .and_then(Value::as_array)
         .and_then(|frames| frames.first())
     else {
-        return false;
+        return Ok(false);
     };
-    let frame_line = frame.get("line").and_then(Value::as_u64).unwrap_or(0) as u32;
+    let frame_line = debugger_frame_line(frame)?;
     if frame_line != line {
-        return false;
+        return Ok(false);
     }
     let frame_file = frame
         .get("file")
         .or_else(|| frame.get("source"))
         .and_then(Value::as_str)
         .unwrap_or_default();
-    frame_file == file || file.ends_with(frame_file)
+    Ok(frame_file == file || file.ends_with(frame_file))
+}
+
+fn debugger_frame_line(frame: &Value) -> Result<u32> {
+    let value = frame.get("line").ok_or_else(|| {
+        debugger_frame_line_error(None, "the debugger stack frame omitted `line`")
+    })?;
+    let raw = value.as_u64().ok_or_else(|| {
+        debugger_frame_line_error(
+            Some(value),
+            "the debugger stack frame `line` is not a non-negative integer",
+        )
+    })?;
+    u32::try_from(raw).map_err(|_| {
+        debugger_frame_line_error(
+            Some(value),
+            "the debugger stack frame `line` exceeds the supported u32 range",
+        )
+    })
+}
+
+fn debugger_frame_line_error(value: Option<&Value>, message: &str) -> anyhow::Error {
+    crate::diagnostic::DiagnosticError::new("debugger_bridge_protocol", "debugger", message)
+        .retryable(true)
+        .detail(serde_json::json!({"field": "line", "value": value}))
+        .next_actions([
+            "refresh the suspended session and retry",
+            "update the ShadowDroid Android Studio plugin if the malformed frame persists",
+        ])
+        .into()
 }
 
 fn eval_truthy(eval: &Value) -> bool {
@@ -1278,7 +1308,9 @@ impl BridgeClient {
             return Err(crate::diagnostic::DiagnosticError::new(
                 "debugger_bridge_rejected",
                 "debugger",
-                format!("Android Studio debugger bridge rejected the request (HTTP {status}): {message}"),
+                format!(
+                    "Android Studio debugger bridge rejected the request (HTTP {status}): {message}"
+                ),
             )
             .detail(serde_json::json!({
                 "route": path,
@@ -1337,10 +1369,10 @@ fn route_is_session_scoped(path: &str) -> bool {
 }
 
 fn resolve_url(explicit_url: Option<&str>) -> Result<String> {
-    if let Some(url) = explicit_url {
-        if !url.trim().is_empty() {
-            return Ok(url.trim().to_string());
-        }
+    if let Some(url) = explicit_url
+        && !url.trim().is_empty()
+    {
+        return Ok(url.trim().to_string());
     }
     if let Some(url) = registry_url()? {
         return Ok(url);
@@ -1349,8 +1381,7 @@ fn resolve_url(explicit_url: Option<&str>) -> Result<String> {
 }
 
 fn registry_url() -> Result<Option<String>> {
-    let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
-    let path = PathBuf::from(home).join(studio_contract::REGISTRY_PATH);
+    let path = shadowdroid_home()?.join(studio_contract::REGISTRY_FILE);
     if !path.exists() {
         return Ok(None);
     }
@@ -1385,6 +1416,20 @@ mod tests {
     }
 
     #[test]
+    fn debugger_frame_lines_are_range_checked() {
+        let frame = json!({"file": "Main.kt", "line": 42});
+        assert_eq!(debugger_frame_line(&frame).unwrap(), 42);
+
+        let frame = json!({"file": "Main.kt", "line": u64::from(u32::MAX) + 1});
+        let error = debugger_frame_line(&frame).unwrap_err();
+        assert_eq!(
+            crate::cli::error_code_of(&error),
+            "debugger_bridge_protocol"
+        );
+        assert!(error.to_string().contains("u32 range"));
+    }
+
+    #[test]
     fn session_routes_carry_the_clients_device() {
         let bridge = BridgeClient::with_device(Some(URL), Some("emulator-5556")).unwrap();
         let u = bridge.url(route::SESSION_STACK, &[(query::LIMIT, Some("4"))]);
@@ -1393,9 +1438,11 @@ mod tests {
             u.contains("device=emulator-5556"),
             "session route should carry device: {u}"
         );
-        assert!(bridge
-            .url(route::WATCHES, &[])
-            .contains("device=emulator-5556"));
+        assert!(
+            bridge
+                .url(route::WATCHES, &[])
+                .contains("device=emulator-5556")
+        );
     }
 
     #[test]
@@ -1403,9 +1450,11 @@ mod tests {
         let bridge = BridgeClient::with_device(Some(URL), Some("emulator-5556")).unwrap();
         assert!(!bridge.url(route::STATUS, &[]).contains("device="));
         assert!(!bridge.url(route::SESSIONS, &[]).contains("device="));
-        assert!(!bridge
-            .url(route::WATCHES_ADD, &[(query::EXPRESSION, Some("x"))])
-            .contains("device="));
+        assert!(
+            !bridge
+                .url(route::WATCHES_ADD, &[(query::EXPRESSION, Some("x"))])
+                .contains("device=")
+        );
     }
 
     #[test]

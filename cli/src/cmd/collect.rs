@@ -85,10 +85,10 @@ pub async fn run(
         "logcat.txt",
         &adb::recent_logcat(serial, 500).await.join("\n"),
     );
-    if let Ok(crash) = adb::shell(serial, "logcat -d -b crash -t 200").await {
-        if !crash.trim().is_empty() {
-            bundle.write_text("logcat_crash.txt", &crash);
-        }
+    if let Ok(crash) = adb::shell(serial, "logcat -d -b crash -t 200").await
+        && !crash.trim().is_empty()
+    {
+        bundle.write_text("logcat_crash.txt", &crash);
     }
     if let Ok(owners) = adb::ps_ui_automation_owners(serial).await {
         let body = if owners.is_empty() {

@@ -74,11 +74,7 @@ pub fn text_matches(actual: Option<&str>, expected: Option<&str>, exact: bool) -
     };
     let a = normalize(actual).to_lowercase();
     let e = normalize(expected).to_lowercase();
-    if exact {
-        a == e
-    } else {
-        a.contains(&e)
-    }
+    if exact { a == e } else { a.contains(&e) }
 }
 
 /// Raised when an *action* selector (tap / focus / type-into-field) matches more

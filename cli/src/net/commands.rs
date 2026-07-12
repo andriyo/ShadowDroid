@@ -3,14 +3,15 @@
 //! run host-only logic. `cli::dispatch_net` routes the parsed clap command here.
 
 use crate::ids::Serial;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use crate::device::adb;
+use crate::device::{adb, installer};
 use crate::events;
-use crate::net::{control, daemon, paths, store, DaemonConfig, Matcher, Mutation, RuleSpec};
+use crate::net::{DaemonConfig, Matcher, Mutation, RuleSpec, control, daemon, paths, store};
 
 /// Emit a `{"type":"action","cmd":<cmd>, …}` line — thin adapter over the shared
 /// [`crate::events::emit_action`].
@@ -53,18 +54,552 @@ fn checked_control_reply(op: &str, reply: serde_json::Value) -> Result<serde_jso
     }
 }
 
-/// Best-effort terminate a wedged daemon by pid when the control socket is
-/// unreachable. Portable: `kill` on Unix, `taskkill` on Windows (the control
-/// socket is TCP precisely so `net` works on Windows, so the fallback must too).
-fn kill_pid(pid: u32) {
+fn daemon_port_field(status: &serde_json::Value, field: &str) -> Result<Option<u16>> {
+    let Some(value) = status.get(field) else {
+        return Ok(None);
+    };
+    let Some(raw) = value.as_u64() else {
+        return Err(invalid_daemon_port(field, value, status));
+    };
+    match u16::try_from(raw) {
+        Ok(port) if port != 0 => Ok(Some(port)),
+        _ => Err(invalid_daemon_port(field, value, status)),
+    }
+}
+
+fn invalid_daemon_port(
+    field: &str,
+    value: &serde_json::Value,
+    status: &serde_json::Value,
+) -> anyhow::Error {
+    crate::diagnostic::DiagnosticError::new(
+        "net_daemon_protocol",
+        "net",
+        format!("net daemon returned invalid `{field}`; expected an integer from 1 to 65535"),
+    )
+    .retryable(true)
+    .detail(json!({"field": field, "value": value, "daemon_status": status}))
+    .next_actions([
+        "run `shadowdroid net stop`, then `shadowdroid net start`",
+        "retry the original command",
+    ])
+    .into()
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum DaemonProcessIdentity {
+    Matching(String),
+    Missing,
+    Mismatched(String),
+    Unknown(String),
+}
+
+impl DaemonProcessIdentity {
+    fn state(&self) -> &'static str {
+        match self {
+            Self::Matching(_) => "matching",
+            Self::Missing => "missing",
+            Self::Mismatched(_) => "mismatched",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+
+    fn command(&self) -> Option<&str> {
+        match self {
+            Self::Matching(command) | Self::Mismatched(command) => Some(command),
+            Self::Missing | Self::Unknown(_) => None,
+        }
+    }
+
+    fn error(&self) -> Option<&str> {
+        match self {
+            Self::Unknown(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+fn daemon_command_matches(command: &str, serial: &Serial, startup_id: &str) -> bool {
+    if startup_id.is_empty() {
+        return false;
+    }
+    let tokens = command
+        .split_whitespace()
+        .map(|token| token.trim_matches(['\'', '"']))
+        .collect::<Vec<_>>();
+    tokens.iter().any(|token| token.contains("shadowdroid"))
+        && tokens.windows(2).any(|pair| pair == ["net", "daemon"])
+        && tokens
+            .windows(2)
+            .any(|pair| pair[0] == "--serial" && pair[1] == serial.as_str())
+        && tokens
+            .windows(2)
+            .any(|pair| pair[0] == "--startup-id" && pair[1] == startup_id)
+}
+
+fn classify_daemon_command(
+    command: String,
+    serial: &Serial,
+    startup_id: &str,
+) -> DaemonProcessIdentity {
+    if daemon_command_matches(&command, serial, startup_id) {
+        DaemonProcessIdentity::Matching(command)
+    } else {
+        DaemonProcessIdentity::Mismatched(command)
+    }
+}
+
+/// Inspect the command line immediately before using a pidfile as authority.
+/// PID values can be stale and reused, so a numeric match alone is never enough
+/// to signal a process.
+fn inspect_daemon_process(pid: u32, serial: &Serial, startup_id: &str) -> DaemonProcessIdentity {
+    if pid == 0 || startup_id.is_empty() {
+        return DaemonProcessIdentity::Unknown("incomplete daemon identity".into());
+    }
     #[cfg(unix)]
-    let _ = std::process::Command::new("kill")
-        .arg(pid.to_string())
-        .status();
+    {
+        let output = match std::process::Command::new("ps")
+            .args(["-ww", "-p", &pid.to_string(), "-o", "command="])
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) => return DaemonProcessIdentity::Unknown(error.to_string()),
+        };
+        if !output.status.success() {
+            return if output.status.code() == Some(1) {
+                DaemonProcessIdentity::Missing
+            } else {
+                DaemonProcessIdentity::Unknown(
+                    String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                )
+            };
+        }
+        let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if command.is_empty() {
+            DaemonProcessIdentity::Missing
+        } else {
+            classify_daemon_command(command, serial, startup_id)
+        }
+    }
     #[cfg(windows)]
-    let _ = std::process::Command::new("taskkill")
+    {
+        let script = format!(
+            "$p = Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}'; \
+             if ($null -eq $p) {{ exit 3 }}; [Console]::Out.Write($p.CommandLine)"
+        );
+        let output = match std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) => return DaemonProcessIdentity::Unknown(error.to_string()),
+        };
+        if output.status.code() == Some(3) {
+            return DaemonProcessIdentity::Missing;
+        }
+        if !output.status.success() {
+            return DaemonProcessIdentity::Unknown(
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            );
+        }
+        let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if command.is_empty() {
+            DaemonProcessIdentity::Missing
+        } else {
+            classify_daemon_command(command, serial, startup_id)
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (pid, serial, startup_id);
+        DaemonProcessIdentity::Unknown("process inspection is unsupported on this platform".into())
+    }
+}
+
+/// Send a termination signal only after [`inspect_daemon_process`] proves the
+/// pid still belongs to the expected daemon. The caller must subsequently
+/// verify that the process exited; command success alone is not sufficient.
+fn send_termination_signal(pid: u32) -> Result<bool> {
+    if pid == 0 {
+        bail!("refusing to signal pid 0")
+    }
+    #[cfg(unix)]
+    let status = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .context("run kill")?;
+    #[cfg(windows)]
+    let status = std::process::Command::new("taskkill")
         .args(["/F", "/PID", &pid.to_string()])
-        .status();
+        .status()
+        .context("run taskkill")?;
+    #[cfg(not(any(unix, windows)))]
+    bail!("forced daemon termination is unsupported on this platform");
+    #[cfg(any(unix, windows))]
+    Ok(status.success())
+}
+
+fn daemon_start_timeout(serial: &Serial, daemon_pid: u32, startup_id: &str) -> Result<()> {
+    let log = paths::daemon_log_path(serial)?;
+    let log_tail = daemon::log_tail(&log, 10);
+    Err(crate::diagnostic::DiagnosticError::new(
+        "net_daemon_start_timeout",
+        "net",
+        "net daemon did not become ready within 5 seconds",
+    )
+    .retryable(true)
+    .detail(json!({
+        "device": serial.as_str(),
+        "daemon_pid": daemon_pid,
+        "startup_id": startup_id,
+        "timeout_ms": 5_000,
+        "log": log.display().to_string(),
+        "log_tail": log_tail,
+    }))
+    .next_actions([
+        format!(
+            "tail -n 50 {}",
+            crate::events::shell_token(&log.display().to_string())
+        ),
+        "shadowdroid net start".to_string(),
+        "shadowdroid net status".to_string(),
+        "shadowdroid doctor --json".to_string(),
+    ])
+    .into())
+}
+
+fn lifecycle_busy(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::diagnostic::DiagnosticError>()
+        .is_some_and(|diagnostic| diagnostic.code == "device_lifecycle_busy")
+}
+
+async fn request_daemon_stop(serial: &Serial) -> bool {
+    control::request(serial, json!({"op": "stop"}))
+        .await
+        .ok()
+        .and_then(|reply| reply.get("ok").and_then(serde_json::Value::as_bool))
+        == Some(true)
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+struct DaemonIdentity {
+    startup_id: Option<String>,
+    pid: Option<u32>,
+}
+
+impl DaemonIdentity {
+    fn from_status(status: Option<&serde_json::Value>, pid_file: Option<u32>) -> Self {
+        let status = status.filter(|value| {
+            value.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
+                && value.get("running").and_then(serde_json::Value::as_bool) == Some(true)
+        });
+        let startup_id = status
+            .and_then(|value| value.get("startup_id"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let status_pid = status
+            .and_then(|value| value.get("pid"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|pid| *pid != 0);
+        Self {
+            startup_id,
+            pid: status_pid.or(pid_file),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.startup_id.is_none() && self.pid.is_none()
+    }
+
+    fn force_identity(&self) -> Option<(&str, u32)> {
+        Some((
+            self.startup_id
+                .as_deref()
+                .filter(|value| !value.is_empty())?,
+            self.pid.filter(|pid| *pid != 0)?,
+        ))
+    }
+}
+
+fn daemon_status_matches_identity(status: &serde_json::Value, expected: &DaemonIdentity) -> bool {
+    if expected.is_empty()
+        || status.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
+        || status.get("running").and_then(serde_json::Value::as_bool) != Some(true)
+    {
+        return false;
+    }
+    if let Some(startup_id) = &expected.startup_id
+        && status.get("startup_id").and_then(serde_json::Value::as_str) != Some(startup_id.as_str())
+    {
+        return false;
+    }
+    if let Some(pid) = expected.pid
+        && status.get("pid").and_then(serde_json::Value::as_u64) != Some(u64::from(pid))
+    {
+        return false;
+    }
+    true
+}
+
+fn require_daemon_serial(status: &serde_json::Value, serial: &Serial) -> Result<()> {
+    if status.get("serial").and_then(serde_json::Value::as_str) == Some(serial.as_str()) {
+        return Ok(());
+    }
+    Err(crate::diagnostic::DiagnosticError::new(
+        "net_daemon_identity_mismatch",
+        "net",
+        "the control endpoint belongs to a different device daemon",
+    )
+    .detail(json!({
+        "expected_serial": serial.as_str(),
+        "daemon_serial": status.get("serial"),
+        "daemon_status": status,
+    }))
+    .next_actions([
+        "do not mutate this daemon; remove stale pre-0.12 net marker files manually after inspecting them",
+        "run `shadowdroid net status --json` for the intended device",
+    ])
+    .into())
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct OwnedDaemonMarkers {
+    ctl: bool,
+    pid: bool,
+}
+
+impl OwnedDaemonMarkers {
+    fn any(self) -> bool {
+        self.ctl || self.pid
+    }
+}
+
+async fn owned_daemon_markers(
+    serial: &Serial,
+    expected: &DaemonIdentity,
+) -> Result<OwnedDaemonMarkers> {
+    if expected.is_empty() {
+        return Ok(OwnedDaemonMarkers::default());
+    }
+    let ctl_path = paths::ctl_path(serial)?;
+    let ctl_exists = ctl_path.exists();
+    let pid_owned = expected
+        .pid
+        .is_some_and(|pid| control::daemon_pid(serial) == Some(pid));
+    let status = if ctl_exists {
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            control::request(serial, json!({"op": "status"})),
+        )
+        .await
+        .ok()
+        .and_then(std::result::Result::ok)
+    } else {
+        None
+    };
+    let ctl_owned = ctl_exists
+        && (status.as_ref().is_some_and(|status| {
+            require_daemon_serial(status, serial).is_ok()
+                && daemon_status_matches_identity(status, expected)
+        }) || (status.is_none() && pid_owned));
+    Ok(OwnedDaemonMarkers {
+        ctl: ctl_owned,
+        pid: pid_owned,
+    })
+}
+
+async fn await_owned_daemon_markers_gone(
+    serial: &Serial,
+    expected: &DaemonIdentity,
+    timeout: Duration,
+) -> Result<bool> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if !owned_daemon_markers(serial, expected).await?.any() {
+            return Ok(true);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn remove_owned_marker(path: PathBuf) -> Result<()> {
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+async fn remove_owned_daemon_markers(serial: &Serial, expected: &DaemonIdentity) -> Result<()> {
+    let owned = owned_daemon_markers(serial, expected).await?;
+    if owned.ctl {
+        remove_owned_marker(paths::ctl_path(serial)?)?;
+    }
+    if owned.pid {
+        remove_owned_marker(paths::pid_path(serial)?)?;
+    }
+    Ok(())
+}
+
+fn daemon_termination_error(
+    serial: &Serial,
+    expected: &DaemonIdentity,
+    inspection: Option<&DaemonProcessIdentity>,
+    message: impl Into<String>,
+) -> anyhow::Error {
+    crate::diagnostic::DiagnosticError::new(
+        "net_daemon_stop_failed",
+        "net",
+        message,
+    )
+    .retryable(true)
+    .detail(json!({
+        "device": serial.as_str(),
+        "expected_pid": expected.pid,
+        "expected_startup_id": expected.startup_id,
+        "process_state": inspection.map(DaemonProcessIdentity::state),
+        "process_command": inspection.and_then(DaemonProcessIdentity::command),
+        "inspection_error": inspection.and_then(DaemonProcessIdentity::error),
+    }))
+    .next_actions([
+        "retry `shadowdroid net stop`",
+        "inspect `shadowdroid net status --json` and the daemon log before removing marker files manually",
+    ])
+    .into()
+}
+
+/// Wait for normal daemon teardown while the transition lock is held. A stuck
+/// daemon is signalled only after its command line proves the exact pid,
+/// serial, and startup identity still belong together. Marker cleanup happens
+/// only after confirmed process exit; a stale/reused pid is never signalled.
+async fn complete_daemon_teardown(
+    serial: &Serial,
+    expected: &DaemonIdentity,
+    graceful_requested: bool,
+) -> Result<()> {
+    if expected.is_empty() {
+        return Ok(());
+    }
+
+    let markers_gone =
+        await_owned_daemon_markers_gone(serial, expected, Duration::from_secs(2)).await?;
+    if markers_gone && graceful_requested {
+        return Ok(());
+    }
+    let Some((startup_id, pid)) = expected.force_identity() else {
+        if markers_gone {
+            return Ok(());
+        }
+        return Err(daemon_termination_error(
+            serial,
+            expected,
+            None,
+            "the network daemon did not stop and no complete owned identity is available for safe termination",
+        ));
+    };
+    let inspection = inspect_daemon_process(pid, serial, startup_id);
+    match &inspection {
+        DaemonProcessIdentity::Missing => {
+            return remove_owned_daemon_markers(serial, expected).await;
+        }
+        DaemonProcessIdentity::Matching(_) => {}
+        DaemonProcessIdentity::Mismatched(_) | DaemonProcessIdentity::Unknown(_) => {
+            return Err(daemon_termination_error(
+                serial,
+                expected,
+                Some(&inspection),
+                "refusing to terminate a process whose command line does not prove it is the expected network daemon",
+            ));
+        }
+    }
+
+    if !send_termination_signal(pid)? {
+        let after_signal = inspect_daemon_process(pid, serial, startup_id);
+        if after_signal == DaemonProcessIdentity::Missing {
+            return remove_owned_daemon_markers(serial, expected).await;
+        }
+        return Err(daemon_termination_error(
+            serial,
+            expected,
+            Some(&after_signal),
+            "the operating system rejected network-daemon termination",
+        ));
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let inspection = inspect_daemon_process(pid, serial, startup_id);
+        match &inspection {
+            DaemonProcessIdentity::Missing => {
+                return remove_owned_daemon_markers(serial, expected).await;
+            }
+            DaemonProcessIdentity::Matching(_) => {}
+            DaemonProcessIdentity::Mismatched(_) | DaemonProcessIdentity::Unknown(_) => {
+                return Err(daemon_termination_error(
+                    serial,
+                    expected,
+                    Some(&inspection),
+                    "network-daemon exit could not be confirmed after termination",
+                ));
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(daemon_termination_error(
+                serial,
+                expected,
+                Some(&inspection),
+                "the network daemon remained alive after termination",
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_child_exit(child: &mut std::process::Child, timeout: Duration) -> Result<bool> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if child
+            .try_wait()
+            .context("inspect net daemon child")?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Stop a daemon that this process just spawned. The live Child handle is
+/// stronger authority than any marker or PID lookup and also lets us reap the
+/// process on every startup-failure path.
+async fn terminate_spawned_daemon(
+    serial: &Serial,
+    expected: &DaemonIdentity,
+    child: &mut std::process::Child,
+    graceful_requested: bool,
+) -> Result<()> {
+    if graceful_requested && wait_for_child_exit(child, Duration::from_secs(2)).await? {
+        return remove_owned_daemon_markers(serial, expected).await;
+    }
+    child.kill().context("terminate failed net daemon child")?;
+    if !wait_for_child_exit(child, Duration::from_secs(2)).await? {
+        return Err(daemon_termination_error(
+            serial,
+            expected,
+            None,
+            "the freshly spawned network daemon did not exit after termination",
+        ));
+    }
+    remove_owned_daemon_markers(serial, expected).await
 }
 
 // ── lifecycle ─────────────────────────────────────────────────
@@ -85,8 +620,12 @@ pub struct StartOpts {
     pub ca_key: PathBuf,
 }
 
-const NETWORK_STATE_SCHEMA: u32 = 1;
+const NETWORK_STATE_SCHEMA: u32 = 2;
 const RAW_IP_CANARY: &str = "8.8.8.8";
+
+fn net_lifecycle_serial(serial: &Serial) -> Serial {
+    Serial::new(format!("net:{serial}"))
+}
 
 /// The device-side state ShadowDroid owns for one proxy session. Persist this
 /// before wiring so `net stop` can recover after either process crashes.
@@ -94,8 +633,14 @@ const RAW_IP_CANARY: &str = "8.8.8.8";
 struct DeviceNetworkState {
     schema_version: u32,
     serial: String,
+    /// Empty only for state written before startup ownership was introduced.
+    #[serde(default)]
+    startup_id: String,
     /// `None` means the setting did not exist (`settings get` returned null).
     prior_http_proxy: Option<String>,
+    /// Host endpoint previously mapped from `tcp:<device_port>`, if any.
+    #[serde(default)]
+    prior_reverse_host_port: Option<u16>,
     device_port: u16,
     host_port: u16,
     captured_at: f64,
@@ -127,6 +672,12 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
         ca_cert,
         ca_key,
     } = opts;
+    // Network transitions use their own lifecycle namespace so start/stop for
+    // one device cannot race each other, without blocking unrelated UI-server
+    // lifecycle work on that device.
+    let lifecycle_serial = net_lifecycle_serial(serial);
+    let lifecycle_guard = installer::acquire_lifecycle_lock(&lifecycle_serial)?;
+
     // A live daemon may outlive the device-side reverse/proxy settings (most
     // commonly after a device reboot). Reuse its actual ports and repair the
     // wiring idempotently instead of forcing stop/start and losing rules.
@@ -135,16 +686,9 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
             "status",
             control::request(serial, json!({"op": "status"})).await?,
         )?;
-        let daemon_port = daemon_status
-            .get("port")
-            .and_then(|value| value.as_u64())
-            .map(|value| value as u16)
-            .unwrap_or(port);
-        let Some(host_port) = daemon_status
-            .get("host_port")
-            .and_then(|value| value.as_u64())
-            .map(|value| value as u16)
-        else {
+        require_daemon_serial(&daemon_status, serial)?;
+        let daemon_port = daemon_port_field(&daemon_status, "port")?.unwrap_or(port);
+        let Some(host_port) = daemon_port_field(&daemon_status, "host_port")? else {
             return Err(crate::diagnostic::DiagnosticError::new(
                 "net_daemon_metadata_missing",
                 "net",
@@ -183,6 +727,11 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
             })
         };
 
+        let daemon_startup_id = daemon_status
+            .get("startup_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         let state_existed = load_device_network_state(serial)?.is_some();
         if !state_existed {
             // Compatibility path for a daemon started by an older CLI. If the
@@ -197,13 +746,32 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
             save_device_network_state(&DeviceNetworkState {
                 schema_version: NETWORK_STATE_SCHEMA,
                 serial: serial.to_string(),
+                startup_id: daemon_startup_id.clone(),
                 prior_http_proxy: prior,
+                prior_reverse_host_port: match reverse_host_port(serial, daemon_port).await? {
+                    Some(existing) if existing == host_port => None,
+                    other => other,
+                },
                 device_port: daemon_port,
                 host_port,
                 captured_at: events::now_ts(),
             })?;
         }
-        setup_wiring(serial, daemon_port, host_port).await?;
+        let current_reverse = reverse_host_port(serial, daemon_port).await?;
+        let saved_prior = load_device_network_state(serial)?
+            .filter(|state| state.startup_id == daemon_startup_id)
+            .and_then(|state| state.prior_reverse_host_port);
+        let expected_reverse = if current_reverse == Some(host_port)
+            || current_reverse.is_none()
+            || current_reverse == saved_prior
+        {
+            current_reverse
+        } else {
+            bail!(
+                "refusing to rewire adb reverse tcp:{daemon_port}: current host {current_reverse:?} is not owned by the running ShadowDroid session"
+            );
+        };
+        setup_wiring(serial, daemon_port, host_port, expected_reverse).await?;
         emit(
             "net_start",
             json!({
@@ -223,24 +791,33 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
     // A dead daemon can leave its state file and wiring behind. Restore it
     // before starting a genuinely new session so the new snapshot is truthful.
     if let Some(stale) = load_device_network_state(serial)? {
-        restore_network_state(serial, &stale).await?;
+        let outcome = restore_network_state(serial, &stale).await?;
+        for warning in outcome.warnings {
+            tracing::warn!(warning);
+        }
         remove_device_network_state(serial)?;
     }
 
     // Host loopback port is per-serial so concurrent daemons for different
     // devices don't fight over one port; the device-facing `port` stays stable.
-    let host_port = crate::device::portmap::free_loopback_port()?;
+    let startup_id = crate::net::new_startup_id();
+    let host_allocation = crate::device::portmap::reserve_loopback_port()?;
+    let host_port = host_allocation.port();
     let device_state = DeviceNetworkState {
         schema_version: NETWORK_STATE_SCHEMA,
         serial: serial.to_string(),
+        startup_id: startup_id.clone(),
         prior_http_proxy: read_http_proxy(serial).await?,
+        prior_reverse_host_port: reverse_host_port(serial, port).await?,
         device_port: port,
         host_port,
         captured_at: events::now_ts(),
     };
     save_device_network_state(&device_state)?;
+    let expected_reverse_host_port = device_state.prior_reverse_host_port;
     let cfg = DaemonConfig {
         serial: serial.clone(),
+        startup_id: startup_id.clone(),
         ca_cert: ca_cert.clone(),
         ca_key: ca_key.clone(),
         port,
@@ -253,62 +830,97 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
     };
 
     if foreground {
-        if let Err(err) = setup_wiring(serial, port, host_port).await {
-            restore_and_consume_network_state(serial, &device_state).await?;
+        let daemon_pid = std::process::id();
+        let mut daemon_task = tokio::spawn(daemon::run(cfg));
+        if !daemon::await_ready(serial, &startup_id, daemon_pid, 5000).await {
+            daemon_task.abort();
+            let _ = daemon_task.await;
+            if control::daemon_pid(serial) == Some(daemon_pid) {
+                let _ = std::fs::remove_file(paths::pid_path(serial)?);
+                let _ = std::fs::remove_file(paths::ctl_path(serial)?);
+            }
+            remove_device_network_state_if_owned(serial, &startup_id)?;
+            return daemon_start_timeout(serial, daemon_pid, &startup_id);
+        }
+        drop(host_allocation);
+        if let Err(err) = setup_wiring(serial, port, host_port, expected_reverse_host_port).await {
+            if !request_daemon_stop(serial).await {
+                daemon_task.abort();
+            }
+            if tokio::time::timeout(Duration::from_secs(2), &mut daemon_task)
+                .await
+                .is_err()
+            {
+                daemon_task.abort();
+                let _ = daemon_task.await;
+            }
+            if control::daemon_pid(serial) == Some(daemon_pid) {
+                remove_owned_marker(paths::pid_path(serial)?)?;
+                remove_owned_marker(paths::ctl_path(serial)?)?;
+            }
+            restore_and_consume_network_state_if_owned(serial, &startup_id).await?;
             return Err(err);
         }
         emit(
             "net_start",
-            json!({"device": serial, "port": port, "mode": "foreground"}),
+            json!({
+                "device": serial,
+                "port": port,
+                "host_port": host_port,
+                "startup_id": startup_id,
+                "mode": "foreground",
+            }),
         );
-        let r = daemon::run(cfg).await;
-        let restore = restore_and_consume_network_state(serial, &device_state).await;
-        r?;
-        restore?;
-        return Ok(());
+        // The transition is complete; holding a cross-process lock for the
+        // daemon's whole foreground lifetime would make `net stop` impossible.
+        drop(lifecycle_guard);
+        let daemon_result = daemon_task
+            .await
+            .context("join foreground net daemon task")?;
+
+        // A concurrent stop (or a new start after an unexpected daemon exit)
+        // owns teardown while it holds the lock. Do not fight it or restore a
+        // snapshot that a newer startup has replaced.
+        let cleanup = match installer::acquire_lifecycle_lock(&lifecycle_serial) {
+            Ok(_cleanup_guard) => {
+                restore_and_consume_network_state_if_owned(serial, &startup_id).await?;
+                Ok(())
+            }
+            Err(error) if lifecycle_busy(&error) => Ok(()),
+            Err(error) => Err(error),
+        };
+        daemon_result?;
+        return cleanup;
     }
 
-    let daemon_pid = match daemon::spawn(&cfg) {
-        Ok(pid) => pid,
+    let mut daemon_child = match daemon::spawn(&cfg) {
+        Ok(child) => child,
         Err(err) => {
-            remove_device_network_state(serial)?;
+            remove_device_network_state_if_owned(serial, &startup_id)?;
             return Err(err);
         }
     };
-    if !daemon::await_ready(serial, 5000).await {
-        kill_pid(daemon_pid);
-        let _ = std::fs::remove_file(paths::pid_path(serial)?);
-        let _ = std::fs::remove_file(paths::ctl_path(serial)?);
-        let log = paths::daemon_log_path(serial)?;
-        let log_tail = daemon::log_tail(&log, 10);
-        remove_device_network_state(serial)?;
-        return Err(crate::diagnostic::DiagnosticError::new(
-            "net_daemon_start_timeout",
-            "net",
-            "net daemon did not become ready within 5 seconds",
-        )
-        .retryable(true)
-        .detail(json!({
-            "device": serial.as_str(),
-            "daemon_pid": daemon_pid,
-            "timeout_ms": 5_000,
-            "log": log.display().to_string(),
-            "log_tail": log_tail,
-        }))
-        .next_actions([
-            format!(
-                "tail -n 50 {}",
-                crate::events::shell_token(&log.display().to_string())
-            ),
-            "shadowdroid net start".to_string(),
-            "shadowdroid net status".to_string(),
-            "shadowdroid doctor --json".to_string(),
-        ])
-        .into());
+    let daemon_pid = daemon_child.id();
+    let expected_daemon = DaemonIdentity {
+        startup_id: Some(startup_id.clone()),
+        pid: Some(daemon_pid),
+    };
+    if !daemon::await_ready(serial, &startup_id, daemon_pid, 5000).await {
+        terminate_spawned_daemon(serial, &expected_daemon, &mut daemon_child, false).await?;
+        remove_device_network_state_if_owned(serial, &startup_id)?;
+        return daemon_start_timeout(serial, daemon_pid, &startup_id);
     }
-    if let Err(err) = setup_wiring(serial, port, host_port).await {
-        let _ = control::request(serial, json!({"op": "stop"})).await;
-        restore_and_consume_network_state(serial, &device_state).await?;
+    drop(host_allocation);
+    if let Err(err) = setup_wiring(serial, port, host_port, expected_reverse_host_port).await {
+        let graceful_requested = request_daemon_stop(serial).await;
+        terminate_spawned_daemon(
+            serial,
+            &expected_daemon,
+            &mut daemon_child,
+            graceful_requested,
+        )
+        .await?;
+        restore_and_consume_network_state_if_owned(serial, &startup_id).await?;
         return Err(err);
     }
     emit(
@@ -317,6 +929,7 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
             "device": serial,
             "port": port,
             "host_port": host_port,
+            "startup_id": startup_id,
             "proxy": format!("localhost:{port}"),
             "apps": apps,
             "anticache": anticache,
@@ -336,56 +949,96 @@ pub async fn stop(
     canary_host: &str,
     ca_cert: &Path,
 ) -> Result<()> {
+    let lifecycle_serial = net_lifecycle_serial(serial);
+    let _lifecycle_guard = installer::acquire_lifecycle_lock(&lifecycle_serial)?;
     let state = load_device_network_state(serial)?;
     let daemon_status = control::request(serial, json!({"op": "status"})).await.ok();
+    if let Some(status) = &daemon_status {
+        require_daemon_serial(status, serial)?;
+    }
     let pid = control::daemon_pid(serial);
+    let mut expected_daemon = DaemonIdentity::from_status(daemon_status.as_ref(), pid);
+    if expected_daemon.startup_id.is_none() {
+        expected_daemon.startup_id = state
+            .as_ref()
+            .map(|state| state.startup_id.clone())
+            .filter(|startup_id| !startup_id.is_empty());
+    }
     let initial_http_proxy = read_http_proxy(serial).await?;
-    let dangling_legacy_proxy = daemon_status.is_none()
-        && pid.is_none()
-        && state.is_none()
-        && initial_http_proxy
-            .as_deref()
-            .is_some_and(|value| value.starts_with("localhost:"));
-    let already_stopped =
-        daemon_status.is_none() && pid.is_none() && state.is_none() && !dangling_legacy_proxy;
+    let already_stopped = daemon_status.is_none() && pid.is_none() && state.is_none();
 
-    let stopped = if daemon_status.is_some() {
-        control::request(serial, json!({"op": "stop"}))
-            .await
-            .is_ok()
-    } else if let Some(pid) = pid {
-        // Socket unreachable — kill a possibly-wedged daemon by pid.
-        kill_pid(pid);
-        true
+    let daemon_evidence = daemon_status.is_some() || pid.is_some();
+    let stop_requested = if daemon_status.is_some() {
+        request_daemon_stop(serial).await
     } else {
         false
     };
+    if daemon_evidence {
+        if !stop_requested && expected_daemon.force_identity().is_none() {
+            return Err(daemon_termination_error(
+                serial,
+                &expected_daemon,
+                None,
+                "the network daemon is unreachable and its pid/startup ownership cannot be proven safely",
+            ));
+        }
+        complete_daemon_teardown(serial, &expected_daemon, stop_requested).await?;
+    }
+    let stopped = daemon_evidence;
 
     let mut warnings = Vec::<String>::new();
-    let (http_proxy_restored, adb_reverse_removed, prior_http_proxy) = if let Some(state) = &state {
-        restore_network_state(serial, state).await?;
-        remove_device_network_state(serial)?;
-        (true, true, state.prior_http_proxy.clone())
-    } else if daemon_status.is_some() || pid.is_some() || dangling_legacy_proxy {
-        // Compatibility cleanup for an old daemon that has no persisted
-        // state. Be explicit that exact restoration was impossible.
-        let port = daemon_status
-            .as_ref()
-            .and_then(|value| value.get("port"))
-            .and_then(|value| value.as_u64())
-            .map(|value| value as u16)
-            .unwrap_or(crate::net::DEFAULT_PROXY_PORT);
-        legacy_teardown_wiring(serial, port).await?;
-        warnings.push(
-            "no pre-proxy state was available; cleared http_proxy using the legacy :0 fallback"
-                .into(),
-        );
-        (false, true, None)
-    } else {
-        // Idempotent already-stopped path: do not overwrite a proxy setting
-        // owned by the user or another tool.
-        (false, false, read_http_proxy(serial).await?)
-    };
+    let (http_proxy_restored, adb_reverse_restored, adb_reverse_removed, prior_http_proxy) =
+        if let Some(state) = &state {
+            let outcome = restore_network_state(serial, state).await?;
+            remove_device_network_state(serial)?;
+            warnings.extend(outcome.warnings);
+            (
+                outcome.http_proxy_restored,
+                outcome.adb_reverse_restored,
+                outcome.adb_reverse_removed,
+                state.prior_http_proxy.clone(),
+            )
+        } else if let Some(status) = &daemon_status {
+            // Compatibility cleanup for a daemon with no persisted snapshot. Only
+            // remove wiring when both current fields still prove ownership; the
+            // prior values are unknowable, so never touch an arbitrary localhost
+            // proxy or a reverse mapping owned by another tool.
+            let port = daemon_port_field(status, "port")?;
+            let host_port = daemon_port_field(status, "host_port")?;
+            let mut proxy_removed = false;
+            let mut reverse_removed = false;
+            if let (Some(port), Some(host_port)) = (port, host_port) {
+                let current_proxy = read_http_proxy(serial).await?;
+                let current_reverse = reverse_host_port(serial, port).await?;
+                if proxy_points_at(&current_proxy, port) && current_reverse == Some(host_port) {
+                    restore_http_proxy(serial, &None).await?;
+                    // A stale reverse is harmless; a localhost proxy whose reverse
+                    // has already disappeared breaks all device networking. Clear
+                    // the proxy first so a partial failure remains recoverable.
+                    adb::reverse_replace(serial, port, Some(host_port), None).await?;
+                    proxy_removed = true;
+                    reverse_removed = true;
+                    warnings.push(
+                    "no pre-proxy state was available; removed only wiring still proven to belong to this daemon"
+                        .into(),
+                );
+                } else {
+                    warnings.push(format!(
+                    "preserved unowned device wiring (http_proxy {current_proxy:?}, reverse host {current_reverse:?}) because no pre-proxy snapshot exists"
+                ));
+                }
+            } else {
+                warnings.push(
+                "preserved device wiring because the daemon did not expose enough metadata to prove ownership"
+                    .into(),
+            );
+            }
+            (proxy_removed, false, reverse_removed, None)
+        } else {
+            // Idempotent already-stopped path: do not overwrite a proxy setting
+            // owned by the user or another tool.
+            (false, false, false, initial_http_proxy)
+        };
 
     let connectivity = connectivity_check(serial, canary_host).await;
     let connectivity_restored = connectivity.connectivity_restored;
@@ -415,7 +1068,9 @@ pub async fn stop(
             "http_proxy_restored": http_proxy_restored,
             "prior_http_proxy": prior_http_proxy,
             "current_http_proxy": read_http_proxy(serial).await?,
+            "adb_reverse_restored": adb_reverse_restored,
             "adb_reverse_removed": adb_reverse_removed,
+            "prior_reverse_host_port": state.as_ref().and_then(|state| state.prior_reverse_host_port),
             "raw_ip_check": raw_ip_check,
             "dns_check": dns_check,
             "connectivity_restored": connectivity_restored,
@@ -437,12 +1092,10 @@ pub async fn status(serial: &Serial, ca_cert: Option<&Path>) -> Result<()> {
     };
     let port = daemon
         .as_ref()
-        .and_then(|d| d.get("port").and_then(|p| p.as_u64()))
-        .map(|p| p as u16);
+        .map_or(Ok(None), |status| daemon_port_field(status, "port"))?;
     let host_port = daemon
         .as_ref()
-        .and_then(|d| d.get("host_port").and_then(|p| p.as_u64()))
-        .map(|p| p as u16);
+        .map_or(Ok(None), |status| daemon_port_field(status, "host_port"))?;
 
     let http_proxy = adb::shell(serial, "settings get global http_proxy")
         .await
@@ -502,14 +1155,44 @@ fn reverse_mapping_matches(
         .any(|mapping| mapping.device == expected_device && mapping.host == expected_host)
 }
 
+async fn reverse_host_port(serial: &Serial, device_port: u16) -> Result<Option<u16>> {
+    let device = format!("tcp:{device_port}");
+    let mapping = adb::reverse_list(serial)
+        .await?
+        .into_iter()
+        .find(|mapping| mapping.device == device);
+    let Some(mapping) = mapping else {
+        return Ok(None);
+    };
+    let Some(host) = mapping.host.strip_prefix("tcp:") else {
+        bail!(
+            "cannot safely replace existing adb reverse {} -> {}; remove or relocate it first",
+            mapping.device,
+            mapping.host
+        );
+    };
+    let port = host
+        .parse::<u16>()
+        .with_context(|| format!("parse existing adb reverse host endpoint {}", mapping.host))?;
+    if port == 0 {
+        bail!("existing adb reverse host port cannot be zero")
+    }
+    Ok(Some(port))
+}
+
 /// Point the device at the host proxy: `adb reverse` so the device's
 /// `localhost:<port>` tunnels to the host's `localhost:<host_port>` (where the
 /// daemon binds), then set the system `http_proxy` to the device-facing port.
 /// `port` and `host_port` differ so concurrent devices share the device-side
 /// port but each own a distinct host port.
-async fn setup_wiring(serial: &Serial, port: u16, host_port: u16) -> Result<()> {
-    adb::reverse(serial, port, host_port).await?;
-    adb::shell(
+async fn setup_wiring(
+    serial: &Serial,
+    port: u16,
+    host_port: u16,
+    expected_reverse_host_port: Option<u16>,
+) -> Result<()> {
+    adb::reverse_replace(serial, port, expected_reverse_host_port, Some(host_port)).await?;
+    adb::shell_mutating(
         serial,
         format!("settings put global http_proxy localhost:{port}"),
     )
@@ -547,29 +1230,111 @@ async fn restore_http_proxy(serial: &Serial, prior: &Option<String>) -> Result<(
         ),
         None => "settings delete global http_proxy".to_string(),
     };
-    adb::shell(serial, command).await?;
+    adb::shell_mutating(serial, command).await?;
     Ok(())
 }
 
-async fn restore_network_state(serial: &Serial, state: &DeviceNetworkState) -> Result<()> {
-    // Remove the tunnel first so no app can send new traffic through it while
-    // the original proxy setting is being restored.
-    let _ = adb::reverse_remove(serial, state.device_port).await;
-    restore_http_proxy(serial, &state.prior_http_proxy).await
+#[derive(Debug, Default)]
+struct RestoreNetworkOutcome {
+    http_proxy_restored: bool,
+    adb_reverse_restored: bool,
+    adb_reverse_removed: bool,
+    warnings: Vec<String>,
 }
 
-async fn restore_and_consume_network_state(
+async fn restore_network_state(
     serial: &Serial,
     state: &DeviceNetworkState,
-) -> Result<()> {
-    restore_network_state(serial, state).await?;
-    remove_device_network_state(serial)
+) -> Result<RestoreNetworkOutcome> {
+    let mut outcome = RestoreNetworkOutcome::default();
+
+    let current_reverse = reverse_host_port(serial, state.device_port).await?;
+    let owns_reverse = current_reverse == Some(state.host_port);
+    let current_proxy = read_http_proxy(serial).await?;
+    let expected_proxy = format!("localhost:{}", state.device_port);
+    if current_proxy == state.prior_http_proxy {
+        // Already restored by a prior partial attempt (or independently).
+    } else if current_proxy.as_deref() == Some(expected_proxy.as_str())
+        && (owns_reverse || current_reverse.is_none())
+    {
+        // Restore the global proxy first. If the second ADB operation fails,
+        // the remaining reverse is inert and a retry can safely finish it;
+        // doing this in the opposite order can strand a live localhost proxy.
+        // A missing reverse (common after reboot) also makes this exact proxy
+        // endpoint provably dead, so recover it even though the pair is partial.
+        restore_http_proxy(serial, &state.prior_http_proxy).await?;
+        outcome.http_proxy_restored = true;
+    } else {
+        outcome.warnings.push(format!(
+            "preserved http_proxy {:?} because the exact ShadowDroid wiring pair is no longer owned (expected proxy {expected_proxy:?}, reverse host tcp:{})",
+            current_proxy, state.host_port
+        ));
+    }
+
+    if current_reverse == state.prior_reverse_host_port {
+        // Already restored/removed by a prior attempt.
+    } else if owns_reverse {
+        match state.prior_reverse_host_port {
+            Some(previous) => {
+                adb::reverse_replace(
+                    serial,
+                    state.device_port,
+                    Some(state.host_port),
+                    Some(previous),
+                )
+                .await?;
+                outcome.adb_reverse_restored = true;
+            }
+            None => {
+                adb::reverse_replace(serial, state.device_port, Some(state.host_port), None)
+                    .await?;
+                outcome.adb_reverse_removed = true;
+            }
+        }
+    } else {
+        outcome.warnings.push(format!(
+            "preserved adb reverse tcp:{} because its current host {:?} no longer matches ShadowDroid's tcp:{} ownership",
+            state.device_port, current_reverse, state.host_port
+        ));
+    }
+
+    Ok(outcome)
 }
 
-async fn legacy_teardown_wiring(serial: &Serial, port: u16) -> Result<()> {
-    let _ = adb::reverse_remove(serial, port).await;
-    adb::shell(serial, "settings put global http_proxy :0").await?;
-    Ok(())
+fn network_state_owned_by(state: &DeviceNetworkState, startup_id: &str) -> bool {
+    !startup_id.is_empty() && state.startup_id == startup_id
+}
+
+/// Restore a foreground/background startup snapshot only if it is still the
+/// persisted snapshot for that exact startup. The caller holds the net
+/// lifecycle lock, so the ownership check remains stable across the ADB awaits.
+async fn restore_and_consume_network_state_if_owned(
+    serial: &Serial,
+    startup_id: &str,
+) -> Result<bool> {
+    let Some(state) = load_device_network_state(serial)? else {
+        return Ok(false);
+    };
+    if !network_state_owned_by(&state, startup_id) {
+        return Ok(false);
+    }
+    let outcome = restore_network_state(serial, &state).await?;
+    for warning in outcome.warnings {
+        tracing::warn!(warning);
+    }
+    remove_device_network_state(serial)?;
+    Ok(true)
+}
+
+fn remove_device_network_state_if_owned(serial: &Serial, startup_id: &str) -> Result<bool> {
+    let Some(state) = load_device_network_state(serial)? else {
+        return Ok(false);
+    };
+    if !network_state_owned_by(&state, startup_id) {
+        return Ok(false);
+    }
+    remove_device_network_state(serial)?;
+    Ok(true)
 }
 
 fn load_device_network_state(serial: &Serial) -> Result<Option<DeviceNetworkState>> {
@@ -580,7 +1345,8 @@ fn load_device_network_state(serial: &Serial) -> Result<Option<DeviceNetworkStat
     let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
     let state: DeviceNetworkState =
         serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
-    if state.schema_version != NETWORK_STATE_SCHEMA || state.serial != serial.as_str() {
+    if !matches!(state.schema_version, 1 | NETWORK_STATE_SCHEMA) || state.serial != serial.as_str()
+    {
         bail!("invalid device network state in {}", path.display());
     }
     Ok(Some(state))
@@ -651,11 +1417,9 @@ fn parse_ping_check(host: &str, output: &str) -> PingCheck {
 // ── observe (task 8) ──────────────────────────────────────────
 
 pub async fn log(serial: &Serial, matcher: Matcher, limit: usize) -> Result<()> {
-    let flows = store::read_filtered(serial, &matcher, limit)?;
-    let tls_errors = store::read_tls_errors(serial, matcher.host.as_deref())?;
-    // Interleave completed flows with any TLS-handshake failures (issue #5) so a
-    // "why is nothing captured?" moment shows the rejected host inline.
-    let mut items = merge_timeline(serial, &flows, tls_errors, limit);
+    // One bounded pass interleaves completed flows with TLS-handshake failures,
+    // so a "why is nothing captured?" moment shows the rejected host inline.
+    let mut items = store::read_recent_timeline(serial, &matcher, limit)?;
     for v in &mut items {
         attach_recalled_tls_actions(serial, v);
         events::emit(v);
@@ -680,30 +1444,6 @@ fn attach_recalled_tls_actions(serial: &Serial, event: &mut serde_json::Value) {
     {
         event["next_actions"] = json!(crate::net::tls_error_next_actions(serial));
     }
-}
-
-/// Merge completed flows (as `http` events) with `tls_error` markers into one
-/// list ordered by `ts`, keeping the most recent `limit` events overall.
-fn merge_timeline(
-    serial: &Serial,
-    flows: &[crate::net::flow::FlowRecord],
-    tls_errors: Vec<serde_json::Value>,
-    limit: usize,
-) -> Vec<serde_json::Value> {
-    let mut items: Vec<(f64, serde_json::Value)> =
-        Vec::with_capacity(flows.len() + tls_errors.len());
-    for f in flows {
-        if let Ok(v) = serde_json::to_value(f.http_event(serial)) {
-            items.push((f.ts, v));
-        }
-    }
-    for v in tls_errors {
-        let ts = v.get("ts").and_then(|t| t.as_f64()).unwrap_or(0.0);
-        items.push((ts, v));
-    }
-    items.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let start = items.len().saturating_sub(limit);
-    items.split_off(start).into_iter().map(|(_, v)| v).collect()
 }
 
 pub async fn show(
@@ -741,45 +1481,45 @@ pub async fn show(
     }
     if control::is_running(serial).await {
         // Ask the daemon with bodies so `--body-file` works on a held flow too.
-        if let Ok(reply) = control::request(serial, json!({"op": "show", "id": id})).await {
-            if let Some(flow_value) = reply.get("flow").filter(|v| !v.is_null()) {
-                let flow: crate::net::flow::FlowRecord = serde_json::from_value(flow_value.clone())
-                    .map_err(|error| {
-                        crate::diagnostic::DiagnosticError::new(
-                            "net_daemon_protocol",
-                            "net",
-                            format!("network daemon returned an invalid held flow: {error}"),
-                        )
-                        .retryable(true)
-                        .detail(json!({"id": id, "reply": reply}))
-                        .next_actions([
-                            "run `shadowdroid net status` to verify the daemon version",
-                            "restart the proxy, then retry `shadowdroid net show`",
-                        ])
-                    })?;
-                if har {
-                    events::emit_result(&json!({
-                        "format": "har",
-                        "id": id,
-                        "held": true,
-                        "har": crate::net::export::to_har(&[flow]),
-                    }));
-                    return Ok(());
-                }
-                if let Some(path) = body_file {
-                    return write_body_file(
-                        id,
-                        flow.resp_body.as_deref(),
-                        flow.resp_truncated,
-                        path,
-                        true,
-                    );
-                }
-                let mut detail = flow.detail(body);
-                detail["held"] = json!(true);
-                events::emit_result(&detail);
+        if let Ok(reply) = control::request(serial, json!({"op": "show", "id": id})).await
+            && let Some(flow_value) = reply.get("flow").filter(|v| !v.is_null())
+        {
+            let flow: crate::net::flow::FlowRecord = serde_json::from_value(flow_value.clone())
+                .map_err(|error| {
+                    crate::diagnostic::DiagnosticError::new(
+                        "net_daemon_protocol",
+                        "net",
+                        format!("network daemon returned an invalid held flow: {error}"),
+                    )
+                    .retryable(true)
+                    .detail(json!({"id": id, "reply": reply}))
+                    .next_actions([
+                        "run `shadowdroid net status` to verify the daemon version",
+                        "restart the proxy, then retry `shadowdroid net show`",
+                    ])
+                })?;
+            if har {
+                events::emit_result(&json!({
+                    "format": "har",
+                    "id": id,
+                    "held": true,
+                    "har": crate::net::export::to_har(&[flow]),
+                }));
                 return Ok(());
             }
+            if let Some(path) = body_file {
+                return write_body_file(
+                    id,
+                    flow.resp_body.as_deref(),
+                    flow.resp_truncated,
+                    path,
+                    true,
+                );
+            }
+            let mut detail = flow.detail(body);
+            detail["held"] = json!(true);
+            events::emit_result(&detail);
+            return Ok(());
         }
     }
     Err(crate::diagnostic::DiagnosticError::new(
@@ -807,7 +1547,9 @@ fn write_body_file(
     held: bool,
 ) -> Result<()> {
     let Some(b) = resp_body else {
-        bail!("flow `{id}` has no captured response body (binary, empty, or non-textual content-type)");
+        bail!(
+            "flow `{id}` has no captured response body (binary, empty, or non-textual content-type)"
+        );
     };
     std::fs::write(path, b).with_context(|| format!("writing {}", path.display()))?;
     emit(
@@ -861,15 +1603,17 @@ pub async fn ca_import(
     cert: &Path,
     key: Option<&Path>,
 ) -> Result<()> {
-    let (info, warnings) = crate::net::ca::import_into(dir, cert, key)?;
-    // A new CA invalidates any cached "trusted" verdict for this device.
-    crate::net::trust::clear_trust_cache(serial);
-    // Keep the freshly-written CA secrets (and .bak backups) out of git.
+    // Project CA material must never be published until its ignore rules are
+    // durable. Propagate failures so a read-only/broken project cannot receive
+    // an unignored private key.
     let gitignore_added = if origin == "project" {
-        crate::config::ensure_shadowdroid_gitignore(dir).unwrap_or_default()
+        crate::config::ensure_shadowdroid_gitignore(dir)?
     } else {
         Vec::new()
     };
+    let (info, warnings) = crate::net::ca::import_into(dir, cert, key)?;
+    // A new CA invalidates any cached "trusted" verdict for this device.
+    crate::net::trust::clear_trust_cache(serial);
 
     // The device still trusts the *old* CA (or none), and a live daemon holds the
     // old CA in memory — spell out both so leaves actually validate.
@@ -914,13 +1658,13 @@ pub async fn ca_info(dir: &Path, origin: &str) -> Result<()> {
 /// resolved scope (the current one is backed up). Also how a project CA is first
 /// minted.
 pub async fn ca_reset(serial: &Serial, dir: &Path, origin: &str) -> Result<()> {
-    let info = crate::net::ca::reset_in(dir)?;
-    crate::net::trust::clear_trust_cache(serial);
     let gitignore_added = if origin == "project" {
-        crate::config::ensure_shadowdroid_gitignore(dir).unwrap_or_default()
+        crate::config::ensure_shadowdroid_gitignore(dir)?
     } else {
         Vec::new()
     };
+    let info = crate::net::ca::reset_in(dir)?;
+    crate::net::trust::clear_trust_cache(serial);
     let mut next = vec!["re-run `shadowdroid net trust` to install the regenerated CA".to_string()];
     if proxy_running(serial).await {
         next.push(
@@ -1092,10 +1836,10 @@ pub async fn rule_add(serial: &Serial, spec: RuleSpec) -> Result<()> {
         "rule_add",
         control::request(serial, json!({"op": "rule_add", "spec": spec})).await?,
     )?;
-    if let Some(w) = warning {
-        if let Some(obj) = reply.as_object_mut() {
-            obj.insert("warning".into(), json!(w));
-        }
+    if let Some(w) = warning
+        && let Some(obj) = reply.as_object_mut()
+    {
+        obj.insert("warning".into(), json!(w));
     }
     emit("net_rule_add", reply);
     Ok(())
@@ -1260,8 +2004,141 @@ pub async fn replay(serial: &Serial, from: &Path, host: Option<String>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::net::flow::FlowRecord;
     use crate::net::Matcher;
+
+    #[tokio::test]
+    async fn project_ca_reset_does_not_publish_before_gitignore_preflight() {
+        let dir = tempfile::tempdir().unwrap();
+        // Invalid UTF-8 makes the existing ignore file unreadable through the
+        // text-preserving updater. Reset must surface that error before it
+        // creates either CA file.
+        std::fs::write(dir.path().join(".gitignore"), [0xff]).unwrap();
+
+        let error = ca_reset(&Serial::new(""), dir.path(), "project")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(".gitignore"), "{error}");
+        assert!(!dir.path().join(paths::CA_CERT_FILE).exists());
+        assert!(!dir.path().join(paths::CA_KEY_FILE).exists());
+    }
+
+    fn network_state(startup_id: &str) -> DeviceNetworkState {
+        DeviceNetworkState {
+            schema_version: NETWORK_STATE_SCHEMA,
+            serial: "emulator-5554".into(),
+            startup_id: startup_id.into(),
+            prior_http_proxy: Some("proxy.example:8888".into()),
+            prior_reverse_host_port: Some(40000),
+            device_port: 8080,
+            host_port: 49152,
+            captured_at: 1.0,
+        }
+    }
+
+    #[test]
+    fn net_lifecycle_lock_uses_a_separate_device_namespace() {
+        let serial = Serial::new("emulator-5554");
+        assert_eq!(net_lifecycle_serial(&serial).as_str(), "net:emulator-5554");
+    }
+
+    #[test]
+    fn legacy_network_state_defaults_to_unowned() {
+        let legacy: DeviceNetworkState = serde_json::from_value(json!({
+            "schema_version": NETWORK_STATE_SCHEMA,
+            "serial": "emulator-5554",
+            "prior_http_proxy": null,
+            "device_port": 8080,
+            "host_port": 49152,
+            "captured_at": 1.0,
+        }))
+        .unwrap();
+        assert!(legacy.startup_id.is_empty());
+        assert!(!network_state_owned_by(&legacy, "new-startup"));
+
+        let owned = network_state("startup-a");
+        assert!(network_state_owned_by(&owned, "startup-a"));
+        assert!(!network_state_owned_by(&owned, "startup-b"));
+        assert!(!network_state_owned_by(&owned, ""));
+    }
+
+    #[test]
+    fn daemon_identity_requires_exact_status_ownership() {
+        let status = json!({"ok": true, "running": true, "startup_id": "startup-a", "pid": 42});
+        let identity = DaemonIdentity::from_status(Some(&status), Some(7));
+        assert_eq!(
+            identity,
+            DaemonIdentity {
+                startup_id: Some("startup-a".into()),
+                pid: Some(42),
+            }
+        );
+        assert!(daemon_status_matches_identity(&status, &identity));
+        assert!(!daemon_status_matches_identity(
+            &json!({"ok": true, "running": true, "startup_id": "startup-b", "pid": 42}),
+            &identity
+        ));
+        assert!(!daemon_status_matches_identity(
+            &json!({"ok": true, "running": true, "startup_id": "startup-a", "pid": 43}),
+            &identity
+        ));
+        assert!(!daemon_status_matches_identity(
+            &json!({"ok": false, "running": true, "startup_id": "startup-a", "pid": 42}),
+            &identity
+        ));
+
+        let overflowing = json!({
+            "ok": true,
+            "running": true,
+            "startup_id": "startup-a",
+            "pid": u64::from(u32::MAX) + 1,
+        });
+        assert_eq!(
+            DaemonIdentity::from_status(Some(&overflowing), Some(7)).pid,
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn force_termination_requires_the_exact_daemon_command_identity() {
+        let serial = Serial::new("emulator-5554");
+        let command = "/opt/bin/shadowdroid net daemon --serial emulator-5554 \
+                       --startup-id startup-a --port 8080";
+        assert!(daemon_command_matches(command, &serial, "startup-a"));
+        assert!(!daemon_command_matches(command, &serial, "startup-b"));
+        assert!(!daemon_command_matches(
+            command,
+            &Serial::new("emulator-5556"),
+            "startup-a"
+        ));
+        assert!(!daemon_command_matches(
+            "/opt/bin/shadowdroid net daemon --serial emulator-5556 \
+             --startup-id startup-a --ca-cert /tmp/emulator-5554/ca.crt",
+            &serial,
+            "startup-a"
+        ));
+        assert!(!daemon_command_matches(
+            "unrelated --serial emulator-5554 --startup-id startup-a",
+            &serial,
+            "startup-a"
+        ));
+        assert_eq!(
+            DaemonIdentity {
+                startup_id: Some("startup-a".into()),
+                pid: Some(42),
+            }
+            .force_identity(),
+            Some(("startup-a", 42))
+        );
+        assert!(
+            DaemonIdentity {
+                startup_id: None,
+                pid: Some(42),
+            }
+            .force_identity()
+            .is_none()
+        );
+    }
 
     #[test]
     fn rejected_control_reply_is_a_nonzero_typed_failure() {
@@ -1273,32 +2150,23 @@ mod tests {
     }
 
     #[test]
-    fn merge_timeline_orders_by_ts_and_keeps_last_n() {
-        let flow = |id: &str, ts: f64| FlowRecord {
-            id: id.into(),
-            ts,
-            method: "GET".into(),
-            scheme: "https".into(),
-            host: "api.example.com".into(),
-            path: "/x".into(),
-            ..Default::default()
-        };
-        let flows = vec![flow("f1", 1.0), flow("f3", 3.0)];
-        let tls = vec![
-            serde_json::json!({"type":"tls_error","ts":2.0,"host":"api.example.com","reason":"r"}),
-        ];
+    fn daemon_ports_reject_wrapping_protocol_values() {
+        let status = json!({"ok": true, "port": 8080});
+        assert_eq!(daemon_port_field(&status, "port").unwrap(), Some(8080));
+        assert_eq!(daemon_port_field(&status, "host_port").unwrap(), None);
 
-        // All three, chronological.
-        let serial = Serial::new("emulator-5554");
-        let all = merge_timeline(&serial, &flows, tls.clone(), 10);
-        let ts: Vec<f64> = all.iter().map(|v| v["ts"].as_f64().unwrap()).collect();
-        assert_eq!(ts, [1.0, 2.0, 3.0]);
-        assert_eq!(all[1]["type"], "tls_error");
-
-        // limit keeps the most recent N across both kinds.
-        let last2 = merge_timeline(&serial, &flows, tls, 2);
-        let ts: Vec<f64> = last2.iter().map(|v| v["ts"].as_f64().unwrap()).collect();
-        assert_eq!(ts, [2.0, 3.0]);
+        for value in [json!(0), json!(u64::from(u16::MAX) + 1), json!("8080")] {
+            let status = json!({"ok": true, "port": value});
+            let error = daemon_port_field(&status, "port").unwrap_err();
+            assert_eq!(crate::cli::error_code_of(&error), "net_daemon_protocol");
+            assert_eq!(
+                error
+                    .downcast_ref::<crate::diagnostic::DiagnosticError>()
+                    .unwrap()
+                    .detail["field"],
+                "port"
+            );
+        }
     }
 
     #[test]
@@ -1313,10 +2181,12 @@ mod tests {
         attach_recalled_tls_actions(&serial, &mut event);
         let actions = event["next_actions"].as_array().unwrap();
         assert!(!actions.is_empty());
-        assert!(actions.iter().all(|action| action
-            .as_str()
-            .unwrap()
-            .starts_with("shadowdroid -d 'emulator-5554; unsafe' net ")));
+        assert!(actions.iter().all(|action| {
+            action
+                .as_str()
+                .unwrap()
+                .starts_with("shadowdroid -d 'emulator-5554; unsafe' net ")
+        }));
     }
 
     fn spec(kind: &str, arg: &str) -> RuleSpec {

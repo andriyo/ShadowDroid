@@ -1,8 +1,12 @@
 [package]
 name = "shadowdroid"
-version = "0.11.1"
-edition = "2021"
-rust-version = "1.82"   # raised: reqwest 0.13 requires 1.81+; modern crates assume 1.80+
+version = "0.12.0"
+edition = "2024"
+# Intentionally tracks the standard-library APIs used by the CLI (not merely
+# dependency metadata). CI compiles this floor separately from the pinned
+# release toolchain.
+rust-version = "1.91"
+resolver = "3"
 description = "Drive Android apps from the command line — streaming JSON events, structured crashes, declarative popup watchers"
 authors = ["Andrii <andriy@...>"]
 license = "Apache-2.0"
@@ -15,11 +19,13 @@ categories = ["command-line-utilities", "development-tools::testing"]
 name = "shadowdroid"
 path = "src/main.rs"
 
+[lints.rust]
+unsafe_code = "forbid"
+
 [dependencies]
 # Versions verified against crates.io as of the latest stable channel.
-# When bumping, prefer the major version, e.g. `tokio = "1"` only if you
-# explicitly mean "any 1.x" — but pinning the minor lets us treat changes
-# as deliberate.
+# Cargo's caret requirements allow semver-compatible updates; Cargo.lock plus
+# `--locked` pins the exact graph used by CI and release builds.
 
 # ── CLI ──────────────────────────────────────────────────────────────────
 clap = { version = "4.6", features = ["derive", "env"] }
@@ -32,26 +38,27 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 
-# ── XML hierarchy parsing (fallback path; usually we ask the server for elements) ──
-quick-xml = { version = "0.40", features = ["serialize"] }
-
 # ── ADB protocol (no shell-out to adb binary) ───────────────────────────
-adb_client = "3.2"        # NB: 3.x is a breaking change from 2.x; touch points are in device/adb.rs
+# 3.x is a breaking change from 2.x; touch points are in device/adb.rs.
+# Disable the default framebuffer feature because ShadowDroid never requests it.
+adb_client = { version = "3.2", default-features = false }
 
 # ── Logcat tail + crash parsing ─────────────────────────────────────────
 regex = "1.12"
 
 # ── Utility ─────────────────────────────────────────────────────────────
-anyhow = "1.0"
+anyhow = "1.0.103"
 thiserror = "2.0"         # derives Display + Error for ServerError / AmbiguousMatch
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 directories = "6.0"       # NB: 6.x renames ProjectDirs::from() variants — sites in installer.rs
 blake3 = "1.8"            # screen hashing
 sha2 = "0.11"             # release APK checksum verification
-futures = "0.3"
+futures-util = "0.3"
+tokio-util = { version = "0.7", features = ["io", "rt"] } # streamed I/O plus tracked/cancellable proxy tasks
+semver = "1.0"            # compare release versions, including pre-release precedence
 urlencoding = "2.1"   # used for ?package= query strings
-zip = { version = "8.6", default-features = false, features = ["deflate"] }
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 tempfile = "3.27"     # same-directory temporary files for atomic config replacement
 # once_cell removed: std::sync::OnceLock (stable since 1.70) covers our use case.
 # Bring it back if we need the &'static initialisation guarantee for ergonomics.
@@ -59,7 +66,7 @@ tempfile = "3.27"     # same-directory temporary files for atomic config replace
 # ── MITM proxy (`net` namespace) ────────────────────────────────────────
 # All already present transitively (verified in Cargo.lock); promoting to
 # direct deps adds no build cost. aws-lc-rs is the active rustls provider.
-hyper = { version = "1.9", features = ["http1", "http2", "server"] }
+hyper = { version = "1.9", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
 http = "1.4"
 http-body-util = "0.1"
@@ -69,12 +76,9 @@ rustls = "0.23"
 rustls-platform-verifier = "0.7" # make --verify-upstream apply to WSS as well as HTTP(S)
 rcgen = { version = "0.14", features = ["x509-parser"] }
 x509-parser = "0.18"     # inspect a user-provided CA cert (SPKI match, CA flag, validity) on `net ca import`; already in lock via rcgen
-flate2 = "1"             # decompress captured gzip/deflate response bodies (already in lock via zip)
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] } # keep zip and proxy decompression on the same backend
 brotli = "8"             # decompress captured `br` response bodies (pure Rust; keeps the single binary)
 ruzstd = "0.8"           # decompress captured `zstd` response bodies (pure Rust decoder, no libzstd C dep)
-
-[dev-dependencies]
-wiremock = "0.6"          # mock the on-device HTTP server for unit tests
 
 [profile.release]
 lto = "thin"

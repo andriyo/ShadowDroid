@@ -224,7 +224,7 @@ fn profile_from_args(a: &ProfileApplyArgs) -> Result<Profile> {
                 "shadowdroid commands --json --describe 'profile apply'",
                 "shadowdroid profile apply --preset automation",
             ])
-            .into())
+            .into());
         }
         None => {}
     }

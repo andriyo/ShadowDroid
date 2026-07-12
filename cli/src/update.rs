@@ -99,15 +99,9 @@ async fn check_latest() -> Result<UpdateCheck> {
 async fn latest_release() -> Result<LatestRelease> {
     let url = std::env::var("SHADOWDROID_UPDATE_LATEST_URL")
         .unwrap_or_else(|_| DEFAULT_LATEST_RELEASE_URL.to_string());
-    let resp = reqwest::Client::new()
-        .get(&url)
-        .header(reqwest::header::USER_AGENT, "shadowdroid")
-        .send()
-        .await
-        .with_context(|| format!("request latest release from {url}"))?
-        .error_for_status()
-        .with_context(|| format!("latest release request failed for {url}"))?;
-    Ok(resp.json::<LatestRelease>().await?)
+    let client = crate::release::http_client(std::time::Duration::from_secs(30))?;
+    let bytes = crate::release::download_small_bytes(&client, &url, 1024 * 1024).await?;
+    serde_json::from_slice(&bytes).with_context(|| format!("parse latest release JSON from {url}"))
 }
 
 fn print_human(check: &UpdateCheck) {
@@ -209,6 +203,18 @@ fn normalize_tag(value: &str) -> String {
 }
 
 fn compare_versions(a: &str, b: &str) -> Ordering {
+    let a_normalized = normalize_tag(a);
+    let b_normalized = normalize_tag(b);
+    if let (Ok(a), Ok(b)) = (
+        semver::Version::parse(&a_normalized),
+        semver::Version::parse(&b_normalized),
+    ) {
+        return a.cmp_precedence(&b);
+    }
+
+    // Release tags should be SemVer. Keep the old numeric comparison as a
+    // conservative fallback for historical/nonstandard tags: an unparseable
+    // latest tag must never make us recommend an update on its own.
     let a_parts = version_parts(a);
     let b_parts = version_parts(b);
     for i in 0..a_parts.len().max(b_parts.len()) {
@@ -239,6 +245,16 @@ mod tests {
         assert_eq!(compare_versions("0.1.10", "0.1.2"), Ordering::Greater);
         assert_eq!(compare_versions("v0.1.2", "0.1.2"), Ordering::Equal);
         assert_eq!(compare_versions("0.1.2", "0.2.0"), Ordering::Less);
+        assert_eq!(compare_versions("1.0.0-rc.1", "1.0.0"), Ordering::Less);
+        assert_eq!(
+            compare_versions("1.0.0-beta.11", "1.0.0-rc.1"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_versions("1.0.0+local", "1.0.0+release"),
+            Ordering::Equal
+        );
+        assert_eq!(compare_versions("1.2.3", "nightly"), Ordering::Greater);
     }
 
     #[test]

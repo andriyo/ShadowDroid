@@ -83,15 +83,19 @@ fn plugin_failure_is_one_nonzero_typed_error_with_recovery() {
         value["detail"]["failed_steps"],
         serde_json::json!(["studio_plugin"])
     );
-    assert!(value["detail"]["steps"]["studio_plugin"]["error"]
-        .as_str()
-        .unwrap()
-        .contains("Android Studio was not detected"));
-    assert!(value["next_actions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|action| action.as_str().unwrap_or("").contains("--no-studio-plugin")));
+    assert!(
+        value["detail"]["steps"]["studio_plugin"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("Android Studio was not detected")
+    );
+    assert!(
+        value["next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action.as_str().unwrap_or("").contains("--no-studio-plugin"))
+    );
 }
 
 #[test]
@@ -128,12 +132,14 @@ fn skill_failure_is_one_nonzero_typed_error_with_full_report() {
         std::fs::read_to_string(&claude_skill).unwrap(),
         "personal instructions\n"
     );
-    assert!(value["next_actions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|action| action
-            .as_str()
-            .unwrap_or("")
-            .contains("review each destination")));
+    assert!(
+        value["next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action
+                .as_str()
+                .unwrap_or("")
+                .contains("review each destination"))
+    );
 }

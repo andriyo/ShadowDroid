@@ -642,12 +642,11 @@ fn dynamic_next_actions(
         .and_then(serde_json::Value::as_object)
         .cloned()
     {
-        if !screen.contains_key("device") {
-            if let Some(device) =
+        if !screen.contains_key("device")
+            && let Some(device) =
                 observed_value(map, "device").or_else(|| current_device().map(str::to_owned))
-            {
-                screen.insert("device".into(), serde_json::json!(device));
-            }
+        {
+            screen.insert("device".into(), serde_json::json!(device));
         }
         let actions = screen_element_actions(&screen);
         if !actions.is_empty() {
@@ -1058,23 +1057,23 @@ fn specialize_action(template: &str, map: &serde_json::Map<String, serde_json::V
     if let Some(device) = observed_value(map, "device")
         .or_else(|| observed_value(map, "target"))
         .or_else(|| current_device().map(str::to_owned))
+        && let Some(command) = action.strip_prefix("shadowdroid ")
+        && !command.starts_with("-d ")
+        && !command.starts_with("--device ")
     {
-        if let Some(command) = action.strip_prefix("shadowdroid ") {
-            if !command.starts_with("-d ") && !command.starts_with("--device ") {
-                action = format!("shadowdroid -d {} {command}", shell_token(&device));
-            }
-        }
+        action = format!("shadowdroid -d {} {command}", shell_token(&device));
     }
     action
 }
 
 fn executable_action(template: &str, map: &serde_json::Map<String, serde_json::Value>) -> String {
     let action = specialize_action(template, map);
-    if action.starts_with("shadowdroid ") && action.contains('<') {
-        if let Some(path) = crate::cmd::introspect::command_path_for_invocation(&action) {
-            let discovery = format!("shadowdroid commands --json --describe '{path}'");
-            return specialize_action(&discovery, map);
-        }
+    if action.starts_with("shadowdroid ")
+        && action.contains('<')
+        && let Some(path) = crate::cmd::introspect::command_path_for_invocation(&action)
+    {
+        let discovery = format!("shadowdroid commands --json --describe '{path}'");
+        return specialize_action(&discovery, map);
     }
     action
 }
@@ -1132,9 +1131,11 @@ mod tests {
         assert_eq!(v["ok"], true);
         assert_eq!(v["x"], 1);
         assert_eq!(v["matched"], true);
-        assert!(v["next_actions"]
-            .as_array()
-            .is_some_and(|actions| !actions.is_empty()));
+        assert!(
+            v["next_actions"]
+                .as_array()
+                .is_some_and(|actions| !actions.is_empty())
+        );
         // One-shot results carry no `ts` (only streamed timeline events do).
         assert!(v.get("ts").is_none(), "action must not carry ts: {v}");
     }

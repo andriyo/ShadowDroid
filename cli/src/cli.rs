@@ -36,11 +36,11 @@
 //!    normalization stays consistent with `ui find`/`tap`.
 
 use crate::ids::Serial;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::error::{ContextKind, ContextValue};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::cmd::app_install::AppInstallArgs;
 use crate::cmd::debug::{DebugArgs, DebugCmd};
@@ -51,11 +51,11 @@ use crate::cmd::layout::{LayoutArgs, LayoutCmd};
 use crate::cmd::permissions::AppOpScope;
 use crate::cmd::scroll::ScrollArgs;
 use crate::cmd::studio::{StudioArgs, StudioCmd};
-use crate::config::{expand_config_path, ShadowDroidConfig};
-use crate::device::client::{is_transient_transport_error, ServerClient};
+use crate::config::{ShadowDroidConfig, expand_config_path};
+use crate::device::client::{ServerClient, is_transient_transport_error};
 use crate::device::{adb, installer};
-use crate::events::{emit_action, emit_error, CompactElement, ScreenFormat};
-use crate::fusion::{top_screen_texts, Outcome};
+use crate::events::{CompactElement, ScreenFormat, emit_action, emit_error};
+use crate::fusion::{Outcome, top_screen_texts};
 use crate::proto::{Element, SelectorQuery};
 use crate::watch::watcher::PermissionDialogPolicy;
 
@@ -1058,6 +1058,9 @@ pub struct NetDaemonArgs {
     /// ADB serial the daemon wires itself to.
     #[arg(long)]
     pub serial: String,
+    /// Identity of the parent `net start` attempt (internal readiness guard).
+    #[arg(long)]
+    pub startup_id: String,
     /// Device-facing proxy port (`http_proxy` target; reverse-mapped to the host).
     #[arg(long, default_value_t = crate::net::DEFAULT_PROXY_PORT)]
     pub port: u16,
@@ -1279,10 +1282,10 @@ impl DeviceSelection {
             return Ok(Some(device));
         }
         if let Some(name) = self.target_name(config) {
-            if let Some((_, target)) = config.target(name) {
-                if let Some(serial) = target.serial.clone() {
-                    return Ok(Some(serial));
-                }
+            if let Some((_, target)) = config.target(name)
+                && let Some(serial) = target.serial.clone()
+            {
+                return Ok(Some(serial));
             }
             return self
                 .resolve(config)
@@ -1966,10 +1969,10 @@ fn apply_net_config(args: &mut NetCmd, config: &ShadowDroidConfig) {
             redact,
             ..
         } => {
-            if *port == crate::net::DEFAULT_PROXY_PORT {
-                if let Some(p) = proxy.port {
-                    *port = p;
-                }
+            if *port == crate::net::DEFAULT_PROXY_PORT
+                && let Some(p) = proxy.port
+            {
+                *port = p;
             }
             if host.is_empty() && !proxy.hosts.is_empty() {
                 *host = proxy.hosts.clone();
@@ -2257,12 +2260,11 @@ async fn resolve_net_check_package(
             resolved.source
         );
     }
-    if let Some(component) = adb::foreground_activity(serial).await {
-        if let Some((package, _)) = component.split_once('/') {
-            if !package.is_empty() {
-                return Ok(package.to_string());
-            }
-        }
+    if let Some(component) = adb::foreground_activity(serial).await
+        && let Some((package, _)) = component.split_once('/')
+        && !package.is_empty()
+    {
+        return Ok(package.to_string());
     }
     bail!(
         "`shadowdroid net check` needs a package, and no default app is configured. \
@@ -2300,11 +2302,12 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
             ui,
             fresh,
         } => {
-            let tctx = crate::net::trust::TrustContext::resolve(config, serial, *fresh)?;
+            let mut tctx = crate::net::trust::TrustContext::resolve(config, serial, *fresh)?;
             // A genuine install needs the CA on disk; an assertion doesn't touch
             // the device, so don't mint a bogus CA just to assert it's trusted.
             if !tctx.asserted {
                 crate::net::ca::ensure_ca(&tctx.ca)?;
+                tctx.refresh_ca_lease()?;
             }
             nc::trust(serial, *auto, *system, *ui, &tctx).await
         }
@@ -2425,7 +2428,7 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
                     )
                     .detail(json!({"provided_count": values.len()}))
                     .next_actions(["rerun with `--replace <REGEX> <REPL>` as two adjacent values"])
-                    .into())
+                    .into());
                 }
                 None => None,
             };
@@ -2482,6 +2485,7 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
         NetCmd::Daemon(a) => {
             crate::net::daemon::run(DaemonConfig {
                 serial: Serial::new(a.serial.clone()),
+                startup_id: a.startup_id.clone(),
                 ca_cert: a.ca_cert.clone(),
                 ca_key: a.ca_key.clone(),
                 port: a.port,
@@ -2663,11 +2667,11 @@ async fn app_start_with_transport_recovery(
         Err(err) if is_transient_transport_error(&err) => {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             loop {
-                if let Some(component) = adb::foreground_activity(serial).await {
-                    if let Some(foreground_activity) =
+                if let Some(component) = adb::foreground_activity(serial).await
+                    && let Some(foreground_activity) =
                         matching_started_activity(&component, package, activity)
-                    {
-                        return Ok(crate::proto::AppStartResp {
+                {
+                    return Ok(crate::proto::AppStartResp {
                             ok: true,
                             activity: Some(foreground_activity),
                             launcher_activities: Vec::new(),
@@ -2676,7 +2680,6 @@ async fn app_start_with_transport_recovery(
                                     .into(),
                             ),
                         });
-                    }
                 }
                 if std::time::Instant::now() >= deadline {
                     return Err(err);
@@ -2866,13 +2869,12 @@ async fn dispatch_files(c: FilesCmd, client: &ServerClient, serial: &Serial) -> 
             remote,
             mode,
         } => {
-            let bytes = std::fs::read(&local).with_context(|| format!("reading {local}"))?;
-            let bytes_len = bytes.len() as u64;
+            let local_path = Path::new(&local);
             // Server first (app-accessible storage); fall back to `adb push` for
             // paths the instrumentation uid can't write (e.g. /sdcard under
             // scoped storage). A structured client error (4xx, e.g. bad_mode) is
             // a contract violation adb can't fix, so surface it instead.
-            match client.push_file(&remote, bytes, mode).await {
+            match client.push_file(&remote, local_path, mode).await {
                 Ok(r) => {
                     if mode.is_some_and(|requested| requested != r.mode) {
                         return Err(file_mode_postcondition_error(
@@ -2889,7 +2891,7 @@ async fn dispatch_files(c: FilesCmd, client: &ServerClient, serial: &Serial) -> 
                     );
                 }
                 Err(err) if should_fall_back_to_adb(&err) => {
-                    adb::push(serial, std::path::PathBuf::from(&local), remote.clone()).await?;
+                    let bytes_len = adb::push(serial, local_path, remote.clone()).await?;
                     let mode_applied = match mode {
                         Some(requested) => Some(chmod_via_adb(serial, requested, &remote).await),
                         None => None,
@@ -2908,14 +2910,24 @@ async fn dispatch_files(c: FilesCmd, client: &ServerClient, serial: &Serial) -> 
             }
         }
         FilesCmd::Pull { remote, local } => {
-            let (bytes, via) = match client.pull_file(&remote).await {
-                Ok(b) => (b, "server"),
-                Err(_) => (adb::pull(serial, remote.clone()).await?, "adb"),
+            let local_path = Path::new(&local);
+            let server_pull = match client.pull_file_response(&remote).await {
+                Ok(response) => {
+                    crate::transfer::response_to_path_atomic(response, local_path, None).await
+                }
+                Err(error) => Err(error),
             };
-            std::fs::write(&local, &bytes).with_context(|| format!("writing {local}"))?;
+            let (bytes, via) = match server_pull {
+                Ok(receipt) => (receipt.bytes, "server"),
+                Err(err) if should_pull_fall_back_to_adb(&err) => (
+                    adb::pull_to_path(serial, remote.clone(), local_path).await?,
+                    "adb",
+                ),
+                Err(err) => return Err(err),
+            };
             emit_action(
                 "pull",
-                &json!({"remote":remote,"local":local,"bytes":bytes.len() as u64,"via":via}),
+                &json!({"remote":remote,"local":local,"bytes":bytes,"via":via}),
             );
         }
     }
@@ -2975,6 +2987,13 @@ fn should_fall_back_to_adb(err: &anyhow::Error) -> bool {
     match err.downcast_ref::<crate::device::client::ServerError>() {
         Some(server) => !server.status.is_client_error(),
         None => true,
+    }
+}
+
+fn should_pull_fall_back_to_adb(err: &anyhow::Error) -> bool {
+    match err.downcast_ref::<crate::device::client::ServerError>() {
+        Some(server) => server.status.is_server_error() || server.code == "file_not_found",
+        None => crate::transfer::is_remote_response_failure(err),
     }
 }
 
@@ -3794,7 +3813,7 @@ async fn cmd_wait(
                     None,
                     None,
                     Vec::new(),
-                ))
+                ));
             }
             Ok(result) => match result {
                 Ok(screen) => screen,
@@ -3934,20 +3953,20 @@ fn wait_query_matches(
     // Foreground-app gates: package (must be), package_not (must have left),
     // activity (must be). Package names are case-sensitive, so these stay
     // substring-but-case-sensitive regardless of --exact.
-    if let Some(package) = &query.package {
-        if !app.package.as_deref().unwrap_or("").contains(package) {
-            return no_match;
-        }
+    if let Some(package) = &query.package
+        && !app.package.as_deref().unwrap_or("").contains(package)
+    {
+        return no_match;
     }
-    if let Some(package_not) = &query.package_not {
-        if app.package.as_deref().unwrap_or("").contains(package_not) {
-            return no_match;
-        }
+    if let Some(package_not) = &query.package_not
+        && app.package.as_deref().unwrap_or("").contains(package_not)
+    {
+        return no_match;
     }
-    if let Some(activity) = &query.activity {
-        if !app.activity.as_deref().unwrap_or("").contains(activity) {
-            return no_match;
-        }
+    if let Some(activity) = &query.activity
+        && !app.activity.as_deref().unwrap_or("").contains(activity)
+    {
+        return no_match;
     }
     let has_element_query = query.text.is_some()
         || query.rid.is_some()
@@ -4004,11 +4023,11 @@ async fn cmd_devices(config: &ShadowDroidConfig) -> Result<()> {
         let mut obj = serde_json::Map::new();
         obj.insert("serial".into(), json!(serial));
         obj.insert("state".into(), json!(state));
-        if state == "device" {
-            if let serde_json::Value::Object(info) = adb::device_info(&serial).await {
-                for (k, v) in info {
-                    obj.insert(k, v);
-                }
+        if state == "device"
+            && let serde_json::Value::Object(info) = adb::device_info(&serial).await
+        {
+            for (k, v) in info {
+                obj.insert(k, v);
             }
         }
         let avd = obj.get("avd").and_then(serde_json::Value::as_str);
@@ -4242,7 +4261,7 @@ pub(crate) async fn resolve_serial(explicit: Option<&str>) -> Result<Serial> {
                     "run `shadowdroid devices` to inspect offline or unauthorized devices",
                     "start an emulator or authorize USB debugging, then retry",
                 ])
-                .into())
+                .into());
             }
             1 => Serial::from(devices.into_iter().next().unwrap()),
             _ => {
@@ -4259,7 +4278,7 @@ pub(crate) async fn resolve_serial(explicit: Option<&str>) -> Result<Serial> {
                     "choose a serial from detail.devices and pass `--device <serial>`",
                     "set SHADOWDROID_DEVICE or config.device for subsequent commands",
                 ])
-                .into())
+                .into());
             }
         }
     };
@@ -4373,6 +4392,59 @@ mod tests {
         assert!(should_fall_back_to_adb(&anyhow::anyhow!(
             "connection refused"
         )));
+
+        let missing = anyhow::Error::new(ServerError {
+            status: reqwest::StatusCode::NOT_FOUND,
+            code: "file_not_found".into(),
+            message: "not visible to server uid".into(),
+            detail: None,
+        });
+        assert!(should_pull_fall_back_to_adb(&missing));
+        let bad_path = anyhow::Error::new(ServerError {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            code: "bad_path".into(),
+            message: "path traversal is not allowed".into(),
+            detail: None,
+        });
+        assert!(!should_pull_fall_back_to_adb(&bad_path));
+        let local_disk_error = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "destination is read-only",
+        ));
+        assert!(!should_pull_fall_back_to_adb(&local_disk_error));
+    }
+
+    #[tokio::test]
+    async fn truncated_server_pull_remains_eligible_for_adb_fallback() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort",
+                )
+                .await
+                .unwrap();
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/file"))
+            .send()
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("pull.bin");
+        let error = crate::transfer::response_to_path_atomic(response, &destination, None)
+            .await
+            .unwrap_err();
+        assert!(should_pull_fall_back_to_adb(&error));
+        assert!(!destination.exists());
     }
 
     #[test]
@@ -4387,21 +4459,25 @@ mod tests {
             .as_deref(),
             Some("io.github.andriyo.shadowdroid.sample.MainActivity")
         );
-        assert!(matching_started_activity(
-            "io.github.andriyo.shadowdroid.sample/.AltLauncherActivity",
-            package,
-            Some(".MainActivity")
-        )
-        .is_none());
+        assert!(
+            matching_started_activity(
+                "io.github.andriyo.shadowdroid.sample/.AltLauncherActivity",
+                package,
+                Some(".MainActivity")
+            )
+            .is_none()
+        );
         assert!(
             matching_started_activity("com.android.launcher/.Launcher", package, None).is_none()
         );
-        assert!(matching_started_activity(
-            "io.github.andriyo.shadowdroid.sample/.MainActivity",
-            package,
-            Some("other.package/.MainActivity")
-        )
-        .is_none());
+        assert!(
+            matching_started_activity(
+                "io.github.andriyo.shadowdroid.sample/.MainActivity",
+                package,
+                Some("other.package/.MainActivity")
+            )
+            .is_none()
+        );
     }
 
     #[test]

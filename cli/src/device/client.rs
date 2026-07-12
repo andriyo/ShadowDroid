@@ -9,15 +9,18 @@
 //! caller gets the structured `code` + `message` rather than just a raw status.
 
 use crate::proto::*;
-use anyhow::{anyhow, Result};
+use anyhow::{Context, Result, anyhow};
 use reqwest::{Client, Response};
 use serde::Serialize;
+use std::path::Path;
 use std::time::Duration;
+use tokio_util::io::ReaderStream;
 
 #[derive(Clone)]
 pub struct ServerClient {
     base: String, // e.g. "http://127.0.0.1:7912/v1"
     http: Client,
+    transfer_http: Client,
 }
 
 impl ServerClient {
@@ -26,9 +29,17 @@ impl ServerClient {
             .connect_timeout(Duration::from_secs(2))
             .timeout(Duration::from_secs(30))
             .build()?;
+        // File transfers are streamed and may legitimately exceed the normal
+        // operation wall-clock budget. Bound connect and idle reads instead of
+        // cutting off a healthy progressing transfer at a fixed duration.
+        let transfer_http = Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .read_timeout(Duration::from_secs(30))
+            .build()?;
         Ok(Self {
             base: format!("http://127.0.0.1:{port}/v1"),
             http,
+            transfer_http,
         })
     }
 
@@ -491,29 +502,39 @@ impl ServerClient {
     pub async fn push_file(
         &self,
         remote: &str,
-        bytes: Vec<u8>,
+        local: &Path,
         mode: Option<u32>,
     ) -> Result<FileWriteResp> {
         let mut path = file_path(remote);
         if let Some(mode) = mode {
             path.push_str(&format!("?mode={mode}"));
         }
+        let file = tokio::fs::File::open(local)
+            .await
+            .with_context(|| format!("open {}", local.display()))?;
+        let bytes = file
+            .metadata()
+            .await
+            .with_context(|| format!("stat {}", local.display()))?
+            .len();
+        let body = reqwest::Body::wrap_stream(ReaderStream::new(file));
         let resp = self
-            .http
+            .transfer_http
             .put(format!("{}{}", self.base, path))
-            .body(bytes)
+            .header(reqwest::header::CONTENT_LENGTH, bytes)
+            .body(body)
             .send()
             .await?;
         check_then_json(resp).await
     }
 
-    pub async fn pull_file(&self, remote: &str) -> Result<Vec<u8>> {
+    pub async fn pull_file_response(&self, remote: &str) -> Result<Response> {
         let resp = self
-            .http
+            .transfer_http
             .get(format!("{}{}", self.base, file_path(remote)))
             .send()
             .await?;
-        check_then_bytes(resp).await
+        check_response(resp).await
     }
 
     /// `GET /v1/files/{dir}?list=true` — directory listing.
@@ -528,11 +549,13 @@ impl ServerClient {
 }
 
 pub(crate) fn is_transient_transport_error(err: &anyhow::Error) -> bool {
-    if let Some(reqwest) = err.downcast_ref::<reqwest::Error>() {
-        if reqwest.is_connect() || reqwest.is_timeout() || reqwest.is_request() || reqwest.is_body()
-        {
-            return true;
-        }
+    if let Some(reqwest) = err.downcast_ref::<reqwest::Error>()
+        && (reqwest.is_connect()
+            || reqwest.is_timeout()
+            || reqwest.is_request()
+            || reqwest.is_body())
+    {
+        return true;
     }
     let message = err.to_string();
     message.contains("connection closed before message completed")
@@ -562,29 +585,15 @@ pub struct ServerError {
 /// Check response status; on non-2xx, try to parse our wire-error envelope
 /// for a useful Rust error instead of just `error decoding response body`.
 async fn check_then_json<T: serde::de::DeserializeOwned>(resp: Response) -> Result<T> {
-    let status = resp.status();
-    if status.is_success() {
-        return Ok(resp.json().await?);
-    }
-    // Try to decode the structured error
-    let text = resp.text().await?;
-    if let Ok(env) = serde_json::from_str::<ErrorEnvelope>(&text) {
-        return Err(ServerError {
-            status,
-            code: env.error.code,
-            message: env.error.message,
-            detail: env.error.detail,
-        }
-        .into());
-    }
-    Err(anyhow!("server returned {}: {}", status, text))
+    Ok(check_response(resp).await?.json().await?)
 }
 
-async fn check_then_bytes(resp: Response) -> Result<Vec<u8>> {
+async fn check_response(resp: Response) -> Result<Response> {
     let status = resp.status();
     if status.is_success() {
-        return Ok(resp.bytes().await?.to_vec());
+        return Ok(resp);
     }
+    // Try to decode the structured error
     let text = resp.text().await?;
     if let Ok(env) = serde_json::from_str::<ErrorEnvelope>(&text) {
         return Err(ServerError {

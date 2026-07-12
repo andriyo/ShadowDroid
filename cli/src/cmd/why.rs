@@ -16,7 +16,7 @@
 //! device state to answer a question.
 
 use anyhow::Result;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::config::ShadowDroidConfig;
 use crate::crashscan;
@@ -206,8 +206,8 @@ pub async fn run(
                 }
             }
         }
-        if let Ok(errs) = crate::net::store::read_tls_errors(serial, None) {
-            tls_errors = errs.into_iter().rev().take(3).collect();
+        if let Ok(errs) = crate::net::store::read_tls_errors(serial, None, 3) {
+            tls_errors = errs.into_iter().rev().collect();
         }
         if !net_failed.is_empty() {
             evidence.insert("net_failed".into(), json!(net_failed));

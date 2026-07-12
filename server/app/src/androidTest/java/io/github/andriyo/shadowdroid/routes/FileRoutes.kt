@@ -3,19 +3,25 @@ package io.github.andriyo.shadowdroid.routes
 import android.app.Instrumentation
 import android.system.ErrnoException
 import android.system.Os
+import android.system.OsConstants
 import io.github.andriyo.shadowdroid.BadRequest
 import io.github.andriyo.shadowdroid.NotFound
 import io.ktor.http.ContentType
+import io.ktor.server.http.content.LocalFileContent
 import io.ktor.server.request.receiveChannel
 import io.ktor.server.response.respond
-import io.ktor.server.response.respondBytes
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.get
 import io.ktor.server.routing.put
-import io.ktor.utils.io.core.readBytes
-import io.ktor.utils.io.readRemaining
+import io.ktor.utils.io.ByteReadChannel
+import io.ktor.utils.io.jvm.javaio.copyTo
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+import java.security.MessageDigest
 
 object FileRoutes {
     /** PUT/GET /v1/files{path}. Limited to app storage and shared /sdcard paths. */
@@ -26,12 +32,8 @@ object FileRoutes {
         route.put("/files/{path...}") {
             val file = resolveRequestedFile(call.parameters.getAll("path"), instr)
             val requestedMode = parseMode(call.request.queryParameters["mode"])
-            file.parentFile?.mkdirs()
-            @Suppress("DEPRECATION")
-            val bytes = call.receiveChannel().readRemaining().readBytes()
-            file.writeBytes(bytes)
-            requestedMode?.let { applyMode(file, it) }
-            call.respond(FileWriteResp(path = file.path, bytes = bytes.size.toLong(), mode = fileMode(file)))
+            val bytes = writeFileAtomically(call.receiveChannel(), file, requestedMode)
+            call.respond(FileWriteResp(path = file.path, bytes = bytes, mode = fileMode(file)))
         }
 
         route.get("/files/{path...}") {
@@ -51,12 +53,61 @@ object FileRoutes {
             }
             if (!file.exists()) throw NotFound("file_not_found", "no such file: ${file.path}")
             if (file.isDirectory) throw BadRequest("is_directory", "path is a directory: ${file.path}")
-            call.respondBytes(file.readBytes(), ContentType.Application.OctetStream)
+            call.respond(LocalFileContent(file, ContentType.Application.OctetStream))
         }
     }
 }
 
-private fun resolveRequestedFile(
+internal suspend fun writeFileAtomically(
+    source: ByteReadChannel,
+    destination: File,
+    requestedMode: Int?,
+): Long {
+    val parent = destination.parentFile ?: throw IOException("file has no parent: ${destination.path}")
+    if (!parent.isDirectory && !parent.mkdirs()) {
+        throw IOException("cannot create directory: ${parent.path}")
+    }
+    rejectNonRegularDestination(destination)
+    val preservedMode = if (requestedMode == null && destination.exists()) fileMode(destination) else null
+    val temp = File.createTempFile(transferTempPrefix(destination.name), ".tmp", parent)
+    try {
+        val bytes =
+            withContext(Dispatchers.IO) {
+                FileOutputStream(temp).use { output ->
+                    val copied = source.copyTo(output)
+                    output.flush()
+                    output.fd.sync()
+                    copied
+                }
+            }
+        (requestedMode ?: preservedMode)?.let { applyMode(temp, it) }
+        Os.rename(temp.path, destination.path)
+        return bytes
+    } finally {
+        temp.delete()
+    }
+}
+
+private fun rejectNonRegularDestination(destination: File) {
+    val stat =
+        try {
+            Os.lstat(destination.path)
+        } catch (error: ErrnoException) {
+            if (error.errno == OsConstants.ENOENT) return
+            throw IOException("cannot inspect destination: ${destination.path}", error)
+        }
+    if ((stat.st_mode and OsConstants.S_IFMT) != OsConstants.S_IFREG) {
+        throw IOException("refusing to replace non-regular destination: ${destination.path}")
+    }
+}
+
+private fun transferTempPrefix(name: String): String {
+    val digest = MessageDigest.getInstance("SHA-256").digest(name.toByteArray(Charsets.UTF_8))
+    val shortHash = digest.take(8).joinToString("") { byte -> "%02x".format(byte.toInt() and 0xFF) }
+    return ".shadowdroid-$shortHash-"
+}
+
+internal fun resolveRequestedFile(
     parts: List<String>?,
     instr: Instrumentation,
 ): File {
@@ -67,19 +118,32 @@ private fun resolveRequestedFile(
         throw BadRequest("bad_path", "path traversal is not allowed")
     }
 
-    return if (path.startsWith("/sdcard/") || path.startsWith("/storage/emulated/0/")) {
-        File(path)
+    return if (path.startsWith("/sdcard/")) {
+        resolveUnderRoot(File("/sdcard"), path.removePrefix("/sdcard/"))
+    } else if (path.startsWith("/storage/emulated/0/")) {
+        resolveUnderRoot(
+            File("/storage/emulated/0"),
+            path.removePrefix("/storage/emulated/0/"),
+        )
     } else {
         val root = instr.targetContext.getExternalFilesDir(null) ?: instr.targetContext.filesDir
         val relative = path.trimStart('/')
-        File(root, relative).canonicalFile.also { file ->
-            val canonicalRoot = root.canonicalFile
-            if (!file.path.startsWith(canonicalRoot.path)) {
-                throw BadRequest("bad_path", "path escapes server storage")
-            }
-        }
+        resolveUnderRoot(root, relative)
     }
 }
+
+internal fun resolveUnderRoot(
+    root: File,
+    relative: String,
+): File =
+    File(root, relative).canonicalFile.also { file ->
+        val canonicalRoot = root.canonicalFile
+        // Path components, not string prefixes: `/root-evil` is not a
+        // descendant of `/root`, even though its text begins the same way.
+        if (!file.toPath().startsWith(canonicalRoot.toPath())) {
+            throw BadRequest("bad_path", "path escapes server storage")
+        }
+    }
 
 private fun parseMode(value: String?): Int? {
     if (value == null) return null

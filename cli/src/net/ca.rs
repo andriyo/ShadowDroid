@@ -21,17 +21,18 @@
 //! inner leg never negotiates h2 (we serve http1); `DnsName` SAN (CN alone is
 //! rejected by modern clients) + `serverAuth` EKU.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use rcgen::string::Ia5String;
 use rcgen::{
-    date_time_ymd, BasicConstraints, CertificateParams, DistinguishedName, DnType,
-    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PublicKeyData, SanType,
-    SerialNumber,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+    Issuer, KeyPair, KeyUsagePurpose, PublicKeyData, SanType, SerialNumber, date_time_ymd,
 };
-use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
+use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -53,6 +54,11 @@ pub struct CertAuthority {
     leaf_key: PrivateKeyDer<'static>,
     provider: Arc<rustls::crypto::CryptoProvider>,
     cache: Mutex<HashMap<String, Arc<ServerConfig>>>,
+    fingerprint: String,
+    /// Shared lease held for the daemon lifetime. CA import/reset takes an
+    /// exclusive non-blocking lease, so disk bytes cannot diverge from the
+    /// signer while any daemon is using this managed CA.
+    _ca_lease: Option<CaFileLock>,
 }
 
 impl CertAuthority {
@@ -61,26 +67,44 @@ impl CertAuthority {
     /// paths (via `--ca-cert`/`--ca-key`) and must never mint a new CA, since it
     /// runs without config context and can't know *which* CA the project wants.
     pub fn load_from_files(cert_path: &Path, key_path: &Path) -> Result<Arc<CertAuthority>> {
+        let lock = managed_pair_dir(cert_path, key_path)
+            .map(|dir| acquire_ca_lock(dir, false))
+            .transpose()?;
         let key_pem = std::fs::read_to_string(key_path)
             .with_context(|| format!("read {}", key_path.display()))?;
         let cert_pem = std::fs::read_to_string(cert_path)
             .with_context(|| format!("read {}", cert_path.display()))?;
         let key = KeyPair::from_pem(&key_pem).map_err(|e| anyhow!("parse CA key: {e}"))?;
-        Self::build(&cert_pem, key)
+        Self::build_with_lease(&cert_pem, key, lock)
     }
 
     fn build(cert_pem: &str, key: KeyPair) -> Result<Arc<CertAuthority>> {
+        Self::build_with_lease(cert_pem, key, None)
+    }
+
+    fn build_with_lease(
+        cert_pem: &str,
+        key: KeyPair,
+        lease: Option<CaFileLock>,
+    ) -> Result<Arc<CertAuthority>> {
         // Reuse the CA keypair as the leaf private key — compute the DER before
         // the keypair is moved into the Issuer.
         let leaf_key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(key.serialize_der()));
         let issuer =
             Issuer::from_ca_cert_pem(cert_pem, key).map_err(|e| anyhow!("parse CA cert: {e}"))?;
+        let fingerprint = fingerprint_bytes(cert_pem.as_bytes())?;
         Ok(Arc::new(CertAuthority {
             issuer,
             leaf_key,
             provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
             cache: Mutex::new(HashMap::new()),
+            fingerprint,
+            _ca_lease: lease,
         }))
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
     }
 
     /// A rustls `ServerConfig` impersonating `host`, minting + caching as needed.
@@ -119,9 +143,14 @@ impl CertAuthority {
         params.distinguished_name = dn;
 
         // SAN is what modern clients actually validate; CN alone is ignored.
-        params.subject_alt_names = vec![SanType::DnsName(
-            Ia5String::try_from(host).map_err(|e| anyhow!("invalid SNI host {host:?}: {e}"))?,
-        )];
+        // Literal origins must use iPAddress SAN bytes, not a DNSName containing
+        // textual digits/colons (which strict TLS clients reject).
+        params.subject_alt_names = match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => vec![SanType::IpAddress(ip)],
+            Err(_) => vec![SanType::DnsName(
+                Ia5String::try_from(host).map_err(|e| anyhow!("invalid SNI host {host:?}: {e}"))?,
+            )],
+        };
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
 
         let cert = params
@@ -162,22 +191,105 @@ fn ca_source_in(dir: &Path) -> PathBuf {
     dir.join(paths::CA_SOURCE_FILE)
 }
 
+#[derive(Debug)]
+struct CaFileLock {
+    _file: File,
+}
+
+#[derive(Debug)]
+pub struct CaReadLease {
+    _lock: Option<CaFileLock>,
+}
+
+pub fn read_lease(ca: &CaPaths) -> Result<CaReadLease> {
+    let lock = ca
+        .dir
+        .as_deref()
+        .map(|dir| acquire_ca_lock(dir, false))
+        .transpose()?;
+    Ok(CaReadLease { _lock: lock })
+}
+
+fn open_ca_lock(dir: &Path) -> Result<(File, PathBuf)> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    // The adjacent inode is the only cross-environment invariant for a given
+    // CA directory. Project setup ignores `.ca.lock`, so it remains persistent
+    // (unlinking a held lock is unsafe) without dirtying git status.
+    let path = dir.join(".ca.lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    Ok((file, path))
+}
+
+fn acquire_ca_lock(dir: &Path, exclusive: bool) -> Result<CaFileLock> {
+    let (file, path) = open_ca_lock(dir)?;
+    if exclusive {
+        file.lock()
+    } else {
+        file.lock_shared()
+    }
+    .with_context(|| format!("lock {}", path.display()))?;
+    Ok(CaFileLock { _file: file })
+}
+
+fn try_acquire_ca_write_lock(dir: &Path) -> Result<CaFileLock> {
+    let (file, path) = open_ca_lock(dir)?;
+    match file.try_lock() {
+        Ok(()) => Ok(CaFileLock { _file: file }),
+        Err(std::fs::TryLockError::WouldBlock) => Err(crate::diagnostic::DiagnosticError::new(
+            "ca_in_use",
+            "net",
+            "the certificate authority is in use by a running network daemon",
+        )
+        .retryable(true)
+        .detail(serde_json::json!({
+            "ca_dir": dir.display().to_string(),
+            "lock": path.display().to_string(),
+        }))
+        .next_actions([
+            "stop every ShadowDroid net session using this project/global CA, then retry",
+            "run `shadowdroid net status --json` for each connected device",
+        ])
+        .into()),
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(error).with_context(|| format!("lock {}", path.display()))
+        }
+    }
+}
+
+fn managed_pair_dir<'a>(cert_path: &'a Path, key_path: &Path) -> Option<&'a Path> {
+    let dir = cert_path.parent()?;
+    (cert_path.file_name()?.to_str()? == paths::CA_CERT_FILE
+        && key_path.parent() == Some(dir)
+        && key_path.file_name()?.to_str()? == paths::CA_KEY_FILE)
+        .then_some(dir)
+}
+
 /// Generate a fresh ShadowDroid CA and persist cert + key + `generated` marker
 /// into `dir`. Returns the material so the caller can build a [`CertAuthority`]
 /// without re-reading it.
-fn generate_ca_files(dir: &Path) -> Result<(String, KeyPair)> {
+fn generate_ca_files_locked(dir: &Path) -> Result<(String, KeyPair)> {
     let key = KeyPair::generate().map_err(|e| anyhow!("generate CA key: {e}"))?;
     let cert = ca_params()
         .self_signed(&key)
         .map_err(|e| anyhow!("self-sign CA: {e}"))?;
     let cert_pem = cert.pem();
-    let cert_path = ca_cert_in(dir);
-    std::fs::write(&cert_path, &cert_pem)
-        .with_context(|| format!("write {}", cert_path.display()))?;
-    write_private(&ca_key_in(dir), &key.serialize_pem())?;
-    // Provenance is best-effort — a missing/stale marker is inferred by `ca info`.
-    let _ = std::fs::write(ca_source_in(dir), SOURCE_GENERATED);
+    replace_ca_files_locked(dir, &cert_pem, &key.serialize_pem(), SOURCE_GENERATED)?;
     Ok((cert_pem, key))
+}
+
+#[cfg(test)]
+fn generate_ca_files(dir: &Path) -> Result<(String, KeyPair)> {
+    let _lock = acquire_ca_lock(dir, true)?;
+    generate_ca_files_locked(dir)
 }
 
 /// Unique-enough serial: time-seeded base + a monotonic counter, so concurrent
@@ -192,12 +304,71 @@ fn next_serial() -> u64 {
         .max(1)
 }
 
-fn write_private(path: &Path, pem: &str) -> Result<()> {
-    std::fs::write(path, pem).with_context(|| format!("write {}", path.display()))?;
+/// Stage one complete CA file in its destination directory. Private files get
+/// their final mode before any key bytes are written, so a crash cannot leave a
+/// briefly world-readable key behind. `NamedTempFile` also makes the final
+/// persist an atomic same-directory rename.
+fn stage_ca_file(dir: &Path, contents: &[u8], private: bool) -> Result<tempfile::NamedTempFile> {
+    let mut temp = tempfile::NamedTempFile::new_in(dir)
+        .with_context(|| format!("create temporary CA file in {}", dir.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        let mode = if private { 0o600 } else { 0o644 };
+        temp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("set temporary CA file mode to {mode:o}"))?;
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    temp.write_all(contents)
+        .context("write temporary CA file")?;
+    temp.as_file()
+        .sync_all()
+        .context("sync temporary CA file")?;
+    Ok(temp)
+}
+
+/// Replace the live cert, private key, and provenance marker as one recoverable
+/// transaction. Every new file is fully written and synced before the existing
+/// set is moved to `.bak`. If any persist then fails, the previous set is
+/// restored instead of leaving a mixed cert/key pair behind.
+fn replace_ca_files_locked(dir: &Path, cert_pem: &str, key_pem: &str, source: &str) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let cert_temp = stage_ca_file(dir, cert_pem.as_bytes(), false)?;
+    let key_temp = stage_ca_file(dir, key_pem.as_bytes(), true)?;
+    let source_temp = stage_ca_file(dir, source.as_bytes(), false)?;
+
+    let cert_path = ca_cert_in(dir);
+    let key_path = ca_key_in(dir);
+    let source_path = ca_source_in(dir);
+    backup_in(dir)?;
+
+    let install = || -> Result<()> {
+        cert_temp
+            .persist(&cert_path)
+            .map_err(|e| e.error)
+            .with_context(|| format!("atomically install {}", cert_path.display()))?;
+        key_temp
+            .persist(&key_path)
+            .map_err(|e| e.error)
+            .with_context(|| format!("atomically install {}", key_path.display()))?;
+        source_temp
+            .persist(&source_path)
+            .map_err(|e| e.error)
+            .with_context(|| format!("atomically install {}", source_path.display()))?;
+        sync_dir(dir)?;
+        Ok(())
+    };
+
+    if let Err(error) = install() {
+        let rollback = restore_backups(dir);
+        return match rollback {
+            Ok(()) => Err(error.context("install CA files; restored the previous CA")),
+            Err(rollback_error) => Err(error.context(format!(
+                "install CA files; restoring the previous CA also failed: {rollback_error:#}"
+            ))),
+        };
     }
     Ok(())
 }
@@ -260,18 +431,10 @@ pub fn resolve_ca(config: &ShadowDroidConfig, _serial: Option<&Serial>) -> Resul
         (None, None) => {}
     }
 
-    if let Ok(dir) = crate::config::project_shadowdroid_dir() {
-        let cert = ca_cert_in(&dir);
-        let key = ca_key_in(&dir);
-        if cert.is_file() && key.is_file() {
-            return Ok(CaPaths {
-                cert,
-                key,
-                dir: Some(dir),
-                origin: "project",
-                generatable: false,
-            });
-        }
+    if let Ok(dir) = crate::config::project_shadowdroid_dir()
+        && let Some(project_ca) = resolve_project_ca(&dir)?
+    {
+        return Ok(project_ca);
     }
 
     let dir = paths::net_dir()?;
@@ -284,15 +447,84 @@ pub fn resolve_ca(config: &ShadowDroidConfig, _serial: Option<&Serial>) -> Resul
     })
 }
 
+/// Resolve the conventional project CA without consulting process-global cwd.
+/// Keeping this separate makes the incomplete-pair behavior deterministic and
+/// testable: once either CA path exists, silently falling back to the global CA
+/// would make the proxy sign with a different identity than the project owner
+/// intended.
+fn resolve_project_ca(dir: &Path) -> Result<Option<CaPaths>> {
+    if !dir.is_dir() {
+        return Ok(None);
+    }
+
+    let cert = ca_cert_in(dir);
+    let key = ca_key_in(dir);
+    let lock_path = dir.join(".ca.lock");
+    // A config-only `.shadowdroid/` must not gain a lock artifact. Once CA
+    // material (or its persistent lock from a transaction) exists, take a
+    // shared lease and recheck the pair atomically.
+    if !path_entry_exists(&cert)? && !path_entry_exists(&key)? && !lock_path.exists() {
+        return Ok(None);
+    }
+
+    let _lock = acquire_ca_lock(dir, false)?;
+    let cert_present = path_entry_exists(&cert)?;
+    let key_present = path_entry_exists(&key)?;
+    match (cert_present, key_present) {
+        (false, false) => Ok(None),
+        (true, true) if cert.is_file() && key.is_file() => Ok(Some(CaPaths {
+            cert,
+            key,
+            dir: Some(dir.to_path_buf()),
+            origin: "project",
+            generatable: false,
+        })),
+        _ => bail!(
+            "project CA is incomplete: expected regular files {} and {}, but found cert={} and \
+             key={}. Restore the missing file, remove the stray CA material to use the global \
+             CA, or run `shadowdroid net ca reset --project` / `shadowdroid net ca import \
+             --project`.",
+            cert.display(),
+            key.display(),
+            if cert.is_file() {
+                "present"
+            } else {
+                "missing or not a regular file"
+            },
+            if key.is_file() {
+                "present"
+            } else {
+                "missing or not a regular file"
+            },
+        ),
+    }
+}
+
+/// `Path::exists` treats dangling symlinks as absent. For CA resolution they
+/// are still project CA material and must produce an actionable error rather
+/// than an unrelated fallback to the global CA.
+fn path_entry_exists(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("inspect {}", path.display())),
+    }
+}
+
 /// Ensure the resolved CA exists on disk, generating a fresh ShadowDroid CA when
 /// permitted (the global dir). An explicit or project CA that is missing is a
 /// hard error with an actionable message — we never silently fabricate a CA a
 /// user pointed us at.
 pub fn ensure_ca(ca: &CaPaths) -> Result<()> {
-    if ca.cert.is_file() && ca.key.is_file() {
-        return Ok(());
-    }
     if !ca.generatable {
+        let _lock = ca
+            .dir
+            .as_deref()
+            .map(|dir| acquire_ca_lock(dir, false))
+            .transpose()?;
+        if ca.cert.is_file() && ca.key.is_file() {
+            return Ok(());
+        }
         bail!(
             "the {} CA is missing: {} / {}. Import one with `net ca import` or generate a \
              project CA with `net ca reset --project`.",
@@ -305,8 +537,17 @@ pub fn ensure_ca(ca: &CaPaths) -> Result<()> {
         .dir
         .as_deref()
         .ok_or_else(|| anyhow!("a generatable CA must have a directory"))?;
-    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    generate_ca_files(dir)?;
+    {
+        let _read_lock = acquire_ca_lock(dir, false)?;
+        if ca.cert.is_file() && ca.key.is_file() {
+            return Ok(());
+        }
+    }
+    let _lock = acquire_ca_lock(dir, true)?;
+    if ca.cert.is_file() && ca.key.is_file() {
+        return Ok(());
+    }
+    generate_ca_files_locked(dir)?;
     Ok(())
 }
 
@@ -317,7 +558,11 @@ pub fn ensure_ca(ca: &CaPaths) -> Result<()> {
 pub fn fingerprint_of(cert_path: &Path) -> Result<String> {
     let bytes =
         std::fs::read(cert_path).with_context(|| format!("read {}", cert_path.display()))?;
-    let der = crate::net::trust::certificate_der(&bytes)?;
+    fingerprint_bytes(&bytes)
+}
+
+fn fingerprint_bytes(bytes: &[u8]) -> Result<String> {
+    let der = crate::net::trust::certificate_der(bytes)?;
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(&der);
@@ -478,17 +723,22 @@ pub fn import_into(
         ));
     }
 
-    // Commit: back up any existing CA, then write the new cert+key+marker.
-    backup_in(net_dir)?;
-    std::fs::write(ca_cert_in(net_dir), &clean_cert_pem).context("write ca.crt")?;
-    write_private(&ca_key_in(net_dir), &key_pem)?;
-    let _ = std::fs::write(ca_source_in(net_dir), SOURCE_IMPORTED);
+    // Commit only after the complete replacement set has been staged and
+    // synced. The helper preserves the previous set as `.bak` and restores it
+    // if any final rename fails.
+    let _lock = try_acquire_ca_write_lock(net_dir)?;
+    replace_ca_files_locked(net_dir, &clean_cert_pem, &key_pem, SOURCE_IMPORTED)?;
 
-    Ok((info_in(net_dir)?, warnings))
+    Ok((info_in_locked(net_dir)?, warnings))
 }
 
 /// Describe the CA in `net_dir`. Errors if none exists yet.
 pub fn info_in(net_dir: &Path) -> Result<CaInfo> {
+    let _lock = acquire_ca_lock(net_dir, false)?;
+    info_in_locked(net_dir)
+}
+
+fn info_in_locked(net_dir: &Path) -> Result<CaInfo> {
     let cert_path = ca_cert_in(net_dir);
     let key_path = ca_key_in(net_dir);
     if !cert_path.exists() {
@@ -525,11 +775,10 @@ pub fn info_in(net_dir: &Path) -> Result<CaInfo> {
 /// ShadowDroid CA — the escape hatch after an import, and how a project CA is
 /// first minted (`net ca reset --project`). Returns the new [`CaInfo`].
 pub fn reset_in(net_dir: &Path) -> Result<CaInfo> {
-    std::fs::create_dir_all(net_dir).with_context(|| format!("create {}", net_dir.display()))?;
-    backup_in(net_dir)?;
-    // Files are gone, so this regenerates + records `generated` provenance.
-    generate_ca_files(net_dir)?;
-    info_in(net_dir)
+    let _lock = try_acquire_ca_write_lock(net_dir)?;
+    // Generation stages the complete new set before backing up the live one.
+    generate_ca_files_locked(net_dir)?;
+    info_in_locked(net_dir)
 }
 
 /// The CA directory a `net ca` verb operates on. Explicit `--project`/`--global`
@@ -553,15 +802,134 @@ pub fn ca_scope_dir(project: bool, global: bool) -> Result<(PathBuf, &'static st
 /// Move any existing `ca.{crt,key,source}` aside to `<name>.bak`, so replacing
 /// the CA never silently destroys a key the user might not have backed up.
 fn backup_in(net_dir: &Path) -> Result<()> {
-    for p in [
+    backup_in_with_sync(net_dir, sync_dir)
+}
+
+fn backup_in_with_sync(net_dir: &Path, final_sync: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+    let mut moved = Vec::new();
+    for path in [
         ca_cert_in(net_dir),
         ca_key_in(net_dir),
         ca_source_in(net_dir),
     ] {
-        if p.exists() {
-            let _ = std::fs::rename(&p, bak_path(&p));
+        if !path.exists() {
+            continue;
+        }
+        let backup = bak_path(&path);
+        if backup.exists()
+            && let Err(error) = std::fs::remove_file(&backup)
+                .with_context(|| format!("remove stale CA backup {}", backup.display()))
+        {
+            return Err(backup_failure(error, net_dir, &moved));
+        }
+        if let Err(error) = std::fs::rename(&path, &backup) {
+            let error = Err::<(), _>(error)
+                .with_context(|| format!("back up {} to {}", path.display(), backup.display()))
+                .unwrap_err();
+            return Err(backup_failure(error, net_dir, &moved));
+        }
+        moved.push((path, backup));
+    }
+    if let Err(error) = final_sync(net_dir) {
+        return Err(backup_failure(error, net_dir, &moved));
+    }
+    Ok(())
+}
+
+/// Restore exactly the live files moved by an incomplete [`backup_in`]. This is
+/// intentionally narrower than [`restore_backups`], which also removes newly
+/// installed files during replacement rollback.
+fn restore_moved_backups(net_dir: &Path, moved: &[(PathBuf, PathBuf)]) -> Result<()> {
+    let mut failures = Vec::new();
+    for (original, backup) in moved.iter().rev() {
+        if original.exists() {
+            failures.push(format!(
+                "refuse to overwrite unexpectedly recreated {}",
+                original.display()
+            ));
+            continue;
+        }
+        if let Err(error) = std::fs::rename(backup, original) {
+            failures.push(format!(
+                "restore {} to {}: {error}",
+                backup.display(),
+                original.display()
+            ));
         }
     }
+    if let Err(error) = sync_dir(net_dir) {
+        failures.push(error.to_string());
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", failures.join("; "))
+    }
+}
+
+fn backup_failure(
+    error: anyhow::Error,
+    net_dir: &Path,
+    moved: &[(PathBuf, PathBuf)],
+) -> anyhow::Error {
+    if moved.is_empty() {
+        return error;
+    }
+    match restore_moved_backups(net_dir, moved) {
+        Ok(()) => anyhow!("back up CA files failed: {error:#}; restored all moved live files"),
+        Err(rollback_error) => anyhow!(
+            "back up CA files failed: {error:#}; restoring moved live files also failed: \
+             {rollback_error:#}"
+        ),
+    }
+}
+
+/// Remove any partially-installed replacement and restore whatever live files
+/// were moved to `.bak` by [`backup_in`]. Missing backups mean that file did not
+/// exist before the transaction, so the partial replacement is simply removed.
+fn restore_backups(net_dir: &Path) -> Result<()> {
+    let mut failures = Vec::new();
+    for path in [
+        ca_cert_in(net_dir),
+        ca_key_in(net_dir),
+        ca_source_in(net_dir),
+    ] {
+        if path.exists()
+            && let Err(error) = std::fs::remove_file(&path)
+        {
+            failures.push(format!("remove {}: {error}", path.display()));
+            continue;
+        }
+        let backup = bak_path(&path);
+        if backup.exists()
+            && let Err(error) = std::fs::rename(&backup, &path)
+        {
+            failures.push(format!(
+                "restore {} to {}: {error}",
+                backup.display(),
+                path.display()
+            ));
+        }
+    }
+    if let Err(error) = sync_dir(net_dir) {
+        failures.push(error.to_string());
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", failures.join("; "))
+    }
+}
+
+fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("sync CA directory {}", dir.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
     Ok(())
 }
 
@@ -788,6 +1156,37 @@ mod tests {
         assert!(!Arc::ptr_eq(&cfg1, &cfg3));
     }
 
+    #[test]
+    fn literal_ip_leaf_uses_ip_address_san() {
+        use x509_parser::extensions::GeneralName;
+
+        let key = KeyPair::generate().unwrap();
+        let cert = ca_params().self_signed(&key).unwrap();
+        let ca = CertAuthority::build(&cert.pem(), key).unwrap();
+
+        for (host, expected) in [
+            ("127.0.0.1", std::net::IpAddr::from([127, 0, 0, 1])),
+            ("::1", std::net::IpAddr::from([0, 0, 0, 0, 0, 0, 0, 1])),
+        ] {
+            let der = ca.mint_leaf(host).unwrap();
+            let (_, cert) = x509_parser::parse_x509_certificate(der.as_ref()).unwrap();
+            let san = cert.subject_alternative_name().unwrap().unwrap();
+            let expected = match expected {
+                std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
+                std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
+            };
+            assert!(san.value.general_names.iter().any(|name| {
+                matches!(name, GeneralName::IPAddress(bytes) if *bytes == expected.as_slice())
+            }));
+            assert!(
+                san.value
+                    .general_names
+                    .iter()
+                    .all(|name| !matches!(name, GeneralName::DNSName(_)))
+            );
+        }
+    }
+
     // ── `net ca` management ───────────────────────────────────────────────────
 
     /// A self-signed CA (cert PEM, PKCS#8 key PEM) minted via rcgen — no openssl,
@@ -875,6 +1274,23 @@ mod tests {
     }
 
     #[test]
+    fn partial_project_ca_pair_is_an_actionable_error() {
+        for (present, missing) in [
+            (paths::CA_CERT_FILE, paths::CA_KEY_FILE),
+            (paths::CA_KEY_FILE, paths::CA_CERT_FILE),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            write(dir.path(), present, "stray project CA material");
+
+            let error = resolve_project_ca(dir.path()).unwrap_err().to_string();
+            assert!(error.contains("project CA is incomplete"), "{error}");
+            assert!(error.contains(present), "{error}");
+            assert!(error.contains(missing), "{error}");
+            assert!(error.contains("net ca reset --project"), "{error}");
+        }
+    }
+
+    #[test]
     fn read_source_prefers_marker_then_infers() {
         let dir = tempfile::tempdir().unwrap();
         // No marker: inferred from our generated subject vs. anything else.
@@ -899,6 +1315,103 @@ mod tests {
         assert_eq!(info.source, SOURCE_GENERATED);
         assert!(info.subject.contains("ShadowDroid MITM CA"));
         assert!(info.is_ca && info.self_signed && !info.expired);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_private_key_is_installed_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        generate_ca_files(dir.path()).unwrap();
+        let mode = std::fs::metadata(ca_key_in(dir.path()))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn backup_errors_are_not_silently_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = ca_cert_in(dir.path());
+        std::fs::write(&cert, "live cert").unwrap();
+        // A directory at the backup path cannot be removed with remove_file.
+        // The live file must remain in place and the error must reach callers.
+        std::fs::create_dir(bak_path(&cert)).unwrap();
+
+        let error = backup_in(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("stale CA backup"), "{error}");
+        assert_eq!(std::fs::read_to_string(cert).unwrap(), "live cert");
+    }
+
+    #[test]
+    fn later_backup_error_restores_files_already_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = ca_cert_in(dir.path());
+        let key = ca_key_in(dir.path());
+        std::fs::write(&cert, "live cert").unwrap();
+        std::fs::write(&key, "live key").unwrap();
+        // The cert is moved first. Failing while removing the key's stale
+        // backup must put that cert back before returning the error.
+        std::fs::create_dir(bak_path(&key)).unwrap();
+
+        let error = backup_in(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("stale CA backup"), "{error}");
+        assert!(error.contains("restored all moved live files"), "{error}");
+        assert_eq!(std::fs::read_to_string(&cert).unwrap(), "live cert");
+        assert_eq!(std::fs::read_to_string(&key).unwrap(), "live key");
+        assert!(!bak_path(&cert).exists());
+    }
+
+    #[test]
+    fn final_backup_sync_error_restores_every_live_file() {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, contents) in [
+            (ca_cert_in(dir.path()), "live cert"),
+            (ca_key_in(dir.path()), "live key"),
+            (ca_source_in(dir.path()), "live source"),
+        ] {
+            std::fs::write(path, contents).unwrap();
+        }
+
+        let error = backup_in_with_sync(dir.path(), |_| bail!("injected final sync failure"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("injected final sync failure"), "{error}");
+        assert!(error.contains("restored all moved live files"), "{error}");
+        for (path, contents) in [
+            (ca_cert_in(dir.path()), "live cert"),
+            (ca_key_in(dir.path()), "live key"),
+            (ca_source_in(dir.path()), "live source"),
+        ] {
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+            assert!(!bak_path(&path).exists());
+        }
+    }
+
+    #[test]
+    fn backup_error_includes_rollback_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = ca_cert_in(dir.path());
+        std::fs::write(&cert, "live cert").unwrap();
+
+        let error = backup_in_with_sync(dir.path(), |_| {
+            // Simulate an external writer recreating the live destination after
+            // it was moved. Rollback refuses to clobber it and reports that
+            // secondary failure alongside the triggering sync error.
+            std::fs::write(&cert, "unexpected replacement").unwrap();
+            bail!("injected final sync failure")
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("injected final sync failure"), "{error}");
+        assert!(
+            error.contains("restoring moved live files also failed"),
+            "{error}"
+        );
+        assert!(error.contains("refuse to overwrite"), "{error}");
     }
 
     #[test]
@@ -1050,4 +1563,32 @@ mod tests {
         // And rcgen can now load it.
         KeyPair::from_pem(&pkcs8).unwrap();
     }
+}
+#[test]
+fn ca_lock_blocks_replacement_while_a_reader_is_active() {
+    let dir = tempfile::tempdir().unwrap();
+    let reader = acquire_ca_lock(dir.path(), false).unwrap();
+    assert!(dir.path().join(".ca.lock").exists());
+    let busy = match try_acquire_ca_write_lock(dir.path()) {
+        Ok(_) => panic!("exclusive mutation lock must not bypass a live reader"),
+        Err(error) => error,
+    };
+    assert_eq!(crate::cli::error_code_of(&busy), "ca_in_use");
+    let contender_dir = dir.path().to_path_buf();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let contender = std::thread::spawn(move || {
+        let writer = acquire_ca_lock(&contender_dir, true).unwrap();
+        sender.send(()).unwrap();
+        drop(writer);
+    });
+    assert!(
+        receiver
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err()
+    );
+    drop(reader);
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .unwrap();
+    contender.join().unwrap();
 }

@@ -19,11 +19,11 @@
 //! required or CONNECT hangs; the 200 is returned synchronously and the MITM
 //! work happens on a detached task.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bytes::Bytes;
-use futures::StreamExt;
+use futures_util::StreamExt;
 use http::uri::{Authority, Scheme};
-use http_body_util::{combinators::UnsyncBoxBody, BodyExt, BodyStream, Empty, Full, StreamBody};
+use http_body_util::{BodyExt, BodyStream, Empty, Full, StreamBody, combinators::UnsyncBoxBody};
 use hyper::body::{Frame, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -34,13 +34,15 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::task::{Context as TaskCtx, Poll};
 use std::time::Duration;
-use tokio::io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_rustls::TlsAcceptor;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::events::{self, Event};
 use crate::net::ca::CertAuthority;
@@ -57,6 +59,15 @@ type ProxyBody = UnsyncBoxBody<Bytes, std::io::Error>;
 /// per-response memory and, with the `text/event-stream` short-circuit, stops an
 /// infinite/large response from hanging or OOMing the daemon (issue: #1/#6).
 const BUFFER_CAP: usize = 8 * 1024 * 1024;
+
+/// Decoded responses use the same memory budget as buffered wire bodies. This
+/// prevents a tiny compressed payload from expanding without bound while still
+/// allowing every response the proxy could have buffered uncompressed.
+const DECOMPRESSED_CAP: usize = BUFFER_CAP;
+const DECOMPRESSION_CONCURRENCY: usize = 4;
+const DECOMPRESSION_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A fully-buffered body from `bytes`.
 fn full_body(bytes: Bytes) -> ProxyBody {
@@ -78,6 +89,11 @@ pub struct ProxyContext {
     /// Apply platform certificate and hostname verification to every upstream
     /// TLS leg, including WebSockets (reqwest handles ordinary HTTP requests).
     pub verify_upstream: bool,
+    /// Every connection/tunnel task is tracked so daemon shutdown can stop
+    /// accepting, cancel active I/O, and drain completed flow records before
+    /// removing readiness markers.
+    pub tasks: TaskTracker,
+    pub shutdown: CancellationToken,
 }
 
 /// Runtime-mutable proxy knobs. (Rules land here in P3.)
@@ -104,12 +120,28 @@ pub struct SharedState {
     /// Completed captures discarded because the bounded persistence queue was
     /// full or closed. Exposed in `net status` so data loss is never silent.
     pub dropped_flows: AtomicU64,
+    /// Flow/TLS records delivered to the daemon but not durably appended.
+    /// Kept separate from queue drops so disk-full/permission failures are
+    /// visible and diagnosable through `net status`.
+    pub persistence_errors: AtomicU64,
+    /// Approximate retained bytes across currently held flow snapshots.
+    pub held_bytes: Arc<AtomicU64>,
+    /// Matching flows that failed open because the held count/byte budget was
+    /// exhausted. Exposed in status so overload is observable.
+    pub rejected_holds: AtomicU64,
 }
 
 impl SharedState {
     /// Should we decrypt + capture this host (vs blind-tunnel it through)?
     pub fn host_in_scope(&self, host: &str) -> bool {
         self.host_filters.is_empty() || self.host_filters.iter().any(|h| host_glob_match(h, host))
+    }
+
+    pub fn record_persistence_error(&self, kind: &str, error: &anyhow::Error) {
+        let count = self.persistence_errors.fetch_add(1, Ordering::Relaxed) + 1;
+        if count == 1 || count.is_power_of_two() {
+            tracing::warn!(count, kind, error = %error, "network capture persistence failed");
+        }
     }
 }
 
@@ -126,8 +158,17 @@ pub struct InterceptCfg {
 
 /// A paused flow: the oneshot that releases it + a snapshot for `net show`.
 pub struct HeldFlow {
-    pub tx: oneshot::Sender<HoldDecision>,
+    pub tx: Option<oneshot::Sender<HoldDecision>>,
     pub meta: FlowRecord,
+    held_charge: Option<(Arc<AtomicU64>, u64)>,
+}
+
+impl Drop for HeldFlow {
+    fn drop(&mut self) {
+        if let Some((counter, bytes)) = self.held_charge.take() {
+            counter.fetch_sub(bytes, Ordering::Relaxed);
+        }
+    }
 }
 
 /// The agent's verdict on a held flow.
@@ -152,20 +193,32 @@ pub fn build_upstream_client(verify_upstream: bool) -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(!verify_upstream)
-        .timeout(std::time::Duration::from_secs(120))
+        // A total request deadline would tear down healthy SSE/gRPC-style
+        // streams after a fixed wall-clock duration. Bound connection setup
+        // and idle reads instead, so progressing streams may remain open.
+        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+        .read_timeout(UPSTREAM_READ_TIMEOUT)
         .build()
         .expect("build upstream reqwest client")
 }
 
-/// Bind `127.0.0.1:port` and serve until `shutdown` fires.
-pub async fn run(
+/// Bind the proxy listener without starting its accept loop.
+///
+/// Keeping this separate from [`serve`] lets the daemon prove that the proxy
+/// port is owned before it publishes the control endpoint as ready.
+pub async fn bind(addr: SocketAddr) -> Result<TcpListener> {
+    TcpListener::bind(addr)
+        .await
+        .map_err(|e| anyhow!("bind proxy {addr}: {e}"))
+}
+
+/// Serve an already-bound proxy listener until `shutdown` fires.
+pub async fn serve(
     ctx: Arc<ProxyContext>,
-    addr: SocketAddr,
+    listener: TcpListener,
     mut shutdown: oneshot::Receiver<()>,
 ) -> Result<()> {
-    let listener = TcpListener::bind(addr)
-        .await
-        .map_err(|e| anyhow!("bind proxy {addr}: {e}"))?;
+    let addr = listener.local_addr()?;
     tracing::info!("net proxy listening on {addr}");
     loop {
         tokio::select! {
@@ -174,21 +227,23 @@ pub async fn run(
                     Ok(v) => v,
                     Err(e) => { tracing::debug!("accept: {e}"); continue; }
                 };
-                let ctx = ctx.clone();
-                tokio::spawn(async move {
+                let task_ctx = ctx.clone();
+                let shutdown = ctx.shutdown.clone();
+                drop(ctx.tasks.spawn(async move {
                     let io = TokioIo::new(tcp);
                     let svc = service_fn(move |req| {
-                        let ctx = ctx.clone();
+                        let ctx = task_ctx.clone();
                         async move { handle(ctx, req, None).await }
                     });
-                    if let Err(e) = http1::Builder::new()
-                        .serve_connection(io, svc)
-                        .with_upgrades()
-                        .await
-                    {
-                        tracing::debug!("proxy connection error: {e}");
+                    tokio::select! {
+                        result = http1::Builder::new().serve_connection(io, svc).with_upgrades() => {
+                            if let Err(e) = result {
+                                tracing::debug!("proxy connection error: {e}");
+                            }
+                        }
+                        _ = shutdown.cancelled() => {}
                     }
-                });
+                }));
             }
             _ = &mut shutdown => {
                 tracing::info!("net proxy shutting down");
@@ -215,11 +270,16 @@ async fn handle(
     if is_websocket_upgrade(req.headers()) {
         return Ok(proxy_websocket(ctx, req, tunnel).await);
     }
+    let method = req.method().clone();
     match proxy_request(ctx, req, tunnel).await {
         Ok(resp) => Ok(resp),
         Err(e) => {
             tracing::debug!("proxy_request error: {e}");
-            Ok(error_response(StatusCode::BAD_GATEWAY, &e.to_string()))
+            Ok(error_response_for(
+                &method,
+                StatusCode::BAD_GATEWAY,
+                &e.to_string(),
+            ))
         }
     }
 }
@@ -233,7 +293,9 @@ fn process_connect(ctx: Arc<ProxyContext>, req: Request<Incoming>) -> Response<P
     };
     let host = authority.host().to_string();
 
-    tokio::spawn(async move {
+    let tasks = ctx.tasks.clone();
+    let shutdown = ctx.shutdown.clone();
+    let task = async move {
         let mut req = req;
         let upgraded = match hyper::upgrade::on(&mut req).await {
             Ok(u) => u,
@@ -288,14 +350,21 @@ fn process_connect(ctx: Arc<ProxyContext>, req: Request<Incoming>) -> Response<P
         } else {
             // Out of scope or not TLS: blind passthrough, no decryption.
             let mut stream = stream;
-            match TcpStream::connect(authority.as_ref()).await {
+            let upstream = TcpStream::connect(authority.as_ref()).await;
+            match upstream {
                 Ok(mut upstream) => {
                     let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
                 }
                 Err(e) => tracing::debug!("blind tunnel connect {authority}: {e}"),
             }
         }
-    });
+    };
+    drop(tasks.spawn(async move {
+        tokio::select! {
+            _ = task => {}
+            _ = shutdown.cancelled() => {}
+        }
+    }));
 
     // 200 OK (empty body) == "tunnel established".
     Response::new(full_body(Bytes::new()))
@@ -317,7 +386,9 @@ fn report_tls_error(ctx: &ProxyContext, host: &str, err: &std::io::Error) {
         reason: tls_failure_reason(err),
         next_actions: crate::net::tls_error_next_actions(&ctx.serial),
     };
-    let _ = crate::net::store::append_event(&ctx.serial, &ev);
+    if let Err(error) = crate::net::store::append_event(&ctx.serial, &ev) {
+        ctx.shared.record_persistence_error("tls_error", &error);
+    }
     let _ = ctx.shared.events.send(Arc::new(ev));
 }
 
@@ -381,6 +452,8 @@ async fn proxy_websocket(
         &path,
         &req_headers,
         ctx.verify_upstream,
+        &ctx.tasks,
+        &ctx.shutdown,
     )
     .await
     {
@@ -436,9 +509,15 @@ async fn proxy_websocket(
     }
 
     if status != 101 {
-        // Server declined the upgrade — pass its response straight back.
-        let bytes = collect_incoming(upstream_resp).await.unwrap_or_default();
-        return build_client_response(status, &resp_headers, bytes);
+        // Server declined the upgrade — stream its response straight back. A
+        // rejection body may be arbitrarily large (or long-lived), so it must
+        // never go through an unbounded `collect()`.
+        return response_with_body(
+            status,
+            &resp_headers,
+            incoming_proxy_body(upstream_resp.into_body()),
+            content_length(&resp_headers),
+        );
     }
 
     let upstream_io = match hyper::upgrade::on(upstream_resp).await {
@@ -447,20 +526,27 @@ async fn proxy_websocket(
             return error_response(
                 StatusCode::BAD_GATEWAY,
                 &format!("upstream ws upgrade: {e}"),
-            )
+            );
         }
     };
     // Once the device sees our 101 it upgrades; copy bytes both ways until close.
-    tokio::spawn(async move {
-        match hyper::upgrade::on(&mut req).await {
-            Ok(device_io) => {
-                let mut a = TokioIo::new(device_io);
-                let mut b = TokioIo::new(upstream_io);
-                let _ = copy_bidirectional(&mut a, &mut b).await;
-            }
-            Err(e) => tracing::debug!("device ws upgrade: {e}"),
+    let shutdown = ctx.shutdown.clone();
+    drop(ctx.tasks.spawn(async move {
+        tokio::select! {
+            result = hyper::upgrade::on(&mut req) => match result {
+                Ok(device_io) => {
+                    let mut a = TokioIo::new(device_io);
+                    let mut b = TokioIo::new(upstream_io);
+                    tokio::select! {
+                        _ = copy_bidirectional(&mut a, &mut b) => {}
+                        _ = shutdown.cancelled() => {}
+                    }
+                }
+                Err(e) => tracing::debug!("device ws upgrade: {e}"),
+            },
+            _ = shutdown.cancelled() => {}
         }
-    });
+    }));
     ws_switching_response(&resp_headers)
 }
 
@@ -472,16 +558,13 @@ fn ws_target_port(uri: &Uri, tunnel: &Option<(Scheme, Authority)>, scheme: &str)
     } else if let Some(p) = uri.port_u16() {
         return p;
     }
-    if scheme == "https" {
-        443
-    } else {
-        80
-    }
+    if scheme == "https" { 443 } else { 80 }
 }
 
 /// Open a client connection to `host:port` (TLS for https), send the handshake,
 /// and return `(status, headers, response)` un-upgraded so the caller can upgrade
 /// (101) or read the reject body.
+#[allow(clippy::too_many_arguments)]
 async fn ws_handshake_upstream(
     scheme: &str,
     host: &str,
@@ -489,6 +572,8 @@ async fn ws_handshake_upstream(
     path: &str,
     req_headers: &[(String, String)],
     verify_upstream: bool,
+    tasks: &TaskTracker,
+    shutdown: &CancellationToken,
 ) -> Result<(u16, Vec<(String, String)>, Response<Incoming>)> {
     let tcp = tokio::time::timeout(Duration::from_secs(15), TcpStream::connect((host, port)))
         .await
@@ -516,11 +601,27 @@ async fn ws_handshake_upstream(
     .await
     .map_err(|_| anyhow!("upstream HTTP handshake timed out after 15s"))?
     .map_err(|e| anyhow!("upstream handshake: {e}"))?;
-    tokio::spawn(conn.with_upgrades());
+    let shutdown = shutdown.clone();
+    drop(tasks.spawn(async move {
+        tokio::select! {
+            _ = conn.with_upgrades() => {}
+            _ = shutdown.cancelled() => {}
+        }
+    }));
 
     let mut builder = Request::builder().method(Method::GET).uri(path);
+    let nominated = connection_nominated_headers(req_headers);
     for (name, value) in req_headers {
-        if name.eq_ignore_ascii_case("content-length") {
+        let lower = name.to_ascii_lowercase();
+        let websocket_hop_header = matches!(lower.as_str(), "connection" | "upgrade");
+        if lower == "content-length"
+            || matches!(
+                lower.as_str(),
+                "proxy-connection" | "proxy-authorization" | "proxy-authenticate"
+            )
+            || (is_hop_by_hop(&lower) && !websocket_hop_header)
+            || (nominated.contains(&lower) && lower != "upgrade")
+        {
             continue;
         }
         if let (Ok(hn), Ok(hv)) = (
@@ -545,13 +646,20 @@ async fn ws_handshake_upstream(
     Ok((status, headers, resp))
 }
 
-async fn collect_incoming(resp: Response<Incoming>) -> Result<Bytes> {
-    Ok(resp
-        .into_body()
-        .collect()
-        .await
-        .map_err(|e| anyhow!("read ws-reject body: {e}"))?
-        .to_bytes())
+/// Adapt an upstream hyper body without polling or collecting it. Keeping the
+/// frame-stream conversion generic makes the no-eager-read behaviour directly
+/// testable even though `Incoming` itself cannot be constructed by callers.
+fn frame_stream_body<S, E>(frames: S) -> ProxyBody
+where
+    S: futures_util::Stream<Item = Result<Frame<Bytes>, E>> + Send + 'static,
+    E: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let frames = frames.map(|result| result.map_err(std::io::Error::other));
+    BodyExt::boxed_unsync(StreamBody::new(frames))
+}
+
+fn incoming_proxy_body(body: Incoming) -> ProxyBody {
+    frame_stream_body(BodyStream::new(body))
 }
 
 /// The `101 Switching Protocols` handed to the device — the upstream's upgrade
@@ -692,10 +800,11 @@ async fn proxy_request(
             req_stream = Some((prefix, rest));
         }
         BodyRead::Error(e) => {
-            return Ok(error_response(
+            return Ok(error_response_for(
+                &method,
                 StatusCode::BAD_REQUEST,
                 &format!("read request body: {e}"),
-            ))
+            ));
         }
     }
 
@@ -705,32 +814,37 @@ async fn proxy_request(
     let mut modified = false;
 
     // ── replay (P3): serve a saved response, never hitting upstream ──
-    if in_scope {
-        if let Some((status, headers, body)) =
+    if in_scope
+        && let Some((status, mut headers, body)) =
             replay_lookup(&ctx.shared, method.as_str(), &host, &path)
-        {
-            capture(
-                &ctx,
-                FlowParts {
-                    id: &id,
-                    method: method.as_str(),
-                    scheme: &scheme,
-                    host: &host,
-                    path: &path,
-                    req_headers: &req_headers,
-                    req_bytes: &req_bytes,
-                    req_streamed: req_streaming,
-                    status: Some(status),
-                    resp_headers: &headers,
-                    resp_bytes: &body,
-                    dur_ms: 0,
-                    error: None,
-                    matched: Some("replay".into()),
-                    modified: true,
-                },
-            );
-            return Ok(build_client_response(status, &headers, body));
-        }
+    {
+        replace_content_length(&mut headers, synthetic_response_length(status, body.len()));
+        let wire_body = if response_allows_body(&method, status) {
+            body.clone()
+        } else {
+            Bytes::new()
+        };
+        capture(
+            &ctx,
+            FlowParts {
+                id: &id,
+                method: method.as_str(),
+                scheme: &scheme,
+                host: &host,
+                path: &path,
+                req_headers: &req_headers,
+                req_bytes: &req_bytes,
+                req_streamed: req_streaming,
+                status: Some(status),
+                resp_headers: &headers,
+                resp_bytes: &wire_body,
+                dur_ms: 0,
+                error: None,
+                matched: Some("replay".into()),
+                modified: true,
+            },
+        );
+        return Ok(build_client_response_for(&method, status, &headers, body));
     }
 
     // ── request-phase rules (P3): block / map-local short-circuit; map-remote
@@ -752,7 +866,13 @@ async fn proxy_request(
         if r.delay_ms > 0 {
             tokio::time::sleep(Duration::from_millis(r.delay_ms as u64)).await;
         }
-        if let Some((status, headers, body)) = r.short_circuit {
+        if let Some((status, mut headers, body)) = r.short_circuit {
+            replace_content_length(&mut headers, synthetic_response_length(status, body.len()));
+            let wire_body = if response_allows_body(&method, status) {
+                body.clone()
+            } else {
+                Bytes::new()
+            };
             capture(
                 &ctx,
                 FlowParts {
@@ -766,14 +886,14 @@ async fn proxy_request(
                     req_streamed: req_streaming,
                     status: Some(status),
                     resp_headers: &headers,
-                    resp_bytes: &body,
+                    resp_bytes: &wire_body,
                     dur_ms: 0,
                     error: None,
                     matched: Some("rule".into()),
                     modified: true,
                 },
             );
-            return Ok(build_client_response(status, &headers, body));
+            return Ok(build_client_response_for(&method, status, &headers, body));
         }
     }
 
@@ -799,13 +919,22 @@ async fn proxy_request(
         });
         if let Some(decision) = hold(&ctx, snap, "request").await {
             match decision {
-                HoldDecision::Drop(s) => return Ok(drop_response(s)),
+                HoldDecision::Drop(s) => return Ok(drop_response(&method, s)),
                 HoldDecision::Respond {
                     status,
                     body,
-                    headers,
+                    mut headers,
                 } => {
                     let resp_bytes = Bytes::from(body);
+                    replace_content_length(
+                        &mut headers,
+                        synthetic_response_length(status, resp_bytes.len()),
+                    );
+                    let wire_bytes = if response_allows_body(&method, status) {
+                        resp_bytes.clone()
+                    } else {
+                        Bytes::new()
+                    };
                     capture(
                         &ctx,
                         FlowParts {
@@ -819,14 +948,16 @@ async fn proxy_request(
                             req_streamed: false,
                             status: Some(status),
                             resp_headers: &headers,
-                            resp_bytes: &resp_bytes,
+                            resp_bytes: &wire_bytes,
                             dur_ms: 0,
                             error: None,
                             matched: Some("intercept:respond".into()),
                             modified: true,
                         },
                     );
-                    return Ok(build_client_response(status, &headers, resp_bytes));
+                    return Ok(build_client_response_for(
+                        &method, status, &headers, resp_bytes,
+                    ));
                 }
                 HoldDecision::Resume(m) => {
                     if !m.is_noop() {
@@ -843,14 +974,23 @@ async fn proxy_request(
     }
 
     // ── forward upstream ──
-    let up_body: Option<reqwest::Body> = if let Some((prefix, rest)) = req_stream.take() {
-        let s =
-            futures::stream::iter(prefix.into_iter().map(Ok::<Bytes, std::io::Error>)).chain(rest);
-        Some(reqwest::Body::wrap_stream(s))
+    let upstream_content_length = if req_streaming {
+        req_len_hint
     } else if req_bytes.is_empty() {
-        None
+        req_len_hint.filter(|length| *length == 0)
     } else {
-        Some(reqwest::Body::from(req_bytes.clone()))
+        Some(u64::try_from(req_bytes.len()).unwrap_or(u64::MAX))
+    };
+    replace_content_length(&mut req_headers, upstream_content_length);
+    let up_body: Option<reqwest::Body> = match req_stream.take() {
+        Some((prefix, rest)) => {
+            let stream =
+                futures_util::stream::iter(prefix.into_iter().map(Ok::<Bytes, std::io::Error>))
+                    .chain(rest);
+            Some(reqwest::Body::wrap_stream(stream))
+        }
+        None if req_bytes.is_empty() => None,
+        None => Some(reqwest::Body::from(req_bytes.clone())),
     };
     let started = std::time::Instant::now();
     let resp = match send_upstream(
@@ -859,6 +999,7 @@ async fn proxy_request(
         &url,
         &req_headers,
         up_body,
+        upstream_content_length,
         &ctx.shared,
     )
     .await
@@ -888,12 +1029,17 @@ async fn proxy_request(
                     ),
                 );
             }
-            return Ok(error_response(StatusCode::BAD_GATEWAY, &e.to_string()));
+            return Ok(error_response_for(
+                &method,
+                StatusCode::BAD_GATEWAY,
+                &e.to_string(),
+            ));
         }
     };
 
     let status_code = resp.status().as_u16();
     let mut resp_headers = header_pairs(resp.headers());
+    let original_response_length = content_length(&resp_headers);
 
     // Stream long-lived / oversized bodies instead of buffering (SSE would hang;
     // a huge download would OOM). A streamed flow skips response rules/intercept
@@ -906,6 +1052,26 @@ async fn proxy_request(
             len_hint,
         } => {
             let dur_ms = started.elapsed().as_millis() as u64;
+            let mut streamed_status = Some(status_code);
+            let mut no_body = Bytes::new();
+            if in_scope
+                && apply_response_rules(
+                    &ctx.shared,
+                    method.as_str(),
+                    &host,
+                    &path,
+                    &mut streamed_status,
+                    &mut resp_headers,
+                    &mut no_body,
+                    false,
+                )
+            {
+                modified = true;
+                if matched.is_none() {
+                    matched = Some("rule".into());
+                }
+            }
+            let final_status = streamed_status.unwrap_or(status_code);
             if in_scope {
                 let parts = FlowParts {
                     id: &id,
@@ -916,7 +1082,7 @@ async fn proxy_request(
                     req_headers: &req_headers,
                     req_bytes: &req_bytes,
                     req_streamed: req_streaming,
-                    status: Some(status_code),
+                    status: Some(final_status),
                     resp_headers: &resp_headers,
                     resp_bytes: &[],
                     dur_ms,
@@ -926,10 +1092,26 @@ async fn proxy_request(
                 };
                 capture_streamed(&ctx, parts, len_hint);
             }
+            let body_allowed = response_allows_body(&method, final_status);
+            let response_body = if body_allowed {
+                streamed_body(prefix, rest)
+            } else {
+                // A rule may change a streaming 200 into 204/304. Never attach
+                // the original stream to a status (or HEAD response) that
+                // forbids a message body.
+                full_body(Bytes::new())
+            };
+            let response_length =
+                if body_allowed || (method == Method::HEAD && !status_forbids_body(final_status)) {
+                    len_hint
+                } else {
+                    None
+                };
             return Ok(response_with_body(
-                status_code,
+                final_status,
                 &resp_headers,
-                streamed_body(prefix, rest),
+                response_body,
+                response_length,
             ));
         }
         BodyRead::Error(e) => {
@@ -955,21 +1137,35 @@ async fn proxy_request(
                     ),
                 );
             }
-            return Ok(error_response(StatusCode::BAD_GATEWAY, &e));
+            return Ok(error_response_for(&method, StatusCode::BAD_GATEWAY, &e));
         }
     };
     let dur_ms = started.elapsed().as_millis() as u64;
     let mut status = Some(status_code);
     let error: Option<String> = None;
+    let mut plaintext_body = true;
 
     // Decompress in-scope responses so capture, rules, and intercept all see
     // plain text — and strip `content-encoding` so the (decompressed) body we
-    // hand the client stays consistent. (The app decompresses gzip anyway, so
-    // serving it already-decompressed is transparent.)
+    // hand the client stays consistent. Decode work runs off the async worker
+    // and its output is capped. Unknown, invalid, or oversized encodings are
+    // passed through untouched and must skip plaintext-only mutation paths.
     if in_scope && error.is_none() {
-        if let Some(plain) = decompress(&resp_headers, &resp_bytes) {
-            resp_bytes = Bytes::from(plain);
-            resp_headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-encoding"));
+        match decompress_bounded(&resp_headers, &resp_bytes).await {
+            DecodeOutcome::Identity => {}
+            DecodeOutcome::Decoded(plain) => {
+                resp_bytes = Bytes::from(plain);
+                resp_headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-encoding"));
+                strip_body_validators(&mut resp_headers);
+            }
+            DecodeOutcome::PassThrough(reason) => {
+                tracing::debug!(
+                    ?reason,
+                    wire_len = resp_bytes.len(),
+                    "passing through encoded response without capture or mutation"
+                );
+                plaintext_body = false;
+            }
         }
     }
 
@@ -984,6 +1180,7 @@ async fn proxy_request(
             &mut status,
             &mut resp_headers,
             &mut resp_bytes,
+            plaintext_body,
         )
     {
         modified = true;
@@ -994,7 +1191,7 @@ async fn proxy_request(
 
     // ── response-phase interception ──
     if in_scope && error.is_none() {
-        let snap = make_flow(FlowParts {
+        let mut snap = make_flow(FlowParts {
             id: &id,
             method: method.as_str(),
             scheme: &scheme,
@@ -1005,15 +1202,20 @@ async fn proxy_request(
             req_streamed: req_streaming,
             status,
             resp_headers: &resp_headers,
-            resp_bytes: &resp_bytes,
+            resp_bytes: if plaintext_body { &resp_bytes } else { &[] },
             dur_ms,
             error: None,
             matched: None,
             modified: false,
         });
+        if !plaintext_body {
+            snap.streamed = true;
+            snap.resp_body = None;
+            snap.resp_len = u64::try_from(resp_bytes.len()).unwrap_or(u64::MAX);
+        }
         if let Some(decision) = hold(&ctx, snap, "response").await {
             match decision {
-                HoldDecision::Drop(s) => return Ok(drop_response(s)),
+                HoldDecision::Drop(s) => return Ok(drop_response(&method, s)),
                 HoldDecision::Respond {
                     status: rs,
                     body,
@@ -1022,19 +1224,20 @@ async fn proxy_request(
                     status = Some(rs);
                     resp_headers = headers;
                     resp_bytes = Bytes::from(body);
+                    plaintext_body = true;
                     modified = true;
                     matched = Some("intercept:respond".into());
                 }
                 HoldDecision::Resume(m) => {
-                    if !m.is_noop() {
+                    if apply_response_mutation(
+                        &mut status,
+                        &mut resp_headers,
+                        &mut resp_bytes,
+                        &m,
+                        plaintext_body,
+                    ) {
                         modified = true;
                         matched = Some("intercept".into());
-                        apply_response_mutation(
-                            &mut status,
-                            &mut resp_headers,
-                            &mut resp_bytes,
-                            &m,
-                        );
                     }
                     if let Some(d) = m.delay_ms {
                         tokio::time::sleep(Duration::from_millis(d as u64)).await;
@@ -1044,8 +1247,32 @@ async fn proxy_request(
         }
     }
 
+    // A response status and method decide whether a message body is legal.
+    // Apply this after rules/interception so a synthetic 204/304 or a HEAD
+    // interception can never leak buffered bytes onto the wire.
+    let body_len_before_suppression = resp_bytes.len();
+    if let Some(final_status) = status
+        && !response_allows_body(&method, final_status)
+        && !resp_bytes.is_empty()
+    {
+        resp_bytes = Bytes::new();
+        modified = true;
+    }
+    if let Some(final_status) = status {
+        let length = if status_forbids_body(final_status) {
+            None
+        } else if method == Method::HEAD {
+            (body_len_before_suppression != 0)
+                .then(|| u64::try_from(body_len_before_suppression).unwrap_or(u64::MAX))
+                .or(original_response_length)
+        } else {
+            Some(u64::try_from(resp_bytes.len()).unwrap_or(u64::MAX))
+        };
+        replace_content_length(&mut resp_headers, length);
+    }
+
     // ── capture + return ──
-    if in_scope {
+    if in_scope && plaintext_body {
         capture(
             &ctx,
             FlowParts {
@@ -1066,11 +1293,44 @@ async fn proxy_request(
                 modified,
             },
         );
+    } else if in_scope {
+        let wire_len = u64::try_from(resp_bytes.len()).unwrap_or(u64::MAX);
+        capture_streamed(
+            &ctx,
+            FlowParts {
+                id: &id,
+                method: method.as_str(),
+                scheme: &scheme,
+                host: &host,
+                path: &path,
+                req_headers: &req_headers,
+                req_bytes: &req_bytes,
+                req_streamed: req_streaming,
+                status,
+                resp_headers: &resp_headers,
+                resp_bytes: &[],
+                dur_ms,
+                error: error.clone(),
+                matched,
+                modified,
+            },
+            Some(wire_len),
+        );
     }
 
     Ok(match status {
-        Some(status) => build_client_response(status, &resp_headers, resp_bytes),
-        None => error_response(
+        Some(status) => {
+            let length = if status_forbids_body(status) {
+                None
+            } else if method == Method::HEAD {
+                content_length(&resp_headers)
+            } else {
+                Some(u64::try_from(resp_bytes.len()).unwrap_or(u64::MAX))
+            };
+            response_with_body(status, &resp_headers, full_body(resp_bytes), length)
+        }
+        None => error_response_for(
+            &method,
             StatusCode::BAD_GATEWAY,
             error.as_deref().unwrap_or("upstream error"),
         ),
@@ -1115,33 +1375,15 @@ async fn send_upstream(
     url: &str,
     req_headers: &[(String, String)],
     body: Option<reqwest::Body>,
+    content_length: Option<u64>,
     shared: &SharedState,
 ) -> Result<reqwest::Response> {
-    let mut headers = http::HeaderMap::new();
-    for (name, value) in req_headers {
-        let lname = name.to_lowercase();
-        if is_hop_by_hop(&lname) || lname == "host" || lname == "content-length" {
-            continue;
-        }
-        if shared.anticache && (lname == "if-none-match" || lname == "if-modified-since") {
-            continue;
-        }
-        if shared.anticomp && lname == "accept-encoding" {
-            continue;
-        }
-        if let (Ok(hn), Ok(hv)) = (
-            http::HeaderName::from_bytes(name.as_bytes()),
-            http::HeaderValue::from_str(value),
-        ) {
-            headers.insert(hn, hv);
-        }
-    }
-    if shared.anticomp {
-        headers.insert(
-            http::header::ACCEPT_ENCODING,
-            http::HeaderValue::from_static("identity"),
-        );
-    }
+    let headers = upstream_headers(
+        req_headers,
+        shared.anticache,
+        shared.anticomp,
+        content_length,
+    );
 
     let mut rb = client.request(method.clone(), url).headers(headers);
     if let Some(b) = body {
@@ -1150,9 +1392,57 @@ async fn send_upstream(
     rb.send().await.map_err(|e| anyhow!("upstream: {e}"))
 }
 
+fn upstream_headers(
+    req_headers: &[(String, String)],
+    anticache: bool,
+    anticomp: bool,
+    content_length: Option<u64>,
+) -> http::HeaderMap {
+    let mut headers = http::HeaderMap::new();
+    let nominated = connection_nominated_headers(req_headers);
+    for (name, value) in req_headers {
+        let lname = name.to_lowercase();
+        if is_hop_by_hop(&lname)
+            || nominated.contains(&lname)
+            || lname == "host"
+            || lname == "content-length"
+        {
+            continue;
+        }
+        if anticache && (lname == "if-none-match" || lname == "if-modified-since") {
+            continue;
+        }
+        if anticomp && lname == "accept-encoding" {
+            continue;
+        }
+        if let (Ok(hn), Ok(hv)) = (
+            http::HeaderName::from_bytes(name.as_bytes()),
+            http::HeaderValue::from_str(value),
+        ) {
+            // HeaderMap::insert overwrites a previous value. Request headers
+            // such as Cookie, X-Forwarded-For, and vendor extensions can be
+            // repeated and their ordering is significant, so preserve every
+            // field-line when forwarding upstream.
+            headers.append(hn, hv);
+        }
+    }
+    if anticomp {
+        headers.insert(
+            http::header::ACCEPT_ENCODING,
+            http::HeaderValue::from_static("identity"),
+        );
+    }
+    if let Some(length) = content_length
+        && let Ok(value) = http::HeaderValue::from_str(&length.to_string())
+    {
+        headers.insert(http::header::CONTENT_LENGTH, value);
+    }
+    headers
+}
+
 /// A byte stream normalised to `io::Result` (reqwest's error mapped away) so the
 /// cap loop is decoupled from reqwest and unit-testable.
-type ByteStream = Pin<Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + Send>>;
+type ByteStream = Pin<Box<dyn futures_util::Stream<Item = std::io::Result<Bytes>> + Send>>;
 
 /// The outcome of reading an upstream response body.
 enum BodyRead {
@@ -1182,6 +1472,21 @@ fn is_streaming_content_type(headers: &[(String, String)]) -> bool {
 
 fn content_length(headers: &[(String, String)]) -> Option<u64> {
     flow::header_get(headers, "content-length").and_then(|v| v.trim().parse().ok())
+}
+
+fn replace_content_length(headers: &mut Vec<(String, String)>, length: Option<u64>) {
+    headers.retain(|(name, _)| !name.eq_ignore_ascii_case("content-length"));
+    if let Some(length) = length {
+        headers.push(("content-length".into(), length.to_string()));
+    }
+}
+
+fn synthetic_response_length(status: u16, body_len: usize) -> Option<u64> {
+    if status_forbids_body(status) {
+        None
+    } else {
+        Some(u64::try_from(body_len).unwrap_or(u64::MAX))
+    }
 }
 
 /// Read the upstream body, buffering up to [`BUFFER_CAP`] then spilling to a
@@ -1216,7 +1521,8 @@ async fn read_stream_capped(
     let mut prefix: Vec<Bytes> = Vec::new();
     let mut total = 0usize;
     loop {
-        match rest.next().await {
+        let next = rest.next().await;
+        match next {
             None => return BodyRead::Buffered(concat_chunks(&prefix)),
             Some(Err(e)) => return BodyRead::Error(e.to_string()),
             Some(Ok(chunk)) => {
@@ -1251,7 +1557,7 @@ fn concat_chunks(chunks: &[Bytes]) -> Bytes {
 /// A streaming `ProxyBody` that emits the already-pulled `prefix` chunks, then
 /// the rest of the live upstream stream.
 fn streamed_body(prefix: Vec<Bytes>, rest: ByteStream) -> ProxyBody {
-    let head = futures::stream::iter(prefix.into_iter().map(Ok::<Bytes, std::io::Error>));
+    let head = futures_util::stream::iter(prefix.into_iter().map(Ok::<Bytes, std::io::Error>));
     let frames = head.chain(rest).map(|r| r.map(Frame::data));
     BodyExt::boxed_unsync(StreamBody::new(frames))
 }
@@ -1262,19 +1568,36 @@ fn response_with_body(
     status: u16,
     headers: &[(String, String)],
     body: ProxyBody,
+    known_length: Option<u64>,
 ) -> Response<ProxyBody> {
     let mut builder = Response::builder().status(status);
+    let nominated = connection_nominated_headers(headers);
     for (name, value) in headers {
         let lname = name.to_lowercase();
         // hyper sets framing headers from the body; copying them corrupts it.
-        if is_hop_by_hop(&lname) || lname == "content-length" || lname == "transfer-encoding" {
+        if is_hop_by_hop(&lname)
+            || nominated.contains(&lname)
+            || lname == "content-length"
+            || lname == "transfer-encoding"
+        {
             continue;
         }
         builder = builder.header(name, value);
     }
+    if let Some(length) = known_length {
+        builder = builder.header(http::header::CONTENT_LENGTH, length);
+    }
     builder
         .body(body)
         .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
+}
+
+fn status_forbids_body(status: u16) -> bool {
+    (100..200).contains(&status) || status == 204 || status == 304
+}
+
+fn response_allows_body(method: &Method, status: u16) -> bool {
+    *method != Method::HEAD && !status_forbids_body(status)
 }
 
 fn build_client_response(
@@ -1282,15 +1605,39 @@ fn build_client_response(
     headers: &[(String, String)],
     body: Bytes,
 ) -> Response<ProxyBody> {
-    response_with_body(status, headers, full_body(body))
+    let length = u64::try_from(body.len()).unwrap_or(u64::MAX);
+    response_with_body(status, headers, full_body(body), Some(length))
+}
+
+fn build_client_response_for(
+    method: &Method,
+    status: u16,
+    headers: &[(String, String)],
+    body: Bytes,
+) -> Response<ProxyBody> {
+    if response_allows_body(method, status) {
+        build_client_response(status, headers, body)
+    } else {
+        let length = if *method == Method::HEAD && !status_forbids_body(status) {
+            Some(u64::try_from(body.len()).unwrap_or(u64::MAX))
+        } else {
+            None
+        };
+        response_with_body(status, headers, full_body(Bytes::new()), length)
+    }
 }
 
 fn error_response(status: StatusCode, msg: &str) -> Response<ProxyBody> {
-    Response::builder()
-        .status(status)
-        .header("content-type", "text/plain; charset=utf-8")
-        .body(full_body(Bytes::from(format!("shadowdroid proxy: {msg}"))))
-        .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
+    error_response_for(&Method::GET, status, msg)
+}
+
+fn error_response_for(method: &Method, status: StatusCode, msg: &str) -> Response<ProxyBody> {
+    build_client_response_for(
+        method,
+        status.as_u16(),
+        &[("content-type".into(), "text/plain; charset=utf-8".into())],
+        Bytes::from(format!("shadowdroid proxy: {msg}")),
+    )
 }
 
 struct FlowParts<'a> {
@@ -1454,7 +1801,39 @@ fn redact_headers(headers: &mut [(String, String)]) {
 // ── interception ──────────────────────────────────────────────
 
 /// Max concurrently-held flows before `hold` fails open (see [`hold`]).
-const MAX_HELD_FLOWS: usize = 128;
+const MAX_HELD_FLOWS: usize = 32;
+const MAX_HELD_BYTES: u64 = 32 * 1024 * 1024;
+
+fn held_flow_charge(flow: &FlowRecord) -> u64 {
+    let strings = [
+        flow.id.as_str(),
+        flow.method.as_str(),
+        flow.scheme.as_str(),
+        flow.host.as_str(),
+        flow.path.as_str(),
+    ]
+    .into_iter()
+    .map(|value| u64::try_from(value.len()).unwrap_or(u64::MAX))
+    .fold(0_u64, u64::saturating_add);
+    let bodies = flow
+        .req_body
+        .as_ref()
+        .into_iter()
+        .chain(flow.resp_body.as_ref())
+        .map(|value| u64::try_from(value.len()).unwrap_or(u64::MAX))
+        .fold(0_u64, u64::saturating_add);
+    let headers = flow
+        .req_headers
+        .iter()
+        .chain(&flow.resp_headers)
+        .map(|(name, value)| name.len().saturating_add(value.len()))
+        .map(|bytes| u64::try_from(bytes).unwrap_or(u64::MAX))
+        .fold(0_u64, u64::saturating_add);
+    strings
+        .saturating_add(bodies)
+        .saturating_add(headers)
+        .saturating_add(1024)
+}
 
 /// If interception is active and `snap` matches at this `phase`, register the
 /// flow as held, emit an `http_intercept` event, and await the agent's decision
@@ -1472,23 +1851,32 @@ async fn hold(ctx: &ProxyContext, snap: FlowRecord, phase: &'static str) -> Opti
 
     let (tx, rx) = oneshot::channel();
     let id = snap.id.clone();
+    let charge = held_flow_charge(&snap);
     {
         // Cap concurrent holds: each pins a FlowRecord (with bodies) until acted
         // on or its deadline. An app hammering a matched endpoint faster than the
         // agent can resume would otherwise grow this map without bound, so past
         // the cap we fail open — let the flow through unheld rather than OOM.
         let mut held = ctx.shared.held.lock().unwrap();
-        if held.len() >= MAX_HELD_FLOWS {
+        let held_bytes = ctx.shared.held_bytes.load(Ordering::Relaxed);
+        if held.len() >= MAX_HELD_FLOWS || held_bytes.saturating_add(charge) > MAX_HELD_BYTES {
+            let rejected = ctx.shared.rejected_holds.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::warn!(
-                "net intercept: {MAX_HELD_FLOWS} flows already held; letting {id} through unheld"
+                rejected,
+                held = held.len(),
+                held_bytes,
+                charge,
+                "net intercept hold budget exhausted; letting {id} through unheld"
             );
             return None;
         }
+        ctx.shared.held_bytes.fetch_add(charge, Ordering::Relaxed);
         held.insert(
             id.clone(),
             HeldFlow {
-                tx,
+                tx: Some(tx),
                 meta: snap.clone(),
+                held_charge: Some((ctx.shared.held_bytes.clone(), charge)),
             },
         );
     }
@@ -1536,6 +1924,18 @@ pub(crate) async fn resolve_held(
     deadline: Duration,
     fail_open: impl Fn() -> HoldDecision,
 ) -> HoldDecision {
+    struct Cleanup<'a> {
+        held: &'a Mutex<HashMap<String, HeldFlow>>,
+        id: &'a str,
+    }
+    impl Drop for Cleanup<'_> {
+        fn drop(&mut self) {
+            self.held.lock().unwrap().remove(self.id);
+        }
+    }
+    // Also covers cancellation: dropping this future removes the map entry and
+    // releases its byte charge instead of leaking interception capacity.
+    let _cleanup = Cleanup { held, id };
     tokio::select! {
         biased;
         r = &mut rx => r.unwrap_or_else(|_| fail_open()),
@@ -1564,7 +1964,10 @@ pub(crate) fn release_held(
     decision: HoldDecision,
 ) -> bool {
     match held.lock().unwrap().remove(id) {
-        Some(h) => h.tx.send(decision).is_ok(),
+        Some(mut held) => held
+            .tx
+            .take()
+            .is_some_and(|sender| sender.send(decision).is_ok()),
         None => false,
     }
 }
@@ -1622,12 +2025,25 @@ fn apply_response_mutation(
     headers: &mut Vec<(String, String)>,
     body: &mut Bytes,
     m: &Mutation,
-) {
+    allow_body: bool,
+) -> bool {
+    let mut modified = false;
     if let Some(s) = m.set_status {
         *status = Some(s);
+        modified = true;
     }
-    apply_header_mutations(headers, m);
-    apply_body_mutation(body, m);
+    if !m.remove_headers.is_empty() || !m.set_headers.is_empty() {
+        modified |= apply_response_header_mutations(headers, m);
+    }
+    if allow_body && (m.body.is_some() || m.replace.is_some()) {
+        let before = body.clone();
+        apply_body_mutation(body, m);
+        if *body != before {
+            strip_body_validators(headers);
+            modified = true;
+        }
+    }
+    modified
 }
 
 fn apply_header_mutations(headers: &mut Vec<(String, String)>, m: &Mutation) {
@@ -1635,15 +2051,54 @@ fn apply_header_mutations(headers: &mut Vec<(String, String)>, m: &Mutation) {
         headers.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
     }
     for (name, value) in &m.set_headers {
-        if let Some(slot) = headers
-            .iter_mut()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        {
-            slot.1 = value.clone();
-        } else {
-            headers.push((name.clone(), value.clone()));
-        }
+        set_header_vec(headers, name, value);
     }
+}
+
+fn apply_response_header_mutations(
+    headers: &mut Vec<(String, String)>,
+    mutation: &Mutation,
+) -> bool {
+    let mut modified = false;
+    for name in &mutation.remove_headers {
+        if is_response_framing_header(name) {
+            continue;
+        }
+        let before = headers.len();
+        headers.retain(|(candidate, _)| !candidate.eq_ignore_ascii_case(name));
+        modified |= headers.len() != before;
+    }
+    for (name, value) in &mutation.set_headers {
+        if is_response_framing_header(name) {
+            continue;
+        }
+        set_header_vec(headers, name, value);
+        modified = true;
+    }
+    modified
+}
+
+fn is_response_framing_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "content-encoding" | "content-length" | "transfer-encoding"
+    )
+}
+
+fn strip_body_validators(headers: &mut Vec<(String, String)>) {
+    headers.retain(|(name, _)| {
+        !matches!(
+            name.to_ascii_lowercase().as_str(),
+            "content-md5"
+                | "digest"
+                | "content-digest"
+                | "repr-digest"
+                | "etag"
+                | "last-modified"
+                | "content-range"
+                | "accept-ranges"
+        )
+    });
 }
 
 fn apply_body_mutation(body: &mut Bytes, m: &Mutation) {
@@ -1651,19 +2106,20 @@ fn apply_body_mutation(body: &mut Bytes, m: &Mutation) {
         *body = Bytes::from(b.clone());
         return;
     }
-    if let Some((re, repl)) = &m.replace {
-        if let Ok(rx) = regex::Regex::new(re) {
-            let text = String::from_utf8_lossy(body);
-            let new = rx.replace_all(&text, repl.as_str()).into_owned();
-            *body = Bytes::from(new.into_bytes());
-        }
+    if let Some((re, repl)) = &m.replace
+        && let Ok(rx) = regex::Regex::new(re)
+        && let Ok(text) = std::str::from_utf8(body)
+        && rx.is_match(text)
+    {
+        let new = rx.replace_all(text, repl.as_str()).into_owned();
+        *body = Bytes::from(new.into_bytes());
     }
 }
 
-fn drop_response(status: Option<u16>) -> Response<ProxyBody> {
+fn drop_response(method: &Method, status: Option<u16>) -> Response<ProxyBody> {
     match status {
-        Some(s) => build_client_response(s, &[], Bytes::new()),
-        None => error_response(StatusCode::BAD_GATEWAY, "dropped by net intercept"),
+        Some(s) => build_client_response_for(method, s, &[], Bytes::new()),
+        None => error_response_for(method, StatusCode::BAD_GATEWAY, "dropped by net intercept"),
     }
 }
 
@@ -1679,7 +2135,14 @@ struct ReqRules {
     modified: bool,
 }
 
-fn rule_matches(spec: &RuleSpec, method: &str, host: &str, path: &str, ct: Option<&str>) -> bool {
+fn rule_matches(
+    spec: &RuleSpec,
+    method: &str,
+    host: &str,
+    path: &str,
+    ct: Option<&str>,
+    status: Option<u16>,
+) -> bool {
     let m = &spec.matcher;
     let sub = |hay: &str, n: &Option<String>| {
         n.as_deref()
@@ -1689,6 +2152,9 @@ fn rule_matches(spec: &RuleSpec, method: &str, host: &str, path: &str, ct: Optio
     sub(host, &m.host)
         && sub(path, &m.path)
         && sub(method, &m.method)
+        && m.status
+            .map(|wanted| status == Some(wanted))
+            .unwrap_or(true)
         && spec
             .content_type
             .as_deref()
@@ -1711,7 +2177,7 @@ fn apply_request_rules(
         modified: false,
     };
     for (_, spec) in rules.iter() {
-        if !rule_matches(spec, method, host, path, None) {
+        if !rule_matches(spec, method, host, path, None, None) {
             continue;
         }
         match spec.kind.as_str() {
@@ -1726,16 +2192,16 @@ fn apply_request_rules(
                 return out;
             }
             "map-local" => {
-                if let Some(p) = spec.args.first() {
-                    if let Ok(bytes) = std::fs::read(p) {
-                        out.short_circuit = Some((
-                            200,
-                            vec![("content-type".into(), guess_content_type(p))],
-                            Bytes::from(bytes),
-                        ));
-                        out.modified = true;
-                        return out;
-                    }
+                if let Some(p) = spec.args.first()
+                    && let Ok(bytes) = std::fs::read(p)
+                {
+                    out.short_circuit = Some((
+                        200,
+                        vec![("content-type".into(), guess_content_type(p))],
+                        Bytes::from(bytes),
+                    ));
+                    out.modified = true;
+                    return out;
                 }
             }
             "map-remote" => {
@@ -1761,6 +2227,7 @@ fn apply_request_rules(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_response_rules(
     shared: &SharedState,
     method: &str,
@@ -1769,12 +2236,13 @@ fn apply_response_rules(
     status: &mut Option<u16>,
     headers: &mut Vec<(String, String)>,
     body: &mut Bytes,
+    allow_body: bool,
 ) -> bool {
     let rules = shared.rules.read().unwrap();
     let ct = flow::content_type(headers);
     let mut modified = false;
     for (_, spec) in rules.iter() {
-        if !rule_matches(spec, method, host, path, ct.as_deref()) {
+        if !rule_matches(spec, method, host, path, ct.as_deref(), *status) {
             continue;
         }
         match spec.kind.as_str() {
@@ -1785,18 +2253,24 @@ fn apply_response_rules(
                 }
             }
             "set-response-header" => {
-                if let (Some(n), Some(v)) = (spec.args.first(), spec.args.get(1)) {
+                if let (Some(n), Some(v)) = (spec.args.first(), spec.args.get(1))
+                    && !is_response_framing_header(n)
+                {
                     set_header_vec(headers, n, v);
                     modified = true;
                 }
             }
-            "replace" => {
+            "replace" if allow_body => {
                 if let (Some(re), Some(rp)) = (spec.args.first(), spec.args.get(1)) {
-                    if let Ok(rx) = regex::Regex::new(re) {
-                        let text = String::from_utf8_lossy(body);
-                        let new = rx.replace_all(&text, rp.as_str()).into_owned();
+                    let regex = regex::Regex::new(re);
+                    if let Ok(rx) = regex
+                        && let Ok(text) = std::str::from_utf8(body)
+                        && rx.is_match(text)
+                    {
+                        let new = rx.replace_all(text, rp.as_str()).into_owned();
                         if new.as_bytes() != body.as_ref() {
                             *body = Bytes::from(new.into_bytes());
+                            strip_body_validators(headers);
                             modified = true;
                         }
                     }
@@ -1872,52 +2346,157 @@ fn guess_content_type(path: &str) -> String {
 }
 
 fn set_header_vec(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
-    if let Some(slot) = headers
-        .iter_mut()
-        .find(|(k, _)| k.eq_ignore_ascii_case(name))
-    {
-        slot.1 = value.to_string();
+    headers.retain(|(candidate, _)| !candidate.eq_ignore_ascii_case(name));
+    headers.push((name.to_string(), value.to_string()));
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContentEncoding {
+    Gzip,
+    Deflate,
+    Brotli,
+    Zstd,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EncodingDisposition {
+    Identity,
+    Supported(ContentEncoding),
+    Opaque,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DecodeFailure {
+    Unsupported,
+    Invalid,
+    TooLarge,
+    Overloaded,
+    WorkerFailed,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum DecodeOutcome {
+    Identity,
+    Decoded(Vec<u8>),
+    PassThrough(DecodeFailure),
+}
+
+fn encoding_disposition(headers: &[(String, String)]) -> EncodingDisposition {
+    let mut values = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-encoding"))
+        .map(|(_, value)| value.trim());
+    let Some(value) = values.next() else {
+        return EncodingDisposition::Identity;
+    };
+    if values.next().is_some() {
+        return EncodingDisposition::Opaque;
+    }
+
+    if value.eq_ignore_ascii_case("identity") {
+        EncodingDisposition::Identity
+    } else if value.eq_ignore_ascii_case("gzip") || value.eq_ignore_ascii_case("x-gzip") {
+        EncodingDisposition::Supported(ContentEncoding::Gzip)
+    } else if value.eq_ignore_ascii_case("deflate") {
+        EncodingDisposition::Supported(ContentEncoding::Deflate)
+    } else if value.eq_ignore_ascii_case("br") {
+        EncodingDisposition::Supported(ContentEncoding::Brotli)
+    } else if value.eq_ignore_ascii_case("zstd") {
+        EncodingDisposition::Supported(ContentEncoding::Zstd)
     } else {
-        headers.push((name.to_string(), value.to_string()));
+        // Includes empty, unknown, and stacked (`gzip, br`) encodings. Applying
+        // rules to bytes we cannot fully decode would corrupt the response.
+        EncodingDisposition::Opaque
     }
 }
 
-/// Decompress a `content-encoding` body so capture, rules, and intercept all see
-/// plain bytes. Handles gzip, deflate, `br` (brotli), and `zstd` — the encodings
-/// clients actually negotiate (OkHttp → gzip; WebViews/Cronet/CDNs → br/zstd).
-/// Returns `None` if not encoded or on decode error, leaving the original bytes
-/// untouched (the client still gets a consistent compressed body since
-/// `content-encoding` is only stripped when this returns `Some`).
-fn decompress(headers: &[(String, String)], body: &[u8]) -> Option<Vec<u8>> {
-    use std::io::Read;
-    let enc = headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
-        .map(|(_, v)| v.trim().to_lowercase())?;
-    let mut out = Vec::new();
-    match enc.as_str() {
-        "gzip" | "x-gzip" => flate2::read::GzDecoder::new(body)
-            .read_to_end(&mut out)
-            .ok()?,
-        "deflate" => match flate2::read::ZlibDecoder::new(body).read_to_end(&mut out) {
-            Ok(n) => n,
-            Err(_) => {
-                out.clear();
-                flate2::read::DeflateDecoder::new(body)
-                    .read_to_end(&mut out)
-                    .ok()?
-            }
-        },
-        "br" => brotli::Decompressor::new(body, 4096)
-            .read_to_end(&mut out)
-            .ok()?,
-        "zstd" => ruzstd::decoding::StreamingDecoder::new(body)
-            .ok()?
-            .read_to_end(&mut out)
-            .ok()?,
-        _ => return None,
+/// Decode a supported response away from Tokio's async workers. `Bytes::clone`
+/// is a cheap owned view, which gives the blocking closure a `'static` input
+/// without moving the headers or the original pass-through body.
+async fn decompress_bounded(headers: &[(String, String)], body: &Bytes) -> DecodeOutcome {
+    decompress_bounded_with_cap(headers, body, DECOMPRESSED_CAP).await
+}
+
+async fn decompress_bounded_with_cap(
+    headers: &[(String, String)],
+    body: &Bytes,
+    cap: usize,
+) -> DecodeOutcome {
+    let encoding = match encoding_disposition(headers) {
+        EncodingDisposition::Identity => return DecodeOutcome::Identity,
+        EncodingDisposition::Opaque => {
+            return DecodeOutcome::PassThrough(DecodeFailure::Unsupported);
+        }
+        EncodingDisposition::Supported(encoding) => encoding,
     };
-    Some(out)
+    let input = body.clone();
+    static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    let slots = SLOTS
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(DECOMPRESSION_CONCURRENCY)))
+        .clone();
+    let permit =
+        match tokio::time::timeout(DECOMPRESSION_QUEUE_TIMEOUT, slots.acquire_owned()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) | Err(_) => {
+                return DecodeOutcome::PassThrough(DecodeFailure::Overloaded);
+            }
+        };
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        decode_capped(encoding, input.as_ref(), cap)
+    })
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            tracing::warn!(%error, "response decompression worker failed");
+            DecodeOutcome::PassThrough(DecodeFailure::WorkerFailed)
+        }
+    }
+}
+
+/// Decode at most `cap + 1` bytes so an expansion beyond the limit is detected
+/// without retaining the full output. Deflate accepts both the RFC zlib wrapper
+/// and the raw stream emitted by some servers; an over-limit zlib stream is not
+/// retried as raw deflate.
+fn decode_capped(encoding: ContentEncoding, body: &[u8], cap: usize) -> DecodeOutcome {
+    let decoded = match encoding {
+        ContentEncoding::Gzip => read_decoder_capped(flate2::read::GzDecoder::new(body), cap),
+        ContentEncoding::Deflate => {
+            match read_decoder_capped(flate2::read::ZlibDecoder::new(body), cap) {
+                Err(DecodeFailure::Invalid) => {
+                    read_decoder_capped(flate2::read::DeflateDecoder::new(body), cap)
+                }
+                outcome => outcome,
+            }
+        }
+        ContentEncoding::Brotli => read_decoder_capped(brotli::Decompressor::new(body, 4096), cap),
+        ContentEncoding::Zstd => match ruzstd::decoding::StreamingDecoder::new(body) {
+            Ok(decoder) => read_decoder_capped(decoder, cap),
+            Err(_) => Err(DecodeFailure::Invalid),
+        },
+    };
+
+    match decoded {
+        Ok(plain) => DecodeOutcome::Decoded(plain),
+        Err(failure) => DecodeOutcome::PassThrough(failure),
+    }
+}
+
+fn read_decoder_capped<R: std::io::Read>(decoder: R, cap: usize) -> Result<Vec<u8>, DecodeFailure> {
+    use std::io::Read;
+
+    let limit = u64::try_from(cap).unwrap_or(u64::MAX).saturating_add(1);
+    let mut output = Vec::with_capacity(cap.min(64 * 1024));
+    decoder
+        .take(limit)
+        .read_to_end(&mut output)
+        .map_err(|_| DecodeFailure::Invalid)?;
+    if output.len() > cap {
+        Err(DecodeFailure::TooLarge)
+    } else {
+        Ok(output)
+    }
 }
 
 fn header_pairs(h: &http::HeaderMap) -> Vec<(String, String)> {
@@ -1939,10 +2518,24 @@ fn is_hop_by_hop(name_lower: &str) -> bool {
             | "keep-alive"
             | "proxy-authenticate"
             | "proxy-authorization"
+            | "transfer-encoding"
             | "te"
             | "trailer"
             | "upgrade"
     )
+}
+
+fn connection_nominated_headers(headers: &[(String, String)]) -> HashSet<String> {
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            name.eq_ignore_ascii_case("connection") || name.eq_ignore_ascii_case("proxy-connection")
+        })
+        .flat_map(|(_, value)| value.split(','))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
 }
 
 /// Glob host match used to scope which hosts the proxy MITMs (`net start --host`).
@@ -2021,14 +2614,21 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Rewind<T> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decompress, host_glob_match, release_held, resolve_held, tls_failure_reason,
-        ws_tls_connector, HeldFlow, HoldDecision,
+        ContentEncoding, DecodeFailure, DecodeOutcome, EncodingDisposition, HeldFlow, HoldDecision,
+        decode_capped, decompress_bounded_with_cap, encoding_disposition, frame_stream_body,
+        host_glob_match, release_held, resolve_held, tls_failure_reason, upstream_headers,
+        ws_tls_connector,
     };
-    use crate::net::flow::FlowRecord;
     use crate::net::Mutation;
+    use crate::net::flow::FlowRecord;
+    use bytes::Bytes;
+    use http_body_util::BodyExt;
+    use hyper::body::Frame;
     use std::collections::HashMap;
     use std::io;
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::task::Poll;
     use std::time::Duration;
     use tokio::sync::oneshot;
 
@@ -2072,37 +2672,191 @@ mod tests {
         assert!(!self_signed_tls_handshake(true).await);
     }
 
-    #[test]
-    fn decompress_round_trips_every_supported_encoding() {
+    fn gzip(plain: &[u8]) -> Vec<u8> {
         use std::io::Write;
-        let plain = b"{\"hello\":\"world\",\"items\":[1,2,3]}".repeat(20);
-        let ce = |v: &str| vec![("Content-Encoding".to_string(), v.to_string())];
-
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        gz.write_all(&plain).unwrap();
-        assert_eq!(
-            decompress(&ce("gzip"), &gz.finish().unwrap()).unwrap(),
-            plain
-        );
+        gz.write_all(plain).unwrap();
+        gz.finish().unwrap()
+    }
 
+    fn zlib_deflate(plain: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut deflate =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        deflate.write_all(plain).unwrap();
+        deflate.finish().unwrap()
+    }
+
+    fn raw_deflate(plain: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut deflate =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        deflate.write_all(plain).unwrap();
+        deflate.finish().unwrap()
+    }
+
+    fn brotli(plain: &[u8]) -> Vec<u8> {
+        use std::io::Write;
         let mut br = Vec::new();
         {
             let mut w = brotli::CompressorWriter::new(&mut br, 4096, 5, 22);
-            w.write_all(&plain).unwrap();
+            w.write_all(plain).unwrap();
         }
-        assert_eq!(decompress(&ce("br"), &br).unwrap(), plain);
+        br
+    }
 
-        let zs = ruzstd::encoding::compress_to_vec(
-            &plain[..],
-            ruzstd::encoding::CompressionLevel::Fastest,
+    fn zstd(plain: &[u8]) -> Vec<u8> {
+        ruzstd::encoding::compress_to_vec(plain, ruzstd::encoding::CompressionLevel::Fastest)
+    }
+
+    fn encoded_bodies(plain: &[u8]) -> Vec<(ContentEncoding, Vec<u8>)> {
+        vec![
+            (ContentEncoding::Gzip, gzip(plain)),
+            (ContentEncoding::Deflate, zlib_deflate(plain)),
+            (ContentEncoding::Deflate, raw_deflate(plain)),
+            (ContentEncoding::Brotli, brotli(plain)),
+            (ContentEncoding::Zstd, zstd(plain)),
+        ]
+    }
+
+    fn ce(value: &str) -> Vec<(String, String)> {
+        vec![("Content-Encoding".to_string(), value.to_string())]
+    }
+
+    #[test]
+    fn decompress_round_trips_every_supported_encoding() {
+        let plain = b"{\"hello\":\"world\",\"items\":[1,2,3]}".repeat(20);
+        for (encoding, encoded) in encoded_bodies(&plain) {
+            assert_eq!(
+                decode_capped(encoding, &encoded, plain.len()),
+                DecodeOutcome::Decoded(plain.clone()),
+                "failed to decode {encoding:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decompression_cap_accepts_limit_and_rejects_next_byte() {
+        const CAP: usize = 1024;
+        let exact = vec![b'x'; CAP];
+        for (encoding, encoded) in encoded_bodies(&exact) {
+            assert_eq!(
+                decode_capped(encoding, &encoded, CAP),
+                DecodeOutcome::Decoded(exact.clone()),
+                "exact cap failed for {encoding:?}"
+            );
+        }
+
+        let oversized = vec![b'y'; CAP + 1];
+        for (encoding, encoded) in encoded_bodies(&oversized) {
+            assert_eq!(
+                decode_capped(encoding, &encoded, CAP),
+                DecodeOutcome::PassThrough(DecodeFailure::TooLarge),
+                "cap was not enforced for {encoding:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn corrupt_encodings_are_passed_through() {
+        let corrupt = [
+            (ContentEncoding::Gzip, b"not really gzip".as_slice()),
+            (ContentEncoding::Deflate, b"\xff\xff\xff\xff".as_slice()),
+            (ContentEncoding::Brotli, b"not really brotli".as_slice()),
+            (ContentEncoding::Zstd, b"not really zstd".as_slice()),
+        ];
+        for (encoding, body) in corrupt {
+            assert_eq!(
+                decode_capped(encoding, body, 1024),
+                DecodeOutcome::PassThrough(DecodeFailure::Invalid),
+                "corrupt {encoding:?} payload was accepted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn async_decompression_classifies_and_bounds_encoded_responses() {
+        assert_eq!(encoding_disposition(&[]), EncodingDisposition::Identity);
+        assert_eq!(
+            encoding_disposition(&ce("identity")),
+            EncodingDisposition::Identity
         );
-        assert_eq!(decompress(&ce("zstd"), &zs).unwrap(), plain);
+        assert_eq!(
+            encoding_disposition(&ce("X-GZIP")),
+            EncodingDisposition::Supported(ContentEncoding::Gzip)
+        );
+        assert_eq!(
+            encoding_disposition(&ce("gzip, br")),
+            EncodingDisposition::Opaque
+        );
+        assert_eq!(
+            encoding_disposition(&ce("compress")),
+            EncodingDisposition::Opaque
+        );
+        assert_eq!(
+            encoding_disposition(&[
+                ("Content-Encoding".into(), "gzip".into()),
+                ("content-encoding".into(), "br".into()),
+            ]),
+            EncodingDisposition::Opaque
+        );
 
-        // No / unknown / identity encoding → leave bytes untouched.
-        assert!(decompress(&[], &plain).is_none());
-        assert!(decompress(&ce("identity"), &plain).is_none());
-        // Corrupt br payload → None (fall back to passthrough), never a panic.
-        assert!(decompress(&ce("br"), b"not really brotli").is_none());
+        let plain = b"spawn-blocking decode".repeat(8);
+        let wire = gzip(&plain);
+        let encoded = Bytes::from(wire.clone());
+        assert_eq!(
+            decompress_bounded_with_cap(&ce("gzip"), &encoded, plain.len()).await,
+            DecodeOutcome::Decoded(plain.clone())
+        );
+        assert_eq!(
+            decompress_bounded_with_cap(&ce("gzip"), &encoded, plain.len() - 1).await,
+            DecodeOutcome::PassThrough(DecodeFailure::TooLarge)
+        );
+        // The owned `Bytes` remains available for exact pass-through after the
+        // blocking decoder reports a failure.
+        assert_eq!(encoded.as_ref(), wire);
+
+        assert_eq!(
+            decompress_bounded_with_cap(&ce("gzip, br"), &encoded, 1).await,
+            DecodeOutcome::PassThrough(DecodeFailure::Unsupported)
+        );
+        assert_eq!(
+            decompress_bounded_with_cap(&[], &Bytes::from_static(b"plain"), 1).await,
+            DecodeOutcome::Identity
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_rejection_body_adapter_is_lazy_and_propagates_errors() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let step = Arc::new(AtomicUsize::new(0));
+        let stream_polls = Arc::clone(&polls);
+        let stream_step = Arc::clone(&step);
+        let frames = futures_util::stream::poll_fn(move |_| {
+            stream_polls.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(match stream_step.fetch_add(1, Ordering::SeqCst) {
+                0 => Some(Ok::<_, io::Error>(Frame::data(Bytes::from_static(b"too ")))),
+                1 => Some(Ok(Frame::data(Bytes::from_static(b"large")))),
+                _ => None,
+            })
+        });
+
+        let body = frame_stream_body(frames);
+        assert_eq!(polls.load(Ordering::SeqCst), 0, "adapter eagerly polled");
+        assert_eq!(
+            body.collect().await.unwrap().to_bytes(),
+            Bytes::from_static(b"too large")
+        );
+        assert_eq!(polls.load(Ordering::SeqCst), 3);
+
+        let erroring = futures_util::stream::iter(vec![
+            Ok(Frame::data(Bytes::from_static(b"prefix"))),
+            Err(io::Error::other("boom")),
+        ]);
+        match frame_stream_body(erroring).collect().await {
+            Ok(_) => panic!("stream error was discarded"),
+            Err(error) => assert!(error.to_string().contains("boom")),
+        }
     }
 
     #[test]
@@ -2122,10 +2876,10 @@ mod tests {
 
     #[tokio::test]
     async fn stream_cap_buffers_small_and_spills_large() {
-        use super::{read_stream_capped, BodyRead, ByteStream};
+        use super::{BodyRead, ByteStream, read_stream_capped};
         use bytes::Bytes;
         let chunks = |parts: Vec<&'static [u8]>| -> ByteStream {
-            Box::pin(futures::stream::iter(
+            Box::pin(futures_util::stream::iter(
                 parts.into_iter().map(|b| Ok(Bytes::from_static(b))),
             ))
         };
@@ -2155,7 +2909,7 @@ mod tests {
         }
 
         // A stream error surfaces as Error, not a panic.
-        let erroring: ByteStream = Box::pin(futures::stream::iter(vec![
+        let erroring: ByteStream = Box::pin(futures_util::stream::iter(vec![
             Ok(Bytes::from_static(b"x")),
             Err(std::io::Error::other("boom")),
         ]));
@@ -2211,6 +2965,164 @@ mod tests {
     }
 
     #[test]
+    fn upstream_headers_preserve_repeated_field_lines() {
+        let input = vec![
+            ("Cookie".into(), "a=1".into()),
+            ("cookie".into(), "b=2".into()),
+            ("X-Debug".into(), "first".into()),
+            ("X-Debug".into(), "second".into()),
+            ("Host".into(), "example.test".into()),
+            ("Content-Length".into(), "123".into()),
+            ("Transfer-Encoding".into(), "chunked".into()),
+            ("Connection".into(), "X-Hop".into()),
+            ("connection".into(), "x-second, keep-alive".into()),
+            ("X-Hop".into(), "secret".into()),
+            ("X-Second".into(), "also-secret".into()),
+        ];
+        let headers = upstream_headers(&input, false, false, Some(1_048_576));
+
+        let cookies = headers
+            .get_all(http::header::COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(cookies, ["a=1", "b=2"]);
+        let debug = headers
+            .get_all("x-debug")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(debug, ["first", "second"]);
+        assert!(!headers.contains_key(http::header::HOST));
+        assert!(!headers.contains_key(http::header::CONNECTION));
+        assert!(!headers.contains_key(http::header::TRANSFER_ENCODING));
+        assert!(!headers.contains_key("x-hop"));
+        assert!(!headers.contains_key("x-second"));
+        assert_eq!(headers[http::header::CONTENT_LENGTH], "1048576");
+
+        let headers = upstream_headers(&input, false, true, None);
+        assert_eq!(headers[http::header::ACCEPT_ENCODING], "identity");
+    }
+
+    #[test]
+    fn response_filters_connection_nominated_headers() {
+        let response = super::response_with_body(
+            200,
+            &[
+                ("Connection".into(), "X-Hop".into()),
+                ("X-Hop".into(), "secret".into()),
+                ("X-End-To-End".into(), "keep".into()),
+            ],
+            super::full_body(Bytes::new()),
+            Some(0),
+        );
+        assert!(!response.headers().contains_key(http::header::CONNECTION));
+        assert!(!response.headers().contains_key("x-hop"));
+        assert_eq!(response.headers()["x-end-to-end"], "keep");
+    }
+
+    #[test]
+    fn setting_a_header_replaces_every_duplicate_field_line() {
+        let mut headers: Vec<(String, String)> = vec![
+            ("Set-Cookie".into(), "old-a=1".into()),
+            ("X-Keep".into(), "yes".into()),
+            ("set-cookie".into(), "old-b=2".into()),
+        ];
+        super::set_header_vec(&mut headers, "Set-Cookie", "new=3");
+        let set_cookie = headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
+            .collect::<Vec<_>>();
+        assert_eq!(set_cookie.len(), 1);
+        assert_eq!(set_cookie[0].0, "Set-Cookie");
+        assert_eq!(set_cookie[0].1, "new=3");
+        assert!(headers.contains(&("X-Keep".into(), "yes".into())));
+
+        let mutation = Mutation {
+            set_headers: vec![("X-Keep".into(), "replaced".into())],
+            ..Default::default()
+        };
+        headers.push(("x-keep".into(), "stale".into()));
+        super::apply_header_mutations(&mut headers, &mutation);
+        let kept = headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("x-keep"))
+            .collect::<Vec<_>>();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].1, "replaced");
+    }
+
+    #[test]
+    fn opaque_response_metadata_edits_preserve_wire_encoding() {
+        let mut status = Some(200);
+        let mut headers = vec![
+            ("Content-Encoding".into(), "gzip".into()),
+            ("ETag".into(), "old-validator".into()),
+        ];
+        let mut body = Bytes::from_static(b"opaque-gzip-bytes");
+        let mutation = Mutation {
+            set_status: Some(201),
+            set_headers: vec![
+                ("Content-Encoding".into(), "identity".into()),
+                ("X-Debug".into(), "yes".into()),
+            ],
+            remove_headers: vec!["content-encoding".into()],
+            body: Some(b"must-not-apply".to_vec()),
+            ..Default::default()
+        };
+
+        assert!(super::apply_response_mutation(
+            &mut status,
+            &mut headers,
+            &mut body,
+            &mutation,
+            false,
+        ));
+        assert_eq!(status, Some(201));
+        assert_eq!(body, Bytes::from_static(b"opaque-gzip-bytes"));
+        assert!(headers.contains(&("Content-Encoding".into(), "gzip".into())));
+        assert!(headers.contains(&("X-Debug".into(), "yes".into())));
+    }
+
+    #[test]
+    fn textual_replace_never_corrupts_unmatched_or_binary_bodies() {
+        let mutation = Mutation {
+            replace: Some(("needle".into(), "replacement".into())),
+            ..Default::default()
+        };
+        let mut unmatched = Bytes::from_static(b"plain text without a match");
+        super::apply_body_mutation(&mut unmatched, &mutation);
+        assert_eq!(unmatched, Bytes::from_static(b"plain text without a match"));
+
+        let mut binary = Bytes::from_static(&[0xff, 0xfe, b'n', b'e', b'e', b'd', b'l', b'e']);
+        super::apply_body_mutation(&mut binary, &mutation);
+        assert_eq!(
+            binary,
+            Bytes::from_static(&[0xff, 0xfe, b'n', b'e', b'e', b'd', b'l', b'e'])
+        );
+    }
+
+    #[test]
+    fn head_and_bodyless_statuses_never_forward_a_message_body() {
+        assert!(!super::response_allows_body(&hyper::Method::HEAD, 200));
+        assert!(!super::response_allows_body(&hyper::Method::GET, 101));
+        assert!(!super::response_allows_body(&hyper::Method::GET, 204));
+        assert!(!super::response_allows_body(&hyper::Method::GET, 304));
+        assert!(super::response_allows_body(&hyper::Method::GET, 200));
+    }
+
+    #[test]
+    fn response_framing_keeps_known_stream_length() {
+        let response = super::response_with_body(
+            200,
+            &[("Content-Length".into(), "999".into())],
+            super::streamed_body(Vec::new(), Box::pin(futures_util::stream::empty())),
+            Some(42),
+        );
+        assert_eq!(response.headers()[http::header::CONTENT_LENGTH], "42");
+    }
+
+    #[test]
     fn redact_headers_masks_only_sensitive() {
         let mut headers = vec![
             (
@@ -2258,8 +3170,9 @@ mod tests {
         held.lock().unwrap().insert(
             id.to_string(),
             HeldFlow {
-                tx,
+                tx: Some(tx),
                 meta: FlowRecord::default(),
+                held_charge: None,
             },
         );
         rx
@@ -2303,6 +3216,20 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cancelling_a_held_request_removes_its_map_entry() {
+        let held = Arc::new(Mutex::new(HashMap::new()));
+        let rx = insert_held(&held, "f1");
+        let task_held = held.clone();
+        let task = tokio::spawn(async move {
+            resolve_held(&task_held, "f1", rx, Duration::from_secs(60), fail_open).await
+        });
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+        assert!(held.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn host_globs() {
         assert!(host_glob_match("*.livd.app", "api.livd.app"));
@@ -2318,5 +3245,34 @@ mod tests {
         // …but NOT a longer domain that merely contains it (the over-capture bug).
         assert!(!host_glob_match("example.com", "example.com.evil.com"));
         assert!(!host_glob_match("livd.app", "notlivd.app"));
+    }
+
+    #[test]
+    fn response_rule_status_matcher_is_enforced() {
+        let spec = crate::net::RuleSpec {
+            kind: "set-status".into(),
+            matcher: crate::net::Matcher {
+                status: Some(200),
+                ..Default::default()
+            },
+            content_type: None,
+            args: vec!["201".into()],
+        };
+        assert!(super::rule_matches(
+            &spec,
+            "GET",
+            "api.example",
+            "/",
+            None,
+            Some(200),
+        ));
+        assert!(!super::rule_matches(
+            &spec,
+            "GET",
+            "api.example",
+            "/",
+            None,
+            Some(404),
+        ));
     }
 }

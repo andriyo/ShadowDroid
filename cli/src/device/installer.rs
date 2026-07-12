@@ -17,19 +17,18 @@
 //! if bytes changed). Sources 5-6 are *user* sources; versionName must match
 //! the CLI's baked-in `EXPECTED_APK_VERSION`.
 
-use crate::ids::Serial;
-use anyhow::{anyhow, bail, Context, Result};
-use std::fs;
-use std::io::Write;
+use crate::ids::{Serial, stable_file_component};
+use anyhow::{Context, Result, anyhow, bail};
+use std::fs::{self, File, TryLockError};
+use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::device::{adb, client::ServerClient, portmap};
 use crate::hostenv::{env_truthy, shadowdroid_home};
 use crate::release::{
-    download_file, download_text, expected_sha, release_asset_url, release_base_url, sha256_file,
-    verify_sha256, CHECKSUMS_ASSET,
+    CHECKSUMS_ASSET, checksum_for, download_text, download_verified_file, expected_sha,
+    release_asset_url, release_base_url, release_client, sha256_file, verify_sha256,
 };
 
 pub const EXPECTED_APK_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -45,209 +44,99 @@ pub const SERVER_TEST_CLASS: &str = "io.github.andriyo.shadowdroid.ShadowDroidSe
 pub const DEFAULT_PORT: u16 = 7912;
 const RELEASE_MAIN_APK_ASSET: &str = "shadowdroid-server-main.apk";
 const RELEASE_TEST_APK_ASSET: &str = "shadowdroid-server-test.apk";
+const CACHE_MAIN_APK: &str = "main.apk";
+const CACHE_TEST_APK: &str = "test.apk";
+const CACHE_COMPLETE_FILE: &str = ".complete.sha256";
 pub const INSTRUMENT_LOG_PATH: &str = "/sdcard/shadowdroid-instr.log";
 
 /// Cross-process ownership guard for lifecycle mutations on one device. The
-/// file is intentionally short-lived and carries no device data beyond a
-/// sanitized serial in its filename.
+/// OS releases the advisory lock when this file handle closes, including when
+/// the owning process exits unexpectedly. The lock file itself is persistent:
+/// unlinking a held lock can let another process lock a different inode at the
+/// same path and enter the critical section concurrently.
+#[derive(Debug)]
 pub struct DeviceLifecycleGuard {
-    path: PathBuf,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProcessLiveness {
-    Alive,
-    Dead,
-    Unknown,
-}
-
-impl ProcessLiveness {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Alive => "alive",
-            Self::Dead => "dead",
-            Self::Unknown => "unknown",
-        }
-    }
+    file: File,
 }
 
 impl Drop for DeviceLifecycleGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let _ = self.file.unlock();
     }
 }
 
 pub fn acquire_lifecycle_lock(serial: &Serial) -> Result<DeviceLifecycleGuard> {
     let dir = shadowdroid_home()?.join("locks");
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let safe_serial: String = serial
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let path = dir.join(format!("device-{safe_serial}.lock"));
+    let component = stable_file_component(serial.as_str());
+    acquire_lifecycle_lock_at(serial, &dir.join(format!("device-{component}.lock")))
+}
 
-    for _ in 0..2 {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                if let Err(error) =
-                    write_lock_pid(&mut file, std::process::id()).and_then(|()| file.sync_all())
-                {
-                    drop(file);
-                    let cleanup_error = std::fs::remove_file(&path)
-                        .err()
-                        .map(|error| error.to_string());
-                    return Err(crate::diagnostic::DiagnosticError::new(
-                        "device_lifecycle_lock_write_failed",
-                        "device",
-                        format!("could not record ownership of the lifecycle lock for {serial}"),
-                    )
-                    .retryable(true)
-                    .detail(serde_json::json!({
-                        "device": serial.as_str(),
-                        "lock": path.display().to_string(),
-                        "error": error.to_string(),
-                        "cleanup_error": cleanup_error,
-                    }))
-                    .next_actions([
-                        "retry the lifecycle command",
-                        "inspect detail.lock only if the retry reports device_lifecycle_busy",
-                    ])
-                    .into());
-                }
-                return Ok(DeviceLifecycleGuard { path });
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let owner = std::fs::read_to_string(&path)
-                    .ok()
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty());
-                let age = std::fs::metadata(&path)
-                    .and_then(|metadata| metadata.modified())
-                    .ok()
-                    .and_then(|modified| modified.elapsed().ok());
-                let owner_pid = owner.as_deref().and_then(|value| value.parse::<u32>().ok());
-                let liveness = owner_pid.map(shadowdroid_process_liveness);
-                if should_reclaim_lifecycle_lock(owner_pid, liveness, age) {
-                    let _ = std::fs::remove_file(&path);
-                    continue;
-                }
-                return Err(crate::diagnostic::DiagnosticError::new(
-                    "device_lifecycle_busy",
-                    "device",
-                    format!("another ShadowDroid process is changing device {serial}"),
-                )
-                .retryable(true)
-                .detail(serde_json::json!({
-                    "device": serial.as_str(),
-                    "owner_pid": owner,
-                    "owner_liveness": liveness.map(ProcessLiveness::as_str),
-                    "age_ms": age.map(|age| age.as_millis() as u64),
-                    "lock": path.display().to_string(),
-                }))
-                .next_actions([
-                    "wait for the active ShadowDroid lifecycle command to finish, then retry",
-                    "inspect detail.owner_pid only if the lock remains after that process exits",
-                ])
-                .into());
-            }
-            Err(error) => return Err(error).with_context(|| format!("create {}", path.display())),
+fn acquire_lifecycle_lock_at(serial: &Serial, path: &Path) -> Result<DeviceLifecycleGuard> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => {
+            let owner = std::fs::read_to_string(path)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            return Err(crate::diagnostic::DiagnosticError::new(
+                "device_lifecycle_busy",
+                "device",
+                format!("another ShadowDroid process is changing device {serial}"),
+            )
+            .retryable(true)
+            .detail(serde_json::json!({
+                "device": serial.as_str(),
+                "owner_pid": owner,
+                "lock": path.display().to_string(),
+            }))
+            .next_actions([
+                "wait for the active ShadowDroid lifecycle command to finish, then retry",
+            ])
+            .into());
+        }
+        Err(TryLockError::Error(error)) => {
+            return Err(error).with_context(|| format!("lock {}", path.display()));
         }
     }
-    Err(anyhow!("could not acquire lifecycle lock for {serial}"))
+
+    let write_result = (|| -> std::io::Result<()> {
+        file.set_len(0)?;
+        file.rewind()?;
+        write_lock_pid(&mut file, std::process::id())?;
+        file.sync_all()
+    })();
+    if let Err(error) = write_result {
+        let _ = file.unlock();
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "device_lifecycle_lock_write_failed",
+            "device",
+            format!("could not record ownership of the lifecycle lock for {serial}"),
+        )
+        .retryable(true)
+        .detail(serde_json::json!({
+            "device": serial.as_str(),
+            "lock": path.display().to_string(),
+            "error": error.to_string(),
+        }))
+        .next_actions(["retry the lifecycle command"])
+        .into());
+    }
+
+    Ok(DeviceLifecycleGuard { file })
 }
 
 fn write_lock_pid(writer: &mut impl Write, pid: u32) -> std::io::Result<()> {
     writeln!(writer, "{pid}")
-}
-
-fn should_reclaim_lifecycle_lock(
-    owner_pid: Option<u32>,
-    liveness: Option<ProcessLiveness>,
-    age: Option<Duration>,
-) -> bool {
-    const LOCK_EXPIRY: Duration = Duration::from_secs(600);
-    const INCOMPLETE_WRITE_GRACE: Duration = Duration::from_secs(1);
-
-    match (owner_pid, liveness) {
-        // A confirmed live owner always wins over the age heuristic. Long
-        // installs and slow downloads are valid lifecycle operations.
-        (Some(_), Some(ProcessLiveness::Alive)) => false,
-        (Some(_), Some(ProcessLiveness::Dead)) => true,
-        // Failure to inspect a valid PID is not evidence that it is dead. Age
-        // remains the bounded recovery mechanism for an unverifiable lock.
-        (Some(_), Some(ProcessLiveness::Unknown) | None) => {
-            age.is_some_and(|age| age > LOCK_EXPIRY)
-        }
-        // A contender can observe create_new before the owner PID is durable.
-        // Give that write a grace period, then reclaim empty/malformed locks.
-        (None, _) => age.is_some_and(|age| age > INCOMPLETE_WRITE_GRACE),
-    }
-}
-
-fn shadowdroid_process_liveness(pid: u32) -> ProcessLiveness {
-    #[cfg(unix)]
-    {
-        let output = match std::process::Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "comm="])
-            .output()
-        {
-            Ok(output) => output,
-            Err(_) => return ProcessLiveness::Unknown,
-        };
-        if !output.status.success() {
-            return if output.status.code() == Some(1) {
-                ProcessLiveness::Dead
-            } else {
-                ProcessLiveness::Unknown
-            };
-        }
-        match String::from_utf8(output.stdout) {
-            Ok(command) if command.to_ascii_lowercase().contains("shadowdroid") => {
-                ProcessLiveness::Alive
-            }
-            Ok(_) => ProcessLiveness::Dead,
-            Err(_) => ProcessLiveness::Unknown,
-        }
-    }
-    #[cfg(windows)]
-    {
-        let output = match std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-            .output()
-        {
-            Ok(output) => output,
-            Err(_) => return ProcessLiveness::Unknown,
-        };
-        if !output.status.success() {
-            return ProcessLiveness::Unknown;
-        }
-        match String::from_utf8(output.stdout) {
-            Ok(output)
-                if output.to_ascii_lowercase().contains("shadowdroid")
-                    && output.contains(&pid.to_string()) =>
-            {
-                ProcessLiveness::Alive
-            }
-            Ok(output) if output.contains(&pid.to_string()) => ProcessLiveness::Dead,
-            Ok(_) => ProcessLiveness::Dead,
-            Err(_) => ProcessLiveness::Unknown,
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = pid;
-        ProcessLiveness::Unknown
-    }
 }
 
 /// Where each APK pair came from. Used for logging + to decide whether to
@@ -339,24 +228,24 @@ fn resolve_repo_build() -> Result<Option<ApkPair>> {
     let mut dir: &Path = &cwd;
     loop {
         let test_glob = dir.join("server/app/build/outputs/apk/androidTest/debug");
-        if test_glob.is_dir() {
-            if let Some(test) = first_apk(&test_glob)? {
-                let main_glob = dir.join("server/app/build/outputs/apk/debug");
-                if let Some(main) = first_apk(&main_glob)? {
-                    return Ok(Some(ApkPair {
-                        main,
-                        test,
-                        source: ApkSource::RepoBuild,
-                    }));
-                }
-                warn!(
-                    "found test APK at {} but no main APK at {} — building both: \
-                     `./gradlew :app:assembleDebug :app:assembleDebugAndroidTest`",
-                    test_glob.display(),
-                    main_glob.display()
-                );
-                return Ok(None);
+        if test_glob.is_dir()
+            && let Some(test) = first_apk(&test_glob)?
+        {
+            let main_glob = dir.join("server/app/build/outputs/apk/debug");
+            if let Some(main) = first_apk(&main_glob)? {
+                return Ok(Some(ApkPair {
+                    main,
+                    test,
+                    source: ApkSource::RepoBuild,
+                }));
             }
+            warn!(
+                "found test APK at {} but no main APK at {} — building both: \
+                     `./gradlew :app:assembleDebug :app:assembleDebugAndroidTest`",
+                test_glob.display(),
+                main_glob.display()
+            );
+            return Ok(None);
         }
         match dir.parent() {
             Some(p) => dir = p,
@@ -382,9 +271,9 @@ fn resolve_local_dropin() -> Result<Option<ApkPair>> {
 
 fn resolve_versioned_cache() -> Result<Option<ApkPair>> {
     let dir = versioned_cache_dir()?;
-    let main = dir.join("main.apk");
-    let test = dir.join("test.apk");
-    if main.is_file() && test.is_file() {
+    let main = dir.join(CACHE_MAIN_APK);
+    let test = dir.join(CACHE_TEST_APK);
+    if apk_cache_is_complete(&dir) {
         info!(
             "using cached APK at {} (version {EXPECTED_APK_VERSION})",
             dir.display()
@@ -401,16 +290,17 @@ fn resolve_versioned_cache() -> Result<Option<ApkPair>> {
 
 async fn download_github_release() -> Result<ApkPair> {
     let cache_dir = versioned_cache_dir()?;
-    let staging_dir = shadowdroid_home()?.join("apks").join(format!(
-        ".download-{}-{}",
-        EXPECTED_APK_VERSION,
-        std::process::id()
-    ));
-    if staging_dir.exists() {
-        fs::remove_dir_all(&staging_dir)
-            .context(format!("remove stale {}", staging_dir.display()))?;
-    }
-    fs::create_dir_all(&staging_dir).context(format!("create {}", staging_dir.display()))?;
+    let cache_parent = cache_dir
+        .parent()
+        .ok_or_else(|| anyhow!("invalid APK cache path {}", cache_dir.display()))?;
+    fs::create_dir_all(cache_parent).context(format!(
+        "create APK cache parent {}",
+        cache_parent.display()
+    ))?;
+    let staging_dir = tempfile::Builder::new()
+        .prefix(&format!(".download-{EXPECTED_APK_VERSION}-"))
+        .tempdir_in(cache_parent)
+        .context("create APK download staging directory")?;
 
     let base = release_base_url(EXPECTED_APK_VERSION);
     let main_url = release_asset_url(&base, RELEASE_MAIN_APK_ASSET);
@@ -418,7 +308,8 @@ async fn download_github_release() -> Result<ApkPair> {
     let sums_url = release_asset_url(&base, CHECKSUMS_ASSET);
     info!("downloading ShadowDroid server APKs from {base}");
 
-    let checksums = download_text(&sums_url).await.with_context(|| {
+    let client = release_client()?;
+    let checksums = download_text(&client, &sums_url).await.with_context(|| {
         format!("download {CHECKSUMS_ASSET} from GitHub release v{EXPECTED_APK_VERSION}")
     })?;
     let main_sha = expected_sha(
@@ -432,35 +323,102 @@ async fn download_github_release() -> Result<ApkPair> {
         RELEASE_TEST_APK_ASSET,
     )?;
 
-    let main_tmp = staging_dir.join("main.apk");
-    let test_tmp = staging_dir.join("test.apk");
-    download_file(&main_url, &main_tmp)
+    let staged_main = staging_dir.path().join(CACHE_MAIN_APK);
+    let staged_test = staging_dir.path().join(CACHE_TEST_APK);
+    let main_receipt = download_verified_file(&client, &main_url, &staged_main, &main_sha)
         .await
-        .with_context(|| format!("download {RELEASE_MAIN_APK_ASSET}"))?;
-    verify_sha256(&main_tmp, &main_sha)
-        .with_context(|| format!("verify {RELEASE_MAIN_APK_ASSET}"))?;
-    download_file(&test_url, &test_tmp)
+        .with_context(|| format!("download and verify {RELEASE_MAIN_APK_ASSET}"))?;
+    let test_receipt = download_verified_file(&client, &test_url, &staged_test, &test_sha)
         .await
-        .with_context(|| format!("download {RELEASE_TEST_APK_ASSET}"))?;
-    verify_sha256(&test_tmp, &test_sha)
-        .with_context(|| format!("verify {RELEASE_TEST_APK_ASSET}"))?;
-
-    if cache_dir.exists() {
-        fs::remove_dir_all(&cache_dir).context(format!("replace {}", cache_dir.display()))?;
-    }
-    fs::create_dir_all(cache_dir.parent().unwrap())
-        .context(format!("create parent for {}", cache_dir.display()))?;
-    fs::rename(&staging_dir, &cache_dir)
-        .context(format!("move downloaded APKs into {}", cache_dir.display()))?;
+        .with_context(|| format!("download and verify {RELEASE_TEST_APK_ASSET}"))?;
+    publish_apk_pair(
+        staging_dir.path(),
+        &cache_dir,
+        &main_receipt.sha256,
+        &test_receipt.sha256,
+    )?;
     info!(
         "cached ShadowDroid server APKs at {} (version {EXPECTED_APK_VERSION})",
         cache_dir.display()
     );
     Ok(ApkPair {
-        main: cache_dir.join("main.apk"),
-        test: cache_dir.join("test.apk"),
+        main: cache_dir.join(CACHE_MAIN_APK),
+        test: cache_dir.join(CACHE_TEST_APK),
         source: ApkSource::GithubRelease,
     })
+}
+
+fn publish_apk_pair(
+    staging_dir: &Path,
+    cache_dir: &Path,
+    main_sha: &str,
+    test_sha: &str,
+) -> Result<()> {
+    let staged_main = staging_dir.join(CACHE_MAIN_APK);
+    let staged_test = staging_dir.join(CACHE_TEST_APK);
+    if !staged_main.is_file() || !staged_test.is_file() {
+        bail!("cannot publish incomplete staged APK pair")
+    }
+    fs::create_dir_all(cache_dir).context(format!("create {}", cache_dir.display()))?;
+
+    // Both downloads are complete and verified before the old cache becomes
+    // unavailable. With the marker withdrawn, readers reject the brief mixed
+    // generation while the two atomic file replacements are published.
+    let marker = cache_dir.join(CACHE_COMPLETE_FILE);
+    match fs::remove_file(&marker) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("invalidate {}", marker.display()));
+        }
+    }
+
+    tempfile::TempPath::try_from_path(staged_main)
+        .context("adopt staged main APK")?
+        .persist(cache_dir.join(CACHE_MAIN_APK))
+        .map_err(|error| error.error)
+        .context("atomically publish main APK")?;
+    tempfile::TempPath::try_from_path(staged_test)
+        .context("adopt staged test APK")?
+        .persist(cache_dir.join(CACHE_TEST_APK))
+        .map_err(|error| error.error)
+        .context("atomically publish test APK")?;
+    write_apk_cache_complete(cache_dir, main_sha, test_sha)
+}
+
+fn apk_cache_is_complete(cache_dir: &Path) -> bool {
+    let manifest = match fs::read_to_string(cache_dir.join(CACHE_COMPLETE_FILE)) {
+        Ok(manifest) => manifest,
+        Err(_) => return false,
+    };
+    let Some(main_sha) = checksum_for(&manifest, CACHE_MAIN_APK) else {
+        return false;
+    };
+    let Some(test_sha) = checksum_for(&manifest, CACHE_TEST_APK) else {
+        return false;
+    };
+    verify_sha256(&cache_dir.join(CACHE_MAIN_APK), &main_sha).is_ok()
+        && verify_sha256(&cache_dir.join(CACHE_TEST_APK), &test_sha).is_ok()
+}
+
+fn write_apk_cache_complete(cache_dir: &Path, main_sha: &str, test_sha: &str) -> Result<()> {
+    let destination = cache_dir.join(CACHE_COMPLETE_FILE);
+    let mut temporary = tempfile::NamedTempFile::new_in(cache_dir)
+        .with_context(|| format!("create completion marker in {}", cache_dir.display()))?;
+    writeln!(temporary, "{main_sha}  {CACHE_MAIN_APK}")?;
+    writeln!(temporary, "{test_sha}  {CACHE_TEST_APK}")?;
+    temporary.flush()?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(&destination)
+        .map_err(|error| error.error)
+        .with_context(|| format!("atomically publish {}", destination.display()))?;
+    #[cfg(unix)]
+    fs::File::open(cache_dir)
+        .with_context(|| format!("open {} for sync", cache_dir.display()))?
+        .sync_all()
+        .with_context(|| format!("sync {}", cache_dir.display()))?;
+    Ok(())
 }
 
 fn versioned_cache_dir() -> Result<PathBuf> {
@@ -490,14 +448,12 @@ fn pair_from_path(p: &Path) -> Result<(PathBuf, PathBuf)> {
     // or in the same dir (user-staged).
     let candidates = [parent.join("../../debug"), parent.to_path_buf()];
     for cand in &candidates {
-        if cand.is_dir() {
-            if let Some(main) =
+        if cand.is_dir()
+            && let Some(main) =
                 first_apk_matching(cand, "app-debug.apk")?.or(first_apk_matching(cand, "main.apk")?)
-            {
-                if main != *p {
-                    return Ok((main, p.to_path_buf()));
-                }
-            }
+            && main != *p
+        {
+            return Ok((main, p.to_path_buf()));
         }
     }
     Err(crate::diagnostic::DiagnosticError::new(
@@ -571,13 +527,7 @@ fn first_apk_matching(dir: &Path, suffix: &str) -> Result<Option<PathBuf>> {
 /// host port to the serial is what lets concurrent sessions drive different
 /// devices without rebinding each other's forward.
 pub async fn ensure_forward(serial: &Serial) -> Result<u16> {
-    let port = portmap::assign(serial, UI_CHANNEL)?;
-    if adb::forward(serial, port, DEFAULT_PORT).await.is_ok() {
-        return Ok(port);
-    }
-    let port = portmap::reassign(serial, UI_CHANNEL)?;
-    adb::forward(serial, port, DEFAULT_PORT).await?;
-    Ok(port)
+    portmap::publish_forward(serial, UI_CHANNEL, DEFAULT_PORT).await
 }
 
 /// Return a client only when the already-established session is reachable.
@@ -711,8 +661,9 @@ fn running_version_mismatch_error(found: &str) -> anyhow::Error {
 /// Best-effort version probe used by `connect` to report when it reconciled a
 /// stale live server. Returns `Ok(None)` when no server is answering.
 pub async fn running_server_version(serial: &Serial) -> Result<Option<String>> {
-    let host_port = ensure_forward(serial).await?;
-    let client = ServerClient::new(host_port)?;
+    let Some(client) = probe_existing(serial, true).await? else {
+        return Ok(None);
+    };
     Ok(client.state().await.ok().map(|state| state.server_version))
 }
 
@@ -1001,6 +952,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn apk_cache_is_visible_only_after_a_verified_pair_is_published() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let staging = root.path().join("staging");
+        fs::create_dir_all(&cache).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        let main = cache.join(CACHE_MAIN_APK);
+        let test = cache.join(CACHE_TEST_APK);
+        fs::write(&main, b"complete-main").unwrap();
+        fs::write(&test, b"complete-test").unwrap();
+        let main_sha = sha256_file(&main).unwrap();
+        let test_sha = sha256_file(&test).unwrap();
+        write_apk_cache_complete(&cache, &main_sha, &test_sha).unwrap();
+        assert!(apk_cache_is_complete(&cache));
+
+        let staged_main = staging.join(CACHE_MAIN_APK);
+        fs::write(&staged_main, b"replacement-main").unwrap();
+        let replacement_main_sha = sha256_file(&staged_main).unwrap();
+        assert!(
+            publish_apk_pair(&staging, &cache, &replacement_main_sha, &test_sha).is_err(),
+            "an incomplete staging pair must not begin publication"
+        );
+        assert!(apk_cache_is_complete(&cache));
+        assert_eq!(fs::read(&main).unwrap(), b"complete-main");
+        assert_eq!(fs::read(&test).unwrap(), b"complete-test");
+
+        let staged_test = staging.join(CACHE_TEST_APK);
+        fs::write(&staged_test, b"replacement-test").unwrap();
+        let replacement_test_sha = sha256_file(&staged_test).unwrap();
+        publish_apk_pair(
+            &staging,
+            &cache,
+            &replacement_main_sha,
+            &replacement_test_sha,
+        )
+        .unwrap();
+        assert!(apk_cache_is_complete(&cache));
+        assert_eq!(fs::read(&main).unwrap(), b"replacement-main");
+        assert_eq!(fs::read(&test).unwrap(), b"replacement-test");
+    }
+
+    #[test]
     fn mislabeled_apk_error_names_the_bypass() {
         let error = mislabeled_apk_error(ApkSource::GithubRelease, Some("0.3.1"));
         let diagnostic = error
@@ -1009,60 +1002,41 @@ mod tests {
         assert_eq!(diagnostic.code, "apk_version_mismatch");
         assert_eq!(diagnostic.detail["found"], "0.3.1");
         assert_eq!(diagnostic.detail["expected"], EXPECTED_APK_VERSION);
-        assert!(diagnostic
-            .next_actions
-            .iter()
-            .any(|action| action.contains("--any-apk-version")));
-        assert!(diagnostic
-            .next_actions
-            .iter()
-            .any(|action| action.contains("--apk")));
-    }
-
-    #[test]
-    #[cfg(any(unix, windows))]
-    fn lifecycle_lock_owner_check_distinguishes_live_and_dead_processes() {
-        assert_eq!(
-            shadowdroid_process_liveness(std::process::id()),
-            ProcessLiveness::Alive
+        assert!(
+            diagnostic
+                .next_actions
+                .iter()
+                .any(|action| action.contains("--any-apk-version"))
         );
-        assert_eq!(
-            shadowdroid_process_liveness(u32::MAX),
-            ProcessLiveness::Dead
+        assert!(
+            diagnostic
+                .next_actions
+                .iter()
+                .any(|action| action.contains("--apk"))
         );
     }
 
     #[test]
-    fn lifecycle_reclaim_policy_preserves_live_and_unverifiable_owners() {
-        let old = Some(Duration::from_secs(601));
-        let fresh = Some(Duration::from_secs(2));
+    fn lifecycle_lock_contends_and_releases_without_unlinking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.lock");
+        let serial = Serial::new("device:5555");
 
-        assert!(!should_reclaim_lifecycle_lock(
-            Some(10),
-            Some(ProcessLiveness::Alive),
-            old,
-        ));
-        assert!(should_reclaim_lifecycle_lock(
-            Some(10),
-            Some(ProcessLiveness::Dead),
-            fresh,
-        ));
-        assert!(!should_reclaim_lifecycle_lock(
-            Some(10),
-            Some(ProcessLiveness::Unknown),
-            fresh,
-        ));
-        assert!(should_reclaim_lifecycle_lock(
-            Some(10),
-            Some(ProcessLiveness::Unknown),
-            old,
-        ));
-        assert!(!should_reclaim_lifecycle_lock(
-            None,
-            None,
-            Some(Duration::from_millis(900)),
-        ));
-        assert!(should_reclaim_lifecycle_lock(None, None, fresh));
+        let first = acquire_lifecycle_lock_at(&serial, &path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            std::process::id().to_string()
+        );
+
+        let error = acquire_lifecycle_lock_at(&serial, &path).unwrap_err();
+        let diagnostic = error
+            .downcast_ref::<crate::diagnostic::DiagnosticError>()
+            .expect("contention should stay machine-actionable");
+        assert_eq!(diagnostic.code, "device_lifecycle_busy");
+
+        drop(first);
+        assert!(path.exists(), "persistent lock inode must not be unlinked");
+        acquire_lifecycle_lock_at(&serial, &path).unwrap();
     }
 
     #[test]

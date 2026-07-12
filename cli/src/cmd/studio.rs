@@ -9,7 +9,7 @@
 //!   4. versioned cache: `~/.shadowdroid/plugins/<version>/shadowdroid-studio-plugin.zip`
 //!   5. GitHub release fallback.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -25,8 +25,8 @@ use crate::cmd::skill;
 use crate::cmd::studio_contract;
 use crate::hostenv::{env_truthy, home_dir, shadowdroid_home};
 use crate::release::{
-    download_file, download_text, expected_sha, release_asset_url, release_base_url, sha256_file,
-    verify_sha256, CHECKSUMS_ASSET,
+    CHECKSUMS_ASSET, download_text, download_verified_file, expected_sha, release_asset_url,
+    release_base_url, release_client, sha256_file, verify_sha256,
 };
 
 const EXPECTED_PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -719,13 +719,13 @@ fn resolve_repo_plugin() -> Result<Option<PluginZip>> {
     let cwd = std::env::current_dir().context("cannot read $CWD")?;
     for dir in cwd.ancestors() {
         let distributions = dir.join("shadowdroid-plugin/build/distributions");
-        if distributions.is_dir() {
-            if let Some(path) = newest_zip(&distributions)? {
-                return Ok(Some(PluginZip {
-                    path,
-                    source: PluginSource::RepoBuild,
-                }));
-            }
+        if distributions.is_dir()
+            && let Some(path) = newest_zip(&distributions)?
+        {
+            return Ok(Some(PluginZip {
+                path,
+                source: PluginSource::RepoBuild,
+            }));
         }
     }
     Ok(None)
@@ -750,14 +750,51 @@ fn resolve_local_dropin() -> Result<Option<PluginZip>> {
 
 fn resolve_versioned_cache() -> Result<Option<PluginZip>> {
     let path = versioned_plugin_cache_file()?;
-    if path.is_file() {
-        Ok(Some(PluginZip {
-            path,
-            source: PluginSource::VersionedCache,
-        }))
-    } else {
-        Ok(None)
+    resolve_verified_cache_at(path)
+}
+
+fn resolve_verified_cache_at(path: PathBuf) -> Result<Option<PluginZip>> {
+    if !path.is_file() {
+        return Ok(None);
     }
+    let sidecar = plugin_digest_sidecar(&path);
+    let expected = match fs::read_to_string(&sidecar) {
+        Ok(value) => value.trim().to_string(),
+        Err(error) => {
+            tracing::warn!(path = %path.display(), error = %error, "ignoring plugin cache without a checksum sidecar");
+            return Ok(None);
+        }
+    };
+    if let Err(error) = verify_sha256(&path, &expected) {
+        tracing::warn!(path = %path.display(), error = %error, "ignoring corrupt plugin cache");
+        return Ok(None);
+    }
+    Ok(Some(PluginZip {
+        path,
+        source: PluginSource::VersionedCache,
+    }))
+}
+
+fn plugin_digest_sidecar(path: &Path) -> PathBuf {
+    path.with_added_extension("sha256")
+}
+
+fn write_plugin_digest_sidecar(path: &Path, digest: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("plugin cache has no parent: {}", path.display()))?;
+    let sidecar = plugin_digest_sidecar(path);
+    let mut temp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("create checksum sidecar in {}", parent.display()))?;
+    use std::io::Write;
+    writeln!(temp, "{digest}").context("write plugin checksum sidecar")?;
+    temp.as_file()
+        .sync_all()
+        .context("sync plugin checksum sidecar")?;
+    temp.persist(&sidecar)
+        .map_err(|error| error.error)
+        .with_context(|| format!("publish {}", sidecar.display()))?;
+    Ok(())
 }
 
 async fn download_github_release() -> Result<PluginZip> {
@@ -765,24 +802,15 @@ async fn download_github_release() -> Result<PluginZip> {
     let cache_dir = cache_file
         .parent()
         .ok_or_else(|| anyhow!("invalid cache path {}", cache_file.display()))?;
-    let staging_dir = shadowdroid_home()?.join("plugins").join(format!(
-        ".download-{}-{}",
-        EXPECTED_PLUGIN_VERSION,
-        std::process::id()
-    ));
-    if staging_dir.exists() {
-        fs::remove_dir_all(&staging_dir)
-            .with_context(|| format!("remove stale {}", staging_dir.display()))?;
-    }
-    fs::create_dir_all(&staging_dir)
-        .with_context(|| format!("create {}", staging_dir.display()))?;
+    fs::create_dir_all(cache_dir).with_context(|| format!("create {}", cache_dir.display()))?;
 
     let base = release_base_url(EXPECTED_PLUGIN_VERSION);
     let plugin_url = release_asset_url(&base, RELEASE_PLUGIN_ASSET);
     let sums_url = release_asset_url(&base, CHECKSUMS_ASSET);
     info!("downloading ShadowDroid Android Studio plugin from {base}");
 
-    let checksums = download_text(&sums_url)
+    let client = release_client()?;
+    let checksums = download_text(&client, &sums_url)
         .await
         .with_context(|| format!("download {CHECKSUMS_ASSET} from GitHub release"))?;
     let expected = expected_sha(
@@ -791,21 +819,10 @@ async fn download_github_release() -> Result<PluginZip> {
         RELEASE_PLUGIN_ASSET,
     )?;
 
-    let staging_file = staging_dir.join(RELEASE_PLUGIN_ASSET);
-    download_file(&plugin_url, &staging_file)
+    let receipt = download_verified_file(&client, &plugin_url, &cache_file, &expected)
         .await
-        .with_context(|| format!("download {RELEASE_PLUGIN_ASSET}"))?;
-    verify_sha256(&staging_file, &expected)
-        .with_context(|| format!("verify {RELEASE_PLUGIN_ASSET}"))?;
-
-    if cache_dir.exists() {
-        fs::remove_dir_all(cache_dir)
-            .with_context(|| format!("replace {}", cache_dir.display()))?;
-    }
-    fs::create_dir_all(cache_dir).with_context(|| format!("create {}", cache_dir.display()))?;
-    fs::rename(&staging_file, &cache_file)
-        .with_context(|| format!("move plugin ZIP into {}", cache_file.display()))?;
-    fs::remove_dir_all(&staging_dir).ok();
+        .with_context(|| format!("download and verify {RELEASE_PLUGIN_ASSET}"))?;
+    write_plugin_digest_sidecar(&cache_file, &receipt.sha256)?;
 
     Ok(PluginZip {
         path: cache_file,
@@ -816,6 +833,17 @@ async fn download_github_release() -> Result<PluginZip> {
 fn install_plugin_zip(zip_path: &Path, plugins_dir: &Path) -> Result<PathBuf> {
     ensure_zip(zip_path)?;
     fs::create_dir_all(plugins_dir).with_context(|| format!("create {}", plugins_dir.display()))?;
+    let install_lock_path = plugins_dir.join(".shadowdroid-plugin-install.lock");
+    let install_lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&install_lock_path)
+        .with_context(|| format!("open {}", install_lock_path.display()))?;
+    install_lock
+        .lock()
+        .with_context(|| format!("lock {}", install_lock_path.display()))?;
 
     let file = fs::File::open(zip_path).with_context(|| format!("open {}", zip_path.display()))?;
     let mut archive =
@@ -825,18 +853,22 @@ fn install_plugin_zip(zip_path: &Path, plugins_dir: &Path) -> Result<PathBuf> {
         bail!("unexpected plugin archive root `{top_dir}`; expected `{PLUGIN_DIR_NAME}`");
     }
 
-    let installed_dir = plugins_dir.join(&top_dir);
-    if installed_dir.exists() {
-        fs::remove_dir_all(&installed_dir)
-            .with_context(|| format!("replace {}", installed_dir.display()))?;
-    }
+    let stage = tempfile::Builder::new()
+        .prefix(".shadowdroid-plugin-stage-")
+        .tempdir_in(plugins_dir)
+        .with_context(|| {
+            format!(
+                "create plugin staging directory in {}",
+                plugins_dir.display()
+            )
+        })?;
 
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
         let Some(enclosed) = entry.enclosed_name() else {
             bail!("unsafe path in plugin ZIP: {}", entry.name());
         };
-        let out_path = plugins_dir.join(enclosed);
+        let out_path = stage.path().join(enclosed);
         if entry.is_dir() {
             fs::create_dir_all(&out_path)
                 .with_context(|| format!("create {}", out_path.display()))?;
@@ -849,16 +881,80 @@ fn install_plugin_zip(zip_path: &Path, plugins_dir: &Path) -> Result<PathBuf> {
                 .with_context(|| format!("create {}", out_path.display()))?;
             io::copy(&mut entry, &mut out)
                 .with_context(|| format!("extract {}", out_path.display()))?;
+            out.sync_all()
+                .with_context(|| format!("sync {}", out_path.display()))?;
         }
     }
 
-    if !installed_dir.join("lib").is_dir() {
+    let staged_dir = stage.path().join(&top_dir);
+    if !staged_dir.join("lib").is_dir() {
         bail!(
             "plugin ZIP extracted but {} has no lib directory",
-            installed_dir.display()
+            staged_dir.display()
         );
     }
+
+    let installed_dir = plugins_dir.join(&top_dir);
+    let backup_dir = plugins_dir.join(format!(".{top_dir}.backup"));
+    if fs::symlink_metadata(&backup_dir).is_ok() {
+        if fs::symlink_metadata(&installed_dir).is_err() {
+            fs::rename(&backup_dir, &installed_dir).with_context(|| {
+                format!(
+                    "recover interrupted plugin install {} -> {}",
+                    backup_dir.display(),
+                    installed_dir.display()
+                )
+            })?;
+        } else {
+            remove_path(&backup_dir)?;
+        }
+    }
+
+    let had_existing = fs::symlink_metadata(&installed_dir).is_ok();
+    if had_existing {
+        fs::rename(&installed_dir, &backup_dir).with_context(|| {
+            format!(
+                "stage existing plugin {} -> {}",
+                installed_dir.display(),
+                backup_dir.display()
+            )
+        })?;
+    }
+    if let Err(error) = fs::rename(&staged_dir, &installed_dir) {
+        let rollback = if had_existing {
+            fs::rename(&backup_dir, &installed_dir).with_context(|| {
+                format!(
+                    "restore previous plugin {} -> {}",
+                    backup_dir.display(),
+                    installed_dir.display()
+                )
+            })
+        } else {
+            Ok(())
+        };
+        return match rollback {
+            Ok(()) => Err(error)
+                .with_context(|| format!("publish staged plugin to {}", installed_dir.display())),
+            Err(rollback_error) => Err(anyhow!(
+                "publish staged plugin to {} failed: {error}; rollback also failed: {rollback_error:#}",
+                installed_dir.display()
+            )),
+        };
+    }
+    if had_existing && let Err(error) = remove_path(&backup_dir) {
+        tracing::warn!(path = %backup_dir.display(), error = %error, "plugin installed but old backup could not be removed");
+    }
     Ok(installed_dir)
+}
+
+fn remove_path(path: &Path) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(path).with_context(|| format!("remove {}", path.display()))
+    } else {
+        fs::remove_file(path).with_context(|| format!("remove {}", path.display()))
+    }
 }
 
 fn archive_top_dir<R: Read + io::Seek>(archive: &mut ZipArchive<R>) -> Result<String> {
@@ -951,10 +1047,10 @@ fn expand_home(path: &Path) -> PathBuf {
     if raw == "~" {
         return home_dir().unwrap_or_else(|_| path.to_path_buf());
     }
-    if let Some(rest) = raw.strip_prefix("~/") {
-        if let Ok(home) = home_dir() {
-            return home.join(rest);
-        }
+    if let Some(rest) = raw.strip_prefix("~/")
+        && let Ok(home) = home_dir()
+    {
+        return home.join(rest);
     }
     path.to_path_buf()
 }
@@ -1094,8 +1190,8 @@ mod tests {
     #[test]
     fn install_plugin_zip_extracts_nested_entries() {
         use std::io::Write;
-        use zip::write::{SimpleFileOptions, ZipWriter};
         use zip::CompressionMethod;
+        use zip::write::{SimpleFileOptions, ZipWriter};
 
         let tmp = tempfile::tempdir().unwrap();
         let zip_path = tmp.path().join("plugin.zip");
@@ -1126,5 +1222,47 @@ mod tests {
             fs::read(installed.join("META-INF").join("plugin.xml")).unwrap(),
             b"<idea-plugin/>"
         );
+    }
+
+    #[test]
+    fn invalid_plugin_archive_preserves_existing_install() {
+        use std::io::Write;
+        use zip::write::{SimpleFileOptions, ZipWriter};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let plugins_dir = tmp.path().join("plugins");
+        let existing = plugins_dir.join(PLUGIN_DIR_NAME).join("lib");
+        fs::create_dir_all(&existing).unwrap();
+        fs::write(existing.join("plugin.jar"), b"known-good").unwrap();
+
+        let zip_path = tmp.path().join("invalid.zip");
+        let file = fs::File::create(&zip_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        zip.start_file(
+            "shadowdroid-plugin/META-INF/plugin.xml",
+            SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.write_all(b"<idea-plugin/>").unwrap();
+        zip.finish().unwrap();
+
+        assert!(install_plugin_zip(&zip_path, &plugins_dir).is_err());
+        assert_eq!(
+            fs::read(existing.join("plugin.jar")).unwrap(),
+            b"known-good"
+        );
+    }
+
+    #[test]
+    fn tampered_versioned_cache_is_not_reused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("plugin.zip");
+        fs::write(&cache, b"verified bytes").unwrap();
+        let digest = sha256_file(&cache).unwrap();
+        write_plugin_digest_sidecar(&cache, &digest).unwrap();
+        assert!(resolve_verified_cache_at(cache.clone()).unwrap().is_some());
+
+        fs::write(&cache, b"tampered bytes").unwrap();
+        assert!(resolve_verified_cache_at(cache).unwrap().is_none());
     }
 }
