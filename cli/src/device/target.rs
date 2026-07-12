@@ -13,7 +13,7 @@ use crate::config::{
 use crate::device::{adb, installer};
 use crate::hostenv::{home_dir, shadowdroid_home};
 use crate::ids::Serial;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -29,6 +29,7 @@ const DEFAULT_BOOT_TIMEOUT_SECONDS: u64 = 180;
 const MIN_BOOT_TIMEOUT_SECONDS: u64 = 10;
 const MAX_BOOT_TIMEOUT_SECONDS: u64 = 900;
 const EMULATOR_LIST_TIMEOUT: Duration = Duration::from_secs(15);
+const ADB_START_TIMEOUT: Duration = Duration::from_secs(15);
 const BOOT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -294,7 +295,7 @@ async fn resolve_avd(
 }
 
 async fn find_running_avd(avd: &str) -> Result<Option<Serial>> {
-    let serials = adb::list_devices().await.context("listing devices")?;
+    let serials = list_target_devices().await?;
     let probes = serials.into_iter().map(|serial| async move {
         let name = avd_name(&serial).await;
         (serial, name)
@@ -319,6 +320,47 @@ async fn find_running_avd(avd: &str) -> Result<Option<Serial>> {
         ])
         .into()),
     }
+}
+
+/// The wire client deliberately does not shell out to `adb`, but a fresh host
+/// may not have an ADB server yet. Named AVD targets already require an Android
+/// SDK emulator, so use the colocated platform tool once to start the server,
+/// then return to the wire protocol for all device operations.
+async fn list_target_devices() -> Result<Vec<String>> {
+    let initial = match adb::list_devices().await {
+        Ok(devices) => return Ok(devices),
+        Err(error) => error,
+    };
+    let adb_program = adb_program();
+    if let Err(start_error) = start_adb_server(&adb_program).await {
+        return Err(initial.context(format!(
+            "listing devices; also failed to start the ADB server with `{}`: {start_error:#}",
+            adb_program.display()
+        )));
+    }
+    adb::list_devices().await.with_context(|| {
+        format!(
+            "listing devices after starting the ADB server with `{}`",
+            adb_program.display()
+        )
+    })
+}
+
+async fn start_adb_server(adb_program: &Path) -> Result<()> {
+    let mut command = TokioCommand::new(adb_program);
+    command.arg("start-server").kill_on_drop(true);
+    let output = tokio::time::timeout(ADB_START_TIMEOUT, command.output())
+        .await
+        .map_err(|_| anyhow!("adb start-server timed out after 15 seconds"))?
+        .with_context(|| format!("run {} start-server", adb_program.display()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "adb start-server exited with {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
 }
 
 pub async fn avd_name(serial: &str) -> Option<String> {
@@ -506,6 +548,39 @@ fn emulator_program() -> PathBuf {
     } else {
         "emulator"
     })
+}
+
+fn adb_program() -> PathBuf {
+    if let Some(explicit) = std::env::var_os("SHADOWDROID_ADB") {
+        return PathBuf::from(explicit);
+    }
+    for variable in ["ANDROID_SDK_ROOT", "ANDROID_HOME"] {
+        if let Some(root) = std::env::var_os(variable) {
+            let candidate = PathBuf::from(root)
+                .join("platform-tools")
+                .join(if cfg!(windows) { "adb.exe" } else { "adb" });
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    if let Ok(home) = home_dir() {
+        let candidates = if cfg!(target_os = "macos") {
+            vec![home.join("Library/Android/sdk/platform-tools/adb")]
+        } else if cfg!(windows) {
+            std::env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .map(|root| root.join("Android/Sdk/platform-tools/adb.exe"))
+                .into_iter()
+                .collect()
+        } else {
+            vec![home.join("Android/Sdk/platform-tools/adb")]
+        };
+        if let Some(candidate) = candidates.into_iter().find(|path| path.is_file()) {
+            return candidate;
+        }
+    }
+    PathBuf::from(if cfg!(windows) { "adb.exe" } else { "adb" })
 }
 
 async fn list_available_avds(emulator: &Path) -> Result<Vec<String>> {
