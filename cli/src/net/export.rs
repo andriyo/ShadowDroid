@@ -312,6 +312,8 @@ mod tests {
     fn sample() -> FlowRecord {
         FlowRecord {
             id: "f1".into(),
+            flow_sequence: 1,
+            capture_session_id: "n-test".into(),
             ts: 1_609_459_200.0,
             method: "GET".into(),
             scheme: "https".into(),
@@ -330,6 +332,8 @@ mod tests {
             req_truncated: false,
             resp_truncated: false,
             matched: None,
+            rule_id: None,
+            rule_ids: vec![],
             modified: false,
             error: None,
             streamed: false,

@@ -671,7 +671,7 @@ selector (then optionally activates it) — the TV analog of `ui tap` /
 | **Device/system** | `device info`, `shell`, `wake`, `sleep`, `unlock`, `orientation`, `clipboard`, `notifications`, `quick-settings`, `open-url` |
 | **Display profile** | `profile snapshot`, `apply`, `reset` (animations, font, density, size, rotation) |
 | **Files** | `files ls`, `push`, `pull` |
-| **Network MITM** | `net check`, `trust`, `ca import/info/reset`, `start`, `stop`, `status`, `log`, `show`, `export`, `intercept`, `resume`, `drop`, `respond`, `rule`, `rules`, `replay` |
+| **Network MITM** | `net check`, `trust`, `ca import/info/reset`, `start`, `stop`, `status`, `log`, `checkpoint`, `show`, `export`, `intercept`, `resume`, `drop`, `respond`, `rule`, `rules`, `replay` |
 | **In-app AAR agent** | `aar install` (`--okhttp`, `--coroutine-probes`, `--build`), `status`, `remove`, `capture`, `intercept`, `resume`, `drop`, `agent`, `coroutines` |
 | **Authoring/testing helpers** | `ui audit` (selector gaps), `ui gen` (Screen Object scaffold), `net export fixtures` (replayable response set + `manifest.json`, GraphQL keyed by operationName), `test` (instrumentation command with the slot freed), `debug replay --repeat --diff` (flake hunting) |
 
@@ -712,6 +712,13 @@ The pre-existing device proxy setting is persisted before wiring; a repeated
 `net start` repairs wiring to an already-running daemon, while `net stop`
 restores that exact setting and reports separate raw-IP and DNS connectivity
 checks (`--canary-host` selects the neutral DNS probe).
+Each new proxy run returns a stable `capture_session_id`, and every captured
+flow records both that session and any matching rule ids. Isolate a phase with
+`net log --session`, `--since 2m`, `--after-id`, `--rule-id`, or create a
+durable boundary with `net checkpoint` and query it using
+`net log --after-checkpoint`. `net log clear` clears only queryable history
+while preserving an active proxy and its rules; restarting the proxy creates a
+new session.
 Beyond observing, the agent can **intercept** a flow — `net intercept` pauses
 matching requests/responses and emits them as `http_intercept` events on
 `watch`; each held event includes device-scoped `net show`, `resume`, `drop`,

@@ -149,6 +149,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         flow_tx,
         shared: shared.clone(),
         serial: cfg.serial.clone(),
+        capture_session_id: crate::net::capture_session_id(&cfg.startup_id),
         verify_upstream: cfg.verify_upstream,
         tasks: proxy_tasks.clone(),
         shutdown: proxy_shutdown.clone(),
@@ -161,6 +162,8 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         startup_id: cfg.startup_id.clone(),
         pid: std::process::id(),
         started: events::now_ts(),
+        capture_session_id: crate::net::capture_session_id(&cfg.startup_id),
+        checkpoint_count: AtomicU64::new(0),
         // Derived from the exact PEM loaded above, so a concurrent managed-CA
         // replacement cannot make status describe different bytes than the
         // in-memory signer.

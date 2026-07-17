@@ -50,6 +50,10 @@ pub(crate) fn new_startup_id() -> String {
     format!("{:x}-{nanos:x}-{sequence:x}", std::process::id())
 }
 
+pub(crate) fn capture_session_id(startup_id: &str) -> String {
+    format!("n-{startup_id}")
+}
+
 fn scoped_action(serial: &crate::ids::Serial, args: &str) -> String {
     format!(
         "shadowdroid -d {} net {args}",

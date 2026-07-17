@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::events::Event;
 use crate::net::Matcher;
 
+static FLOW_COUNTER: AtomicU64 = AtomicU64::new(1);
+
 /// Max bytes of a textual body stored in the session log (per direction).
 /// Generous enough that most JSON/dictionary responses are captured whole;
 /// `net show --body-file` writes whatever was stored, and `resp_truncated`
@@ -23,6 +25,10 @@ pub const PREVIEW_CAP: usize = 512;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FlowRecord {
     pub id: String,
+    #[serde(default)]
+    pub flow_sequence: u64,
+    #[serde(default)]
+    pub capture_session_id: String,
     pub ts: f64,
     pub method: String,
     pub scheme: String,
@@ -54,6 +60,10 @@ pub struct FlowRecord {
     /// The rule/intercept tag that touched this flow, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matched: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rule_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub modified: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,6 +105,8 @@ impl FlowRecord {
         Event::Http {
             ts: self.ts,
             id: self.id.clone(),
+            flow_sequence: self.flow_sequence,
+            capture_session_id: self.capture_session_id.clone(),
             method: self.method.clone(),
             scheme: self.scheme.clone(),
             host: self.host.clone(),
@@ -108,6 +120,8 @@ impl FlowRecord {
             resp_type: self.resp_type.clone(),
             resp_len: self.resp_len,
             matched: self.matched.clone(),
+            rule_id: self.rule_id.clone(),
+            rule_ids: self.rule_ids.clone(),
             modified: self.modified,
             error: self.error.clone(),
             streamed: self.streamed,
@@ -121,6 +135,8 @@ impl FlowRecord {
         let mut v = serde_json::json!({
             "type": "flow",
             "id": self.id,
+            "flow_sequence": self.flow_sequence,
+            "capture_session_id": self.capture_session_id,
             "ts": self.ts,
             "method": self.method,
             "scheme": self.scheme,
@@ -137,6 +153,8 @@ impl FlowRecord {
             "req_len": self.req_len,
             "resp_len": self.resp_len,
             "matched": self.matched,
+            "rule_id": self.rule_id,
+            "rule_ids": self.rule_ids,
             "modified": self.modified,
             "error": self.error,
             "streamed": self.streamed,
@@ -154,8 +172,19 @@ impl FlowRecord {
 
 /// Short per-flow id (`f1`, `f2`, …), unique within a daemon run.
 pub fn new_id() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    format!("f{:x}", COUNTER.fetch_add(1, Ordering::Relaxed))
+    format!("f{:x}", FLOW_COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+pub fn sequence_from_id(id: &str) -> Option<u64> {
+    id.strip_prefix('f')
+        .and_then(|value| u64::from_str_radix(value, 16).ok())
+}
+
+/// Last flow sequence assigned in this daemon process. A checkpoint uses the
+/// assignment boundary rather than persistence order, so an older in-flight
+/// flow that completes later remains correctly before the checkpoint.
+pub fn last_sequence() -> u64 {
+    FLOW_COUNTER.load(Ordering::Relaxed).saturating_sub(1)
 }
 
 /// The mime portion of a Content-Type header value (drops `; charset=…`).
@@ -308,6 +337,8 @@ mod tests {
     fn matcher_and_content_type() {
         let mut rec = FlowRecord {
             id: "f1".into(),
+            flow_sequence: 1,
+            capture_session_id: "n-test".into(),
             ts: 0.0,
             method: "POST".into(),
             scheme: "https".into(),
@@ -329,6 +360,8 @@ mod tests {
             req_truncated: false,
             resp_truncated: false,
             matched: None,
+            rule_id: None,
+            rule_ids: vec![],
             modified: false,
             error: None,
             streamed: false,

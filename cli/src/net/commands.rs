@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use crate::device::{adb, installer};
 use crate::events;
-use crate::net::{DaemonConfig, Matcher, Mutation, RuleSpec, control, daemon, paths, store};
+use crate::net::{DaemonConfig, Matcher, Mutation, RuleSpec, control, daemon, flow, paths, store};
 
 /// Emit a `{"type":"action","cmd":<cmd>, …}` line — thin adapter over the shared
 /// [`crate::events::emit_action`].
@@ -779,6 +779,8 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
                 "port": daemon_port,
                 "host_port": host_port,
                 "already_running": true,
+                "capture_session_id": daemon_status.get("capture_session_id"),
+                "started_at": daemon_status.get("started"),
                 "rewired": true,
                 "rules_preserved": true,
                 "state_recovered": !state_existed,
@@ -861,6 +863,8 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
             restore_and_consume_network_state_if_owned(serial, &startup_id).await?;
             return Err(err);
         }
+        let (capture_session_id, started_at) =
+            capture_identity(serial, &startup_id, device_state.captured_at).await;
         emit(
             "net_start",
             json!({
@@ -868,6 +872,8 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
                 "port": port,
                 "host_port": host_port,
                 "startup_id": startup_id,
+                "capture_session_id": capture_session_id,
+                "started_at": started_at,
                 "mode": "foreground",
             }),
         );
@@ -923,6 +929,8 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
         restore_and_consume_network_state_if_owned(serial, &startup_id).await?;
         return Err(err);
     }
+    let (capture_session_id, started_at) =
+        capture_identity(serial, &startup_id, device_state.captured_at).await;
     emit(
         "net_start",
         json!({
@@ -930,6 +938,8 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
             "port": port,
             "host_port": host_port,
             "startup_id": startup_id,
+            "capture_session_id": capture_session_id,
+            "started_at": started_at,
             "proxy": format!("localhost:{port}"),
             "apps": apps,
             "anticache": anticache,
@@ -941,6 +951,31 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
         }),
     );
     Ok(())
+}
+
+async fn capture_identity(
+    serial: &Serial,
+    startup_id: &str,
+    fallback_started: f64,
+) -> (String, f64) {
+    let fallback_session = crate::net::capture_session_id(startup_id);
+    let Ok(status) = control::request(serial, json!({"op": "status"})).await else {
+        return (fallback_session, fallback_started);
+    };
+    if status.get("startup_id").and_then(serde_json::Value::as_str) != Some(startup_id) {
+        return (fallback_session, fallback_started);
+    }
+    let session = status
+        .get("capture_session_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|session| !session.is_empty())
+        .unwrap_or(&fallback_session)
+        .to_string();
+    let started = status
+        .get("started")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(fallback_started);
+    (session, started)
 }
 
 pub async fn stop(
@@ -1416,10 +1451,157 @@ fn parse_ping_check(host: &str, output: &str) -> PingCheck {
 
 // ── observe (task 8) ──────────────────────────────────────────
 
-pub async fn log(serial: &Serial, matcher: Matcher, limit: usize) -> Result<()> {
+#[derive(Debug, Clone, Default)]
+pub struct LogOpts {
+    pub matcher: Matcher,
+    pub limit: usize,
+    pub capture_session_id: Option<String>,
+    pub since: Option<String>,
+    pub after_id: Option<String>,
+    pub after_checkpoint: Option<String>,
+    pub rule_id: Option<String>,
+}
+
+fn parse_since_duration(value: &str) -> Result<Duration> {
+    let value = value.trim().to_ascii_lowercase();
+    let split = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (amount, unit) = value.split_at(split);
+    let amount = amount.parse::<u64>().ok().filter(|amount| *amount > 0);
+    let millis = match (amount, unit) {
+        (Some(amount), "ms") => Some(amount),
+        (Some(amount), "s") => amount.checked_mul(1_000),
+        (Some(amount), "m") => amount.checked_mul(60_000),
+        (Some(amount), "h") => amount.checked_mul(3_600_000),
+        (Some(amount), "d") => amount.checked_mul(86_400_000),
+        _ => None,
+    };
+    millis.map(Duration::from_millis).ok_or_else(|| {
+        crate::diagnostic::DiagnosticError::new(
+            "invalid_net_since",
+            "input",
+            format!("invalid duration `{value}` for `net log --since`"),
+        )
+        .detail(
+            json!({"value": value, "expected": "positive integer followed by ms, s, m, h, or d"}),
+        )
+        .next_actions(["use a duration such as `500ms`, `2m`, or `1h`"])
+        .into()
+    })
+}
+
+pub async fn log(serial: &Serial, opts: LogOpts) -> Result<()> {
+    let LogOpts {
+        matcher,
+        limit,
+        mut capture_session_id,
+        since,
+        after_id,
+        after_checkpoint,
+        rule_id,
+    } = opts;
+    let since_ts = since
+        .as_deref()
+        .map(parse_since_duration)
+        .transpose()?
+        .map(|duration| events::now_ts() - duration.as_secs_f64());
+    let mut after_flow_sequence = after_id
+        .as_deref()
+        .map(|id| -> Result<u64> {
+            flow::sequence_from_id(id).ok_or_else(|| {
+                crate::diagnostic::DiagnosticError::new(
+                    "invalid_net_flow_id",
+                    "input",
+                    format!("invalid flow id `{id}` for `net log --after-id`"),
+                )
+                .detail(json!({"id": id, "expected": "f followed by a hexadecimal sequence"}))
+                .next_actions(["copy an id from `shadowdroid net log`"])
+                .into()
+            })
+        })
+        .transpose()?;
+    let mut after_ts = None;
+    if let Some(after_id) = after_id.as_deref() {
+        let boundary = store::find_by_id(serial, after_id)?.ok_or_else(|| {
+            crate::diagnostic::DiagnosticError::new(
+                "net_flow_not_found",
+                "net",
+                format!("flow `{after_id}` was not found for `net log --after-id`"),
+            )
+            .detail(json!({"id": after_id}))
+            .next_actions(["run `shadowdroid net log` and choose an emitted flow id"])
+        })?;
+        if capture_session_id.as_deref().is_some_and(|session| {
+            !boundary.capture_session_id.is_empty() && session != boundary.capture_session_id
+        }) {
+            return Err(crate::diagnostic::DiagnosticError::new(
+                "net_flow_session_mismatch",
+                "input",
+                "the `--after-id` flow and `--session` identify different capture sessions",
+            )
+            .detail(json!({
+                "after_id": after_id,
+                "flow_session": boundary.capture_session_id,
+                "requested_session": capture_session_id,
+            }))
+            .next_actions(["remove `--session` or use the flow's capture session id"])
+            .into());
+        }
+        if !boundary.capture_session_id.is_empty() {
+            capture_session_id.get_or_insert(boundary.capture_session_id);
+        }
+        after_ts = Some(boundary.ts);
+    }
+    if let Some(checkpoint_id) = after_checkpoint.as_deref() {
+        let checkpoint = store::read_checkpoint(serial, checkpoint_id)?.ok_or_else(|| {
+            crate::diagnostic::DiagnosticError::new(
+                "net_checkpoint_not_found",
+                "net",
+                format!("capture checkpoint `{checkpoint_id}` was not found"),
+            )
+            .detail(json!({"checkpoint": checkpoint_id}))
+            .next_actions([
+                "create a new boundary with `shadowdroid net checkpoint`",
+                "list the current session with `shadowdroid net log`",
+            ])
+        })?;
+        if capture_session_id
+            .as_deref()
+            .is_some_and(|session| session != checkpoint.capture_session_id)
+        {
+            return Err(crate::diagnostic::DiagnosticError::new(
+                "net_checkpoint_session_mismatch",
+                "input",
+                "the checkpoint and `--session` identify different capture sessions",
+            )
+            .detail(json!({
+                "checkpoint": checkpoint_id,
+                "checkpoint_session": checkpoint.capture_session_id,
+                "requested_session": capture_session_id,
+            }))
+            .next_actions(["remove `--session` or use the checkpoint's capture session id"])
+            .into());
+        }
+        capture_session_id.get_or_insert(checkpoint.capture_session_id);
+        after_flow_sequence = Some(checkpoint.last_flow_sequence);
+        after_ts = Some(checkpoint.created_at);
+    }
+    let result = store::read_recent_timeline_query(
+        serial,
+        &store::LogQuery {
+            matcher,
+            limit,
+            capture_session_id: capture_session_id.clone(),
+            since_ts,
+            after_flow_sequence,
+            after_ts,
+            rule_id: rule_id.clone(),
+        },
+    )?;
+    let mut items = result.items;
     // One bounded pass interleaves completed flows with TLS-handshake failures,
     // so a "why is nothing captured?" moment shows the rejected host inline.
-    let mut items = store::read_recent_timeline(serial, &matcher, limit)?;
     for v in &mut items {
         attach_recalled_tls_actions(serial, v);
         events::emit(v);
@@ -1430,8 +1612,51 @@ pub async fn log(serial: &Serial, matcher: Matcher, limit: usize) -> Result<()> 
         .collect::<Vec<_>>();
     emit(
         "net_log",
-        json!({"count": items.len(), "limit": limit, "ids": ids}),
+        json!({
+            "count": items.len(),
+            "limit": limit,
+            "ids": ids,
+            "capture_session_id": capture_session_id,
+            "since": since,
+            "since_ts": since_ts,
+            "after_id": after_id,
+            "after_checkpoint": after_checkpoint,
+            "rule_id": rule_id,
+            "older_events_excluded": result.older_events_excluded,
+            "excluded_count": result.excluded_count,
+            "logical_clear_applied": result.logical_clear_applied,
+        }),
     );
+    Ok(())
+}
+
+pub async fn checkpoint(serial: &Serial) -> Result<()> {
+    let reply = checked_control_reply(
+        "checkpoint",
+        control::request(serial, json!({"op": "checkpoint"})).await?,
+    )?;
+    emit("net_checkpoint", reply);
+    Ok(())
+}
+
+pub async fn log_clear(serial: &Serial) -> Result<()> {
+    if control::is_running(serial).await {
+        let reply = checked_control_reply(
+            "log_clear",
+            control::request(serial, json!({"op": "log_clear"})).await?,
+        )?;
+        emit("net_log_clear", reply);
+    } else {
+        store::clear(serial)?;
+        emit(
+            "net_log_clear",
+            json!({
+                "scope": "physical_queryable_history",
+                "active_proxy_preserved": false,
+                "rules_preserved": 0,
+            }),
+        );
+    }
     Ok(())
 }
 
@@ -2070,6 +2295,16 @@ mod tests {
     fn net_lifecycle_lock_uses_a_separate_device_namespace() {
         let serial = Serial::new("emulator-5554");
         assert_eq!(net_lifecycle_serial(&serial).as_str(), "net:emulator-5554");
+    }
+
+    #[test]
+    fn net_log_since_accepts_explicit_units_and_rejects_ambiguous_values() {
+        assert_eq!(parse_since_duration("500ms").unwrap().as_millis(), 500);
+        assert_eq!(parse_since_duration("2m").unwrap().as_secs(), 120);
+        assert_eq!(parse_since_duration("1h").unwrap().as_secs(), 3_600);
+        assert!(parse_since_duration("2").is_err());
+        assert!(parse_since_duration("0s").is_err());
+        assert!(parse_since_duration("1.5m").is_err());
     }
 
     #[test]

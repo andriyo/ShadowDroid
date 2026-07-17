@@ -117,6 +117,8 @@ pub enum Event {
     Http {
         ts: f64,
         id: String,
+        flow_sequence: u64,
+        capture_session_id: String,
         method: String,
         scheme: String,
         host: String,
@@ -135,6 +137,10 @@ pub enum Event {
         resp_len: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         matched: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rule_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        rule_ids: Vec<String>,
         #[serde(default, skip_serializing_if = "is_false")]
         modified: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -180,6 +186,7 @@ pub enum Event {
     /// per host within a session so a retrying client doesn't flood the timeline.
     TlsError {
         ts: f64,
+        capture_session_id: String,
         host: String,
         reason: String,
         next_actions: Vec<String>,
@@ -828,6 +835,15 @@ fn dynamic_next_actions(
                 "shadowdroid net status".into(),
             ]
         }
+        Some("net log")
+            if map.get("cmd").and_then(serde_json::Value::as_str) == Some("net_log_clear") =>
+        {
+            vec![
+                "shadowdroid net checkpoint".to_string(),
+                "shadowdroid net rule list".to_string(),
+                "shadowdroid watch".to_string(),
+            ]
+        }
         Some("net log") => map
             .get("ids")
             .and_then(serde_json::Value::as_array)
@@ -837,6 +853,20 @@ fn dynamic_next_actions(
             .take(3)
             .map(|id| format!("shadowdroid net show {} --body", shell_token(id)))
             .collect(),
+        Some("net checkpoint") => map
+            .get("checkpoint")
+            .and_then(serde_json::Value::as_str)
+            .map(|checkpoint| {
+                vec![
+                    format!(
+                        "shadowdroid net log --after-checkpoint {}",
+                        shell_token(checkpoint)
+                    ),
+                    "shadowdroid net log clear".to_string(),
+                    "shadowdroid watch".to_string(),
+                ]
+            })
+            .unwrap_or_default(),
         Some("net show") => map
             .get("id")
             .and_then(serde_json::Value::as_str)
@@ -1935,6 +1965,7 @@ mod tests {
 
         let tls = serde_json::to_value(Event::TlsError {
             ts: 2.0,
+            capture_session_id: "n-test".into(),
             host: "api.example.com".into(),
             reason: "certificate rejected".into(),
             next_actions: vec!["shadowdroid net check com.example".into()],

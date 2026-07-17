@@ -87,6 +87,7 @@ pub struct ProxyContext {
     /// This daemon's device serial — used to persist a `tls_error` to the
     /// session log so `net log` can recall handshake failures.
     pub serial: crate::ids::Serial,
+    pub capture_session_id: String,
     /// Apply platform certificate and hostname verification to every upstream
     /// TLS leg, including WebSockets (reqwest handles ordinary HTTP requests).
     pub verify_upstream: bool,
@@ -520,6 +521,7 @@ fn report_tls_error(ctx: &ProxyContext, host: &str, err: &std::io::Error) {
     }
     let ev = Event::TlsError {
         ts: events::now_ts(),
+        capture_session_id: ctx.capture_session_id.clone(),
         host: host.to_string(),
         reason: tls_failure_reason(err),
         next_actions: crate::net::tls_error_next_actions(&ctx.serial),
@@ -615,6 +617,7 @@ async fn proxy_websocket(
                         e.to_string(),
                         Some("websocket".into()),
                         false,
+                        &[],
                     ),
                 );
             }
@@ -642,6 +645,7 @@ async fn proxy_websocket(
                 error: None,
                 matched: Some("websocket".into()),
                 modified: false,
+                rule_ids: &[],
             },
         );
     }
@@ -949,6 +953,7 @@ async fn proxy_request(
     let id = flow::new_id();
     let in_scope = ctx.shared.host_in_scope(&host);
     let mut matched: Option<String> = None;
+    let mut rule_ids = Vec::<String>::new();
     let mut modified = false;
 
     // ── replay (P3): serve a saved response, never hitting upstream ──
@@ -980,6 +985,7 @@ async fn proxy_request(
                 error: None,
                 matched: Some("replay".into()),
                 modified: true,
+                rule_ids: &[],
             },
         );
         return Ok(build_client_response_for(&method, status, &headers, body));
@@ -999,7 +1005,10 @@ async fn proxy_request(
         );
         if r.modified {
             modified = true;
+        }
+        if !r.rule_ids.is_empty() {
             matched = Some("rule".into());
+            rule_ids.extend(r.rule_ids.iter().cloned());
         }
         if r.delay_ms > 0 {
             tokio::time::sleep(Duration::from_millis(r.delay_ms as u64)).await;
@@ -1029,6 +1038,7 @@ async fn proxy_request(
                     error: None,
                     matched: Some("rule".into()),
                     modified: true,
+                    rule_ids: &rule_ids,
                 },
             );
             return Ok(build_client_response_for(&method, status, &headers, body));
@@ -1038,7 +1048,7 @@ async fn proxy_request(
     // ── request-phase interception ── (skipped for streamed uploads: no buffered
     //    body to preview or mutate, like a streamed response skips response intercept)
     if in_scope && !req_streaming {
-        let snap = make_flow(FlowParts {
+        let mut snap = make_flow(FlowParts {
             id: &id,
             method: method.as_str(),
             scheme: &scheme,
@@ -1054,7 +1064,9 @@ async fn proxy_request(
             error: None,
             matched: None,
             modified: false,
+            rule_ids: &rule_ids,
         });
+        stamp_capture_context(&ctx, &mut snap);
         if let Some(decision) = hold(&ctx, snap, "request").await {
             match decision {
                 HoldDecision::Drop(s) => return Ok(drop_response(&method, s)),
@@ -1091,6 +1103,7 @@ async fn proxy_request(
                             error: None,
                             matched: Some("intercept:respond".into()),
                             modified: true,
+                            rule_ids: &rule_ids,
                         },
                     );
                     return Ok(build_client_response_for(
@@ -1164,6 +1177,7 @@ async fn proxy_request(
                         e.to_string(),
                         matched.clone(),
                         modified,
+                        &rule_ids,
                     ),
                 );
             }
@@ -1192,8 +1206,8 @@ async fn proxy_request(
             let dur_ms = started.elapsed().as_millis() as u64;
             let mut streamed_status = Some(status_code);
             let mut no_body = Bytes::new();
-            if in_scope
-                && apply_response_rules(
+            let response_rule_ids = if in_scope {
+                apply_response_rules(
                     &ctx.shared,
                     method.as_str(),
                     &host,
@@ -1203,7 +1217,11 @@ async fn proxy_request(
                     &mut no_body,
                     false,
                 )
-            {
+            } else {
+                Vec::new()
+            };
+            if !response_rule_ids.is_empty() {
+                extend_rule_ids(&mut rule_ids, response_rule_ids);
                 modified = true;
                 if matched.is_none() {
                     matched = Some("rule".into());
@@ -1227,6 +1245,7 @@ async fn proxy_request(
                     error: None,
                     matched: matched.clone(),
                     modified,
+                    rule_ids: &rule_ids,
                 };
                 capture_streamed(&ctx, parts, len_hint);
             }
@@ -1272,6 +1291,7 @@ async fn proxy_request(
                         e.clone(),
                         matched.clone(),
                         modified,
+                        &rule_ids,
                     ),
                 );
             }
@@ -1308,9 +1328,8 @@ async fn proxy_request(
     }
 
     // ── response-phase rules (P3): set-status / set-response-header / replace ──
-    if in_scope
-        && error.is_none()
-        && apply_response_rules(
+    let response_rule_ids = if in_scope && error.is_none() {
+        apply_response_rules(
             &ctx.shared,
             method.as_str(),
             &host,
@@ -1320,7 +1339,11 @@ async fn proxy_request(
             &mut resp_bytes,
             plaintext_body,
         )
-    {
+    } else {
+        Vec::new()
+    };
+    if !response_rule_ids.is_empty() {
+        extend_rule_ids(&mut rule_ids, response_rule_ids);
         modified = true;
         if matched.is_none() {
             matched = Some("rule".into());
@@ -1345,7 +1368,9 @@ async fn proxy_request(
             error: None,
             matched: None,
             modified: false,
+            rule_ids: &rule_ids,
         });
+        stamp_capture_context(&ctx, &mut snap);
         if !plaintext_body {
             snap.streamed = true;
             snap.resp_body = None;
@@ -1429,6 +1454,7 @@ async fn proxy_request(
                 error: error.clone(),
                 matched,
                 modified,
+                rule_ids: &rule_ids,
             },
         );
     } else if in_scope {
@@ -1451,6 +1477,7 @@ async fn proxy_request(
                 error: error.clone(),
                 matched,
                 modified,
+                rule_ids: &rule_ids,
             },
             Some(wire_len),
         );
@@ -1797,6 +1824,7 @@ struct FlowParts<'a> {
     error: Option<String>,
     matched: Option<String>,
     modified: bool,
+    rule_ids: &'a [String],
 }
 
 fn make_flow(p: FlowParts<'_>) -> FlowRecord {
@@ -1816,6 +1844,8 @@ fn make_flow(p: FlowParts<'_>) -> FlowRecord {
     };
     FlowRecord {
         id: p.id.to_string(),
+        flow_sequence: flow::sequence_from_id(p.id).unwrap_or_default(),
+        capture_session_id: String::new(),
         ts: events::now_ts(),
         method: p.method.to_string(),
         scheme: p.scheme.to_string(),
@@ -1834,6 +1864,8 @@ fn make_flow(p: FlowParts<'_>) -> FlowRecord {
         req_truncated,
         resp_truncated,
         matched: p.matched,
+        rule_id: p.rule_ids.last().cloned(),
+        rule_ids: p.rule_ids.to_vec(),
         modified: p.modified,
         error: p.error,
         streamed: false,
@@ -1859,6 +1891,7 @@ fn error_flow<'a>(
     error: String,
     matched: Option<String>,
     modified: bool,
+    rule_ids: &'a [String],
 ) -> FlowParts<'a> {
     FlowParts {
         id,
@@ -1876,12 +1909,14 @@ fn error_flow<'a>(
         error: Some(error),
         matched,
         modified,
+        rule_ids,
     }
 }
 
 /// Build the final flow record and push it to the daemon (store + broadcast).
 fn capture(ctx: &ProxyContext, parts: FlowParts<'_>) {
     let mut rec = make_flow(parts);
+    stamp_capture_context(ctx, &mut rec);
     if ctx.shared.redact {
         redact_headers(&mut rec.req_headers);
         redact_headers(&mut rec.resp_headers);
@@ -1894,6 +1929,7 @@ fn capture(ctx: &ProxyContext, parts: FlowParts<'_>) {
 /// (the real streamed length isn't known when the flow is recorded).
 fn capture_streamed(ctx: &ProxyContext, parts: FlowParts<'_>, len_hint: Option<u64>) {
     let mut rec = make_flow(parts);
+    stamp_capture_context(ctx, &mut rec);
     rec.streamed = true;
     rec.resp_body = None;
     rec.resp_len = len_hint.unwrap_or(rec.resp_len);
@@ -1902,6 +1938,10 @@ fn capture_streamed(ctx: &ProxyContext, parts: FlowParts<'_>, len_hint: Option<u
         redact_headers(&mut rec.resp_headers);
     }
     enqueue_flow(ctx, rec);
+}
+
+fn stamp_capture_context(ctx: &ProxyContext, rec: &mut FlowRecord) {
+    rec.capture_session_id.clone_from(&ctx.capture_session_id);
 }
 
 fn enqueue_flow(ctx: &ProxyContext, rec: FlowRecord) {
@@ -2305,6 +2345,15 @@ struct ReqRules {
     short_circuit: Option<SyntheticResponse>,
     delay_ms: u32,
     modified: bool,
+    rule_ids: Vec<String>,
+}
+
+fn extend_rule_ids(target: &mut Vec<String>, incoming: Vec<String>) {
+    for id in incoming {
+        if !target.contains(&id) {
+            target.push(id);
+        }
+    }
 }
 
 fn rule_matches(
@@ -2347,8 +2396,9 @@ fn apply_request_rules(
         short_circuit: None,
         delay_ms: 0,
         modified: false,
+        rule_ids: Vec::new(),
     };
-    for (_, spec) in rules.iter() {
+    for (id, spec) in rules.iter() {
         if !rule_matches(spec, method, host, path, None, None) {
             continue;
         }
@@ -2361,6 +2411,7 @@ fn apply_request_rules(
                     .unwrap_or(444);
                 out.short_circuit = Some((status, Vec::new(), Bytes::new()));
                 out.modified = true;
+                out.rule_ids.push(id.clone());
                 return out;
             }
             "map-local" => {
@@ -2373,6 +2424,7 @@ fn apply_request_rules(
                         Bytes::from(bytes),
                     ));
                     out.modified = true;
+                    out.rule_ids.push(id.clone());
                     return out;
                 }
             }
@@ -2380,17 +2432,20 @@ fn apply_request_rules(
                 if let Some(repl) = spec.args.first() {
                     rewrite_url(url, repl);
                     out.modified = true;
+                    out.rule_ids.push(id.clone());
                 }
             }
             "set-request-header" => {
                 if let (Some(n), Some(v)) = (spec.args.first(), spec.args.get(1)) {
                     set_header_vec(headers, n, v);
                     out.modified = true;
+                    out.rule_ids.push(id.clone());
                 }
             }
             "delay" => {
                 if let Some(ms) = spec.args.first().and_then(|s| s.parse::<u32>().ok()) {
                     out.delay_ms = out.delay_ms.max(ms);
+                    out.rule_ids.push(id.clone());
                 }
             }
             _ => {}
@@ -2409,19 +2464,20 @@ fn apply_response_rules(
     headers: &mut Vec<(String, String)>,
     body: &mut Bytes,
     allow_body: bool,
-) -> bool {
+) -> Vec<String> {
     let rules = shared.rules.read().unwrap();
     let ct = flow::content_type(headers);
-    let mut modified = false;
-    for (_, spec) in rules.iter() {
+    let mut rule_ids = Vec::new();
+    for (id, spec) in rules.iter() {
         if !rule_matches(spec, method, host, path, ct.as_deref(), *status) {
             continue;
         }
+        let mut applied = false;
         match spec.kind.as_str() {
             "set-status" => {
                 if let Some(c) = spec.args.first().and_then(|s| s.parse().ok()) {
                     *status = Some(c);
-                    modified = true;
+                    applied = true;
                 }
             }
             "set-response-header" => {
@@ -2429,7 +2485,7 @@ fn apply_response_rules(
                     && !is_response_framing_header(n)
                 {
                     set_header_vec(headers, n, v);
-                    modified = true;
+                    applied = true;
                 }
             }
             "replace" if allow_body => {
@@ -2443,15 +2499,18 @@ fn apply_response_rules(
                         if new.as_bytes() != body.as_ref() {
                             *body = Bytes::from(new.into_bytes());
                             strip_body_validators(headers);
-                            modified = true;
+                            applied = true;
                         }
                     }
                 }
             }
             _ => {}
         }
+        if applied {
+            rule_ids.push(id.clone());
+        }
     }
-    modified
+    rule_ids
 }
 
 /// If replay is loaded and a saved flow matches (method+host+path), return its
@@ -3116,6 +3175,7 @@ mod tests {
             error: None,
             matched: None,
             modified: false,
+            rule_ids: &[],
         });
         assert!(rec.req_streamed);
         assert!(rec.req_body.is_none());

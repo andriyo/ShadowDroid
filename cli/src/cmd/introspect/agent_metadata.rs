@@ -962,7 +962,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "net start" => Some(serde_json::json!({
             "use_when": ["Need watch to include HTTP(S) events or need to intercept/modify traffic."],
-            "output": "action JSON with host-side proxy daemon and device wiring details",
+            "output": "action JSON with stable capture_session_id, started_at, host-side proxy daemon, and device wiring details",
             "side_effects": ["starts host proxy daemon", "sets adb reverse", "sets device global http_proxy"],
             "next_actions": ["watch", "net status", "net check <pkg>", "net intercept"]
         })),
@@ -974,15 +974,21 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "net status" => Some(serde_json::json!({
             "use_when": ["Need to verify whether the proxy daemon is running and both the device http_proxy and adb reverse mapping point at it."],
-            "output": "net_status action JSON with separate wiring checks, dropped-flow counters, and actionable held_flows lifecycle entries (phase/state/held_at/expires_at/client_connected)",
+            "output": "net_status action JSON with capture_session_id, separate wiring checks, dropped-flow counters, and actionable held_flows lifecycle entries (phase/state/held_at/expires_at/client_connected)",
             "side_effects": ["none"],
             "next_actions": ["net check <pkg>", "watch", "ui dump"]
         })),
         "net log" => Some(serde_json::json!({
-            "use_when": ["Need recent HTTP flows from the session log without watching live UI."],
-            "output": "line-delimited JSON: http (and tls_error, when an app rejected the CA) events with immediate device-scoped next_actions in ts order, followed by a net_log summary object",
+            "use_when": ["Need recent HTTP flows from the session log without watching live UI.", "Need to isolate a test phase by session, duration, flow/checkpoint boundary, or applied rule."],
+            "output": "line-delimited JSON: filtered http/tls_error events in ts order, then a net_log summary with the effective boundary and older_events_excluded",
             "side_effects": ["none"],
-            "next_actions": ["net show <id>", "net export har <id>", "watch"]
+            "next_actions": ["net checkpoint", "net show <id>", "net export har <id>", "watch"]
+        })),
+        "net checkpoint" => Some(serde_json::json!({
+            "use_when": ["Need a durable boundary before performing one test action while keeping the proxy and rules active."],
+            "output": "net_checkpoint action JSON with checkpoint id, capture_session_id, created_at, and last_flow_id",
+            "side_effects": ["appends a checkpoint marker to capture history"],
+            "next_actions": ["net log --after-checkpoint <checkpoint>", "net log clear"]
         })),
         "net show" => Some(serde_json::json!({
             "use_when": ["Need headers, bodies, or full detail for a flow id seen in watch or net log."],

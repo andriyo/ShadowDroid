@@ -904,6 +904,23 @@ pub enum NetCmd {
     Status,
     /// Recall past flows from the session log.
     Log {
+        /// Clear queryable capture history while preserving a running proxy and its rules.
+        #[arg(
+            value_parser = ["clear"],
+            conflicts_with_all = [
+                "host",
+                "path",
+                "method",
+                "status",
+                "limit",
+                "session",
+                "since",
+                "after_id",
+                "after_checkpoint",
+                "rule_id"
+            ]
+        )]
+        action: Option<String>,
         /// Filter by host (substring), e.g. api.example.com.
         #[arg(long)]
         host: Option<String>,
@@ -919,7 +936,24 @@ pub enum NetCmd {
         /// Max number of flows to return (most recent first).
         #[arg(short = 'n', long, default_value_t = 50)]
         limit: usize,
+        /// Restrict results to one capture session id returned by `net start`.
+        #[arg(long, value_name = "SESSION")]
+        session: Option<String>,
+        /// Restrict results to a recent duration, e.g. 500ms, 2m, 1h.
+        #[arg(long, value_name = "DURATION")]
+        since: Option<String>,
+        /// Exclude this flow id and every older flow in its capture session.
+        #[arg(long, value_name = "FLOW_ID", conflicts_with = "after_checkpoint")]
+        after_id: Option<String>,
+        /// Exclude events at or before a durable capture checkpoint.
+        #[arg(long, value_name = "CHECKPOINT", conflicts_with = "after_id")]
+        after_checkpoint: Option<String>,
+        /// Restrict results to flows modified by this rule id.
+        #[arg(long, value_name = "RULE_ID")]
+        rule_id: Option<String>,
     },
+    /// Mark the current capture boundary without stopping the proxy.
+    Checkpoint,
     /// Full headers + bodies for one flow.
     Show {
         id: String,
@@ -2569,12 +2603,37 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
             nc::status(serial, ca.as_deref()).await
         }
         NetCmd::Log {
+            action,
             host,
             path,
             method,
             status,
             limit,
-        } => nc::log(serial, matcher(host, path, method, status), *limit).await,
+            session,
+            since,
+            after_id,
+            after_checkpoint,
+            rule_id,
+        } => {
+            if action.as_deref() == Some("clear") {
+                nc::log_clear(serial).await
+            } else {
+                nc::log(
+                    serial,
+                    nc::LogOpts {
+                        matcher: matcher(host, path, method, status),
+                        limit: *limit,
+                        capture_session_id: session.clone(),
+                        since: since.clone(),
+                        after_id: after_id.clone(),
+                        after_checkpoint: after_checkpoint.clone(),
+                        rule_id: rule_id.clone(),
+                    },
+                )
+                .await
+            }
+        }
+        NetCmd::Checkpoint => nc::checkpoint(serial).await,
         NetCmd::Show {
             id,
             body,

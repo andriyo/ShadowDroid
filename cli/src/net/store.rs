@@ -17,6 +17,46 @@ use crate::events::Event;
 use crate::net::flow::FlowRecord;
 use crate::net::{Matcher, paths};
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CheckpointRecord {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub checkpoint: String,
+    pub capture_session_id: String,
+    pub created_at: f64,
+    pub last_flow_id: Option<String>,
+    pub last_flow_sequence: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ClearRecord {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub capture_session_id: String,
+    pub cleared_at: f64,
+    pub after_flow_id: Option<String>,
+    pub after_flow_sequence: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LogQuery {
+    pub matcher: Matcher,
+    pub limit: usize,
+    pub capture_session_id: Option<String>,
+    pub since_ts: Option<f64>,
+    pub after_flow_sequence: Option<u64>,
+    pub after_ts: Option<f64>,
+    pub rule_id: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct TimelineResult {
+    pub items: Vec<serde_json::Value>,
+    pub older_events_excluded: bool,
+    pub excluded_count: usize,
+    pub logical_clear_applied: bool,
+}
+
 /// Cap each on-disk generation. One prior generation is retained, bounding a
 /// capture session to roughly 128 MiB even under sustained traffic.
 const SESSION_LOG_BYTES: u64 = 64 * 1024 * 1024;
@@ -28,10 +68,18 @@ pub fn append(serial: &Serial, rec: &FlowRecord) -> Result<()> {
 }
 
 /// Append a non-flow [Event] (currently only `tls_error`) as its own JSON line.
-/// Flow-only readers skip these; [`read_recent_timeline`] interleaves them with
+/// Flow-only readers skip these; [`read_recent_timeline_query`] interleaves them with
 /// compact HTTP events for `net log`.
 pub fn append_event(serial: &Serial, ev: &Event) -> Result<()> {
     append_line(serial, &serde_json::to_string(ev)?)
+}
+
+pub fn append_checkpoint(serial: &Serial, checkpoint: &CheckpointRecord) -> Result<()> {
+    append_line(serial, &serde_json::to_string(checkpoint)?)
+}
+
+pub fn append_clear(serial: &Serial, clear: &ClearRecord) -> Result<()> {
+    append_line(serial, &serde_json::to_string(clear)?)
 }
 
 fn append_line(serial: &Serial, line: &str) -> Result<()> {
@@ -153,6 +201,12 @@ fn acquire_log_lock_mode(path: &Path, exclusive: bool) -> Result<File> {
 enum StoredLine {
     Flow(serde_json::Value),
     TlsError(serde_json::Value),
+    Checkpoint(CheckpointRecord),
+    Clear(ClearRecord),
+}
+
+fn flow_is_after_floor(flow_sequence: u64, floor: u64) -> bool {
+    floor == 0 || flow_sequence > floor
 }
 
 /// Visit valid records across the rotated generation and then the current one.
@@ -181,10 +235,19 @@ fn visit_records(path: &Path, mut visit: impl FnMut(StoredLine)) -> Result<()> {
             let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
                 continue;
             };
-            if value.get("type").and_then(serde_json::Value::as_str) == Some("tls_error") {
-                visit(StoredLine::TlsError(value));
-            } else {
-                visit(StoredLine::Flow(value));
+            match value.get("type").and_then(serde_json::Value::as_str) {
+                Some("tls_error") => visit(StoredLine::TlsError(value)),
+                Some("capture_checkpoint") => {
+                    if let Ok(checkpoint) = serde_json::from_value(value) {
+                        visit(StoredLine::Checkpoint(checkpoint));
+                    }
+                }
+                Some("capture_clear") => {
+                    if let Ok(clear) = serde_json::from_value(value) {
+                        visit(StoredLine::Clear(clear));
+                    }
+                }
+                _ => visit(StoredLine::Flow(value)),
             }
         }
     }
@@ -217,12 +280,20 @@ fn open_generation_snapshot(path: &Path) -> Result<Vec<(std::path::PathBuf, File
 
 fn read_all_from(path: &Path) -> Result<Vec<FlowRecord>> {
     let mut flows = Vec::new();
-    visit_records(path, |record| {
-        if let StoredLine::Flow(value) = record
-            && let Ok(flow) = serde_json::from_value::<FlowRecord>(value)
-        {
-            flows.push(flow);
+    let mut floor = 0;
+    visit_records(path, |record| match record {
+        StoredLine::Flow(value) => {
+            if let Ok(flow) = serde_json::from_value::<FlowRecord>(value)
+                && flow_is_after_floor(flow.flow_sequence, floor)
+            {
+                flows.push(flow);
+            }
         }
+        StoredLine::Clear(clear) => {
+            floor = clear.after_flow_sequence;
+            flows.clear();
+        }
+        StoredLine::TlsError(_) | StoredLine::Checkpoint(_) => {}
     })?;
     Ok(flows)
 }
@@ -234,7 +305,7 @@ pub fn read_all(serial: &Serial) -> Result<Vec<FlowRecord>> {
 }
 
 /// The last `limit` flows matching `m`, oldest first. Retained for the bounded
-/// diagnostic snapshot used by `why`; `net log` uses [`read_recent_timeline`]
+/// diagnostic snapshot used by `why`; `net log` uses [`read_recent_timeline_query`]
 /// so HTTP and TLS records share one combined limit and one disk pass.
 pub fn read_filtered(serial: &Serial, m: &Matcher, limit: usize) -> Result<Vec<FlowRecord>> {
     let path = paths::session_log_path(serial)?;
@@ -242,29 +313,45 @@ pub fn read_filtered(serial: &Serial, m: &Matcher, limit: usize) -> Result<Vec<F
         return Ok(Vec::new());
     }
     let mut recent = VecDeque::new();
-    visit_records(&path, |record| {
-        if let StoredLine::Flow(value) = record
-            && let Ok(flow) = serde_json::from_value::<FlowRecord>(value)
-            && flow.matches(m)
-        {
-            recent.push_back(flow);
-            if recent.len() > limit {
-                recent.pop_front();
+    let mut floor = 0;
+    visit_records(&path, |record| match record {
+        StoredLine::Flow(value) => {
+            if let Ok(flow) = serde_json::from_value::<FlowRecord>(value)
+                && flow_is_after_floor(flow.flow_sequence, floor)
+                && flow.matches(m)
+            {
+                recent.push_back(flow);
+                if recent.len() > limit {
+                    recent.pop_front();
+                }
             }
         }
+        StoredLine::Clear(clear) => {
+            floor = clear.after_flow_sequence;
+            recent.clear();
+        }
+        StoredLine::TlsError(_) | StoredLine::Checkpoint(_) => {}
     })?;
     Ok(recent.into_iter().collect())
 }
 
 fn find_by_id_from(path: &Path, id: &str) -> Result<Option<FlowRecord>> {
     let mut found = None;
-    visit_records(path, |record| {
-        if let StoredLine::Flow(value) = record
-            && let Ok(flow) = serde_json::from_value::<FlowRecord>(value)
-            && flow.id == id
-        {
-            found = Some(flow);
+    let mut floor = 0;
+    visit_records(path, |record| match record {
+        StoredLine::Flow(value) => {
+            if let Ok(flow) = serde_json::from_value::<FlowRecord>(value)
+                && flow_is_after_floor(flow.flow_sequence, floor)
+                && flow.id == id
+            {
+                found = Some(flow);
+            }
         }
+        StoredLine::Clear(clear) => {
+            floor = clear.after_flow_sequence;
+            found = None;
+        }
+        StoredLine::TlsError(_) | StoredLine::Checkpoint(_) => {}
     })?;
     Ok(found)
 }
@@ -318,51 +405,133 @@ fn tls_host_matches(value: &serde_json::Value, host: Option<&str>) -> bool {
     })
 }
 
+#[cfg(test)]
 fn read_recent_timeline_from(
     path: &Path,
     serial: &Serial,
     matcher: &Matcher,
     limit: usize,
 ) -> Result<Vec<serde_json::Value>> {
-    if limit == 0 {
-        return Ok(Vec::new());
+    Ok(read_recent_timeline_query_from(
+        path,
+        serial,
+        &LogQuery {
+            matcher: matcher.clone(),
+            limit,
+            ..Default::default()
+        },
+    )?
+    .items)
+}
+
+fn read_recent_timeline_query_from(
+    path: &Path,
+    serial: &Serial,
+    query: &LogQuery,
+) -> Result<TimelineResult> {
+    if query.limit == 0 {
+        return Ok(TimelineResult {
+            items: Vec::new(),
+            older_events_excluded: false,
+            excluded_count: 0,
+            logical_clear_applied: false,
+        });
     }
 
     let mut recent = BinaryHeap::<Reverse<RankedEvent>>::new();
     let mut sequence = 0_u64;
+    let mut floor = 0_u64;
+    let mut excluded_count = 0_usize;
+    let mut older_events_excluded = false;
+    let mut logical_clear_applied = false;
     visit_records(path, |record| {
-        let entry = match record {
-            StoredLine::Flow(value) => serde_json::from_value::<FlowRecord>(value)
-                .ok()
-                .filter(|flow| flow.matches(matcher))
-                .and_then(|flow| {
-                    let ts = flow.ts;
-                    serde_json::to_value(flow.http_event(serial))
-                        .ok()
-                        .map(|value| RankedEvent {
+        let entry =
+            match record {
+                StoredLine::Flow(value) => serde_json::from_value::<FlowRecord>(value)
+                    .ok()
+                    .and_then(|flow| {
+                        if !flow.matches(&query.matcher) {
+                            return None;
+                        }
+                        let before_boundary = (floor > 0 && flow.flow_sequence <= floor)
+                            || query
+                                .after_flow_sequence
+                                .is_some_and(|after| flow.flow_sequence <= after)
+                            || query.since_ts.is_some_and(|since| flow.ts < since)
+                            || query.after_ts.is_some_and(|after| flow.ts <= after);
+                        if before_boundary {
+                            excluded_count = excluded_count.saturating_add(1);
+                            older_events_excluded = true;
+                            return None;
+                        }
+                        if query
+                            .capture_session_id
+                            .as_deref()
+                            .is_some_and(|session| flow.capture_session_id.as_str() != session)
+                            || query
+                                .rule_id
+                                .as_deref()
+                                .is_some_and(|rule| !flow.rule_ids.iter().any(|id| id == rule))
+                        {
+                            return None;
+                        }
+                        let ts = flow.ts;
+                        serde_json::to_value(flow.http_event(serial))
+                            .ok()
+                            .map(|value| RankedEvent {
+                                ts,
+                                kind: 0,
+                                sequence,
+                                value,
+                            })
+                    }),
+                StoredLine::TlsError(value)
+                    if tls_host_matches(&value, query.matcher.host.as_deref()) =>
+                {
+                    let ts = value
+                        .get("ts")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0);
+                    let before_boundary = (query.after_flow_sequence.is_some()
+                        && query.after_ts.is_none())
+                        || query.since_ts.is_some_and(|since| ts < since)
+                        || query.after_ts.is_some_and(|after| ts <= after);
+                    if before_boundary {
+                        excluded_count = excluded_count.saturating_add(1);
+                        older_events_excluded = true;
+                        None
+                    } else if query.rule_id.is_some()
+                        || query.capture_session_id.as_deref().is_some_and(|session| {
+                            value
+                                .get("capture_session_id")
+                                .and_then(serde_json::Value::as_str)
+                                != Some(session)
+                        })
+                    {
+                        None
+                    } else {
+                        Some(RankedEvent {
                             ts,
-                            kind: 0,
+                            kind: 1,
                             sequence,
                             value,
                         })
-                }),
-            StoredLine::TlsError(value) if tls_host_matches(&value, matcher.host.as_deref()) => {
-                Some(RankedEvent {
-                    ts: value
-                        .get("ts")
-                        .and_then(serde_json::Value::as_f64)
-                        .unwrap_or(0.0),
-                    kind: 1,
-                    sequence,
-                    value,
-                })
-            }
-            StoredLine::TlsError(_) => None,
-        };
+                    }
+                }
+                StoredLine::Clear(clear) => {
+                    floor = clear.after_flow_sequence;
+                    excluded_count = excluded_count.saturating_add(recent.len());
+                    older_events_excluded = true;
+                    logical_clear_applied = true;
+                    recent.clear();
+                    None
+                }
+                StoredLine::TlsError(_) | StoredLine::Checkpoint(_) => None,
+            };
         sequence = sequence.saturating_add(1);
         if let Some(entry) = entry {
             recent.push(Reverse(entry));
-            if recent.len() > limit {
+            if recent.len() > query.limit {
                 recent.pop();
             }
         }
@@ -373,19 +542,19 @@ fn read_recent_timeline_from(
         .map(|Reverse(entry)| entry)
         .collect::<Vec<_>>();
     recent.sort_unstable();
-    Ok(recent.into_iter().map(|entry| entry.value).collect())
+    Ok(TimelineResult {
+        items: recent.into_iter().map(|entry| entry.value).collect(),
+        older_events_excluded,
+        excluded_count,
+        logical_clear_applied,
+    })
 }
 
 /// Most recent matching HTTP and TLS-error events, ordered chronologically.
-/// Both generations are scanned once and only `limit` compact events are kept;
-/// full captured request/response bodies are dropped immediately after a flow
-/// is converted to its public HTTP event.
-pub fn read_recent_timeline(
-    serial: &Serial,
-    matcher: &Matcher,
-    limit: usize,
-) -> Result<Vec<serde_json::Value>> {
-    read_recent_timeline_from(&paths::session_log_path(serial)?, serial, matcher, limit)
+/// Both generations are scanned once and only `query.limit` compact events are
+/// kept; full captured bodies are dropped after conversion to public events.
+pub fn read_recent_timeline_query(serial: &Serial, query: &LogQuery) -> Result<TimelineResult> {
+    read_recent_timeline_query_from(&paths::session_log_path(serial)?, serial, query)
 }
 
 /// Drop the session log (called on `net start` so each session is fresh).
@@ -403,6 +572,32 @@ pub fn clear(serial: &Serial) -> Result<()> {
     Ok(())
 }
 
+fn read_checkpoint_from(path: &Path, checkpoint_id: &str) -> Result<Option<CheckpointRecord>> {
+    let mut found = None;
+    let mut floor = 0_u64;
+    let mut cleared_at = 0.0_f64;
+    visit_records(path, |record| match record {
+        StoredLine::Checkpoint(checkpoint)
+            if checkpoint.checkpoint == checkpoint_id
+                && checkpoint.last_flow_sequence >= floor
+                && checkpoint.created_at >= cleared_at =>
+        {
+            found = Some(checkpoint);
+        }
+        StoredLine::Clear(clear) => {
+            floor = clear.after_flow_sequence;
+            cleared_at = clear.cleared_at;
+            found = None;
+        }
+        StoredLine::Flow(_) | StoredLine::TlsError(_) | StoredLine::Checkpoint(_) => {}
+    })?;
+    Ok(found)
+}
+
+pub fn read_checkpoint(serial: &Serial, checkpoint_id: &str) -> Result<Option<CheckpointRecord>> {
+    read_checkpoint_from(&paths::session_log_path(serial)?, checkpoint_id)
+}
+
 fn read_tls_errors_from(
     path: &Path,
     host: Option<&str>,
@@ -412,15 +607,15 @@ fn read_tls_errors_from(
         return Ok(Vec::new());
     }
     let mut errors = VecDeque::new();
-    visit_records(path, |record| {
-        if let StoredLine::TlsError(value) = record
-            && tls_host_matches(&value, host)
-        {
+    visit_records(path, |record| match record {
+        StoredLine::TlsError(value) if tls_host_matches(&value, host) => {
             errors.push_back(value);
             if errors.len() > limit {
                 errors.pop_front();
             }
         }
+        StoredLine::Clear(_) => errors.clear(),
+        StoredLine::Flow(_) | StoredLine::TlsError(_) | StoredLine::Checkpoint(_) => {}
     })?;
     Ok(errors.into_iter().collect())
 }
@@ -439,8 +634,9 @@ pub fn read_tls_errors(
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_log_lock, acquire_log_read_lock, find_by_id_from, read_all_from,
-        read_recent_timeline_from, read_tls_errors_from, secure_existing_log,
+        CheckpointRecord, ClearRecord, LogQuery, acquire_log_lock, acquire_log_read_lock,
+        find_by_id_from, read_all_from, read_checkpoint_from, read_recent_timeline_from,
+        read_recent_timeline_query_from, read_tls_errors_from, secure_existing_log,
     };
     use crate::ids::Serial;
     use crate::net::Matcher;
@@ -683,5 +879,120 @@ mod tests {
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0]["ts"], 3.0);
         assert!(read_tls_errors_from(&path, None, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn clear_boundary_excludes_delayed_older_flows_and_preserves_new_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.jsonl");
+        let serial = Serial::new("emulator-5554");
+        let mut first = flow("f1", 1.0, "api.example", "/old");
+        first.flow_sequence = 1;
+        first.capture_session_id = "n-one".into();
+        first.rule_id = Some("r1".into());
+        first.rule_ids = vec!["r1".into()];
+        let mut second = flow("f2", 2.0, "api.example", "/old");
+        second.flow_sequence = 2;
+        second.capture_session_id = "n-one".into();
+        let checkpoint = CheckpointRecord {
+            kind: "capture_checkpoint".into(),
+            checkpoint: "cp1".into(),
+            capture_session_id: "n-one".into(),
+            created_at: 2.5,
+            last_flow_id: Some("f2".into()),
+            last_flow_sequence: 2,
+        };
+        let clear = ClearRecord {
+            kind: "capture_clear".into(),
+            capture_session_id: "n-one".into(),
+            cleared_at: 3.0,
+            after_flow_id: Some("f2".into()),
+            after_flow_sequence: 2,
+        };
+        let mut delayed_first = first.clone();
+        delayed_first.path = "/completed-after-clear".into();
+        let mut third = flow("f3", 4.0, "api.example", "/new");
+        third.flow_sequence = 3;
+        third.capture_session_id = "n-one".into();
+        third.rule_id = Some("r7".into());
+        third.rule_ids = vec!["r7".into()];
+        let post_clear_checkpoint = CheckpointRecord {
+            kind: "capture_checkpoint".into(),
+            checkpoint: "cp2".into(),
+            capture_session_id: "n-one".into(),
+            created_at: 4.5,
+            last_flow_id: Some("f3".into()),
+            last_flow_sequence: 3,
+        };
+        write_lines(
+            &path,
+            &[
+                line(first),
+                line(second),
+                line(checkpoint),
+                line(clear),
+                line(delayed_first),
+                line(third),
+                line(json!({
+                    "type": "tls_error",
+                    "ts": 4.2,
+                    "capture_session_id": "n-one",
+                    "host": "api.example",
+                    "reason": "rejected"
+                })),
+                line(post_clear_checkpoint),
+            ],
+            true,
+        );
+
+        let result = read_recent_timeline_query_from(
+            &path,
+            &serial,
+            &LogQuery {
+                matcher: Matcher::default(),
+                limit: 50,
+                capture_session_id: Some("n-one".into()),
+                after_flow_sequence: Some(2),
+                rule_id: Some("r7".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["id"], "f3");
+        assert!(result.older_events_excluded);
+        assert!(result.logical_clear_applied);
+
+        let with_tls = read_recent_timeline_query_from(
+            &path,
+            &serial,
+            &LogQuery {
+                matcher: Matcher::default(),
+                limit: 50,
+                capture_session_id: Some("n-one".into()),
+                after_flow_sequence: Some(2),
+                after_ts: Some(2.5),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            with_tls
+                .items
+                .iter()
+                .map(|item| item["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["http", "tls_error"]
+        );
+        assert!(find_by_id_from(&path, "f1").unwrap().is_none());
+        assert!(read_checkpoint_from(&path, "cp1").unwrap().is_none());
+        assert_eq!(
+            read_checkpoint_from(&path, "cp2")
+                .unwrap()
+                .unwrap()
+                .last_flow_id
+                .as_deref(),
+            Some("f3")
+        );
     }
 }

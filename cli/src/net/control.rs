@@ -24,7 +24,7 @@ use tokio::sync::{broadcast, mpsc};
 use crate::events::Event;
 use crate::net::flow::FlowRecord;
 use crate::net::proxy::{HoldDecision, InterceptCfg, ReleaseHeldResult, SharedState, TerminalHold};
-use crate::net::{Matcher, Mutation, RuleSpec, paths};
+use crate::net::{Matcher, Mutation, RuleSpec, flow, paths, store};
 
 /// In-daemon state the control handlers read/mutate.
 pub struct DaemonState {
@@ -40,6 +40,8 @@ pub struct DaemonState {
     pub startup_id: String,
     pub pid: u32,
     pub started: f64,
+    pub capture_session_id: String,
+    pub checkpoint_count: AtomicU64,
     /// SHA-256 of the CA cert the daemon signs with, so a repeated `net start`
     /// resolving a *different* CA (e.g. switching projects on one device) can
     /// warn that the live daemon is still using the old one.
@@ -146,6 +148,7 @@ pub async fn serve_client(
                     .map(|h| {
                         json!({
                             "id": h.meta.id,
+                            "capture_session_id": h.meta.capture_session_id,
                             "phase": h.phase,
                             "state": "held",
                             "held_at": h.held_at,
@@ -186,6 +189,7 @@ pub async fn serve_client(
                     "startup_id": state.startup_id,
                     "pid": state.pid,
                     "started": state.started,
+                    "capture_session_id": state.capture_session_id,
                     "ca_fingerprint": state.ca_fingerprint,
                     "flows": state.flow_count.load(Ordering::Relaxed),
                     "dropped_flows": shared.dropped_flows.load(Ordering::Relaxed),
@@ -306,6 +310,79 @@ pub async fn serve_client(
                 }),
             )
             .await?;
+        }
+        "checkpoint" => {
+            let sequence = flow::last_sequence();
+            let checkpoint = format!(
+                "cp{:x}",
+                state.checkpoint_count.fetch_add(1, Ordering::Relaxed) + 1
+            );
+            let record = store::CheckpointRecord {
+                kind: "capture_checkpoint".into(),
+                checkpoint: checkpoint.clone(),
+                capture_session_id: state.capture_session_id.clone(),
+                created_at: crate::events::now_ts(),
+                last_flow_id: (sequence > 0).then(|| format!("f{sequence:x}")),
+                last_flow_sequence: sequence,
+            };
+            match store::append_checkpoint(&state.serial, &record) {
+                Ok(()) => {
+                    write_json(
+                        &mut wr,
+                        &json!({
+                            "ok": true,
+                            "checkpoint": record.checkpoint,
+                            "capture_session_id": record.capture_session_id,
+                            "created_at": record.created_at,
+                            "last_flow_id": record.last_flow_id,
+                            "last_flow_sequence": record.last_flow_sequence,
+                        }),
+                    )
+                    .await?
+                }
+                Err(error) => {
+                    write_json(
+                        &mut wr,
+                        &json!({"ok": false, "error": format!("persist checkpoint: {error}")}),
+                    )
+                    .await?
+                }
+            }
+        }
+        "log_clear" => {
+            let sequence = flow::last_sequence();
+            let record = store::ClearRecord {
+                kind: "capture_clear".into(),
+                capture_session_id: state.capture_session_id.clone(),
+                cleared_at: crate::events::now_ts(),
+                after_flow_id: (sequence > 0).then(|| format!("f{sequence:x}")),
+                after_flow_sequence: sequence,
+            };
+            match store::append_clear(&state.serial, &record) {
+                Ok(()) => {
+                    write_json(
+                        &mut wr,
+                        &json!({
+                            "ok": true,
+                            "capture_session_id": record.capture_session_id,
+                            "cleared_at": record.cleared_at,
+                            "after_flow_id": record.after_flow_id,
+                            "after_flow_sequence": record.after_flow_sequence,
+                            "scope": "queryable_history",
+                            "active_proxy_preserved": true,
+                            "rules_preserved": shared.rules.read().unwrap().len(),
+                        }),
+                    )
+                    .await?
+                }
+                Err(error) => {
+                    write_json(
+                        &mut wr,
+                        &json!({"ok": false, "error": format!("persist clear boundary: {error}")}),
+                    )
+                    .await?
+                }
+            }
         }
         "rule_add" => {
             let spec: Option<RuleSpec> = req
@@ -1148,6 +1225,7 @@ mod tests {
     fn tls_error_events_reach_watch_and_respect_host_filter() {
         let ev = Event::TlsError {
             ts: 1.0,
+            capture_session_id: "n-test".into(),
             host: "appconfigs.disney-plus.net".into(),
             reason: "rejected".into(),
             next_actions: vec!["shadowdroid net check --fresh".into()],

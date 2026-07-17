@@ -331,7 +331,10 @@ shadowdroid net check com.example.app
 shadowdroid net trust --auto
 shadowdroid net start --verify-upstream
 shadowdroid watch
+shadowdroid net checkpoint
+shadowdroid net log --after-checkpoint <checkpoint>
 shadowdroid net log
+shadowdroid net log clear
 shadowdroid net show <id> --body-file /tmp/body.json
 shadowdroid net stop
 ```
@@ -340,6 +343,13 @@ Use `net check` before assuming HTTPS will decrypt. A `tls_error` means the app
 rejected the MITM path; inspect its reason. `--verify-upstream` validates HTTPS
 and WSS upstream certificates. Captured bodies are bounded; honor
 `req_truncated`/`resp_truncated` and original length fields.
+
+`net start` returns a stable `capture_session_id`; every flow and TLS failure
+carries it. Use `net log --session`, `--since 2m`, `--after-id`,
+`--after-checkpoint`, or `--rule-id` to isolate one test phase. `net checkpoint`
+adds a durable boundary. `net log clear` clears queryable history without
+stopping an active proxy or removing its rules; its summary explicitly reports
+that preservation. A later `net start` creates a new capture session.
 
 Rules have an explicit phase. The ambiguous old `set-header` name is rejected:
 
