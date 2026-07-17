@@ -43,8 +43,11 @@ $ shadowdroid ui dump
 
 // Act + re-observe in ONE call: --observe returns the post-action screen.
 $ shadowdroid ui tap --text "Sign in" --observe
-{"type":"action","cmd":"tap","ok":true,"via":"selector","x":540,"y":1200,"matched":true,
- "element":{"id":7,"text":"Sign in","tap":[540,1200]},
+{"type":"action","cmd":"tap","ok":true,"via":"selector","matched":true,
+ "selector_matched":true,"actionable_resolved":true,"input_delivered":true,
+ "matched_element":{"id":7,"text":"Sign in","tap":[540,1200]},
+ "activated_element":{"id":7,"text":"Sign in","clickable":true},
+ "action":"accessibility_click","screen_changed":true,"postcondition_satisfied":null,
  "screen":{"screen_hash":"9c01d2aa87b3e544","screen_hash_version":2,
            "snapshot_state":"consistent","captured_at_ms":1760000000440,
            "element_count":24,"elements":[…]}}
@@ -550,8 +553,9 @@ stripped — so `--text "sign in"` matches a `SIGN IN` button and `--text "Don't
 allow"` matches text rendered with a typographic apostrophe. Add `--exact` (on
 `ui find`/`tap`/`text`/`wait`/`focus`) to require a full match (so `--text
 Allow` won't hit a label reading "Allow Disney+…"), and `--clickable` to skip
-non-clickable labels. `--rid` is the most reliable target when a stable resource
-id exists. Matching is **literal** — `*`, `.`, `?` and other symbols match
+non-clickable matches instead of resolving their clickable ancestor. `--rid` is
+the most reliable target when a stable resource id exists. Matching is
+**literal** — `*`, `.`, `?` and other symbols match
 themselves, with no wildcards or regex (a value starting with `-` needs the
 `--text=-50%` equals form so it isn't read as a flag).
 
@@ -560,6 +564,16 @@ elements and none is an exact match, they fail with a structured
 `ambiguous_match` error listing the candidates rather than guessing — narrow
 with `--exact`, `--rid`, or `--clickable`. On a hit, `ui tap`/`wait`/`focus`
 echo back the matched element so you can confirm the right node was targeted.
+
+Selector taps are semantic by default. A non-clickable match resolves to its
+nearest enabled clickable ancestor and reports both `matched_element` and
+`activated_element`; a disabled target fails with `element_disabled`, and a
+label with no safe ancestor fails with `element_not_clickable`. Raw center
+injection requires explicit `--coordinate-fallback` (or direct `X Y`
+coordinates). Tap results separate `selector_matched`, `actionable_resolved`,
+`input_delivered`, `screen_changed` (with `--observe`), and
+`postcondition_satisfied`, so a valid no-op action is not confused with an
+undelivered input.
 
 Loop-fusion action verbs (`ui tap`, coordinate gestures, `ui pinch`, `ui text`,
 `ui key`, `ui back`, and `ui home`) accept `--observe` (return the post-action

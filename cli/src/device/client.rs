@@ -247,18 +247,20 @@ impl ServerClient {
             &XpathReq {
                 query: query.to_string(),
                 tap,
+                coordinate_fallback: false,
             },
         )
         .await
     }
 
-    pub async fn xpath_tap(&self, query: &str) -> Result<FindTapResp> {
+    pub async fn xpath_tap(&self, query: &str, coordinate_fallback: bool) -> Result<FindTapResp> {
         let resp = self
             .http
             .post(format!("{}/xpath", self.base))
             .json(&XpathReq {
                 query: query.to_string(),
                 tap: true,
+                coordinate_fallback,
             })
             .send()
             .await?;

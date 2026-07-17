@@ -111,14 +111,19 @@ pub async fn run_fused<F>(
 where
     F: std::future::Future<Output = Result<(&'static str, Value)>>,
 {
+    let pre_screen = if fusion.if_screen.is_some() || fusion.observe {
+        Some(client.screen().await?)
+    } else {
+        None
+    };
     if let Some(expected) = &fusion.if_screen {
-        let screen = client.screen().await?;
+        let screen = pre_screen.as_ref().expect("pre-screen requested above");
         if &screen.screen_hash != expected {
             let actual = screen.screen_hash.clone();
             return Err(ScreenChanged {
                 expected: expected.clone(),
                 actual,
-                screen: compact_screen_value(&screen),
+                screen: compact_screen_value(screen),
             }
             .into());
         }
@@ -138,6 +143,9 @@ where
         // the response into an error. Report it as a field instead.
         match client.screen().await {
             Ok(screen) => {
+                if let Some(pre) = &pre_screen {
+                    attach_screen_change(&mut body, &pre.screen_hash, &screen.screen_hash);
+                }
                 body["screen"] = compact_screen_value(&screen);
             }
             Err(err) => {
@@ -146,6 +154,12 @@ where
         }
     }
     Ok(Outcome::Action(cmd, body))
+}
+
+fn attach_screen_change(body: &mut Value, pre_hash: &str, post_hash: &str) {
+    body["pre_screen_hash"] = json!(pre_hash);
+    body["post_screen_hash"] = json!(post_hash);
+    body["screen_changed"] = json!(pre_hash != post_hash);
 }
 
 /// The compact screen payload — same shape as `ui dump`'s default output.
@@ -418,6 +432,19 @@ mod tests {
         assert_eq!(compact["current_app"]["sampled_at_ms"], 120);
         assert_eq!(compact["ui_tree"]["window_id"], 7);
         assert_eq!(compact["warning"], "still converging");
+    }
+
+    #[test]
+    fn observed_outcome_distinguishes_noop_from_screen_change() {
+        let mut noop = json!({});
+        attach_screen_change(&mut noop, "same", "same");
+        assert_eq!(noop["screen_changed"], false);
+        assert_eq!(noop["pre_screen_hash"], "same");
+        assert_eq!(noop["post_screen_hash"], "same");
+
+        let mut changed = json!({});
+        attach_screen_change(&mut changed, "before", "after");
+        assert_eq!(changed["screen_changed"], true);
     }
 
     #[test]

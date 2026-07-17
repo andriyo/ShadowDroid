@@ -172,6 +172,49 @@ class ScreenIdentityTest {
         assertTrue(assessment.warning?.contains("accessible content") == true)
     }
 
+    @Test
+    fun tapResolutionChoosesNearestEnabledClickableAncestor() {
+        val states =
+            listOf(
+                TapCandidateState(enabled = true, clickable = false),
+                TapCandidateState(enabled = true, clickable = true),
+                TapCandidateState(enabled = true, clickable = true),
+            )
+        assertEquals(1, chooseActionableIndex(states))
+        assertEquals(
+            null,
+            chooseActionableIndex(
+                listOf(
+                    TapCandidateState(enabled = true, clickable = false),
+                    TapCandidateState(enabled = true, clickable = false),
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun tapResolutionRejectsDisabledTargetOrAncestor() {
+        val disabledTarget =
+            assertThrows(BadRequest::class.java) {
+                chooseActionableIndex(
+                    listOf(TapCandidateState(enabled = false, clickable = true)),
+                )
+            }
+        assertEquals("element_disabled", disabledTarget.code)
+
+        val disabledCard =
+            assertThrows(BadRequest::class.java) {
+                chooseActionableIndex(
+                    listOf(
+                        TapCandidateState(enabled = true, clickable = false),
+                        TapCandidateState(enabled = false, clickable = true),
+                        TapCandidateState(enabled = true, clickable = true),
+                    ),
+                )
+            }
+        assertEquals("element_disabled", disabledCard.code)
+    }
+
     @Suppress("DEPRECATION")
     @Test
     fun xpathActionRejectsAmbiguousMatches() {

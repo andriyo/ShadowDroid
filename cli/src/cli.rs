@@ -553,10 +553,14 @@ pub enum UiCmd {
         /// label whose text merely contains the target (e.g. "Allow Disney+…" vs "Allow").
         #[arg(long)]
         exact: bool,
-        /// Only tap a clickable element. Skips a non-clickable label/TextView that
-        /// shares the target's text in favor of the actual button.
+        /// Require the matched node itself to be clickable instead of resolving
+        /// its nearest enabled clickable ancestor.
         #[arg(long)]
         clickable: bool,
+        /// Explicitly allow center-coordinate injection when no enabled clickable
+        /// target can perform ACTION_CLICK. Selector taps otherwise fail safely.
+        #[arg(long)]
+        coordinate_fallback: bool,
         #[command(flatten)]
         fusion: crate::fusion::FusionArgs,
     },
@@ -1702,6 +1706,7 @@ async fn dispatch_ui_inner(
             xpath,
             exact,
             clickable,
+            coordinate_fallback,
             fusion,
         } => {
             let hint = crate::fusion::SelectorHint {
@@ -1713,7 +1718,19 @@ async fn dispatch_ui_inner(
                 client,
                 &fusion,
                 Some(hint),
-                cmd_tap(client, id, a, b, text, rid, desc, xpath, exact, clickable),
+                cmd_tap(
+                    client,
+                    id,
+                    a,
+                    b,
+                    text,
+                    rid,
+                    desc,
+                    xpath,
+                    exact,
+                    clickable,
+                    coordinate_fallback,
+                ),
             )
             .await
         }
@@ -3258,6 +3275,19 @@ fn server_error_next_actions(code: &str, command_path: Option<&str>) -> Option<V
                 .to_string(),
             current_contract("ui find"),
         ]),
+        "element_not_clickable" => Some(vec![
+            "inspect detail.matched_element and target its enabled clickable control or ancestor"
+                .to_string(),
+            "use --coordinate-fallback only when raw center injection is explicitly intended"
+                .to_string(),
+            current_contract("ui tap"),
+        ]),
+        "element_disabled" => Some(vec![
+            "do not retry the same disabled control; inspect the current screen for its enabling condition"
+                .to_string(),
+            "shadowdroid ui dump".to_string(),
+            current_contract("ui tap"),
+        ]),
         "server_version_mismatch" | "server_unavailable" => Some(vec![
             "shadowdroid connect".to_string(),
             "shadowdroid doctor --fix --json".to_string(),
@@ -3623,14 +3653,13 @@ async fn cmd_tap(
     xpath: Option<String>,
     exact: bool,
     clickable: bool,
+    coordinate_fallback: bool,
 ) -> Result<(&'static str, serde_json::Value)> {
     // Selector modes take priority.
     if let Some(query) = xpath {
-        let r = client.xpath_tap(&query).await?;
-        return Ok((
-            "tap",
-            json!({"via":"xpath","xpath":query,"x":r.x,"y":r.y,"action":r.action,"matched":true,"element":r.matched}),
-        ));
+        let r = client.xpath_tap(&query, coordinate_fallback).await?;
+        let body = selector_tap_body("xpath", Some(("xpath", json!(query))), r);
+        return Ok(("tap", body));
     }
     if text.is_some() || rid.is_some() || desc.is_some() {
         let r = client
@@ -3640,17 +3669,15 @@ async fn cmd_tap(
                 desc,
                 exact,
                 clickable: clickable.then_some(true),
+                coordinate_fallback,
                 ..Default::default()
             })
             .await?;
-        return Ok((
-            "tap",
-            json!({"via":"selector","x":r.x,"y":r.y,"action":r.action,"matched":true,"element":r.matched}),
-        ));
+        return Ok(("tap", selector_tap_body("selector", None, r)));
     }
     // Coordinate / id modes.
     match (id, a, b) {
-        (Some(id), None, None) => tap_element_id(client, id).await,
+        (Some(id), None, None) => tap_element_id(client, id, coordinate_fallback).await,
         (Some(_), Some(_), _) | (Some(_), None, Some(_)) => {
             Err(crate::diagnostic::DiagnosticError::new(
                 "tap_target_conflict",
@@ -3665,7 +3692,20 @@ async fn cmd_tap(
         }
         (None, Some(x), Some(y)) => {
             client.tap_xy(x, y).await?;
-            Ok(("tap", json!({"via":"coords","x":x,"y":y})))
+            Ok((
+                "tap",
+                json!({
+                    "via":"coords",
+                    "x":x,
+                    "y":y,
+                    "action":"coordinate",
+                    "selector_matched":false,
+                    "actionable_resolved":false,
+                    "input_delivered":true,
+                    "screen_changed":null,
+                    "postcondition_satisfied":null
+                }),
+            ))
         }
         (None, Some(a), None) => {
             let id = u32::try_from(a).map_err(|_| {
@@ -3677,7 +3717,7 @@ async fn cmd_tap(
                 .detail(json!({"element_id": a}))
                 .next_actions(["use a non-negative id from a fresh `shadowdroid ui dump`"])
             })?;
-            tap_element_id(client, id).await
+            tap_element_id(client, id, coordinate_fallback).await
         }
         (None, None, _) => {
             Err(crate::diagnostic::DiagnosticError::new(
@@ -3697,20 +3737,56 @@ async fn cmd_tap(
 async fn tap_element_id(
     client: &ServerClient,
     id: u32,
+    coordinate_fallback: bool,
 ) -> Result<(&'static str, serde_json::Value)> {
     let r = client
         .find_tap(&SelectorQuery {
             id: Some(id),
+            coordinate_fallback,
             ..Default::default()
         })
         .await?;
-    Ok((
-        "tap",
-        json!({
-            "via":"id","id": id, "x": r.x, "y": r.y, "action": r.action,
-            "matched": true, "element": r.matched
-        }),
-    ))
+    Ok(("tap", selector_tap_body("id", Some(("id", json!(id))), r)))
+}
+
+fn selector_tap_body(
+    via: &'static str,
+    extra: Option<(&'static str, serde_json::Value)>,
+    response: crate::proto::FindTapResp,
+) -> serde_json::Value {
+    let matched = response.matched;
+    let activated = response.activated_element;
+    let actionable_resolved = response
+        .actionable_resolved
+        .unwrap_or_else(|| activated.is_some() || (matched.clickable && matched.enabled));
+    let input_delivered = response.input_delivered.unwrap_or(true);
+    // Older servers called their implicit center fallback simply
+    // `coordinate`; surface it honestly even though only newer servers enforce
+    // the explicit opt-in request field.
+    let coordinate_fallback = matches!(
+        response.action.as_deref(),
+        Some("coordinate_fallback" | "coordinate")
+    );
+    let mut body = json!({
+        "via": via,
+        "x": response.x,
+        "y": response.y,
+        "action": response.action,
+        "matched": true,
+        "selector_matched": true,
+        "actionable_resolved": actionable_resolved,
+        "input_delivered": input_delivered,
+        "coordinate_fallback": coordinate_fallback,
+        "screen_changed": null,
+        "postcondition_satisfied": null,
+        "element": matched,
+        "matched_element": matched,
+        "activated_element": activated,
+    });
+    if let Some((key, value)) = extra {
+        body[key] = value;
+    }
+    body
 }
 
 fn text_target_query(
@@ -4504,6 +4580,8 @@ mod tests {
             "bad_orientation",
             "bad_path",
             "element_not_found",
+            "element_not_clickable",
+            "element_disabled",
             "empty_selector",
             "file_not_found",
             "internal",
@@ -4628,7 +4706,7 @@ mod tests {
     }
 
     #[test]
-    fn ui_tap_accepts_exact_and_clickable() {
+    fn ui_tap_accepts_exact_clickable_and_coordinate_fallback() {
         let cli = Cli::try_parse_from([
             "shadowdroid",
             "ui",
@@ -4637,17 +4715,20 @@ mod tests {
             "Allow",
             "--exact",
             "--clickable",
+            "--coordinate-fallback",
         ])
         .expect("`ui tap --exact --clickable` should parse");
         match cli.cmd {
             Cmd::Ui(UiCmd::Tap {
                 exact,
                 clickable,
+                coordinate_fallback,
                 text,
                 ..
             }) => {
                 assert!(exact, "--exact should be set");
                 assert!(clickable, "--clickable should be set");
+                assert!(coordinate_fallback, "--coordinate-fallback should be set");
                 assert_eq!(text.as_deref(), Some("Allow"));
             }
             _ => panic!("expected `ui tap`"),
@@ -4768,6 +4849,34 @@ mod tests {
         assert_eq!(got, ["Something went wrong", "Retry", "Contact support"]);
         // Cap is honored.
         assert_eq!(top_screen_texts(&els, 2), ["Something went wrong", "Retry"]);
+    }
+
+    #[test]
+    fn selector_tap_result_separates_match_resolution_and_delivery() {
+        let matched = text_el("Nested child");
+        let mut activated = text_el("Card");
+        activated.id = 1;
+        activated.clickable = true;
+        let body = selector_tap_body(
+            "selector",
+            None,
+            crate::proto::FindTapResp {
+                matched,
+                activated_element: Some(activated),
+                actionable_resolved: Some(true),
+                input_delivered: Some(true),
+                x: None,
+                y: None,
+                action: Some("accessibility_click".into()),
+            },
+        );
+        assert_eq!(body["selector_matched"], true);
+        assert_eq!(body["actionable_resolved"], true);
+        assert_eq!(body["input_delivered"], true);
+        assert_eq!(body["matched_element"]["id"], 0);
+        assert_eq!(body["activated_element"]["id"], 1);
+        assert!(body["screen_changed"].is_null());
+        assert!(body["postcondition_satisfied"].is_null());
     }
 
     #[test]

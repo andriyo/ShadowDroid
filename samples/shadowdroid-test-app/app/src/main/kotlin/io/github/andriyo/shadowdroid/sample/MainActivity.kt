@@ -131,6 +131,85 @@ class MainActivity : Activity() {
         }.apply {
             isEnabled = false
         })
+        root.addView(
+            LinearLayout(this).apply {
+                id = R.id.nested_card
+                orientation = LinearLayout.VERTICAL
+                isClickable = true
+                isFocusable = true
+                contentDescription = "Nested clickable card"
+                setPadding(12.dp, 12.dp, 12.dp, 12.dp)
+                setOnClickListener { setStatus("Nested clickable ancestor activated") }
+                addView(
+                    TextView(context).apply {
+                        id = R.id.nested_card_label
+                        text = "Nested child action"
+                        contentDescription = "Nested non-clickable child"
+                    },
+                    fullWidth(),
+                )
+            },
+            fullWidth(),
+        )
+        root.addView(
+            LinearLayout(this).apply {
+                id = R.id.nested_outer_card
+                orientation = LinearLayout.VERTICAL
+                isClickable = true
+                isFocusable = true
+                contentDescription = "Outer clickable ancestor"
+                setPadding(12.dp, 12.dp, 12.dp, 12.dp)
+                setOnClickListener { setStatus("Outer clickable ancestor activated") }
+                addView(
+                    LinearLayout(context).apply {
+                        id = R.id.nested_inner_card
+                        orientation = LinearLayout.VERTICAL
+                        isClickable = true
+                        isFocusable = true
+                        contentDescription = "Inner clickable ancestor"
+                        setPadding(12.dp, 12.dp, 12.dp, 12.dp)
+                        setOnClickListener { setStatus("Nearest clickable ancestor activated") }
+                        addView(
+                            TextView(context).apply {
+                                id = R.id.nested_inner_label
+                                text = "Nearest ancestor action"
+                                contentDescription = "Child with multiple clickable ancestors"
+                            },
+                            fullWidth(),
+                        )
+                    },
+                    fullWidth(),
+                )
+            },
+            fullWidth(),
+        )
+        root.addView(
+            LinearLayout(this).apply {
+                id = R.id.disabled_card
+                orientation = LinearLayout.VERTICAL
+                isClickable = true
+                isFocusable = true
+                isEnabled = false
+                contentDescription = "Disabled clickable card"
+                setPadding(12.dp, 12.dp, 12.dp, 12.dp)
+                setOnClickListener { setStatus("Disabled card should not run") }
+                addView(
+                    TextView(context).apply {
+                        id = R.id.disabled_card_label
+                        text = "Disabled child action"
+                        contentDescription = "Child inside disabled card"
+                    },
+                    fullWidth(),
+                )
+            },
+            fullWidth(),
+        )
+        root.addView(
+            button(R.id.noop_button, "No-op action", "Valid action without screen change") {
+                // Deliberately no visible mutation: delivery and outcome must
+                // remain distinct in `ui tap --observe`.
+            },
+        )
 
         addSection(root, "Popups And Permissions")
         root.addView(button(R.id.dialog_button, "Show dialog", "Show alert dialog button") { showDialog() })

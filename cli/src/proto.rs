@@ -234,6 +234,8 @@ pub struct SelectorQuery {
     pub clickable: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    #[serde(default)]
+    pub coordinate_fallback: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -245,6 +247,12 @@ pub struct FindResp {
 #[derive(Debug, Clone, Deserialize)]
 pub struct FindTapResp {
     pub matched: Element,
+    #[serde(default)]
+    pub activated_element: Option<Element>,
+    #[serde(default)]
+    pub actionable_resolved: Option<bool>,
+    #[serde(default)]
+    pub input_delivered: Option<bool>,
     #[serde(default)]
     pub x: Option<i32>,
     #[serde(default)]
@@ -265,6 +273,8 @@ pub struct ScrollResp {
 pub struct XpathReq {
     pub query: String,
     pub tap: bool,
+    #[serde(default)]
+    pub coordinate_fallback: bool,
 }
 
 // ── /v1/toast/* ──────────────────────────────────────────────────────

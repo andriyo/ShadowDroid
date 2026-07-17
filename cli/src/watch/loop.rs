@@ -753,9 +753,21 @@ async fn dispatch_command(
             };
             let start_hash = state.last_hash.clone();
             let r = cfg.client.find_tap(&query).await?;
+            let matched_id = r.matched.id;
+            let source = r.action.clone().unwrap_or_else(|| "server".to_string());
             emit_action(
                 base_op,
-                &json!({"value":value, "x":r.x, "y":r.y, "action":r.action, "matched":r.matched}),
+                &json!({
+                    "value":value,
+                    "x":r.x,
+                    "y":r.y,
+                    "action":r.action,
+                    "selector_matched":true,
+                    "actionable_resolved":r.actionable_resolved,
+                    "input_delivered":r.input_delivered,
+                    "matched_element":r.matched,
+                    "activated_element":r.activated_element
+                }),
             );
             if op.ends_with("_and_wait") {
                 wait_after_action(
@@ -765,10 +777,10 @@ async fn dispatch_command(
                     start_hash,
                     op,
                     Some(TapOutcome {
-                        id: Some(r.matched.id),
+                        id: Some(matched_id),
                         x: r.x,
                         y: r.y,
-                        source: r.action.unwrap_or_else(|| "server".to_string()),
+                        source,
                     }),
                 )
                 .await?;
@@ -785,10 +797,20 @@ async fn dispatch_command(
         }
         "xpath_tap" => {
             let query = req_any_str(cmd, &["query", "value"])?;
-            let r = cfg.client.xpath_tap(query).await?;
+            let r = cfg.client.xpath_tap(query, false).await?;
             emit_action(
                 "xpath_tap",
-                &json!({"query":query, "x":r.x, "y":r.y, "action":r.action, "matched":r.matched}),
+                &json!({
+                    "query":query,
+                    "x":r.x,
+                    "y":r.y,
+                    "action":r.action,
+                    "selector_matched":true,
+                    "actionable_resolved":r.actionable_resolved,
+                    "input_delivered":r.input_delivered,
+                    "matched_element":r.matched,
+                    "activated_element":r.activated_element
+                }),
             );
         }
         "toast" => {
@@ -912,7 +934,17 @@ async fn dispatch_tap(
         let source = r.action.clone().unwrap_or_else(|| "server".to_string());
         emit_action(
             action_cmd,
-            &json!({"id":id, "x":r.x, "y":r.y, "source":source, "matched":r.matched}),
+            &json!({
+                "id":id,
+                "x":r.x,
+                "y":r.y,
+                "source":source,
+                "selector_matched":true,
+                "actionable_resolved":r.actionable_resolved,
+                "input_delivered":r.input_delivered,
+                "matched_element":r.matched,
+                "activated_element":r.activated_element
+            }),
         );
         return Ok(TapOutcome {
             id: Some(id),

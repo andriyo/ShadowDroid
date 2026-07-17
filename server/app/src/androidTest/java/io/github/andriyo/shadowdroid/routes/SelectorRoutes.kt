@@ -36,8 +36,18 @@ object SelectorRoutes {
         route.post("/find_tap") {
             val request: SelectorReq = call.receive()
             val match = chooseUnique(findElementMatches(request.copy(all = true), uiDevice, instr), request)
-            val tap = tapMatch(match, uiDevice)
-            call.respond(FindTapResp(matched = match.element, x = tap.x, y = tap.y, action = tap.action))
+            val tap = tapMatch(match, uiDevice, request.coordinate_fallback)
+            call.respond(
+                FindTapResp(
+                    matched = match.element,
+                    activated_element = tap.activatedElement,
+                    actionable_resolved = tap.actionableResolved,
+                    input_delivered = tap.inputDelivered,
+                    x = tap.x,
+                    y = tap.y,
+                    action = tap.action,
+                ),
+            )
         }
 
         route.post("/xpath") {
@@ -50,8 +60,18 @@ object SelectorRoutes {
             val matches = findElementMatches(selector, uiDevice, instr)
             if (request.tap) {
                 val match = chooseUnique(matches, selector)
-                val tap = tapMatch(match, uiDevice)
-                call.respond(FindTapResp(matched = match.element, x = tap.x, y = tap.y, action = tap.action))
+                val tap = tapMatch(match, uiDevice, request.coordinate_fallback)
+                call.respond(
+                    FindTapResp(
+                        matched = match.element,
+                        activated_element = tap.activatedElement,
+                        actionable_resolved = tap.actionableResolved,
+                        input_delivered = tap.inputDelivered,
+                        x = tap.x,
+                        y = tap.y,
+                        action = tap.action,
+                    ),
+                )
             } else {
                 val elements = matches.map { it.element }
                 call.respond(FindResp(matched = elements.firstOrNull(), elements = elements))
@@ -87,10 +107,9 @@ object SelectorRoutes {
             // and unnormalized. A match with a usable tap point is on-screen.
             val selector = SelectorReq(text = r.text, rid = r.rid, desc = r.desc)
 
-            fun visibleHit(): Element? =
+            fun visibleHit(): ElementMatch? =
                 findElementMatches(selector, uiDevice, instr)
-                    .map { it.element }
-                    .firstOrNull { it.tap != null }
+                    .firstOrNull { it.element.tap != null }
 
             var found = visibleHit()
             var swipes = 0
@@ -101,11 +120,11 @@ object SelectorRoutes {
                 if (!more) break
             }
             val hit = found
-            val tap = hit?.tap
+            val tap = hit?.element?.tap
             if (tap == null) {
                 call.respond(ScrollResp(matched = false, x = -1, y = -1, swipes = swipes))
             } else {
-                if (r.tap) uiDevice.click(tap[0], tap[1])
+                if (r.tap) tapMatch(hit, uiDevice, coordinateFallback = false)
                 call.respond(ScrollResp(matched = true, x = tap[0], y = tap[1], swipes = swipes))
             }
         }
@@ -162,6 +181,7 @@ private fun candidatesDetail(matches: List<ElementMatch>): JsonElement =
 internal data class ElementMatch(
     val element: Element,
     val node: AccessibilityNodeInfo,
+    val tree: List<TreeWalker.WalkedElement> = emptyList(),
 )
 
 internal fun findElementMatches(
@@ -175,7 +195,7 @@ internal fun findElementMatches(
     val matches =
         elements
             .filter { request.matches(it.element) }
-            .map { ElementMatch(it.element, it.node) }
+            .map { ElementMatch(it.element, it.node, elements) }
     return if (request.all) matches else matches.take(1)
 }
 
@@ -191,6 +211,7 @@ data class SelectorReq(
     val exact: Boolean = false,
     val clickable: Boolean? = null,
     val enabled: Boolean? = null,
+    val coordinate_fallback: Boolean = false,
 ) {
     fun validate() {
         if (
@@ -224,6 +245,7 @@ data class SelectorReq(
 private data class XpathReq(
     val query: String,
     val tap: Boolean = false,
+    val coordinate_fallback: Boolean = false,
 )
 
 @Serializable
@@ -254,12 +276,18 @@ private data class FindResp(
 @Serializable
 private data class FindTapResp(
     val matched: Element,
+    val activated_element: Element? = null,
+    val actionable_resolved: Boolean,
+    val input_delivered: Boolean,
     val x: Int? = null,
     val y: Int? = null,
     val action: String,
 )
 
 private data class TapResult(
+    val activatedElement: Element? = null,
+    val actionableResolved: Boolean,
+    val inputDelivered: Boolean,
     val x: Int? = null,
     val y: Int? = null,
     val action: String,
@@ -268,34 +296,168 @@ private data class TapResult(
 private fun tapMatch(
     match: ElementMatch,
     uiDevice: UiDevice,
+    coordinateFallback: Boolean,
 ): TapResult {
-    val tap = match.element.tap
-    if (tap != null && tap.size >= 2) {
-        val x = tap[0]
-        val y = tap[1]
-        if (!uiDevice.click(x, y)) throw BadRequest("tap_failed", "UiDevice.click returned false")
-        return TapResult(x = x, y = y, action = "coordinate")
+    val candidates = actionableCandidates(match)
+    val actionableIndex =
+        try {
+            chooseActionableIndex(candidates.map { it.state })
+        } catch (error: BadRequest) {
+            if (error.code != "element_disabled") throw error
+            val depth = (error.detail?.get("ancestor_depth") as? Number)?.toInt() ?: 0
+            val disabled = candidates.getOrNull(depth)?.element
+            throw BadRequest(
+                "element_disabled",
+                error.message ?: "tap target is disabled; no input was injected",
+                detail =
+                    buildMap {
+                        put("ancestor_depth", depth)
+                        put("selector_matched", true)
+                        put("actionable_resolved", false)
+                        put("input_delivered", false)
+                        put("postcondition_satisfied", null)
+                        put("matched_element", elementDetail(match.element))
+                        disabled?.let { put("disabled_element", elementDetail(it)) }
+                    },
+            )
+        }
+    if (actionableIndex != null) {
+        val activated = candidates[actionableIndex]
+        val activatedElement =
+            activated.element
+                ?: throw BadRequest(
+                    "tap_failed",
+                    "clickable ancestor was absent from the actionable UI tree",
+                )
+        if (activated.node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+            return TapResult(
+                activatedElement = activatedElement,
+                actionableResolved = true,
+                inputDelivered = true,
+                action = "accessibility_click",
+            )
+        }
+        if (!coordinateFallback) {
+            throw BadRequest(
+                "tap_failed",
+                "ACTION_CLICK failed for the resolved clickable element; pass coordinate_fallback=true for explicit center injection",
+                detail =
+                    mapOf(
+                        "selector_matched" to true,
+                        "actionable_resolved" to true,
+                        "input_delivered" to false,
+                        "postcondition_satisfied" to null,
+                        "activated_element" to elementDetail(activatedElement),
+                    ),
+            )
+        }
+        return coordinateTap(activatedElement, uiDevice, activatedElement, actionableResolved = true)
     }
 
-    if (performAccessibilityClick(match.node)) {
-        return TapResult(action = "accessibility_click")
+    if (!coordinateFallback) {
+        throw BadRequest(
+            "element_not_clickable",
+            "matched element has no enabled clickable ancestor; pass coordinate_fallback=true for explicit center injection",
+            detail =
+                mapOf(
+                    "selector_matched" to true,
+                    "actionable_resolved" to false,
+                    "input_delivered" to false,
+                    "postcondition_satisfied" to null,
+                    "matched_element" to elementDetail(match.element),
+                ),
+        )
     }
-    throw BadRequest(
-        "tap_failed",
-        "matched element has no usable bounds and ACTION_CLICK failed",
-    )
+    return coordinateTap(match.element, uiDevice, activatedElement = null, actionableResolved = false)
 }
 
-private fun performAccessibilityClick(node: AccessibilityNodeInfo): Boolean {
-    var current: AccessibilityNodeInfo? = node
+internal data class TapCandidateState(
+    val enabled: Boolean,
+    val clickable: Boolean,
+)
+
+private data class TapCandidate(
+    val node: AccessibilityNodeInfo,
+    val element: Element?,
+    val state: TapCandidateState,
+)
+
+private fun actionableCandidates(match: ElementMatch): List<TapCandidate> {
+    val candidates = mutableListOf(
+        TapCandidate(
+            node = match.node,
+            element = match.element,
+            state = TapCandidateState(match.element.enabled, match.element.clickable),
+        ),
+    )
+    var current = match.node.parent
     var depth = 0
-    while (current != null && depth < 5) {
-        if (current.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+    while (current != null && depth < MAX_ANCESTOR_DEPTH) {
+        val walked = match.tree.firstOrNull { it.node == current }
+        candidates +=
+            TapCandidate(
+                node = current,
+                element = walked?.element,
+                state = TapCandidateState(current.isEnabled, current.isClickable),
+            )
         current = current.parent
         depth++
     }
-    return false
+    return candidates
 }
+
+internal fun chooseActionableIndex(candidates: List<TapCandidateState>): Int? {
+    candidates.forEachIndexed { index, candidate ->
+        if (!candidate.enabled) {
+            val subject = if (index == 0) "matched element" else "ancestor at depth $index"
+            throw BadRequest(
+                "element_disabled",
+                "$subject is disabled; no input was injected",
+                detail = mapOf("ancestor_depth" to index),
+            )
+        }
+        if (candidate.clickable) return index
+    }
+    return null
+}
+
+private fun coordinateTap(
+    target: Element,
+    uiDevice: UiDevice,
+    activatedElement: Element?,
+    actionableResolved: Boolean,
+): TapResult {
+    val tap = target.tap
+    if (tap == null || tap.size < 2) {
+        throw BadRequest(
+            "tap_failed",
+            "explicit coordinate fallback requested but the target has no usable center point",
+        )
+    }
+    val x = tap[0]
+    val y = tap[1]
+    if (!uiDevice.click(x, y)) throw BadRequest("tap_failed", "UiDevice.click returned false")
+    return TapResult(
+        activatedElement = activatedElement,
+        actionableResolved = actionableResolved,
+        inputDelivered = true,
+        x = x,
+        y = y,
+        action = "coordinate_fallback",
+    )
+}
+
+private fun elementDetail(element: Element): JsonElement =
+    buildJsonObject {
+        put("id", element.id)
+        element.text?.let { put("text", it) }
+        element.rid?.let { put("rid", it) }
+        element.desc?.let { put("desc", it) }
+        put("clickable", element.clickable)
+        put("enabled", element.enabled)
+    }
+
+private const val MAX_ANCESTOR_DEPTH = 32
 
 private fun matchString(
     actual: String?,

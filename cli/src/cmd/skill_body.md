@@ -168,6 +168,15 @@ Selector actions are strict. Multiple non-exact matches produce
 `ambiguous_match` with candidates instead of choosing one. Narrow the selector
 or inspect all matches with `ui find`.
 
+Selector taps also require an enabled clickable target. A non-clickable child
+resolves to its nearest enabled clickable ancestor; the response reports both
+`matched_element` and `activated_element`. Disabled targets fail with
+`element_disabled`, and labels without a safe ancestor fail with
+`element_not_clickable`. Use `--coordinate-fallback` only when raw center
+injection is explicitly intended. With `--observe`, read `input_delivered` and
+`screen_changed` separately because a valid action may intentionally leave the
+screen unchanged.
+
 Every screen payload includes `screen_hash`, `screen_hash_version`,
 `snapshot_state`, `captured_at_ms`, `current_app.sampled_at_ms`, and `ui_tree`
 freshness metadata. Cache a hash only with its version and only act from a

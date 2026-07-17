@@ -9,6 +9,14 @@
     <item name="duplicate_one_button" type="id" />
     <item name="duplicate_two_button" type="id" />
     <item name="disabled_button" type="id" />
+    <item name="nested_card" type="id" />
+    <item name="nested_card_label" type="id" />
+    <item name="nested_outer_card" type="id" />
+    <item name="nested_inner_card" type="id" />
+    <item name="nested_inner_label" type="id" />
+    <item name="disabled_card" type="id" />
+    <item name="disabled_card_label" type="id" />
+    <item name="noop_button" type="id" />
     <item name="dialog_button" type="id" />
     <item name="popup_button" type="id" />
     <item name="toast_button" type="id" />
@@ -45,4 +53,3 @@
     <item name="coroutines_status" type="id" />
     <item name="coroutines_spawn_button" type="id" />
 </resources>
-

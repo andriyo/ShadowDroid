@@ -246,9 +246,9 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "ui tap" => Some(serde_json::json!({
             "use_when": ["Need to activate a visible element by selector, fresh ui dump id, or coordinates."],
-            "output": "action JSON with the chosen target/action",
+            "output": "action JSON separating selector match, activated element, input delivery, observed screen change, and postcondition status",
             "side_effects": ["taps the device UI"],
-            "prerequisites": ["prefer selectors or ids from a fresh ui dump over hard-coded coordinates"],
+            "prerequisites": ["prefer selectors or ids from a fresh ui dump over hard-coded coordinates", "selector taps require an enabled clickable node/ancestor unless --coordinate-fallback is explicit"],
             "next_actions": ["ui wait", "ui dump", "watch"]
         })),
         "ui double-tap" => Some(serde_json::json!({
