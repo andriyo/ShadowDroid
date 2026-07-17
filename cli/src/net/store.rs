@@ -633,10 +633,12 @@ pub fn read_tls_errors(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::secure_existing_log;
     use super::{
         CheckpointRecord, ClearRecord, LogQuery, acquire_log_lock, acquire_log_read_lock,
         find_by_id_from, read_all_from, read_checkpoint_from, read_recent_timeline_from,
-        read_recent_timeline_query_from, read_tls_errors_from, secure_existing_log,
+        read_recent_timeline_query_from, read_tls_errors_from,
     };
     use crate::ids::Serial;
     use crate::net::Matcher;

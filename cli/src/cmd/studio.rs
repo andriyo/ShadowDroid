@@ -17,6 +17,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(unix)]
 use std::process::Stdio;
 use tracing::info;
 use zip::ZipArchive;
@@ -626,6 +627,7 @@ fn path_lookup(name: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn collect_named_dirs(base: &Path, name: &str, max_depth: usize, out: &mut Vec<PathBuf>) {
     if max_depth == 0 || !base.is_dir() {
         return;

@@ -28,9 +28,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
-import java.util.concurrent.TimeoutException
 
 object ScreenRoutes {
     /** GET /v1/screen?format=elements|xml and GET /v1/screenshot.png. */
@@ -286,7 +286,8 @@ internal fun assessSnapshot(
             "foreground metadata had not converged for package '$foregroundPackage'",
         )
     }
-    if (elementCount > 0 && foregroundPackage != null &&
+    if (elementCount > 0 &&
+        foregroundPackage != null &&
         (enrichment.activity == null || enrichment.pid == null)
     ) {
         return SnapshotAssessment(
@@ -392,12 +393,14 @@ internal class ScreenEnrichmentCache private constructor(
             val cached = value.get()
             val now = SystemClock.elapsedRealtime()
             val packageMatches = cached.`package` == currentPackage
-            val complete = !requireComplete || currentPackage == null ||
-                (
-                    cached.activity != null &&
-                        cached.pid != null &&
-                        cached.windowId == treeWindowId
-                )
+            val complete =
+                !requireComplete ||
+                    currentPackage == null ||
+                    (
+                        cached.activity != null &&
+                            cached.pid != null &&
+                            cached.windowId == treeWindowId
+                    )
             val fresh = now - cached.refreshedAtElapsedMs < ENRICHMENT_TTL_MS
             if (packageMatches && complete && fresh) {
                 return cached

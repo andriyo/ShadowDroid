@@ -130,8 +130,7 @@ object SelectorRoutes {
                     all = true,
                 )
 
-            fun visibleHit(): ElementMatch? =
-                chooseVisibleScrollTarget(findElementMatches(selector, uiDevice, instr), selector)
+            fun visibleHit(): ElementMatch? = chooseVisibleScrollTarget(findElementMatches(selector, uiDevice, instr), selector)
 
             var found = visibleHit()
             var swipes = 0

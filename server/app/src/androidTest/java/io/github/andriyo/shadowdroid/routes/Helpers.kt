@@ -27,7 +27,8 @@ internal fun parseFocusedApp(dumpsys: String): FocusedApp? {
     val m =
         listOf("topResumedActivity=", "mResumedActivity:", "ResumedActivity:")
             .firstNotNullOfOrNull { marker ->
-                dumpsys.lineSequence()
+                dumpsys
+                    .lineSequence()
                     .filter { it.contains(marker) }
                     .mapNotNull(regex::find)
                     .firstOrNull()
