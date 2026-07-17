@@ -197,12 +197,15 @@ pub async fn run(
                 let ok = v.get("ok").and_then(|o| o.as_bool()).unwrap_or(true);
                 if !ok || status >= 400 {
                     net_failed.push(json!({
+                        "ts": v.get("ts"),
                         "method": v.get("method"),
                         "host": v.get("host"),
                         "path": v.get("path"),
                         "status": v.get("status"),
                         "error": v.get("error"),
                         "id": v.get("id"),
+                        "matched": v.get("matched"),
+                        "modified": v.get("modified"),
                     }));
                     if net_failed.len() >= 5 {
                         break;
@@ -211,7 +214,19 @@ pub async fn run(
             }
         }
         if let Ok(errs) = crate::net::store::read_tls_errors(serial, None, 3) {
-            tls_errors = errs.into_iter().rev().collect();
+            tls_errors = errs
+                .into_iter()
+                .rev()
+                .map(|mut event| {
+                    // The device-wide proxy sees the rejected host but Android
+                    // does not expose the originating package on the CONNECT
+                    // socket. Keep that limitation explicit so an unrelated
+                    // background rejection is not mistaken for app causality.
+                    event["attribution"] = json!("device_wide_unattributed");
+                    event["target_app_related"] = Value::Null;
+                    event
+                })
+                .collect();
         }
         if !net_failed.is_empty() {
             evidence.insert("net_failed".into(), json!(net_failed));
@@ -228,61 +243,22 @@ pub async fn run(
         (Some(pkg), Some(fg)) => !fg.contains(pkg.as_str()),
         _ => false,
     };
-    let mut verdicts: Vec<(&'static str, &'static str)> = Vec::new();
-    if last_crash.is_some() {
-        verdicts.push((
-            "app_crashed",
-            "the app process crashed — see evidence.crash (project_frames point into your code)",
-        ));
-    }
-    if last_anr.is_some() {
-        verdicts.push((
-            "app_not_responding",
-            "the system reported an ANR — the main thread was blocked; see evidence.anr",
-        ));
-    }
-    if !tls_errors.is_empty() {
-        verdicts.push((
-            "tls_rejected",
-            "the app rejected the proxy CA during TLS — see evidence.tls_errors and `net check`",
-        ));
-    }
-    if net_failed.iter().any(|f| {
-        f.get("status")
-            .and_then(|s| s.as_u64())
-            .is_some_and(|s| s >= 500)
-    }) {
-        verdicts.push((
-            "backend_errors",
-            "recent 5xx responses from the backend — see evidence.net_failed",
-        ));
-    } else if net_failed.len() >= 2 {
-        verdicts.push((
-            "request_failures",
-            "several failed requests — see evidence.net_failed",
-        ));
-    }
-    if app_left_foreground {
-        verdicts.push((
-            "app_not_foreground",
-            "the target app is not the foreground app — a dialog, launcher, or another app took over; see evidence.screen",
-        ));
-    }
-    if verdicts.is_empty() && !log_errors.is_empty() {
-        verdicts.push((
-            "log_errors_only",
-            "no crash/ANR/network failure — but the app logged errors; see evidence.log_errors",
-        ));
-    }
-    if verdicts.is_empty() {
-        verdicts.push((
-            "no_obvious_cause",
-            "no crash, ANR, network failure, or error logs in the window — the screen state itself may be the answer",
-        ));
-    }
-
-    let (verdict, explanation) = verdicts[0];
-    let also: Vec<&str> = verdicts.iter().skip(1).map(|(v, _)| *v).collect();
+    let verdicts = rank_verdicts(VerdictInputs {
+        crashed: last_crash.is_some(),
+        anr: last_anr.is_some(),
+        net_failed: &net_failed,
+        tls_errors: &tls_errors,
+        app_left_foreground,
+        has_log_errors: !log_errors.is_empty(),
+    });
+    let primary = verdicts[0];
+    let verdict = primary.code;
+    let explanation = primary.explanation;
+    let also: Vec<&str> = verdicts
+        .iter()
+        .skip(1)
+        .map(|finding| finding.code)
+        .collect();
 
     let hints: Vec<String> = match verdict {
         "app_crashed" => vec![
@@ -317,6 +293,7 @@ pub async fn run(
 
     let mut body = json!({
         "verdict": verdict,
+        "confidence": primary.confidence,
         "explanation": explanation,
         "window": args.last,
         "package": package,
@@ -325,9 +302,207 @@ pub async fn run(
         "evidence": Value::Object(evidence),
         "hints": hints,
     });
+    if let Some(flow) = primary.flow {
+        body["primary_evidence"] = json!({
+            "flow_id": flow.get("id"),
+            "matched": flow.get("matched"),
+            "modified": flow.get("modified"),
+            "status": flow.get("status"),
+            "host": flow.get("host"),
+            "path": flow.get("path"),
+        });
+    }
     if !also.is_empty() {
         body["also"] = json!(also);
     }
     emit_action("why", &body);
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct VerdictInputs<'a> {
+    crashed: bool,
+    anr: bool,
+    net_failed: &'a [Value],
+    tls_errors: &'a [Value],
+    app_left_foreground: bool,
+    has_log_errors: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RankedVerdict<'a> {
+    code: &'static str,
+    explanation: &'static str,
+    confidence: f64,
+    flow: Option<&'a Value>,
+}
+
+/// Rank causal evidence ahead of category severity. A failed flow deliberately
+/// modified by an active ShadowDroid rule/intercept is direct evidence about
+/// the current experiment, whereas a background TLS rejection may be unrelated.
+/// Crashes and ANRs retain their existing top precedence.
+fn rank_verdicts(inputs: VerdictInputs<'_>) -> Vec<RankedVerdict<'_>> {
+    let finding = |code, explanation, confidence, flow| RankedVerdict {
+        code,
+        explanation,
+        confidence,
+        flow,
+    };
+    let mut verdicts = Vec::new();
+    if inputs.crashed {
+        verdicts.push(finding(
+            "app_crashed",
+            "the app process crashed — see evidence.crash (project_frames point into your code)",
+            0.99,
+            None,
+        ));
+    }
+    if inputs.anr {
+        verdicts.push(finding(
+            "app_not_responding",
+            "the system reported an ANR — the main thread was blocked; see evidence.anr",
+            0.99,
+            None,
+        ));
+    }
+
+    let modified_failure = inputs.net_failed.iter().find(|flow| {
+        flow.get("modified").and_then(Value::as_bool) == Some(true)
+            || flow
+                .get("matched")
+                .and_then(Value::as_str)
+                .is_some_and(|matched| matched == "rule" || matched.starts_with("intercept"))
+    });
+    if let Some(flow) = modified_failure {
+        verdicts.push(finding(
+            "backend_errors",
+            "a ShadowDroid rule/intercept modified a failed response in this run — see primary_evidence and evidence.net_failed",
+            0.94,
+            Some(flow),
+        ));
+    }
+
+    if !inputs.tls_errors.is_empty() {
+        verdicts.push(finding(
+            "tls_rejected",
+            "the app rejected the proxy CA during TLS — see evidence.tls_errors and `net check`",
+            0.82,
+            None,
+        ));
+    }
+
+    if modified_failure.is_none()
+        && let Some(flow) = inputs.net_failed.iter().find(|flow| {
+            flow.get("status")
+                .and_then(Value::as_u64)
+                .is_some_and(|status| status >= 500)
+        })
+    {
+        verdicts.push(finding(
+            "backend_errors",
+            "recent 5xx responses from the backend — see evidence.net_failed",
+            0.86,
+            Some(flow),
+        ));
+    } else if modified_failure.is_none() && inputs.net_failed.len() >= 2 {
+        verdicts.push(finding(
+            "request_failures",
+            "several failed requests — see evidence.net_failed",
+            0.76,
+            inputs.net_failed.first(),
+        ));
+    }
+
+    if inputs.app_left_foreground {
+        verdicts.push(finding(
+            "app_not_foreground",
+            "the target app is not the foreground app — a dialog, launcher, or another app took over; see evidence.screen",
+            0.72,
+            None,
+        ));
+    }
+    if verdicts.is_empty() && inputs.has_log_errors {
+        verdicts.push(finding(
+            "log_errors_only",
+            "no crash/ANR/network failure — but the app logged errors; see evidence.log_errors",
+            0.6,
+            None,
+        ));
+    }
+    if verdicts.is_empty() {
+        verdicts.push(finding(
+            "no_obvious_cause",
+            "no crash, ANR, network failure, or error logs in the window — the screen state itself may be the answer",
+            0.25,
+            None,
+        ));
+    }
+    verdicts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn modified_failure_outranks_unrelated_tls_noise() {
+        let failures = vec![json!({
+            "id": "f42",
+            "status": 401,
+            "matched": "rule",
+            "modified": true,
+        })];
+        let tls = vec![json!({"host": "background.example"})];
+        let ranked = rank_verdicts(VerdictInputs {
+            crashed: false,
+            anr: false,
+            net_failed: &failures,
+            tls_errors: &tls,
+            app_left_foreground: false,
+            has_log_errors: false,
+        });
+        assert_eq!(ranked[0].code, "backend_errors");
+        assert_eq!(
+            ranked[0].flow.and_then(|flow| flow["id"].as_str()),
+            Some("f42")
+        );
+        assert!(
+            ranked
+                .iter()
+                .skip(1)
+                .any(|finding| finding.code == "tls_rejected")
+        );
+    }
+
+    #[test]
+    fn crashes_and_anrs_keep_precedence() {
+        let failures = vec![json!({"status": 500, "matched": "rule", "modified": true})];
+        let ranked = rank_verdicts(VerdictInputs {
+            crashed: true,
+            anr: true,
+            net_failed: &failures,
+            tls_errors: &[],
+            app_left_foreground: false,
+            has_log_errors: false,
+        });
+        assert_eq!(ranked[0].code, "app_crashed");
+        assert_eq!(ranked[1].code, "app_not_responding");
+        assert_eq!(ranked[2].code, "backend_errors");
+    }
+
+    #[test]
+    fn tls_still_outranks_unmodified_backend_noise() {
+        let failures = vec![json!({"id": "f1", "status": 503, "modified": false})];
+        let tls = vec![json!({"host": "api.example"})];
+        let ranked = rank_verdicts(VerdictInputs {
+            crashed: false,
+            anr: false,
+            net_failed: &failures,
+            tls_errors: &tls,
+            app_left_foreground: false,
+            has_log_errors: false,
+        });
+        assert_eq!(ranked[0].code, "tls_rejected");
+        assert_eq!(ranked[1].code, "backend_errors");
+    }
 }
