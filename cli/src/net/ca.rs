@@ -25,7 +25,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use rcgen::string::Ia5String;
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
-    Issuer, KeyPair, KeyUsagePurpose, PublicKeyData, SanType, SerialNumber, date_time_ymd,
+    Issuer, KeyPair, KeyUsagePurpose, PKCS_RSA_SHA256, PublicKeyData, SanType, SerialNumber,
+    date_time_ymd,
 };
 use rustls::ServerConfig;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -277,7 +278,11 @@ fn managed_pair_dir<'a>(cert_path: &'a Path, key_path: &Path) -> Option<&'a Path
 /// into `dir`. Returns the material so the caller can build a [`CertAuthority`]
 /// without re-reading it.
 fn generate_ca_files_locked(dir: &Path) -> Result<(String, KeyPair)> {
-    let key = KeyPair::generate().map_err(|e| anyhow!("generate CA key: {e}"))?;
+    // RSA-2048 is intentionally the compatibility default. Some older and
+    // non-GMS Android certificate installers silently omit EC roots from their
+    // picker even though the pushed PEM is otherwise valid.
+    let key = KeyPair::generate_for(&PKCS_RSA_SHA256)
+        .map_err(|e| anyhow!("generate RSA-2048 CA key: {e}"))?;
     let cert = ca_params()
         .self_signed(&key)
         .map_err(|e| anyhow!("self-sign CA: {e}"))?;
@@ -1313,8 +1318,14 @@ mod tests {
         generate_ca_files(dir.path()).unwrap();
         let info = info_in(dir.path()).unwrap();
         assert_eq!(info.source, SOURCE_GENERATED);
+        assert_eq!(info.key_algorithm.as_deref(), Some("RSA"));
         assert!(info.subject.contains("ShadowDroid MITM CA"));
         assert!(info.is_ca && info.self_signed && !info.expired);
+
+        // The generated RSA root remains a usable issuer for intercepted TLS.
+        let ca = CertAuthority::load_from_files(&ca_cert_in(dir.path()), &ca_key_in(dir.path()))
+            .unwrap();
+        ca.server_config("rsa-compatible.example").unwrap();
     }
 
     #[cfg(unix)]
