@@ -17,6 +17,12 @@
     <item name="disabled_card" type="id" />
     <item name="disabled_card_label" type="id" />
     <item name="noop_button" type="id" />
+    <item name="platform_continuous_slider" type="id" />
+    <item name="platform_discrete_slider" type="id" />
+    <item name="platform_disabled_slider" type="id" />
+    <item name="platform_rtl_slider" type="id" />
+    <item name="coordinate_only_range" type="id" />
+    <item name="compose_slider_fixtures" type="id" />
     <item name="dialog_button" type="id" />
     <item name="popup_button" type="id" />
     <item name="toast_button" type="id" />

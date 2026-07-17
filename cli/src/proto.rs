@@ -123,6 +123,10 @@ pub struct Element {
     pub bounds: Option<[i32; 4]>,
     #[serde(default)]
     pub tap: Option<[i32; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<RangeSemantics>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<String>,
     // Flags are omitted from serialized `screen --full` / `find --full` output
     // when they hold their default, so the agent only pays tokens for what's
     // set. `enabled` defaults to true, so it's the inverse — emitted only when an
@@ -150,6 +154,17 @@ pub struct Element {
     pub password: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub input: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RangeSemantics {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub min: f32,
+    pub max: f32,
+    pub current: f32,
+    #[serde(default)]
+    pub step: serde_json::Value,
 }
 
 fn _true() -> bool {
@@ -261,6 +276,35 @@ pub struct FindTapResp {
     pub action: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetProgressResp {
+    pub matched: Element,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_before: Option<RangeSemantics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_after: Option<RangeSemantics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_value: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_percent: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_value: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<f32>,
+    pub verified: bool,
+    pub target_reached: bool,
+    #[serde(default)]
+    pub control_quantized: bool,
+    pub input_delivered: bool,
+    pub action: String,
+    pub coordinate_fallback: bool,
+    pub expected_precision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<i32>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ScrollResp {
     pub matched: bool,
@@ -363,6 +407,8 @@ mod tests {
             rid: None,
             bounds: Some([0, 0, 10, 10]),
             tap: Some([5, 5]),
+            range: None,
+            actions: Vec::new(),
             clickable: true,
             long_clickable: false,
             scrollable: false,

@@ -283,6 +283,8 @@ mod tests {
             rid: None,
             bounds: Some(bounds),
             tap: None,
+            range: None,
+            actions: Vec::new(),
             clickable: false,
             long_clickable: false,
             scrollable: false,

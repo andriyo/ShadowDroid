@@ -3,7 +3,7 @@
 //! IMPORTANT: this shape is the public API. Keep it stable so existing watch
 //! stream consumers and generated agent integrations continue to work.
 
-use crate::proto::{AppRef, Element, ImeState, ScreenResponse, Viewport};
+use crate::proto::{AppRef, Element, ImeState, RangeSemantics, ScreenResponse, Viewport};
 use serde::Serialize;
 use std::fmt;
 use std::io::Write;
@@ -192,6 +192,10 @@ pub struct CompactElement {
     pub klass: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tap: Option<[i32; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<RangeSemantics>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub clickable: bool,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -246,6 +250,8 @@ impl From<Element> for CompactElement {
             rid: el.rid,
             klass: el.klass,
             tap: el.tap,
+            range: el.range,
+            actions: el.actions,
             clickable: el.clickable,
             scrollable: el.scrollable,
             input: el.input,
@@ -800,6 +806,18 @@ fn screen_element_actions(map: &serde_json::Map<String, serde_json::Value>) -> V
     let mut actions = Vec::new();
     let mut used_ids = std::collections::BTreeSet::new();
 
+    // Range controls are semantic actions even when UIAutomator does not mark
+    // them clickable (notably Compose Slider).
+    for element in elements.iter().filter_map(serde_json::Value::as_object) {
+        if let Some(action) = range_element_action(map, element) {
+            if let Some(id) = element.get("id").and_then(serde_json::Value::as_u64) {
+                used_ids.insert(id);
+            }
+            actions.push(action);
+            break;
+        }
+    }
+
     // Inputs come first: tapping a text field is not the real task, and treating
     // any node with center coordinates as clickable can activate the wrong
     // parent. Spell out the one value the caller must choose while preserving
@@ -855,7 +873,31 @@ fn element_actions(map: &serde_json::Map<String, serde_json::Value>) -> Vec<Stri
     if element.get("input").and_then(serde_json::Value::as_bool) == Some(true) {
         return input_element_action(map, element).into_iter().collect();
     }
+    if let Some(action) = range_element_action(map, element) {
+        return vec![action];
+    }
     clickable_element_action(map, element).into_iter().collect()
+}
+
+fn range_element_action(
+    map: &serde_json::Map<String, serde_json::Value>,
+    element: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    let supports = element
+        .get("actions")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .any(|action| action.as_str() == Some("set_progress"));
+    if !supports || element.get("range").is_none() {
+        return None;
+    }
+    let id = element.get("id").and_then(serde_json::Value::as_u64)?;
+    let mut command = format!("shadowdroid ui set-progress --id {id} --percent 50");
+    if let Some(hash) = map.get("screen_hash").and_then(serde_json::Value::as_str) {
+        command.push_str(&format!(" --if-screen {}", shell_token(hash)));
+    }
+    command.push_str(" --observe");
+    Some(command)
 }
 
 fn clickable_element_action(
@@ -1211,6 +1253,14 @@ mod tests {
             rid: None,
             bounds: Some([0, 0, 4, 4]),
             tap: Some([2, 2]),
+            range: Some(RangeSemantics {
+                kind: "float".into(),
+                min: 0.0,
+                max: 1.0,
+                current: 0.5,
+                step: serde_json::Value::Null,
+            }),
+            actions: vec!["set_progress".into()],
             clickable: true,
             long_clickable: true,
             scrollable: false,
@@ -1272,6 +1322,8 @@ mod tests {
         // The actionable bits survive.
         assert!(json.contains("\"clickable\":true"), "{json}");
         assert!(json.contains("\"tap\":[2,2]"), "{json}");
+        assert!(json.contains("\"range\""), "{json}");
+        assert!(json.contains("\"set_progress\""), "{json}");
     }
 
     #[test]
@@ -1339,6 +1391,25 @@ mod tests {
         assert_eq!(
             element_actions(&map),
             ["shadowdroid ui tap --id 7 --if-screen abc123 --observe"]
+        );
+    }
+
+    #[test]
+    fn matched_range_element_becomes_guarded_verified_progress_action() {
+        let map = serde_json::json!({
+            "screen_hash": "abc123",
+            "element": {
+                "id": 9,
+                "range": {"type":"float","min":0,"max":1,"current":0.2},
+                "actions": ["set_progress"]
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert_eq!(
+            element_actions(&map),
+            ["shadowdroid ui set-progress --id 9 --percent 50 --if-screen abc123 --observe"]
         );
     }
 

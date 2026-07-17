@@ -251,6 +251,13 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "prerequisites": ["prefer selectors or ids from a fresh ui dump over hard-coded coordinates", "selector taps require an enabled clickable node/ancestor unless --coordinate-fallback is explicit"],
             "next_actions": ["ui wait", "ui dump", "watch"]
         })),
+        "ui set-progress" => Some(serde_json::json!({
+            "use_when": ["Need to set a platform or Compose slider/range control deterministically."],
+            "output": "set_progress action JSON with range before/after, applied value, delivery method, and readback verification",
+            "side_effects": ["mutates the matched range control through ACTION_SET_PROGRESS; --coordinate-fallback may inject an approximate track click"],
+            "prerequisites": ["target one element by fresh id, resource id/Compose test tag, content description, text, or xpath", "pass exactly one finite --value or --percent", "prefer exposed range plus set_progress action; coordinate fallback is explicit and may be unverified"],
+            "next_actions": ["ui dump", "ui wait", "why"]
+        })),
         "ui double-tap" => Some(serde_json::json!({
             "use_when": ["Need to double-tap fixed coordinates for gestures that have no stable selector."],
             "output": "double-tap action JSON",

@@ -2,7 +2,6 @@ package io.github.andriyo.shadowdroid.sample
 
 import android.Manifest
 import android.annotation.SuppressLint
-import android.app.Activity
 import android.app.AlertDialog
 import android.app.Notification
 import android.app.NotificationChannel
@@ -33,14 +32,16 @@ import android.widget.LinearLayout
 import android.widget.PopupWindow
 import android.widget.ProgressBar
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.ComponentActivity
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.math.roundToInt
 
-class MainActivity : Activity() {
+class MainActivity : ComponentActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private lateinit var statusText: TextView
     private lateinit var counterValue: TextView
@@ -66,9 +67,10 @@ class MainActivity : Activity() {
         setStatus("New intent: ${intentSummary(intent)}")
     }
 
+    @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
     override fun onRequestPermissionsResult(
         requestCode: Int,
-        permissions: Array<out String>,
+        permissions: Array<String>,
         grantResults: IntArray,
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
@@ -96,6 +98,8 @@ class MainActivity : Activity() {
             setPadding(0, 8.dp, 0, 8.dp)
         }
         root.addView(statusText, fullWidth())
+
+        addRangeFixtures(root)
 
         addSection(root, "Inputs")
         nameInput = editText(R.id.name_input, "agent name", "Name input")
@@ -303,6 +307,88 @@ class MainActivity : Activity() {
             setPadding(0, 18.dp, 0, 4.dp)
         }, fullWidth())
     }
+
+    private fun addRangeFixtures(root: LinearLayout) {
+        addSection(root, "Range Controls")
+        root.addView(
+            seekBar(
+                idValue = R.id.platform_continuous_slider,
+                description = "Platform continuous slider",
+                maxValue = 1_000,
+                initialValue = 380,
+            ),
+            fullWidth(),
+        )
+        root.addView(
+            seekBar(
+                idValue = R.id.platform_discrete_slider,
+                description = "Platform discrete slider",
+                maxValue = 4,
+                initialValue = 2,
+            ).apply { keyProgressIncrement = 1 },
+            fullWidth(),
+        )
+        root.addView(
+            seekBar(
+                idValue = R.id.platform_disabled_slider,
+                description = "Platform disabled slider",
+                maxValue = 100,
+                initialValue = 50,
+            ).apply { isEnabled = false },
+            fullWidth(),
+        )
+        root.addView(
+            seekBar(
+                idValue = R.id.platform_rtl_slider,
+                description = "Platform RTL slider",
+                maxValue = 100,
+                initialValue = 25,
+            ).apply { layoutDirection = View.LAYOUT_DIRECTION_RTL },
+            fullWidth(),
+        )
+        root.addView(
+            TextView(this).apply {
+                id = R.id.coordinate_only_range
+                text = "Coordinate-only range surrogate"
+                contentDescription = "Coordinate-only range surrogate"
+                gravity = Gravity.CENTER
+                setPadding(12.dp, 18.dp, 12.dp, 18.dp)
+            },
+            fullWidth(),
+        )
+        root.addView(
+            composeSliderFixtures(this) { message -> setStatus(message) },
+            fullWidth().apply { height = 620.dp },
+        )
+    }
+
+    private fun seekBar(
+        idValue: Int,
+        description: String,
+        maxValue: Int,
+        initialValue: Int,
+    ): SeekBar =
+        SeekBar(this).apply {
+            id = idValue
+            contentDescription = description
+            max = maxValue
+            progress = initialValue
+            setOnSeekBarChangeListener(
+                object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(
+                        seekBar: SeekBar?,
+                        progress: Int,
+                        fromUser: Boolean,
+                    ) {
+                        if (fromUser) setStatus("$description changed to $progress")
+                    }
+
+                    override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
+
+                    override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
+                },
+            )
+        }
 
     private fun title(text: String): TextView =
         TextView(this).apply {

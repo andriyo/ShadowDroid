@@ -154,6 +154,7 @@ Start each UI decision from the structured tree:
 shadowdroid ui dump
 shadowdroid ui find --rid btn_sign_in
 shadowdroid ui tap --rid btn_sign_in --observe
+shadowdroid ui set-progress --rid distance_slider --percent 80 --observe
 shadowdroid ui wait --text "Welcome" --timeout-ms 8000
 ```
 
@@ -176,6 +177,13 @@ resolves to its nearest enabled clickable ancestor; the response reports both
 injection is explicitly intended. With `--observe`, read `input_delivered` and
 `screen_changed` separately because a valid action may intentionally leave the
 screen unchanged.
+
+Range controls expose `range` (`type`, `min`, `max`, `current`, nullable
+`step`) and stable accessibility `actions` in `ui dump`. Set them semantically
+and verify Android's readback with `ui set-progress --rid <id> --value <n>` or
+`--percent 0..100`. Values outside the exposed range fail unless `--clamp` is
+explicit. `--coordinate-fallback` is approximate, is reported as such, and may
+be unverified when the control exposes no range semantics.
 
 Every screen payload includes `screen_hash`, `screen_hash_version`,
 `snapshot_state`, `captured_at_ms`, `current_app.sampled_at_ms`, and `ui_tree`

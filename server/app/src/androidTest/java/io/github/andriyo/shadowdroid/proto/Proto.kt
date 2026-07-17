@@ -1,6 +1,8 @@
 package io.github.andriyo.shadowdroid.proto
 
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 
 /*
  * Wire types for the v1 HTTP API.
@@ -45,7 +47,7 @@ data class AppRef(
 @Serializable
 data class ScreenResponse(
     val screen_hash: String,
-    val screen_hash_version: Int = 2,
+    val screen_hash_version: Int = 3,
     val snapshot_state: String = "consistent",
     val captured_at_ms: Long? = null,
     val viewport: Viewport,
@@ -84,6 +86,8 @@ data class Element(
     val rid: String? = null,
     val bounds: List<Int>? = null, // [x1, y1, x2, y2] when UIA exposes usable bounds
     val tap: List<Int>? = null, // [cx, cy] when coordinate tapping is possible
+    val range: RangeSemantics? = null,
+    val actions: List<String> = emptyList(),
     val clickable: Boolean = false,
     val long_clickable: Boolean = false,
     val scrollable: Boolean = false,
@@ -95,6 +99,17 @@ data class Element(
     val focused: Boolean = false,
     val password: Boolean = false,
     val input: Boolean = false,
+)
+
+@Serializable
+data class RangeSemantics(
+    val type: String,
+    val min: Float,
+    val max: Float,
+    val current: Float,
+    // AccessibilityNodeInfo.RangeInfo does not expose a declared interval.
+    // Keep this nullable so we never invent precision for discrete controls.
+    val step: JsonElement = JsonNull,
 )
 
 // ── shared 'ok' response for state-changing endpoints ────────────────

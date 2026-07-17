@@ -1,6 +1,8 @@
 package io.github.andriyo.shadowdroid.routes
 
 import android.app.Instrumentation
+import android.os.Bundle
+import android.os.SystemClock
 import android.view.accessibility.AccessibilityNodeInfo
 import androidx.test.uiautomator.By
 import androidx.test.uiautomator.Direction
@@ -9,16 +11,23 @@ import io.github.andriyo.shadowdroid.BadRequest
 import io.github.andriyo.shadowdroid.NotFound
 import io.github.andriyo.shadowdroid.dump.TreeWalker
 import io.github.andriyo.shadowdroid.proto.Element
+import io.github.andriyo.shadowdroid.proto.RangeSemantics
 import io.ktor.server.request.receive
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.post
+import kotlinx.coroutines.delay
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.floatOrNull
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import kotlin.math.abs
+import kotlin.math.round
+import kotlin.math.roundToInt
 
 object SelectorRoutes {
     /** POST /v1/{find,find_tap,xpath}. */
@@ -76,6 +85,13 @@ object SelectorRoutes {
                 val elements = matches.map { it.element }
                 call.respond(FindResp(matched = elements.firstOrNull(), elements = elements))
             }
+        }
+
+        route.post("/set_progress") {
+            val request: SetProgressReq = call.receive()
+            val selector = request.selector()
+            val match = chooseUnique(findElementMatches(selector, uiDevice, instr), selector)
+            call.respond(setProgress(match, request, uiDevice, instr))
         }
 
         // Fast on-device scroll-to: drive a scrollable UiObject2 directly rather
@@ -284,6 +300,332 @@ private data class FindTapResp(
     val action: String,
 )
 
+@Serializable
+internal data class SetProgressReq(
+    val id: Int? = null,
+    val text: String? = null,
+    val rid: String? = null,
+    val desc: String? = null,
+    val xpath: String? = null,
+    val exact: Boolean = false,
+    val value: Double? = null,
+    val percent: Double? = null,
+    val clamp: Boolean = false,
+    val coordinate_fallback: Boolean = false,
+) {
+    fun selector(): SelectorReq =
+        SelectorReq(
+            id = id,
+            text = text,
+            rid = rid,
+            desc = desc,
+            xpath = xpath,
+            all = true,
+            exact = exact,
+        ).also { it.validate() }
+}
+
+@Serializable
+private data class SetProgressResp(
+    val matched: Element,
+    val range_before: RangeSemantics? = null,
+    val range_after: RangeSemantics? = null,
+    val requested_value: Double? = null,
+    val requested_percent: Double? = null,
+    val applied_value: Float? = null,
+    val current: Float? = null,
+    val verified: Boolean,
+    val target_reached: Boolean,
+    val control_quantized: Boolean = false,
+    val input_delivered: Boolean,
+    val action: String,
+    val coordinate_fallback: Boolean,
+    val expected_precision: String,
+    val x: Int? = null,
+    val y: Int? = null,
+)
+
+private suspend fun setProgress(
+    match: ElementMatch,
+    request: SetProgressReq,
+    uiDevice: UiDevice,
+    instr: Instrumentation,
+): SetProgressResp {
+    validateProgressRequest(request)
+    if (!match.element.enabled) {
+        throw BadRequest(
+            "element_disabled",
+            "matched range control is disabled; no input was injected",
+            detail =
+                mapOf(
+                    "selector_matched" to true,
+                    "input_delivered" to false,
+                    "matched_element" to elementDetail(match.element),
+                ),
+        )
+    }
+
+    val before = match.element.range
+    val target = before?.let { resolveProgressTarget(request, it) }
+    val supportsSetProgress = match.element.actions.contains("set_progress")
+    if (before != null && supportsSetProgress) {
+        val semanticTarget = checkNotNull(target)
+        val arguments =
+            Bundle().apply {
+                putFloat(AccessibilityNodeInfo.ACTION_ARGUMENT_PROGRESS_VALUE, semanticTarget)
+            }
+        if (match.node.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SET_PROGRESS.id, arguments)) {
+            val readback =
+                readBackRange(request.selector(), uiDevice, instr, semanticTarget, before)
+                    ?: throw BadRequest(
+                        "set_progress_unverified",
+                        "ACTION_SET_PROGRESS was delivered but range-value readback became unavailable",
+                        detail =
+                            mapOf(
+                                "input_delivered" to true,
+                                "requested_value" to semanticTarget,
+                                "range_before" to rangeDetail(before),
+                            ),
+                    )
+            val after = readback.range
+            return SetProgressResp(
+                matched = match.element,
+                range_before = before,
+                range_after = after,
+                requested_value = request.value,
+                requested_percent = request.percent,
+                applied_value = after.current,
+                current = after.current,
+                verified = true,
+                target_reached = readback.targetReached,
+                control_quantized = !readback.targetReached,
+                input_delivered = true,
+                action = "accessibility_set_progress",
+                coordinate_fallback = false,
+                expected_precision = if (readback.targetReached) "range_readback" else "control_quantized_readback",
+            )
+        }
+        if (!request.coordinate_fallback) {
+            throw BadRequest(
+                "set_progress_failed",
+                "ACTION_SET_PROGRESS returned false; pass coordinate_fallback=true for explicit track injection",
+                detail =
+                    mapOf(
+                        "selector_matched" to true,
+                        "input_delivered" to false,
+                        "matched_element" to elementDetail(match.element),
+                        "range" to rangeDetail(before),
+                    ),
+            )
+        }
+    } else if (!request.coordinate_fallback) {
+        val code = if (before == null) "range_semantics_unavailable" else "set_progress_unsupported"
+        val message =
+            if (before == null) {
+                "matched element exposes no accessibility range semantics"
+            } else {
+                "matched range element does not expose ACTION_SET_PROGRESS"
+            }
+        throw BadRequest(
+            code,
+            "$message; pass coordinate_fallback=true for explicit track injection",
+            detail =
+                mapOf(
+                    "selector_matched" to true,
+                    "input_delivered" to false,
+                    "matched_element" to elementDetail(match.element),
+                ),
+        )
+    }
+
+    val fraction =
+        when {
+            target != null -> {
+                val targetRange = checkNotNull(before)
+                ((target - targetRange.min) / (targetRange.max - targetRange.min)).toDouble()
+            }
+            request.percent != null -> normalizedPercent(request.percent, request.clamp) / 100.0
+            else -> throw BadRequest(
+                "range_semantics_unavailable",
+                "--value needs range semantics; only --percent can use coordinate fallback without them",
+            )
+        }.coerceIn(0.0, 1.0)
+    val bounds = match.element.bounds
+    if (bounds == null || bounds.size < 4 || bounds[2] <= bounds[0] || bounds[3] <= bounds[1]) {
+        throw BadRequest(
+            "range_semantics_unavailable",
+            "explicit coordinate fallback requested but the matched element has no usable track bounds",
+        )
+    }
+    // Accessibility does not expose per-node layout direction. Semantic
+    // ACTION_SET_PROGRESS handles RTL correctly; this explicit fallback is an
+    // LTR track estimate and says so in expected_precision.
+    val x = (bounds[0] + fraction * (bounds[2] - bounds[0])).roundToInt()
+    val y = (bounds[1] + bounds[3]) / 2
+    if (!uiDevice.click(x, y)) throw BadRequest("set_progress_failed", "UiDevice.click returned false")
+
+    val readback = target?.let { readBackRange(request.selector(), uiDevice, instr, it, before) }
+    val after = readback?.range
+    val mutationVerified =
+        if (readback == null) {
+            false
+        } else {
+            readback.targetReached || progressChanged(checkNotNull(before), readback.range)
+        }
+    return SetProgressResp(
+        matched = match.element,
+        range_before = before,
+        range_after = after,
+        requested_value = request.value,
+        requested_percent = request.percent,
+        applied_value = after?.current ?: target,
+        current = after?.current,
+        verified = mutationVerified,
+        target_reached = readback?.targetReached == true,
+        input_delivered = true,
+        action = "coordinate_fallback",
+        coordinate_fallback = true,
+        expected_precision =
+            when {
+                readback?.targetReached == true -> "coordinate_range_readback"
+                mutationVerified -> "coordinate_approximate_range_readback"
+                after != null -> "coordinate_range_readback_miss"
+                else -> "ltr_track_estimate_unverified"
+            },
+        x = x,
+        y = y,
+    )
+}
+
+private fun validateProgressRequest(request: SetProgressReq) {
+    if (request.value == null && request.percent == null) {
+        throw BadRequest("progress_target_required", "set-progress needs exactly one of value or percent")
+    }
+    if (request.value != null && request.percent != null) {
+        throw BadRequest("progress_target_conflict", "set-progress accepts value or percent, not both")
+    }
+    val raw = request.value ?: request.percent
+    if (raw?.isFinite() != true) {
+        throw BadRequest("progress_value_invalid", "progress value must be a finite number")
+    }
+}
+
+internal fun resolveProgressTarget(
+    request: SetProgressReq,
+    range: RangeSemantics,
+): Float {
+    validateProgressRequest(request)
+    if (!range.min.isFinite() || !range.max.isFinite() || range.max <= range.min) {
+        throw BadRequest("range_semantics_unavailable", "matched element exposes an invalid accessibility range")
+    }
+    val raw =
+        request.value ?: run {
+            val percent = normalizedPercent(checkNotNull(request.percent), request.clamp)
+            range.min.toDouble() + (percent / 100.0) * (range.max - range.min).toDouble()
+        }
+    val bounded =
+        if (request.clamp) {
+            raw.coerceIn(range.min.toDouble(), range.max.toDouble())
+        } else {
+            if (raw < range.min || raw > range.max) {
+                throw BadRequest(
+                    "progress_value_out_of_range",
+                    "progress value $raw is outside ${range.min}..${range.max}; pass clamp=true to bound it",
+                    detail = mapOf("min" to range.min, "max" to range.max, "requested" to raw),
+                )
+            }
+            raw
+        }
+    val step =
+        range.step.jsonPrimitive.floatOrNull
+            ?.takeIf { it.isFinite() && it > 0f }
+    val quantized =
+        if (step == null) {
+            bounded
+        } else {
+            range.min + round((bounded - range.min) / step) * step
+        }
+    return quantized.coerceIn(range.min.toDouble(), range.max.toDouble()).toFloat()
+}
+
+private fun normalizedPercent(
+    percent: Double,
+    clamp: Boolean,
+): Double {
+    if (!percent.isFinite()) throw BadRequest("progress_value_invalid", "percent must be finite")
+    if (!clamp && percent !in 0.0..100.0) {
+        throw BadRequest(
+            "progress_value_out_of_range",
+            "percent $percent is outside 0..100; pass clamp=true to bound it",
+        )
+    }
+    return percent.coerceIn(0.0, 100.0)
+}
+
+private data class ProgressReadback(
+    val range: RangeSemantics,
+    val targetReached: Boolean,
+)
+
+private suspend fun readBackRange(
+    selector: SelectorReq,
+    uiDevice: UiDevice,
+    instr: Instrumentation,
+    expected: Float,
+    before: RangeSemantics?,
+): ProgressReadback? {
+    val deadline = SystemClock.elapsedRealtime() + PROGRESS_READBACK_MS
+    var latest: RangeSemantics? = null
+    do {
+        // Compose may update its state immediately while UiAutomation keeps an
+        // older virtual-node snapshot cached. Force readback from the current
+        // semantics tree so a successful action cannot be "verified" against
+        // pre-action values.
+        runCatching { instr.uiAutomation.clearCache() }
+        val matches = findElementMatches(selector.copy(all = true), uiDevice, instr)
+        val after =
+            try {
+                chooseUnique(matches, selector).element.range
+            } catch (_: RuntimeException) {
+                null
+            }
+        if (after != null) {
+            latest = after
+            if (progressMatches(after, expected)) return ProgressReadback(after, targetReached = true)
+            if (before != null && progressChanged(before, after)) {
+                return ProgressReadback(after, targetReached = false)
+            }
+        }
+        delay(PROGRESS_READBACK_POLL_MS)
+    } while (SystemClock.elapsedRealtime() < deadline)
+    return latest?.let { ProgressReadback(it, targetReached = false) }
+}
+
+internal fun progressChanged(
+    before: RangeSemantics,
+    after: RangeSemantics,
+): Boolean = !progressMatches(after, before.current)
+
+internal fun progressMatches(
+    range: RangeSemantics,
+    expected: Float,
+): Boolean {
+    val tolerance =
+        range.step.jsonPrimitive.floatOrNull
+            ?.let { abs(it) / 2f }
+            ?: ((range.max - range.min) * 0.001f).coerceAtLeast(0.001f)
+    return abs(range.current - expected) <= tolerance
+}
+
+private fun rangeDetail(range: RangeSemantics): JsonElement =
+    buildJsonObject {
+        put("type", range.type)
+        put("min", range.min)
+        put("max", range.max)
+        put("current", range.current)
+        put("step", range.step)
+    }
+
 private data class TapResult(
     val activatedElement: Element? = null,
     val actionableResolved: Boolean,
@@ -383,13 +725,14 @@ private data class TapCandidate(
 )
 
 private fun actionableCandidates(match: ElementMatch): List<TapCandidate> {
-    val candidates = mutableListOf(
-        TapCandidate(
-            node = match.node,
-            element = match.element,
-            state = TapCandidateState(match.element.enabled, match.element.clickable),
-        ),
-    )
+    val candidates =
+        mutableListOf(
+            TapCandidate(
+                node = match.node,
+                element = match.element,
+                state = TapCandidateState(match.element.enabled, match.element.clickable),
+            ),
+        )
     var current = match.node.parent
     var depth = 0
     while (current != null && depth < MAX_ANCESTOR_DEPTH) {
@@ -458,6 +801,8 @@ private fun elementDetail(element: Element): JsonElement =
     }
 
 private const val MAX_ANCESTOR_DEPTH = 32
+private const val PROGRESS_READBACK_MS = 800L
+private const val PROGRESS_READBACK_POLL_MS = 40L
 
 private fun matchString(
     actual: String?,

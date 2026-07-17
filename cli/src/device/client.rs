@@ -241,6 +241,22 @@ impl ServerClient {
         self.post("/find_tap", query).await
     }
 
+    pub async fn set_progress(
+        &self,
+        query: &SelectorQuery,
+        value: Option<f64>,
+        percent: Option<f64>,
+        clamp: bool,
+        coordinate_fallback: bool,
+    ) -> Result<SetProgressResp> {
+        let mut body = serde_json::to_value(query)?;
+        body["value"] = value.map_or(serde_json::Value::Null, serde_json::Value::from);
+        body["percent"] = percent.map_or(serde_json::Value::Null, serde_json::Value::from);
+        body["clamp"] = clamp.into();
+        body["coordinate_fallback"] = coordinate_fallback.into();
+        self.post("/set_progress", &body).await
+    }
+
     pub async fn xpath(&self, query: &str, tap: bool) -> Result<FindResp> {
         self.post(
             "/xpath",

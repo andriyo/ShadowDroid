@@ -8,7 +8,9 @@ import io.github.andriyo.shadowdroid.dump.TreeWalker
 import io.github.andriyo.shadowdroid.proto.AppRef
 import io.github.andriyo.shadowdroid.proto.Element
 import io.github.andriyo.shadowdroid.proto.ImeState
+import io.github.andriyo.shadowdroid.proto.RangeSemantics
 import io.github.andriyo.shadowdroid.proto.Viewport
+import kotlinx.serialization.json.JsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -20,8 +22,8 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 class ScreenIdentityTest {
     @Test
-    fun canonicalV2IdentityHasGoldenEncoding() {
-        assertEquals("8571983d6cc34025", hash(listOf(element())))
+    fun canonicalV3IdentityHasGoldenEncoding() {
+        assertEquals("8c58a9031017bacb", hash(listOf(element())))
     }
 
     @Test
@@ -44,6 +46,8 @@ class ScreenIdentityTest {
                 base.copy(rid = "other"),
                 base.copy(bounds = listOf(1, 2, 30, 40)),
                 base.copy(tap = listOf(16, 21)),
+                base.copy(range = RangeSemantics("float", 0f, 1f, 0.5f)),
+                base.copy(actions = listOf("set_progress")),
                 base.copy(clickable = true),
                 base.copy(long_clickable = true),
                 base.copy(scrollable = true),
@@ -213,6 +217,56 @@ class ScreenIdentityTest {
                 )
             }
         assertEquals("element_disabled", disabledCard.code)
+    }
+
+    @Test
+    fun progressTargetResolvesAbsolutePercentClampAndDeclaredStep() {
+        val continuous = RangeSemantics("float", 10f, 20f, 12f)
+        assertEquals(15f, resolveProgressTarget(SetProgressReq(percent = 50.0), continuous))
+        assertEquals(18f, resolveProgressTarget(SetProgressReq(value = 18.0), continuous))
+        assertEquals(20f, resolveProgressTarget(SetProgressReq(value = 99.0, clamp = true), continuous))
+
+        val discrete = continuous.copy(step = JsonPrimitive(2f))
+        assertEquals(16f, resolveProgressTarget(SetProgressReq(value = 15.2), discrete))
+    }
+
+    @Test
+    fun progressTargetRejectsInvalidOrOutOfRangeRequests() {
+        val range = RangeSemantics("float", 0f, 1f, 0.5f)
+        assertEquals(
+            "progress_target_required",
+            assertThrows(BadRequest::class.java) {
+                resolveProgressTarget(SetProgressReq(), range)
+            }.code,
+        )
+        assertEquals(
+            "progress_target_conflict",
+            assertThrows(BadRequest::class.java) {
+                resolveProgressTarget(SetProgressReq(value = 0.2, percent = 20.0), range)
+            }.code,
+        )
+        assertEquals(
+            "progress_value_out_of_range",
+            assertThrows(BadRequest::class.java) {
+                resolveProgressTarget(SetProgressReq(value = 2.0), range)
+            }.code,
+        )
+        assertEquals(
+            "progress_value_invalid",
+            assertThrows(BadRequest::class.java) {
+                resolveProgressTarget(SetProgressReq(value = Double.NaN), range)
+            }.code,
+        )
+    }
+
+    @Test
+    fun progressReadbackUsesRangeScaledTolerance() {
+        val range = RangeSemantics("float", 0f, 100f, 50.05f)
+        assertTrue(progressMatches(range, 50f))
+        assertFalse(progressMatches(range.copy(current = 51f), 50f))
+        assertTrue(progressMatches(range.copy(current = 50.9f, step = JsonPrimitive(2f)), 50f))
+        assertFalse(progressChanged(range, range.copy(current = 50.1f)))
+        assertTrue(progressChanged(range, range.copy(current = 51f)))
     }
 
     @Suppress("DEPRECATION")

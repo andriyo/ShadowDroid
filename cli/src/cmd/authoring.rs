@@ -224,6 +224,8 @@ mod tests {
             rid: rid.map(str::to_string),
             bounds: None,
             tap: Some([1, 2]),
+            range: None,
+            actions: Vec::new(),
             clickable,
             long_clickable: false,
             scrollable: false,

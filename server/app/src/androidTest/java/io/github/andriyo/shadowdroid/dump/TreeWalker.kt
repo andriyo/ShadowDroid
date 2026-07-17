@@ -5,7 +5,10 @@ import android.view.accessibility.AccessibilityNodeInfo
 import io.github.andriyo.shadowdroid.proto.AppRef
 import io.github.andriyo.shadowdroid.proto.Element
 import io.github.andriyo.shadowdroid.proto.ImeState
+import io.github.andriyo.shadowdroid.proto.RangeSemantics
 import io.github.andriyo.shadowdroid.proto.Viewport
+import kotlinx.serialization.json.floatOrNull
+import kotlinx.serialization.json.jsonPrimitive
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 
@@ -65,11 +68,23 @@ object TreeWalker {
         val cls = node.className?.toString().orEmpty()
 
         val isInput = cls.contains("EditText")
+        var range = rangeSemantics(node.rangeInfo)
+        if (range != null) {
+            // Compose exposes sliders as virtual accessibility nodes. Their
+            // cached RangeInfo can lag behind a successful set-progress action
+            // even after the window sends a content-change event; refresh the
+            // node before treating current as authoritative readback.
+            runCatching { node.refresh() }
+            range = rangeSemantics(node.rangeInfo)
+        }
+        val actions = accessibilityActions(node)
         val isInteractive =
             node.isClickable ||
                 node.isLongClickable ||
                 node.isScrollable ||
-                node.isCheckable
+                node.isCheckable ||
+                range != null ||
+                actions.contains("set_progress")
         val hasContent = text.isNotEmpty() || desc.isNotEmpty()
 
         if (isInteractive || hasContent || isInput) {
@@ -107,6 +122,8 @@ object TreeWalker {
                                 rid = rid.ifEmpty { null },
                                 bounds = boundsList,
                                 tap = tapList,
+                                range = range,
+                                actions = actions,
                                 clickable = node.isClickable,
                                 long_clickable = node.isLongClickable,
                                 scrollable = node.isScrollable,
@@ -153,7 +170,7 @@ object TreeWalker {
         ime: ImeState,
     ): String {
         val digest = CanonicalDigest(MessageDigest.getInstance("SHA-256"))
-        digest.putString("shadowdroid.screen.v2")
+        digest.putString("shadowdroid.screen.v3")
         digest.putInt(viewport.w)
         digest.putInt(viewport.h)
         digest.putNullableString(currentApp.`package`)
@@ -171,6 +188,16 @@ object TreeWalker {
             digest.putNullableString(e.rid)
             digest.putNullableIntList(e.bounds)
             digest.putNullableIntList(e.tap)
+            digest.putBoolean(e.range != null)
+            e.range?.let { range ->
+                digest.putString(range.type)
+                digest.putFloat(range.min)
+                digest.putFloat(range.max)
+                digest.putFloat(range.current)
+                digest.putNullableFloat(range.step.jsonPrimitive.floatOrNull)
+            }
+            digest.putInt(e.actions.size)
+            e.actions.forEach(digest::putString)
             digest.putBoolean(e.clickable)
             digest.putBoolean(e.long_clickable)
             digest.putBoolean(e.scrollable)
@@ -187,6 +214,40 @@ object TreeWalker {
         return digest.finish().take(8).joinToString("") { "%02x".format(it) }
     }
 }
+
+private fun rangeSemantics(info: AccessibilityNodeInfo.RangeInfo?): RangeSemantics? {
+    if (info == null) return null
+    val type =
+        when (info.type) {
+            AccessibilityNodeInfo.RangeInfo.RANGE_TYPE_INT -> "int"
+            AccessibilityNodeInfo.RangeInfo.RANGE_TYPE_FLOAT -> "float"
+            AccessibilityNodeInfo.RangeInfo.RANGE_TYPE_PERCENT -> "percent"
+            AccessibilityNodeInfo.RangeInfo.RANGE_TYPE_INDETERMINATE -> "indeterminate"
+            else -> "unknown"
+        }
+    return RangeSemantics(
+        type = type,
+        min = info.min,
+        max = info.max,
+        current = info.current,
+    )
+}
+
+/**
+ * Stable, non-localized semantic actions that are not already represented by
+ * an Element boolean. ACTION_CLICK/scroll/focus/set-text stay compact through
+ * clickable/scrollable/focusable/input; set-progress is the new capability an
+ * agent otherwise cannot discover.
+ */
+private fun accessibilityActions(node: AccessibilityNodeInfo): List<String> =
+    node.actionList
+        .mapNotNull { action ->
+            when (action.id) {
+                AccessibilityNodeInfo.AccessibilityAction.ACTION_SET_PROGRESS.id -> "set_progress"
+                else -> null
+            }
+        }.distinct()
+        .sorted()
 
 /** Small binary encoder for the versioned screen identity above. */
 private class CanonicalDigest(
@@ -209,6 +270,13 @@ private class CanonicalDigest(
     fun putNullableInt(value: Int?) {
         putBoolean(value != null)
         value?.let(::putInt)
+    }
+
+    fun putFloat(value: Float) = putInt(value.toBits())
+
+    fun putNullableFloat(value: Float?) {
+        putBoolean(value != null)
+        value?.let(::putFloat)
     }
 
     fun putString(value: String) {

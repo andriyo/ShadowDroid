@@ -564,6 +564,41 @@ pub enum UiCmd {
         #[command(flatten)]
         fusion: crate::fusion::FusionArgs,
     },
+    /// Set a slider/range control through Android accessibility and verify readback.
+    SetProgress {
+        /// Element id from a fresh `ui dump`.
+        #[arg(long)]
+        id: Option<u32>,
+        /// Match by exact/normalized visible text.
+        #[arg(long)]
+        text: Option<String>,
+        /// Match by resource id or Compose test tag.
+        #[arg(long)]
+        rid: Option<String>,
+        /// Match by content description.
+        #[arg(long)]
+        desc: Option<String>,
+        /// Match by supported xpath.
+        #[arg(long)]
+        xpath: Option<String>,
+        /// Match selector values exactly instead of as a substring.
+        #[arg(long)]
+        exact: bool,
+        /// Absolute value in the control's exposed min..max range.
+        #[arg(long, allow_hyphen_values = true)]
+        value: Option<f64>,
+        /// Position from 0 to 100 within the exposed range.
+        #[arg(long, allow_hyphen_values = true)]
+        percent: Option<f64>,
+        /// Clamp an out-of-range value/percent instead of rejecting it.
+        #[arg(long)]
+        clamp: bool,
+        /// Explicitly permit an approximate coordinate track click when semantic mutation is unavailable.
+        #[arg(long)]
+        coordinate_fallback: bool,
+        #[command(flatten)]
+        fusion: crate::fusion::FusionArgs,
+    },
     /// Double-tap at <x> <y> coordinates.
     DoubleTap {
         x: i32,
@@ -1732,6 +1767,42 @@ async fn dispatch_ui_inner(
                     coordinate_fallback,
                 ),
             )
+            .await
+        }
+        UiCmd::SetProgress {
+            id,
+            text,
+            rid,
+            desc,
+            xpath,
+            exact,
+            value,
+            percent,
+            clamp,
+            coordinate_fallback,
+            fusion,
+        } => {
+            validate_set_progress_input(value, percent)?;
+            let hint = crate::fusion::SelectorHint {
+                text: text.clone(),
+                rid: rid.clone(),
+                desc: desc.clone(),
+            };
+            let query = SelectorQuery {
+                id,
+                text,
+                rid,
+                desc,
+                xpath,
+                exact,
+                ..Default::default()
+            };
+            crate::fusion::run_fused(client, &fusion, Some(hint), async {
+                let response = client
+                    .set_progress(&query, value, percent, clamp, coordinate_fallback)
+                    .await?;
+                Ok(("set_progress", serde_json::to_value(response)?))
+            })
             .await
         }
         UiCmd::DoubleTap { x, y, fusion } => {
@@ -3288,6 +3359,27 @@ fn server_error_next_actions(code: &str, command_path: Option<&str>) -> Option<V
             "shadowdroid ui dump".to_string(),
             current_contract("ui tap"),
         ]),
+        "range_semantics_unavailable" => Some(vec![
+            "inspect the matched element's range/actions in `shadowdroid ui dump --full`"
+                .to_string(),
+            "use --coordinate-fallback only when approximate track injection is explicitly acceptable"
+                .to_string(),
+            current_contract("ui set-progress"),
+        ]),
+        "set_progress_unsupported" | "set_progress_failed" | "set_progress_unverified" => {
+            Some(vec![
+                "inspect the matched element's range/actions and current value in `shadowdroid ui dump --full`"
+                    .to_string(),
+                current_contract("ui set-progress"),
+                "shadowdroid why".to_string(),
+            ])
+        }
+        "progress_target_required" | "progress_target_conflict" | "progress_value_invalid"
+        | "progress_value_out_of_range" => Some(vec![
+            "rerun with exactly one finite --value NUMBER or --percent 0..100; add --clamp only when bounding is intended"
+                .to_string(),
+            current_contract("ui set-progress"),
+        ]),
         "server_version_mismatch" | "server_unavailable" => Some(vec![
             "shadowdroid connect".to_string(),
             "shadowdroid doctor --fix --json".to_string(),
@@ -3732,6 +3824,32 @@ async fn cmd_tap(
             .into())
         }
     }
+}
+
+fn validate_set_progress_input(value: Option<f64>, percent: Option<f64>) -> Result<()> {
+    let (code, message) = match (value, percent) {
+        (None, None) => (
+            "progress_target_required",
+            "set-progress needs exactly one of --value or --percent",
+        ),
+        (Some(_), Some(_)) => (
+            "progress_target_conflict",
+            "set-progress accepts --value or --percent, not both",
+        ),
+        (Some(v), None) | (None, Some(v)) if !v.is_finite() => (
+            "progress_value_invalid",
+            "progress value must be a finite number",
+        ),
+        _ => return Ok(()),
+    };
+    Err(
+        crate::diagnostic::DiagnosticError::new(code, "input", message)
+            .next_actions([
+                "rerun with one finite --value NUMBER or --percent 0..100",
+                "shadowdroid commands --json --describe 'ui set-progress'",
+            ])
+            .into(),
+    )
 }
 
 async fn tap_element_id(
@@ -4597,12 +4715,20 @@ mod tests {
             "no_scrollable",
             "not_directory",
             "package_not_found",
+            "progress_target_conflict",
+            "progress_target_required",
+            "progress_value_invalid",
+            "progress_value_out_of_range",
+            "range_semantics_unavailable",
             "screenshot_failed",
             "shell_failed",
             "shell_timeout",
             "swipe_failed",
             "tap_failed",
             "text_failed",
+            "set_progress_failed",
+            "set_progress_unsupported",
+            "set_progress_unverified",
             "unknown_key",
             "xpath_invalid",
         ];
@@ -4822,6 +4948,8 @@ mod tests {
             rid: None,
             bounds: None,
             tap: None,
+            range: None,
+            actions: Vec::new(),
             clickable: false,
             long_clickable: false,
             scrollable: false,
@@ -4849,6 +4977,22 @@ mod tests {
         assert_eq!(got, ["Something went wrong", "Retry", "Contact support"]);
         // Cap is honored.
         assert_eq!(top_screen_texts(&els, 2), ["Something went wrong", "Retry"]);
+    }
+
+    #[test]
+    fn set_progress_input_requires_one_finite_target() {
+        assert!(validate_set_progress_input(Some(0.5), None).is_ok());
+        assert!(validate_set_progress_input(None, Some(80.0)).is_ok());
+
+        for (value, percent, code) in [
+            (None, None, "progress_target_required"),
+            (Some(1.0), Some(50.0), "progress_target_conflict"),
+            (Some(f64::NAN), None, "progress_value_invalid"),
+            (None, Some(f64::INFINITY), "progress_value_invalid"),
+        ] {
+            let error = validate_set_progress_input(value, percent).unwrap_err();
+            assert_eq!(error_code_of(&error), code);
+        }
     }
 
     #[test]

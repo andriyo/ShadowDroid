@@ -31,7 +31,7 @@ answers the agent's next question *before it's asked*:
 
 ```jsonc
 $ shadowdroid ui dump
-{"screen_hash":"154e97ff111d4b1e","screen_hash_version":2,
+{"screen_hash":"154e97ff111d4b1e","screen_hash_version":3,
  "snapshot_state":"consistent","captured_at_ms":1760000000123,
  "viewport":{"w":1080,"h":2424},
  "current_app":{"package":"com.example.app","activity":".MainActivity","pid":5170,
@@ -48,7 +48,7 @@ $ shadowdroid ui tap --text "Sign in" --observe
  "matched_element":{"id":7,"text":"Sign in","tap":[540,1200]},
  "activated_element":{"id":7,"text":"Sign in","clickable":true},
  "action":"accessibility_click","screen_changed":true,"postcondition_satisfied":null,
- "screen":{"screen_hash":"9c01d2aa87b3e544","screen_hash_version":2,
+ "screen":{"screen_hash":"9c01d2aa87b3e544","screen_hash_version":3,
            "snapshot_state":"consistent","captured_at_ms":1760000000440,
            "element_count":24,"elements":[…]}}
 
@@ -66,7 +66,7 @@ $ shadowdroid ui wait --text "Welcome" --timeout-ms 6000
 {"type":"error","ok":false,"stage":"ui","code":"wait_timeout",
  "retryable":true,
  "detail":{"timeout_ms":6000,"gone":false,
-           "screen_hash":"9c01d2aa87b3e544","screen_hash_version":2,
+           "screen_hash":"9c01d2aa87b3e544","screen_hash_version":3,
            "current_app":{"package":"com.example.app","activity":".MainActivity"},
            "top_texts":["Example App keeps stopping","App info","Close app"]},
  "next_actions":["inspect detail.top_texts and current_app, then correct the selector or expected screen",
@@ -559,6 +559,21 @@ the most reliable target when a stable resource id exists. Matching is
 themselves, with no wildcards or regex (a value starting with `-` needs the
 `--text=-50%` equals form so it isn't read as a flag).
 
+Platform and Compose sliders expose their accessibility `range` (`type`,
+`min`, `max`, `current`, and nullable `step`) plus stable `actions` in the
+normal `ui dump` shape. Android's range API does not expose a declared discrete
+step, so ShadowDroid leaves `step:null` unless a future platform surface can
+prove it. Set a slider semantically and verify the resulting range readback:
+
+```bash
+shadowdroid ui set-progress --desc "Follow stand-off slider" --value 0.45 --observe
+shadowdroid ui set-progress --rid distance_slider --percent 80 --if-screen <hash>
+```
+
+Out-of-range values fail unless `--clamp` is explicit. Missing range semantics
+or `ACTION_SET_PROGRESS` is a typed error; `--coordinate-fallback` opts into an
+approximate track click and reports when readback could not verify it.
+
 Selector **actions** are **strict**: if `ui tap`/`text`/`focus` matches several
 elements and none is an exact match, they fail with a structured
 `ambiguous_match` error listing the candidates rather than guessing — narrow
@@ -575,7 +590,7 @@ coordinates). Tap results separate `selector_matched`, `actionable_resolved`,
 `postcondition_satisfied`, so a valid no-op action is not confused with an
 undelivered input.
 
-Loop-fusion action verbs (`ui tap`, coordinate gestures, `ui pinch`, `ui text`,
+Loop-fusion action verbs (`ui tap`, `ui set-progress`, coordinate gestures, `ui pinch`, `ui text`,
 `ui key`, `ui back`, and `ui home`) accept `--observe` (return the post-action
 compact screen in the same response) and `--if-screen <hash>` (optimistic
 concurrency — refuse to act if the screen changed, and return the fresh one).
@@ -593,7 +608,7 @@ selector (then optionally activates it) — the TV analog of `ui tap` /
 | --- | --- |
 | **Discovery/setup** | `commands --json --depth 1`, `commands --json --describe '<path>'`, `config paths` / `schema` / `explain` / `init` / `validate`, `skill`, `studio status` / `install`, `init`, `update`, `usage` |
 | **Session/diagnostics** | `devices`, `connect`, `disconnect`, `test`, `doctor`, `collect`, `why`, `log` |
-| **UI automation** | `ui dump`, `ui audit`, `ui gen`, `ui screenshot`, `ui find`, `ui tap`, `ui double-tap`, `ui long-tap`, `ui swipe`, `ui drag`, `ui swipe-ext`, `ui pinch`, `ui scroll-to`, `ui focus`, `ui text`, `ui key`, `ui hide-keyboard`, `ui back`, `ui home`, `ui wait`, `ui toast` (tap/gesture/text/key/back/home verbs take `--observe` / `--if-screen`) |
+| **UI automation** | `ui dump`, `ui audit`, `ui gen`, `ui screenshot`, `ui find`, `ui tap`, `ui set-progress`, `ui double-tap`, `ui long-tap`, `ui swipe`, `ui drag`, `ui swipe-ext`, `ui pinch`, `ui scroll-to`, `ui focus`, `ui text`, `ui key`, `ui hide-keyboard`, `ui back`, `ui home`, `ui wait`, `ui toast` (tap/gesture/text/key/back/home/progress verbs take `--observe` / `--if-screen`) |
 | **Triage** | `why` (one-read verdict + evidence), `log` (structured app-scoped logcat + parsed crashes) |
 | **Live timeline** | `watch` (screen changes, crashes, ANRs, toasts, watcher actions, and HTTP events when network capture is active) |
 | **Layout / Compose** | `layout snapshot`, `layout diff`, `layout source`, `layout recompositions` |

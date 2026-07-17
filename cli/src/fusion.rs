@@ -346,6 +346,8 @@ mod tests {
             rid: None,
             bounds: None,
             tap: Some([1, 1]),
+            range: None,
+            actions: Vec::new(),
             clickable: true,
             long_clickable: false,
             scrollable: false,
