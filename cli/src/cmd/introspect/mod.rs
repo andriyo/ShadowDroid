@@ -18,24 +18,32 @@ use agent_metadata::agent_metadata;
 
 static CLI_COMMAND_TEMPLATE: LazyLock<Command> = LazyLock::new(Cli::command);
 
-pub fn run(json: bool, depth: Option<usize>, describe: Option<&str>) -> Result<()> {
+pub fn run(
+    json: bool,
+    depth: Option<usize>,
+    describe: Option<&str>,
+    path: &[String],
+    search: Option<&str>,
+    compact: bool,
+) -> Result<()> {
     let root = &*CLI_COMMAND_TEMPLATE;
-    let catalog = if let Some(path) = describe {
-        describe_catalog(root, path).ok_or_else(|| {
-            crate::diagnostic::DiagnosticError::new(
-                "command_not_found",
-                "commands",
-                format!("no public command has path {path:?}"),
-            )
-            .detail(serde_json::json!({"path": path}))
-            .next_actions(["shadowdroid commands --json --depth 1"])
-        })?
+    let positional_path = (!path.is_empty()).then(|| path.join(" "));
+    let requested_path = describe.or(positional_path.as_deref());
+    let mut catalog = if let Some(query) = search {
+        search_catalog(root, query, compact)?
+    } else if let Some(path) = requested_path {
+        describe_catalog(root, path).ok_or_else(|| command_not_found(root, path))?
     } else {
         catalog_with_depth(root, depth)
     };
+    if compact && search.is_none() {
+        compact_catalog(&mut catalog);
+    }
     if json {
         crate::events::emit_result(&catalog);
-    } else if describe.is_some() {
+    } else if search.is_some() {
+        print_search_results(&catalog);
+    } else if requested_path.is_some() {
         print_command(&catalog["command"], 0);
     } else {
         print_tree(&catalog);
@@ -78,9 +86,166 @@ fn describe_catalog(root: &Command, raw_path: &str) -> Option<serde_json::Value>
         "schema_version": 3,
         "path": names.join(" "),
         "global_args": args(root).into_iter().filter(|arg| arg["global"] == true).collect::<Vec<_>>(),
-        "command": command_json(command, &parent, Some(0)),
+        // Include one level of child names/contracts for namespace queries such
+        // as `commands net`; leaf queries remain a single bounded command.
+        "command": command_json(command, &parent, Some(1)),
         "next_actions": next_actions_for_path("commands"),
     }))
+}
+
+fn command_not_found(root: &Command, path: &str) -> anyhow::Error {
+    let nearest_paths = nearest_command_paths(root, path, 5);
+    let next_actions = if nearest_paths.is_empty() {
+        vec!["shadowdroid commands --json --depth 1".to_string()]
+    } else {
+        nearest_paths
+            .iter()
+            .take(3)
+            .map(|candidate| format!("shadowdroid commands {candidate} --json --compact"))
+            .collect()
+    };
+    crate::diagnostic::DiagnosticError::new(
+        "command_not_found",
+        "commands",
+        format!("no public command has path {path:?}"),
+    )
+    .detail(serde_json::json!({"path": path, "nearest_paths": nearest_paths}))
+    .next_actions(next_actions)
+    .into()
+}
+
+const SEARCH_LIMIT: usize = 25;
+
+fn search_catalog(root: &Command, raw_query: &str, compact: bool) -> Result<serde_json::Value> {
+    let query = raw_query.trim();
+    if query.is_empty() {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "search_query_required",
+            "commands",
+            "--search needs at least one non-whitespace search term",
+        )
+        .next_actions(["shadowdroid commands --search 'response body' --json"])
+        .into());
+    }
+    let terms = query
+        .split_whitespace()
+        .map(|term| term.to_lowercase())
+        .collect::<Vec<_>>();
+    let mut matches = all_command_values(root)
+        .into_iter()
+        .filter(|command| {
+            let searchable = command.to_string().to_lowercase();
+            terms.iter().all(|term| searchable.contains(term))
+        })
+        .collect::<Vec<_>>();
+    let total = matches.len();
+    matches.truncate(SEARCH_LIMIT);
+    if compact {
+        for command in &mut matches {
+            compact_command(command);
+        }
+    }
+    Ok(serde_json::json!({
+        "schema_version": 3,
+        "query": query,
+        "count": matches.len(),
+        "total_matches": total,
+        "truncated": total > SEARCH_LIMIT,
+        "commands": matches,
+        "next_actions": next_actions_for_path("commands"),
+    }))
+}
+
+fn all_command_values(root: &Command) -> Vec<serde_json::Value> {
+    fn collect(command: &Command, parent: &[String], out: &mut Vec<serde_json::Value>) {
+        for child in command
+            .get_subcommands()
+            .filter(|child| child.get_name() != "help" && !child.is_hide_set())
+        {
+            out.push(command_json(child, parent, Some(0)));
+            let mut path = parent.to_vec();
+            path.push(child.get_name().to_string());
+            collect(child, &path, out);
+        }
+    }
+
+    let mut commands = Vec::new();
+    collect(root, &[], &mut commands);
+    commands
+}
+
+fn nearest_command_paths(root: &Command, query: &str, limit: usize) -> Vec<String> {
+    let query = query.trim().to_lowercase();
+    let mut scored = all_command_values(root)
+        .into_iter()
+        .filter_map(|command| command["path"].as_str().map(str::to_string))
+        .map(|path| {
+            let score = crate::fusion::similarity(&query, &path.to_lowercase());
+            (path, score)
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|(left_path, left_score), (right_path, right_score)| {
+        right_score
+            .total_cmp(left_score)
+            .then_with(|| left_path.len().cmp(&right_path.len()))
+            .then_with(|| left_path.cmp(right_path))
+    });
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(path, _)| path)
+        .collect()
+}
+
+fn compact_catalog(catalog: &mut serde_json::Value) {
+    if let Some(command) = catalog.get_mut("command") {
+        compact_command(command);
+    }
+    if let Some(commands) = catalog
+        .get_mut("commands")
+        .and_then(|value| value.as_array_mut())
+    {
+        for command in commands {
+            compact_command(command);
+        }
+    }
+}
+
+fn compact_command(command: &mut serde_json::Value) {
+    let Some(object) = command.as_object_mut() else {
+        return;
+    };
+    let examples = object
+        .remove("agent")
+        .and_then(|agent| agent.get("examples").cloned());
+    if let Some(examples) = examples {
+        object.insert("examples".into(), examples);
+    }
+    if let Some(subcommands) = object
+        .get_mut("subcommands")
+        .and_then(|value| value.as_array_mut())
+    {
+        for child in subcommands {
+            compact_command(child);
+        }
+    }
+}
+
+fn print_search_results(catalog: &serde_json::Value) {
+    println!(
+        "{} command(s) matched {:?}:",
+        catalog["count"].as_u64().unwrap_or(0),
+        catalog["query"].as_str().unwrap_or_default(),
+    );
+    if let Some(commands) = catalog["commands"].as_array() {
+        for command in commands {
+            println!(
+                "  {:<32} {}",
+                command["path"].as_str().unwrap_or_default(),
+                command["about"].as_str().unwrap_or_default(),
+            );
+        }
+    }
 }
 
 fn subcommands(
@@ -724,6 +889,73 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn scoped_compact_leaf_is_small_fast_and_keeps_the_invocation_contract() {
+        let root = Cli::command();
+        let started = std::time::Instant::now();
+        let mut described = describe_catalog(&root, "net rule add").unwrap();
+        compact_catalog(&mut described);
+        let elapsed = started.elapsed();
+        let bytes = serde_json::to_vec(&described).unwrap();
+
+        assert_eq!(described["path"], "net rule add");
+        assert!(described["command"].get("agent").is_none());
+        assert!(
+            described["command"]["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|argument| argument["long"] == "host")
+        );
+        assert!(
+            bytes.len() < 32 * 1024,
+            "leaf contract was {} bytes",
+            bytes.len()
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "leaf lookup took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn search_covers_argument_help_and_examples_and_stays_bounded() {
+        let root = Cli::command();
+        let response_body = search_catalog(&root, "response body", true).unwrap();
+        let paths = response_body["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|command| command["path"].as_str())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"net respond"), "{paths:?}");
+        assert!(
+            response_body["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|command| command.get("agent").is_none())
+        );
+
+        let example = search_catalog(&root, "set-status 503", false).unwrap();
+        assert!(
+            example["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|command| command["path"] == "net rule add")
+        );
+        assert!(response_body["count"].as_u64().unwrap() <= SEARCH_LIMIT as u64);
+    }
+
+    #[test]
+    fn unknown_paths_suggest_the_nearest_public_contracts() {
+        let root = Cli::command();
+        let nearest = nearest_command_paths(&root, "net ruel add", 5);
+        assert_eq!(nearest.first().map(String::as_str), Some("net rule add"));
+        assert!(nearest.iter().all(|path| path != "net daemon"));
     }
 
     #[test]

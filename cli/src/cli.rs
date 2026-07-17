@@ -207,15 +207,40 @@ pub enum Cmd {
     },
     /// Emit the full command catalog (machine-readable self-introspection for agents).
     Commands {
+        /// Command path to inspect directly, e.g. `net rule add`.
+        #[arg(
+            value_name = "COMMAND_PATH",
+            num_args = 0..,
+            conflicts_with_all = ["depth", "describe", "search"]
+        )]
+        path: Vec<String>,
         /// Emit JSON instead of a human tree.
         #[arg(long)]
         json: bool,
         /// Limit command-tree expansion (1 = top-level routing catalog).
-        #[arg(long, value_name = "N", conflicts_with = "describe")]
+        #[arg(
+            long,
+            value_name = "N",
+            conflicts_with_all = ["describe", "search", "path"]
+        )]
         depth: Option<usize>,
         /// Return one command contract by its space-separated path, e.g. "ui tap".
-        #[arg(long, value_name = "COMMAND_PATH", conflicts_with = "depth")]
+        #[arg(
+            long,
+            value_name = "COMMAND_PATH",
+            conflicts_with_all = ["depth", "search", "path"]
+        )]
         describe: Option<String>,
+        /// Search command names, summaries, argument help, and examples.
+        #[arg(
+            long,
+            value_name = "QUERY",
+            conflicts_with_all = ["depth", "describe", "path"]
+        )]
+        search: Option<String>,
+        /// Omit long agent guidance while retaining the invocation contract.
+        #[arg(long)]
+        compact: bool,
     },
     /// Structured, bounded logcat: app-scoped JSON log lines with crash/ANR
     /// blocks parsed out, windowed (`--last 60s`) and deduplicated. Works
@@ -1395,10 +1420,22 @@ async fn run_inner() -> Result<()> {
     // layered load.
     match &cli.cmd {
         Cmd::Commands {
+            path,
             json,
             depth,
             describe,
-        } => return crate::cmd::introspect::run(*json, *depth, describe.as_deref()),
+            search,
+            compact,
+        } => {
+            return crate::cmd::introspect::run(
+                *json,
+                *depth,
+                describe.as_deref(),
+                path,
+                search.as_deref(),
+                *compact,
+            );
+        }
         Cmd::Config(args) => return crate::cmd::config::run(args),
         Cmd::Skill(args) => return crate::cmd::skill::run(args),
         Cmd::Usage(args) => return crate::cmd::usage::run(args),
@@ -4696,6 +4733,45 @@ mod tests {
                 ui: true,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn commands_accepts_a_positional_path_search_and_compact_mode() {
+        let scoped = Cli::try_parse_from([
+            "shadowdroid",
+            "commands",
+            "net",
+            "rule",
+            "add",
+            "--json",
+            "--compact",
+        ])
+        .unwrap();
+        assert!(matches!(
+            scoped.cmd,
+            Cmd::Commands {
+                path,
+                json: true,
+                compact: true,
+                ..
+            } if path == ["net", "rule", "add"]
+        ));
+
+        let searched = Cli::try_parse_from([
+            "shadowdroid",
+            "commands",
+            "--search",
+            "response body",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            searched.cmd,
+            Cmd::Commands {
+                search: Some(query),
+                ..
+            } if query == "response body"
         ));
     }
 

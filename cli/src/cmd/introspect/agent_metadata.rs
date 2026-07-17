@@ -12,12 +12,13 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
                 "Discover ShadowDroid's command tree, flags, output contracts, and agent decision hints without scraping human help text.",
                 "Inspect one command before constructing it, or fetch a shallow catalog when the full tree would cost unnecessary context."
             ],
-            "output": "schema_version 3 JSON catalog with command paths, complete argument construction data, output contracts, and normalized next_actions; --depth limits nesting and --describe returns one command",
+            "output": "schema_version 3 JSON catalog with command paths, complete argument construction data, output contracts, and normalized next_actions; a positional path or --describe returns one command, --search finds relevant contracts, and --compact removes long guidance",
             "side_effects": ["none"],
             "next_actions": ["commands --json --depth 1", "commands --json --describe 'ui tap'", "config schema --json"],
             "examples": [
                 "commands --json --depth 1",
-                "commands --json --describe 'net rule add'"
+                "commands net rule add --json --compact",
+                "commands --search 'response body' --json"
             ]
         })),
         "devices" => Some(serde_json::json!({
