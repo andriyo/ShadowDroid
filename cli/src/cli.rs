@@ -133,6 +133,12 @@ pub struct Cli {
     #[arg(short = 'q', long, global = true)]
     pub quiet: bool,
 
+    /// Redact common secrets, PII, identifiers, and configured patterns from
+    /// supported JSON/text output and diagnostic artifacts. For `net start`,
+    /// the same policy is applied to completed captures before persistence.
+    #[arg(long, global = true)]
+    pub redact: bool,
+
     #[command(subcommand)]
     pub cmd: Cmd,
 }
@@ -204,6 +210,10 @@ pub enum Cmd {
         /// Skip capturing a screenshot.
         #[arg(long)]
         no_screenshot: bool,
+        /// With global --redact enabled, black out accessibility bounds whose
+        /// text matches the policy before writing screenshot.png.
+        #[arg(long)]
+        redact_screenshots: bool,
     },
     /// Emit the full command catalog (machine-readable self-introspection for agents).
     Commands {
@@ -525,6 +535,11 @@ pub enum UiCmd {
         /// JPEG quality 1..100 (format=jpeg only).
         #[arg(long)]
         quality: Option<u32>,
+        /// With global --redact enabled, black out accessibility bounds whose
+        /// text matches the active policy. PNG only; pixels remain potentially
+        /// sensitive because Android may not expose every rendered glyph.
+        #[arg(long)]
+        redact_pixels: bool,
     },
     /// Find elements by selector (--text/--rid/--desc/--xpath); does not tap.
     Find {
@@ -900,9 +915,8 @@ pub enum NetCmd {
         /// upstream (note: it will also surface the app's own pinning failures).
         #[arg(long)]
         verify_upstream: bool,
-        /// Redact sensitive headers (authorization, cookie, set-cookie,
-        /// proxy-authorization) from captured flows before they're logged.
-        #[arg(long)]
+        /// Populated from the global --redact flag or config.
+        #[arg(skip)]
         redact: bool,
     },
     /// Stop the proxy and tear down device wiring.
@@ -1241,9 +1255,15 @@ pub struct NetDaemonArgs {
     /// Validate the upstream server's TLS certificate.
     #[arg(long)]
     pub verify_upstream: bool,
-    /// Redact sensitive headers from captured flows.
-    #[arg(long)]
+    /// Redact captures (internal daemon handoff).
+    #[arg(long = "capture-redact")]
     pub redact: bool,
+    /// Additional JSON key to redact (internal daemon handoff; repeatable).
+    #[arg(long = "redaction-json-key")]
+    pub redaction_json_key: Vec<String>,
+    /// Additional string regex to redact (internal daemon handoff; repeatable).
+    #[arg(long = "redaction-pattern")]
+    pub redaction_pattern: Vec<String>,
 }
 
 /// Parse argv, converting clap's plaintext usage errors into the same
@@ -1252,6 +1272,12 @@ pub struct NetDaemonArgs {
 /// are not errors and are rendered exactly as clap would.
 fn parse_cli() -> Cli {
     use clap::error::ErrorKind;
+    // Activate the built-in sink before clap reports an error so a rejected
+    // invocation that explicitly requested --redact cannot echo another
+    // argument value through structured usage diagnostics.
+    if std::env::args_os().any(|arg| arg == "--redact") {
+        crate::redaction::activate_builtin();
+    }
     let matches = match Cli::command().try_get_matches_from(std::env::args_os()) {
         Ok(matches) => matches,
         Err(err) => {
@@ -1492,6 +1518,7 @@ pub async fn run() -> Result<()> {
 
 async fn run_inner() -> Result<()> {
     let cli = parse_cli();
+    let redact_requested = cli.redact || crate::hostenv::env_truthy("SHADOWDROID_REDACT");
 
     // Recovery and self-description must remain available when a discovered
     // config file is malformed. These commands either inspect raw config files
@@ -1523,6 +1550,17 @@ async fn run_inner() -> Result<()> {
     }
 
     let config = ShadowDroidConfig::load()?;
+    let redaction_config = config.redaction.as_ref();
+    let redact_enabled = redact_requested
+        || redaction_config
+            .and_then(|redaction| redaction.enabled)
+            .unwrap_or(false);
+    crate::redaction::configure(
+        redact_enabled,
+        redaction_config
+            .map(crate::config::RedactionConfig::policy_spec)
+            .unwrap_or_default(),
+    )?;
     let selection = DeviceSelection {
         explicit_device: cli.device.clone(),
         requested_target: cli.target.clone(),
@@ -1538,6 +1576,9 @@ async fn run_inner() -> Result<()> {
     let any_apk_version =
         cli.any_apk_version || crate::hostenv::env_truthy("SHADOWDROID_ANY_APK_VERSION");
     let mut cmd = cli.cmd;
+    if redact_enabled && let Cmd::Net(NetCmd::Start { redact, .. }) = &mut cmd {
+        *redact = true;
+    }
     apply_config_defaults(&mut cmd, &config);
 
     // ── Phase 1: commands that do NOT need the on-device server ──
@@ -1623,10 +1664,18 @@ async fn run_inner() -> Result<()> {
             app,
             out,
             no_screenshot,
+            redact_screenshots,
         } => {
             let serial = selection.resolve(&config).await?;
             let app = resolve_app_package(&config, Some(&serial), app.clone()).await?;
-            return crate::cmd::collect::run(&serial, app, out.clone(), !*no_screenshot).await;
+            return crate::cmd::collect::run(
+                &serial,
+                app,
+                out.clone(),
+                !*no_screenshot,
+                *redact_screenshots,
+            )
+            .await;
         }
         // `log` and `why` are host-side reads over adb (+ existing routes for
         // `why`'s screen section) — they must work when the server is down,
@@ -1832,7 +1881,8 @@ async fn dispatch_ui_inner(
             format,
             scale,
             quality,
-        } => cmd_screenshot(client, path, format, scale, quality).await,
+            redact_pixels,
+        } => cmd_screenshot(client, path, format, scale, quality, redact_pixels).await,
         UiCmd::Find {
             text,
             rid,
@@ -2631,6 +2681,7 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
                     anticomp: *anticomp,
                     verify_upstream: *verify_upstream,
                     redact: *redact,
+                    redaction: crate::redaction::active_spec_or_builtin(),
                     ca_cert: ca.cert,
                     ca_key: ca.key,
                 },
@@ -2828,6 +2879,10 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
                 anticomp: a.anticomp,
                 verify_upstream: a.verify_upstream,
                 redact: a.redact,
+                redaction: crate::redaction::PolicySpec {
+                    json_keys: a.redaction_json_key.clone(),
+                    patterns: a.redaction_pattern.clone(),
+                },
             })
             .await
         }
@@ -3994,8 +4049,34 @@ async fn cmd_screenshot(
     format: Option<String>,
     scale: Option<f32>,
     quality: Option<u32>,
+    redact_pixels: bool,
 ) -> Result<Outcome> {
-    let bytes = client.screenshot(format.as_deref(), scale, quality).await?;
+    if redact_pixels && !matches!(format.as_deref(), None | Some("png")) {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "screenshot_redaction_requires_png",
+            "input",
+            "--redact-pixels supports PNG screenshots only",
+        )
+        .next_actions(["remove --format or pass --format png, then retry"])
+        .into());
+    }
+    let mut bytes = client.screenshot(format.as_deref(), scale, quality).await?;
+    let screen = client.screen().await.ok();
+    let pixel_report = if redact_pixels {
+        let screen = screen.as_ref().ok_or_else(|| {
+            crate::diagnostic::DiagnosticError::new(
+                "screenshot_redaction_screen_unavailable",
+                "ui",
+                "pixel redaction needs a current accessibility screen snapshot",
+            )
+            .next_actions(["retry when `ui dump` succeeds on the target screen"])
+        })?;
+        let (redacted, report) = crate::redaction::redact_png_if_active(&bytes, screen)?;
+        bytes = redacted;
+        Some(report)
+    } else {
+        None
+    };
     let p: std::path::PathBuf = match path {
         Some(p) => p.into(),
         None => {
@@ -4011,6 +4092,10 @@ async fn cmd_screenshot(
         "path": p.display().to_string(),
         "bytes": bytes.len() as u64,
         "format": format.as_deref().unwrap_or("png"),
+        "pixels_redacted": pixel_report.is_some(),
+        "pixel_redaction": pixel_report,
+        "potentially_sensitive": true,
+        "privacy_warning": "screenshot pixels may contain text or images that Android accessibility did not expose",
     });
     if let Some((w, h)) = image_dimensions(&bytes) {
         body["width"] = json!(w);
@@ -4019,7 +4104,7 @@ async fn cmd_screenshot(
     // Best-effort structural screen hash so two screenshots are comparable
     // without pixel-diffing — the same value `ui wait` / `ui dump` return. A slow
     // or failed dump must not fail the screenshot, so the error is swallowed.
-    if let Ok(screen) = client.screen().await {
+    if let Some(screen) = screen {
         body["screen_hash"] = json!(screen.screen_hash);
         body["screen_hash_version"] = json!(screen.screen_hash_version);
         body["content_hash"] = json!(screen.content_hash);
@@ -4029,9 +4114,8 @@ async fn cmd_screenshot(
     Ok(Outcome::Action("screenshot", body))
 }
 
-/// Parse pixel dimensions from a PNG or JPEG byte stream without pulling in an
-/// image-decoding dependency. `None` for anything unrecognized — the screenshot
-/// still succeeds; `width`/`height` are simply omitted.
+/// Parse pixel dimensions directly from a PNG or JPEG header. `None` for anything
+/// unrecognized — the screenshot still succeeds; `width`/`height` are omitted.
 fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     // PNG: 8-byte signature, then an IHDR chunk whose data begins at offset 16
     // with big-endian u32 width, height.
@@ -5510,6 +5594,49 @@ mod tests {
             quiet.get_env().is_none(),
             "SHADOWDROID_QUIET must be resolved manually, not via clap",
         );
+    }
+
+    #[test]
+    fn cli_defines_one_global_redact_flag_including_net_start_position() {
+        Cli::command().debug_assert();
+        for argv in [
+            vec!["shadowdroid", "--redact", "ui", "dump"],
+            vec!["shadowdroid", "ui", "dump", "--redact"],
+            vec!["shadowdroid", "net", "start", "--redact"],
+        ] {
+            let cli = Cli::try_parse_from(argv).expect("global --redact should parse anywhere");
+            assert!(cli.redact);
+        }
+    }
+
+    #[test]
+    fn screenshot_and_collect_pixel_redaction_are_explicit() {
+        let screenshot = Cli::try_parse_from([
+            "shadowdroid",
+            "--redact",
+            "ui",
+            "screenshot",
+            "--redact-pixels",
+        ])
+        .unwrap();
+        assert!(matches!(
+            screenshot.cmd,
+            Cmd::Ui(UiCmd::Screenshot {
+                redact_pixels: true,
+                ..
+            })
+        ));
+
+        let collect =
+            Cli::try_parse_from(["shadowdroid", "--redact", "collect", "--redact-screenshots"])
+                .unwrap();
+        assert!(matches!(
+            collect.cmd,
+            Cmd::Collect {
+                redact_screenshots: true,
+                ..
+            }
+        ));
     }
 
     #[test]

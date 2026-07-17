@@ -114,6 +114,10 @@ fn publish_readiness(pid_path: &Path, ctl_path: &Path, control_port: u16) -> Res
 /// Run the daemon in the foreground (this process IS the detached daemon).
 pub async fn run(cfg: DaemonConfig) -> Result<()> {
     paths::ensure_net_dir()?;
+    crate::redaction::configure(cfg.redact, cfg.redaction.clone())?;
+    let redaction = cfg
+        .redact
+        .then(|| crate::redaction::active_policy().expect("capture redaction configured above"));
 
     // Load the CA the parent resolved for us; never generate here (the daemon
     // has no config context and can't know which CA the project wants).
@@ -126,7 +130,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
     let shared = Arc::new(SharedState {
         anticache: cfg.anticache,
         anticomp: cfg.anticomp,
-        redact: cfg.redact,
+        redaction,
         host_filters: cfg.app_filters.clone(),
         intercept: RwLock::new(None),
         held: Mutex::new(HashMap::new()),
@@ -320,7 +324,13 @@ pub fn spawn(cfg: &DaemonConfig) -> Result<std::process::Child> {
         cmd.arg("--verify-upstream");
     }
     if cfg.redact {
-        cmd.arg("--redact");
+        cmd.arg("--capture-redact");
+        for key in &cfg.redaction.json_keys {
+            cmd.arg("--redaction-json-key").arg(key);
+        }
+        for pattern in &cfg.redaction.patterns {
+            cmd.arg("--redaction-pattern").arg(pattern);
+        }
     }
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log_file))

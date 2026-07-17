@@ -226,6 +226,14 @@ shadowdroid ui wait --pkg-not com.example.app
 shadowdroid ui screenshot /tmp/after.png
 ```
 
+Use global `--redact` for UI, log, network, watch, and collect JSON/text output.
+The result records the applied policy and replacement count. `net start
+--redact` also filters completed capture copies before persistence without
+changing forwarded traffic. Screenshots are only pixel-masked when explicitly
+requested: `shadowdroid --redact ui screenshot --redact-pixels` or
+`shadowdroid --redact collect --redact-screenshots`; they remain labeled
+potentially sensitive because accessibility may not expose every glyph.
+
 For Android TV/leanback, prefer `ui focus` and `ui key dpad_*` over touch.
 
 ## Failure triage without changing the session

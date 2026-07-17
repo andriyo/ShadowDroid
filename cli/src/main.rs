@@ -31,6 +31,13 @@ macro_rules! println {
     }};
 }
 
+macro_rules! eprintln {
+    () => {{ crate::events::write_stderr(format_args!(""), true) }};
+    ($($arg:tt)*) => {{
+        crate::events::write_stderr(format_args!($($arg)*), true)
+    }};
+}
+
 mod cli;
 mod cmd;
 mod config;
@@ -43,6 +50,7 @@ mod hostenv;
 mod ids;
 mod net;
 mod proto;
+mod redaction;
 mod release;
 mod selector;
 mod transfer;

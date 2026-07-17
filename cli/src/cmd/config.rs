@@ -11,7 +11,7 @@ use std::path::Path;
 
 use crate::config as cfg;
 use crate::config::{
-    AppConfig, ProxyConfig, ShadowDroidConfig, TargetFormFactor, TargetStartPolicy,
+    AppConfig, ProxyConfig, RedactionConfig, ShadowDroidConfig, TargetFormFactor, TargetStartPolicy,
 };
 
 #[derive(Args, Debug)]
@@ -546,6 +546,12 @@ fn schema_value() -> Value {
             "debug_mode": {"type": "string", "optional": true, "enum": ["auto", "java", "native", "mixed"], "description": "Default semantic debugger mode."},
             "run_configuration": {"type": "string", "optional": true, "description": "Default Android Studio run configuration."},
             "usage_log": {"type": "boolean", "optional": true, "description": "Opt-in local usage log (verb, duration, error code — never argument values) at ~/.shadowdroid/usage.jsonl; see `shadowdroid usage`."},
+            "redaction": {
+                "type": "object",
+                "optional": true,
+                "description": "Cross-command output, capture, and diagnostic-artifact redaction policy.",
+                "properties": {"$ref": "#/redaction_entry"}
+            },
             "proxy": {
                 "type": "object",
                 "optional": true,
@@ -576,6 +582,11 @@ fn schema_value() -> Value {
             "anticache": {"type": "boolean", "optional": true, "description": "Default for net start --anticache."},
             "anticomp": {"type": "boolean", "optional": true, "description": "Default for net start --anticomp."},
             "redact": {"type": "boolean", "optional": true, "description": "Default for net start --redact."}
+        },
+        "redaction_entry": {
+            "enabled": {"type": "boolean", "optional": true, "default": false, "description": "Enable redaction for every supported command without passing --redact."},
+            "json_keys": {"type": "array", "optional": true, "items": "string", "description": "Additional case/punctuation-insensitive JSON key names to redact."},
+            "patterns": {"type": "array", "optional": true, "items": "string", "description": "Additional Rust-regex patterns replaced in string, UI, log, body, and artifact output."}
         },
         "app_entry": {
             "package": {"type": "string", "required": true, "description": "Android package/process name."},
@@ -759,6 +770,27 @@ fn validate_config(
     if let Some(proxy) = &config.proxy {
         validate_proxy(path, proxy, errors);
     }
+    if let Some(redaction) = &config.redaction {
+        validate_redaction(path, redaction, errors);
+    }
+}
+
+fn validate_redaction(path: &Path, redaction: &RedactionConfig, errors: &mut Vec<String>) {
+    if let Err(error) = crate::redaction::Policy::new(redaction.policy_spec()) {
+        let detail = error
+            .downcast_ref::<crate::diagnostic::DiagnosticError>()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .unwrap_or("invalid redaction policy");
+        errors.push(format!("{}: {detail}", path.display()));
+    }
+    for (index, key) in redaction.json_keys.iter().enumerate() {
+        if key.trim().is_empty() {
+            errors.push(format!(
+                "{}: redaction.json_keys[{index}] must not be empty",
+                path.display()
+            ));
+        }
+    }
 }
 
 fn validate_target_references(config: &ShadowDroidConfig, errors: &mut Vec<String>) {
@@ -836,6 +868,11 @@ fn example_config() -> Value {
         "default_target": "mobile",
         "app": "Example",
         "project": "/path/to/android/project",
+        "redaction": {
+            "enabled": true,
+            "json_keys": ["customerId"],
+            "patterns": ["ORDER-[0-9]+"]
+        },
         "apps": {
             "Example": {
                 "package": "com.example.app",

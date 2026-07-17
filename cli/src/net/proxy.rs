@@ -102,8 +102,9 @@ pub struct ProxyContext {
 pub struct SharedState {
     pub anticache: bool,
     pub anticomp: bool,
-    /// Redact sensitive headers from captured flows before store/broadcast.
-    pub redact: bool,
+    /// Redact completed captures before store/broadcast. Forwarded traffic is
+    /// never changed by this policy.
+    pub redaction: Option<crate::redaction::Policy>,
     /// Host globs to MITM + capture. Empty = all hosts.
     pub host_filters: Vec<String>,
     /// Active interception config (`net intercept`), or `None`.
@@ -1862,6 +1863,10 @@ fn make_flow(p: FlowParts<'_>) -> FlowRecord {
         resp_len: p.resp_bytes.len() as u64,
         req_body,
         resp_body,
+        req_body_redacted: false,
+        resp_body_redacted: false,
+        redaction_policy: None,
+        redaction_policy_version: None,
         req_truncated,
         resp_truncated,
         matched: p.matched,
@@ -1928,9 +1933,8 @@ fn capture_bypassed(ctx: &ProxyContext, parts: FlowParts<'_>) {
 
 fn finish_capture(ctx: &ProxyContext, mut rec: FlowRecord) {
     stamp_capture_context(ctx, &mut rec);
-    if ctx.shared.redact {
-        redact_headers(&mut rec.req_headers);
-        redact_headers(&mut rec.resp_headers);
+    if let Some(policy) = &ctx.shared.redaction {
+        policy.redact_flow_record(&mut rec);
     }
     enqueue_flow(ctx, rec);
 }
@@ -1944,9 +1948,8 @@ fn capture_streamed(ctx: &ProxyContext, parts: FlowParts<'_>, len_hint: Option<u
     rec.streamed = true;
     rec.resp_body = None;
     rec.resp_len = len_hint.unwrap_or(rec.resp_len);
-    if ctx.shared.redact {
-        redact_headers(&mut rec.req_headers);
-        redact_headers(&mut rec.resp_headers);
+    if let Some(policy) = &ctx.shared.redaction {
+        policy.redact_flow_record(&mut rec);
     }
     enqueue_flow(ctx, rec);
 }
@@ -1962,27 +1965,6 @@ fn enqueue_flow(ctx: &ProxyContext, rec: FlowRecord) {
         // discoverable through `net status`.
         if dropped == 1 || dropped.is_power_of_two() {
             tracing::warn!(dropped, "network capture queue full; flow discarded");
-        }
-    }
-}
-
-/// Headers whose values are replaced with a placeholder when `--redact` is on.
-const SENSITIVE_HEADERS: &[&str] = &[
-    "authorization",
-    "proxy-authorization",
-    "cookie",
-    "set-cookie",
-];
-
-/// Replace the values of [`SENSITIVE_HEADERS`] in place (bodies are not touched —
-/// redaction is a best-effort guard, not a guarantee that no secret is logged).
-fn redact_headers(headers: &mut [(String, String)]) {
-    for (name, value) in headers.iter_mut() {
-        if SENSITIVE_HEADERS
-            .iter()
-            .any(|h| name.eq_ignore_ascii_case(h))
-        {
-            *value = "<redacted>".to_string();
         }
     }
 }
@@ -2040,6 +2022,10 @@ async fn hold(ctx: &ProxyContext, snap: FlowRecord, phase: &'static str) -> Opti
 
     let (tx, rx) = oneshot::channel();
     let id = snap.id.clone();
+    let mut visible_snap = snap.clone();
+    if let Some(policy) = &ctx.shared.redaction {
+        policy.redact_flow_record(&mut visible_snap);
+    }
     let charge = held_flow_charge(&snap);
     let held_at = events::now_ts();
     let expires_at = held_at + f64::from(cfg.hold_ms.max(1)) / 1000.0;
@@ -2072,7 +2058,7 @@ async fn hold(ctx: &ProxyContext, snap: FlowRecord, phase: &'static str) -> Opti
             id.clone(),
             HeldFlow {
                 tx: Some(tx),
-                meta: snap.clone(),
+                meta: visible_snap.clone(),
                 phase: phase.into(),
                 held_at,
                 expires_at,
@@ -2082,7 +2068,7 @@ async fn hold(ctx: &ProxyContext, snap: FlowRecord, phase: &'static str) -> Opti
     }
     let _ = ctx.shared.events.send(Arc::new(intercept_event(
         &ctx.serial,
-        &snap,
+        &visible_snap,
         phase,
         cfg.hold_ms,
     )));
@@ -3462,11 +3448,40 @@ mod tests {
             ("set-cookie".to_string(), "session=abc".to_string()),
             ("X-Trace".to_string(), "keep-me".to_string()),
         ];
-        super::redact_headers(&mut headers);
-        assert_eq!(headers[0].1, "<redacted>"); // Authorization (case-insensitive)
+        let policy = crate::redaction::Policy::builtin();
+        for (name, value) in &mut headers {
+            *value = policy.redact_header_value(name, value);
+        }
+        assert_eq!(headers[0].1, "<redacted:token>"); // Authorization (case-insensitive)
         assert_eq!(headers[1].1, "application/json"); // untouched
-        assert_eq!(headers[2].1, "<redacted>"); // set-cookie
+        assert_eq!(headers[2].1, "<redacted:cookie>"); // set-cookie
         assert_eq!(headers[3].1, "keep-me"); // untouched
+    }
+
+    #[test]
+    fn redact_flow_masks_nested_bodies_without_changing_shape_metadata() {
+        let policy = crate::redaction::Policy::builtin();
+        let mut flow = FlowRecord {
+            req_body: Some(
+                r#"{"variables":{"email":"person@example.com","password":"secret"}}"#.into(),
+            ),
+            resp_body: Some(
+                r#"{"data":{"accessToken":"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig"}}"#.into(),
+            ),
+            req_len: 71,
+            resp_len: 73,
+            ..Default::default()
+        };
+        policy.redact_flow_record(&mut flow);
+        let request: serde_json::Value =
+            serde_json::from_str(flow.req_body.as_deref().unwrap()).unwrap();
+        let response: serde_json::Value =
+            serde_json::from_str(flow.resp_body.as_deref().unwrap()).unwrap();
+        assert_eq!(request["variables"]["email"], "<redacted:email>");
+        assert_eq!(request["variables"]["password"], "<redacted:secret>");
+        assert_eq!(response["data"]["accessToken"], "<redacted:jwt>");
+        assert_eq!(flow.req_len, 71);
+        assert_eq!(flow.resp_len, 73);
     }
 
     #[test]

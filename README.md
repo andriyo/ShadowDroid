@@ -327,6 +327,11 @@ shadowdroid config validate --json
   "default_target": "mobile",
   "app": "Livd",
   "project": "/Users/you/Work/Livd",
+  "redaction": {
+    "enabled": true,
+    "json_keys": ["customerId"],
+    "patterns": ["ORDER-[0-9]+"]
+  },
   "proxy": {
     "ca_trusted": true,
     "hosts": ["*.livd.app"],
@@ -545,7 +550,39 @@ object per line, then an action summary.
 **`collect`** is the "I give up, here's everything" bundle: `doctor` output,
 device info, logcat + crash buffer, screenshot, screen dump, and app state, all
 in one directory. It degrades gracefully — the host-side diagnostics are
-captured even if the on-device server can't start.
+captured even if the on-device server can't start. With global `--redact` (or
+`redaction.enabled` in config), every JSON/text artifact is filtered and the
+manifest records privacy status per file. Screenshot pixels are never silently
+treated as safe: they remain marked potentially sensitive; add
+`--redact-screenshots` to explicitly black out accessibility bounds matching
+the active policy.
+
+## Redacting secrets and PII
+
+Pass global `--redact` before or after any subcommand to filter JSON and text at
+the shared output boundary:
+
+```bash
+shadowdroid --redact ui dump
+shadowdroid log --last 2m --redact
+shadowdroid --redact collect --app com.example.app --redact-screenshots
+shadowdroid net start --redact
+```
+
+Built-ins cover password/secret/token/cookie fields, JWTs, bearer values,
+emails, IPv4/IPv6 addresses, usernames/phone values, and common session,
+device, transaction, and serial identifiers. JSON embedded in log or GraphQL
+body strings is parsed and retains its structure. Each emitted record carries
+the policy version and replacement count. Config can enable the policy for all
+commands and add key names or Rust-regex patterns; user and project additions
+are merged, with the nearest `enabled` value winning.
+
+`net start --redact` also applies the same policy to completed capture copies
+before they reach the session log; request/response bytes forwarded to the app
+or upstream are never changed. `ui screenshot` reports raw pixels as
+potentially sensitive. Explicit `--redact-pixels` (PNG only) blacks out matching
+accessibility bounds, but still reports that Android may not expose every
+rendered glyph.
 
 Optionally, opt in to a **local usage log**. Schema version 2 records only the
 command path, duration, CLI version, outcome, and typed error code/stage/retry
@@ -769,8 +806,10 @@ both response and request (a big upload streams chunked; marked
 and raw-tunnels **WebSocket** upgrades. `net start --verify-upstream` validates
 the real server certificate for both HTTPS and WSS (off by default for
 self-signed dev backends);
-`net start --redact` masks `authorization`/`cookie` in captured flows (the
-session log is written `0600` either way).
+Global `--redact` on `net start` applies the built-in/configured policy to
+authorization/cookie headers, nested JSON/GraphQL body fields, JWTs, email/IP
+values, and configured patterns before completed captures are persisted (the
+session log is written `0600` either way). Forwarded traffic is unchanged.
 
 Completed flows enter a bounded in-memory queue; `net status` exposes
 `dropped_flows` if sustained traffic outruns storage. The session JSONL keeps

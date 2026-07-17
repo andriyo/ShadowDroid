@@ -614,6 +614,7 @@ pub struct StartOpts {
     pub anticomp: bool,
     pub verify_upstream: bool,
     pub redact: bool,
+    pub redaction: crate::redaction::PolicySpec,
     /// Resolved signing-CA cert + key (from [`crate::net::ca::resolve_ca`], made
     /// to exist by `ensure_ca`) that the daemon loads and `net start` reports.
     pub ca_cert: PathBuf,
@@ -669,6 +670,7 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
         anticomp,
         verify_upstream,
         redact,
+        redaction,
         ca_cert,
         ca_key,
     } = opts;
@@ -829,6 +831,7 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
         anticomp,
         verify_upstream,
         redact,
+        redaction,
     };
 
     if foreground {
@@ -1802,6 +1805,13 @@ fn write_body_file(
             "flow `{id}` has no captured response body (binary, empty, or non-textual content-type)"
         );
     };
+    let redacted;
+    let b = if let Some(policy) = crate::redaction::active_policy() {
+        redacted = policy.redact_body(b).0;
+        redacted.as_str()
+    } else {
+        b
+    };
     std::fs::write(path, b).with_context(|| format!("writing {}", path.display()))?;
     emit(
         "net_show",
@@ -1946,7 +1956,7 @@ pub async fn export(
     id: Option<String>,
     out: Option<PathBuf>,
 ) -> Result<()> {
-    let flows = match &id {
+    let mut flows = match &id {
         Some(id) => store::find_by_id(serial, id)?
             .map(|f| vec![f])
             .unwrap_or_default(),
@@ -1967,6 +1977,11 @@ pub async fn export(
             "generate the request again while the proxy is running, then retry the export",
         ])
         .into());
+    }
+    if let Some(policy) = crate::redaction::active_policy() {
+        for flow in &mut flows {
+            policy.redact_flow_record(flow);
+        }
     }
     match format {
         "curl" => {

@@ -185,8 +185,9 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "collect" => Some(serde_json::json!({
             "use_when": ["Need a shareable evidence bundle after a failure or before handing off an investigation."],
-            "output": "directory with doctor report, device info, logcat/crash context, and best-effort screen/screenshot/app state",
+            "output": "directory with doctor report, device info, logcat/crash context, best-effort screen/screenshot/app state, and per-artifact privacy status",
             "side_effects": ["writes files under --out or a generated collection directory"],
+            "prerequisites": ["use global --redact for text/JSON artifacts", "--redact-screenshots explicitly applies accessibility-bounds pixel masking and requires global redaction"],
             "next_actions": ["doctor", "debug snapshot", "layout snapshot"]
         })),
         "watch" => Some(serde_json::json!({
@@ -235,8 +236,9 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "ui screenshot" => Some(serde_json::json!({
             "use_when": ["Need a visual artifact of the current device screen for evidence, review, or comparison."],
-            "output": "screenshot file path/action JSON",
+            "output": "screenshot file path/action JSON with explicit pixel-redaction and potentially-sensitive status",
             "side_effects": ["writes an image file"],
+            "prerequisites": ["screenshots may contain sensitive pixels", "use global --redact plus --redact-pixels for explicit PNG accessibility-bounds masking"],
             "next_actions": ["layout snapshot --screenshot", "collect", "ui dump"]
         })),
         "ui find" => Some(serde_json::json!({
@@ -970,7 +972,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         "net start" => Some(serde_json::json!({
             "use_when": ["Need watch to include HTTP(S) events or need to intercept/modify traffic."],
             "output": "action JSON with stable capture_session_id, started_at, host-side proxy daemon, and device wiring details",
-            "side_effects": ["starts host proxy daemon", "sets adb reverse", "sets device global http_proxy"],
+            "side_effects": ["starts host proxy daemon", "sets adb reverse", "sets device global http_proxy", "global --redact filters completed capture copies before persistence without modifying forwarded traffic"],
             "next_actions": ["watch", "net status", "net check <pkg>", "net intercept"]
         })),
         "net stop" => Some(serde_json::json!({

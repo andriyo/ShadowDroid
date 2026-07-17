@@ -55,6 +55,9 @@ pub struct ShadowDroidConfig {
     /// argument values; never leaves the machine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_log: Option<bool>,
+    /// Cross-command output/capture redaction policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redaction: Option<RedactionConfig>,
     /// MITM proxy (`net`) defaults: the signing CA, a trusted-CA assertion, and
     /// per-project defaults for `net start`/`net trust`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -67,6 +70,29 @@ pub struct ShadowDroidConfig {
 
     #[serde(skip)]
     pub sources: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RedactionConfig {
+    /// Enable the policy without requiring the global --redact flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Additional case/punctuation-insensitive JSON field names to replace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub json_keys: Vec<String>,
+    /// Additional Rust-regex patterns to replace in all string output.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub patterns: Vec<String>,
+}
+
+impl RedactionConfig {
+    pub fn policy_spec(&self) -> crate::redaction::PolicySpec {
+        crate::redaction::PolicySpec {
+            json_keys: self.json_keys.clone(),
+            patterns: self.patterns.clone(),
+        }
+    }
 }
 
 /// `net` proxy configuration. All fields optional; nested `deny_unknown_fields`
@@ -370,9 +396,30 @@ impl ShadowDroidConfig {
         self.debug_mode = other.debug_mode.or(self.debug_mode.take());
         self.run_configuration = other.run_configuration.or(self.run_configuration.take());
         self.usage_log = other.usage_log.or(self.usage_log.take());
+        self.redaction = merge_redaction(self.redaction.take(), other.redaction);
         self.proxy = merge_proxy(self.proxy.take(), other.proxy);
         self.apps.extend(other.apps);
         self.targets.extend(other.targets);
+    }
+}
+
+fn merge_redaction(
+    base: Option<RedactionConfig>,
+    over: Option<RedactionConfig>,
+) -> Option<RedactionConfig> {
+    match (base, over) {
+        (base, None) => base,
+        (None, over) => over,
+        (Some(mut base), Some(over)) => {
+            base.enabled = over.enabled.or(base.enabled);
+            base.json_keys.extend(over.json_keys);
+            base.patterns.extend(over.patterns);
+            base.json_keys.sort();
+            base.json_keys.dedup();
+            base.patterns.sort();
+            base.patterns.dedup();
+            Some(base)
+        }
     }
 }
 
@@ -1077,6 +1124,34 @@ mod tests {
             .unwrap()
             .port,
             Some(1)
+        );
+    }
+
+    #[test]
+    fn merge_redaction_keeps_all_additions_and_nearest_enabled_value() {
+        let base = RedactionConfig {
+            enabled: Some(true),
+            json_keys: vec!["email".into(), "customerId".into()],
+            patterns: vec!["BASE-[0-9]+".into()],
+        };
+        let over = RedactionConfig {
+            enabled: Some(false),
+            json_keys: vec!["customerId".into(), "tenantId".into()],
+            patterns: vec!["PROJECT-[0-9]+".into()],
+        };
+        let merged = merge_redaction(Some(base), Some(over)).unwrap();
+        assert_eq!(merged.enabled, Some(false));
+        assert_eq!(
+            merged.json_keys,
+            vec![
+                "customerId".to_string(),
+                "email".to_string(),
+                "tenantId".to_string()
+            ]
+        );
+        assert_eq!(
+            merged.patterns,
+            vec!["BASE-[0-9]+".to_string(), "PROJECT-[0-9]+".to_string()]
         );
     }
 }

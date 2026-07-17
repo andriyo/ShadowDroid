@@ -60,6 +60,7 @@ semver = "1.0"            # compare release versions, including pre-release prec
 urlencoding = "2.1"   # used for ?package= query strings
 zip = { version = "8.6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 tempfile = "3.27"     # same-directory temporary files for atomic config replacement
+image = { version = "0.25", default-features = false, features = ["png"] } # explicit accessibility-bounds screenshot redaction
 # once_cell removed: std::sync::OnceLock (stable since 1.70) covers our use case.
 # Bring it back if we need the &'static initialisation guarantee for ergonomics.
 

@@ -153,6 +153,12 @@ pub enum Event {
         /// Request body was streamed upstream (oversized upload), not captured.
         #[serde(default, skip_serializing_if = "is_false")]
         req_streamed: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        redaction_policy: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        redaction_policy_version: Option<u32>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        body_redacted: bool,
         next_actions: Vec<String>,
     },
     /// A flow paused by `net intercept`, awaiting the agent's `net
@@ -365,10 +371,12 @@ pub fn screen_event(device: &str, screen: ScreenResponse, format: ScreenFormat) 
 /// objects. A serialization failure (practically impossible for our types)
 /// degrades to `{}` rather than panicking the process.
 pub fn emit(value: &impl Serialize) {
+    let value = serde_json::to_value(value).unwrap_or_else(|_| serde_json::json!({}));
+    let value = crate::redaction::redact_output_if_active(value);
     write_stdout(
         format_args!(
             "{}",
-            serde_json::to_string(value).unwrap_or_else(|_| "{}".into())
+            serde_json::to_string(&value).unwrap_or_else(|_| "{}".into())
         ),
         true,
     );
@@ -418,7 +426,24 @@ pub fn emit_result(value: &impl Serialize) {
 pub fn write_stdout(args: fmt::Arguments<'_>, newline: bool) {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    if out.write_fmt(args).is_err() {
+    let rendered = args.to_string();
+    let rendered = crate::redaction::redact_text_if_active(&rendered);
+    if out.write_all(rendered.as_bytes()).is_err() {
+        return;
+    }
+    if newline {
+        let _ = out.write_all(b"\n");
+    }
+}
+
+/// Redaction-aware, non-panicking stderr sink for direct operational messages.
+/// Structured result/error JSON remains on stdout; tracing has its own sink.
+pub fn write_stderr(args: fmt::Arguments<'_>, newline: bool) {
+    let stderr = std::io::stderr();
+    let mut out = stderr.lock();
+    let rendered = args.to_string();
+    let rendered = crate::redaction::redact_text_if_active(&rendered);
+    if out.write_all(rendered.as_bytes()).is_err() {
         return;
     }
     if newline {

@@ -195,6 +195,9 @@ pub struct DaemonConfig {
     /// before they hit the session log or `net show`.
     #[serde(default)]
     pub redact: bool,
+    /// Custom additions to the built-in capture redaction policy.
+    #[serde(default)]
+    pub redaction: crate::redaction::PolicySpec,
 }
 
 #[cfg(test)]

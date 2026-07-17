@@ -54,6 +54,14 @@ pub struct FlowRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resp_body: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
+    pub req_body_redacted: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub resp_body_redacted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redaction_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redaction_policy_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "is_false")]
     pub req_truncated: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub resp_truncated: bool,
@@ -129,6 +137,9 @@ impl FlowRecord {
             error: self.error.clone(),
             streamed: self.streamed,
             req_streamed: self.req_streamed,
+            redaction_policy: self.redaction_policy.clone(),
+            redaction_policy_version: self.redaction_policy_version,
+            body_redacted: self.req_body_redacted || self.resp_body_redacted,
             next_actions: crate::net::flow_next_actions(serial, &self.id),
         }
     }
@@ -155,6 +166,10 @@ impl FlowRecord {
             "resp_type": self.resp_type,
             "req_len": self.req_len,
             "resp_len": self.resp_len,
+            "req_body_redacted": self.req_body_redacted,
+            "resp_body_redacted": self.resp_body_redacted,
+            "redaction_policy": self.redaction_policy,
+            "redaction_policy_version": self.redaction_policy_version,
             "matched": self.matched,
             "rule_id": self.rule_id,
             "rule_ids": self.rule_ids,
@@ -361,6 +376,10 @@ mod tests {
             resp_len: 0,
             req_body: None,
             resp_body: None,
+            req_body_redacted: false,
+            resp_body_redacted: false,
+            redaction_policy: None,
+            redaction_policy_version: None,
             req_truncated: false,
             resp_truncated: false,
             matched: None,
