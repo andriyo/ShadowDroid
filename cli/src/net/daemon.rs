@@ -130,6 +130,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         host_filters: cfg.app_filters.clone(),
         intercept: RwLock::new(None),
         held: Mutex::new(HashMap::new()),
+        terminal_holds: Mutex::new(proxy::TerminalHoldHistory::default()),
         events: event_tx.clone(),
         rules: RwLock::new(Vec::new()),
         replay: RwLock::new(None),

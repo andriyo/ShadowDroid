@@ -23,7 +23,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::events::Event;
 use crate::net::flow::FlowRecord;
-use crate::net::proxy::{HoldDecision, InterceptCfg, SharedState};
+use crate::net::proxy::{HoldDecision, InterceptCfg, ReleaseHeldResult, SharedState, TerminalHold};
 use crate::net::{Matcher, Mutation, RuleSpec, paths};
 
 /// In-daemon state the control handlers read/mutate.
@@ -139,12 +139,18 @@ pub async fn serve_client(
     match op {
         "status" => {
             let intercepting = shared.intercept.read().unwrap().is_some();
-            let held_flows: Vec<Value> = {
+            crate::net::proxy::prune_inactive_holds(&shared.held, &shared.terminal_holds);
+            let mut held_flows: Vec<Value> = {
                 let held = shared.held.lock().unwrap();
                 held.values()
                     .map(|h| {
                         json!({
                             "id": h.meta.id,
+                            "phase": h.phase,
+                            "state": "held",
+                            "held_at": h.held_at,
+                            "expires_at": h.expires_at,
+                            "client_connected": h.tx.as_ref().is_some_and(|tx| !tx.is_closed()),
                             "method": h.meta.method,
                             "host": h.meta.host,
                             "path": h.meta.path,
@@ -153,6 +159,22 @@ pub async fn serve_client(
                     })
                     .collect()
             };
+            held_flows.sort_by(|left, right| {
+                left.get("held_at")
+                    .and_then(Value::as_f64)
+                    .unwrap_or_default()
+                    .total_cmp(
+                        &right
+                            .get("held_at")
+                            .and_then(Value::as_f64)
+                            .unwrap_or_default(),
+                    )
+                    .then_with(|| {
+                        left.get("id")
+                            .and_then(Value::as_str)
+                            .cmp(&right.get("id").and_then(Value::as_str))
+                    })
+            });
             write_json(
                 &mut wr,
                 &json!({
@@ -208,8 +230,8 @@ pub async fn serve_client(
             let decision = HoldDecision::Resume(mutation);
             match validate_held_decision(&shared, id, &decision) {
                 Ok(()) => {
-                    let released = release(&shared, id, decision);
-                    write_json(&mut wr, &released_reply(id, released)).await?;
+                    let released = release(&shared, id, "resume", decision);
+                    write_json(&mut wr, &released_reply(&shared, id, released)).await?;
                 }
                 Err(error) => {
                     write_json(&mut wr, &json!({"ok": false, "error": error})).await?;
@@ -222,8 +244,8 @@ pub async fn serve_client(
             let decision = HoldDecision::Drop(status);
             match validate_held_decision(&shared, id, &decision) {
                 Ok(()) => {
-                    let released = release(&shared, id, decision);
-                    write_json(&mut wr, &released_reply(id, released)).await?;
+                    let released = release(&shared, id, "drop", decision);
+                    write_json(&mut wr, &released_reply(&shared, id, released)).await?;
                 }
                 Err(error) => {
                     write_json(&mut wr, &json!({"ok": false, "error": error})).await?;
@@ -250,8 +272,8 @@ pub async fn serve_client(
             };
             match validate_held_decision(&shared, id, &decision) {
                 Ok(()) => {
-                    let released = release(&shared, id, decision);
-                    write_json(&mut wr, &released_reply(id, released)).await?;
+                    let released = release(&shared, id, "respond", decision);
+                    write_json(&mut wr, &released_reply(&shared, id, released)).await?;
                 }
                 Err(error) => {
                     write_json(&mut wr, &json!({"ok": false, "error": error})).await?;
@@ -260,8 +282,30 @@ pub async fn serve_client(
         }
         "show" => {
             let id = req.get("id").and_then(Value::as_str).unwrap_or("");
-            let flow = shared.held.lock().unwrap().get(id).map(|h| h.meta.clone());
-            write_json(&mut wr, &json!({"ok": flow.is_some(), "flow": flow})).await?;
+            crate::net::proxy::prune_inactive_holds(&shared.held, &shared.terminal_holds);
+            let (flow, lifecycle) = {
+                let held = shared.held.lock().unwrap();
+                (
+                    held.get(id).map(|h| h.meta.clone()),
+                    held.get(id)
+                        .map(|h| serde_json::to_value(h.lifecycle()).unwrap_or_default()),
+                )
+            };
+            let terminal = if flow.is_none() {
+                shared.terminal_holds.lock().unwrap().get(id)
+            } else {
+                None
+            };
+            write_json(
+                &mut wr,
+                &json!({
+                    "ok": flow.is_some(),
+                    "flow": flow,
+                    "lifecycle": lifecycle.or_else(|| terminal.as_ref().and_then(|value| serde_json::to_value(value).ok())),
+                    "terminal_state": terminal.as_ref().map(failure_terminal_state),
+                }),
+            )
+            .await?;
         }
         "rule_add" => {
             let spec: Option<RuleSpec> = req
@@ -708,19 +752,75 @@ fn validate_rule(spec: &RuleSpec) -> Result<(), String> {
     }
 }
 
-/// Hand a held flow its decision (fires the proxy's oneshot). Returns whether a
-/// held flow with that id was present + reachable. Shares the atomic claim with
-/// the proxy's deadline path ([`crate::net::proxy::release_held`]) so the two
-/// can't both resolve the same flow.
-fn release(shared: &SharedState, id: &str, decision: HoldDecision) -> bool {
-    crate::net::proxy::release_held(&shared.held, id, decision)
+/// Hand a held flow its decision (fires the proxy's oneshot). Shares the atomic
+/// claim and bounded terminal history with the deadline/cancellation paths.
+fn release(
+    shared: &SharedState,
+    id: &str,
+    action: &str,
+    decision: HoldDecision,
+) -> ReleaseHeldResult {
+    crate::net::proxy::release_held(&shared.held, &shared.terminal_holds, id, action, decision)
 }
 
-fn released_reply(id: &str, released: bool) -> Value {
-    if released {
-        json!({"ok": true, "id": id, "released": true})
+fn failure_terminal_state(terminal: &TerminalHold) -> &'static str {
+    if terminal.state == "released" {
+        "already_released"
     } else {
-        json!({"ok": false, "id": id, "error": "no such held flow (already released, timed out, or wrong id)"})
+        terminal.state
+    }
+}
+
+fn terminal_failure_reply(id: &str, terminal: &TerminalHold) -> Value {
+    let terminal_state = failure_terminal_state(terminal);
+    json!({
+        "ok": false,
+        "id": id,
+        "released": false,
+        "terminal_state": terminal_state,
+        "phase": terminal.phase,
+        "held_at": terminal.held_at,
+        "expires_at": terminal.expires_at,
+        "terminal_at": terminal.terminal_at,
+        "action": terminal.action,
+        "error": format!("held flow `{id}` is no longer actionable: {terminal_state}"),
+    })
+}
+
+fn missing_held_reply(id: &str, terminal: Option<&TerminalHold>) -> Value {
+    if let Some(terminal) = terminal {
+        terminal_failure_reply(id, terminal)
+    } else {
+        json!({
+            "ok": false,
+            "id": id,
+            "released": false,
+            "terminal_state": "unknown_id",
+            "observed_at": crate::events::now_ts(),
+            "error": format!("held flow `{id}` is unknown to this proxy session"),
+        })
+    }
+}
+
+fn released_reply(shared: &SharedState, id: &str, released: ReleaseHeldResult) -> Value {
+    match released {
+        ReleaseHeldResult::Released(terminal) => json!({
+            "ok": true,
+            "id": id,
+            "released": true,
+            "state": "released",
+            "phase": terminal.phase,
+            "held_at": terminal.held_at,
+            "expires_at": terminal.expires_at,
+            "terminal_at": terminal.terminal_at,
+            "action": terminal.action,
+        }),
+        ReleaseHeldResult::ClientCanceled(terminal) => terminal_failure_reply(id, &terminal),
+        ReleaseHeldResult::DeadlineExpired(terminal) => terminal_failure_reply(id, &terminal),
+        ReleaseHeldResult::Missing => {
+            let terminal = shared.terminal_holds.lock().unwrap().get(id);
+            missing_held_reply(id, terminal.as_ref())
+        }
     }
 }
 
@@ -1004,6 +1104,44 @@ mod tests {
                 "net_control_invalid_request"
             );
         }
+    }
+
+    #[test]
+    fn terminal_hold_failures_name_the_exact_state_and_timestamps() {
+        let released = TerminalHold {
+            id: "f19".into(),
+            phase: "response".into(),
+            state: "released",
+            held_at: 10.0,
+            expires_at: 20.0,
+            terminal_at: 11.0,
+            action: Some("resume".into()),
+        };
+        let reply = terminal_failure_reply("f19", &released);
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["terminal_state"], "already_released");
+        assert_eq!(reply["phase"], "response");
+        assert_eq!(reply["held_at"], 10.0);
+        assert_eq!(reply["expires_at"], 20.0);
+        assert_eq!(reply["terminal_at"], 11.0);
+
+        let mut canceled = released;
+        canceled.state = "client_canceled";
+        canceled.action = None;
+        assert_eq!(
+            terminal_failure_reply("f19", &canceled)["terminal_state"],
+            "client_canceled"
+        );
+
+        canceled.state = "deadline_expired";
+        assert_eq!(
+            terminal_failure_reply("f19", &canceled)["terminal_state"],
+            "deadline_expired"
+        );
+
+        let unknown = missing_held_reply("never-seen", None);
+        assert_eq!(unknown["terminal_state"], "unknown_id");
+        assert!(unknown["observed_at"].as_f64().is_some());
     }
 
     #[test]

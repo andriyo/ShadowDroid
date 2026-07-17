@@ -716,6 +716,10 @@ Beyond observing, the agent can **intercept** a flow — `net intercept` pauses
 matching requests/responses and emits them as `http_intercept` events on
 `watch`; each held event includes device-scoped `net show`, `resume`, `drop`,
 and `respond` actions so the agent can decide before the hold deadline. The
+same flow ID remains actionable across `net status`, `net show`, and the release
+verbs while held. Status includes its phase, held/expiry timestamps, and client
+connection state; a raced action reports `already_released`, `deadline_expired`,
+`client_canceled`, or `unknown_id` with the available lifecycle timestamps. The
 agent inspects with `net show`, then releases with
 `net resume --set-status/--body/…`, `net drop`, or `net respond` (a canned
 reply). Repeated edits can be promoted to declarative `net rule`s (map-local /

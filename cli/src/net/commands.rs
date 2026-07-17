@@ -1479,48 +1479,74 @@ pub async fn show(
         events::emit_result(&detail);
         return Ok(());
     }
+    let mut daemon_lifecycle = None;
+    let mut terminal_state = None;
     if control::is_running(serial).await {
         // Ask the daemon with bodies so `--body-file` works on a held flow too.
-        if let Ok(reply) = control::request(serial, json!({"op": "show", "id": id})).await
-            && let Some(flow_value) = reply.get("flow").filter(|v| !v.is_null())
-        {
-            let flow: crate::net::flow::FlowRecord = serde_json::from_value(flow_value.clone())
-                .map_err(|error| {
-                    crate::diagnostic::DiagnosticError::new(
-                        "net_daemon_protocol",
-                        "net",
-                        format!("network daemon returned an invalid held flow: {error}"),
-                    )
-                    .retryable(true)
-                    .detail(json!({"id": id, "reply": reply}))
-                    .next_actions([
-                        "run `shadowdroid net status` to verify the daemon version",
-                        "restart the proxy, then retry `shadowdroid net show`",
-                    ])
-                })?;
-            if har {
-                events::emit_result(&json!({
-                    "format": "har",
-                    "id": id,
-                    "held": true,
-                    "har": crate::net::export::to_har(&[flow]),
-                }));
+        if let Ok(reply) = control::request(serial, json!({"op": "show", "id": id})).await {
+            daemon_lifecycle = reply.get("lifecycle").filter(|v| !v.is_null()).cloned();
+            terminal_state = reply
+                .get("terminal_state")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            if let Some(flow_value) = reply.get("flow").filter(|v| !v.is_null()) {
+                let flow: crate::net::flow::FlowRecord = serde_json::from_value(flow_value.clone())
+                    .map_err(|error| {
+                        crate::diagnostic::DiagnosticError::new(
+                            "net_daemon_protocol",
+                            "net",
+                            format!("network daemon returned an invalid held flow: {error}"),
+                        )
+                        .retryable(true)
+                        .detail(json!({"id": id, "reply": reply}))
+                        .next_actions([
+                            "run `shadowdroid net status` to verify the daemon version",
+                            "restart the proxy, then retry `shadowdroid net show`",
+                        ])
+                    })?;
+                if har {
+                    events::emit_result(&json!({
+                        "format": "har",
+                        "id": id,
+                        "held": true,
+                        "lifecycle": daemon_lifecycle,
+                        "har": crate::net::export::to_har(&[flow]),
+                    }));
+                    return Ok(());
+                }
+                if let Some(path) = body_file {
+                    return write_body_file(
+                        id,
+                        flow.resp_body.as_deref(),
+                        flow.resp_truncated,
+                        path,
+                        true,
+                    );
+                }
+                let mut detail = flow.detail(body);
+                detail["held"] = json!(true);
+                detail["lifecycle"] = daemon_lifecycle.unwrap_or_default();
+                events::emit_result(&detail);
                 return Ok(());
             }
-            if let Some(path) = body_file {
-                return write_body_file(
-                    id,
-                    flow.resp_body.as_deref(),
-                    flow.resp_truncated,
-                    path,
-                    true,
-                );
-            }
-            let mut detail = flow.detail(body);
-            detail["held"] = json!(true);
-            events::emit_result(&detail);
-            return Ok(());
         }
+    }
+    if let Some(terminal_state) = terminal_state {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "net_flow_terminal",
+            "net",
+            format!("flow `{id}` is no longer held: {terminal_state}"),
+        )
+        .detail(json!({
+            "id": id,
+            "terminal_state": terminal_state,
+            "lifecycle": daemon_lifecycle,
+        }))
+        .next_actions([
+            "run `shadowdroid net log` to inspect the completed flow",
+            "run `shadowdroid net status` and choose a currently held id",
+        ])
+        .into());
     }
     Err(crate::diagnostic::DiagnosticError::new(
         "net_flow_not_found",

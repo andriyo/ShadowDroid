@@ -29,7 +29,8 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
-use std::collections::{HashMap, HashSet};
+use serde::Serialize;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -108,6 +109,9 @@ pub struct SharedState {
     pub intercept: RwLock<Option<InterceptCfg>>,
     /// Flows currently paused, awaiting `net resume`/`drop`/`respond`.
     pub held: Mutex<HashMap<String, HeldFlow>>,
+    /// Recently terminal holds, retained only long enough to explain why an
+    /// action raced with release, timeout, or client cancellation.
+    pub terminal_holds: Mutex<TerminalHoldHistory>,
     /// Live event fan-out (shared with the daemon) — carries `http_intercept`.
     pub events: broadcast::Sender<Arc<Event>>,
     /// Declarative rules (`net rule`), applied in order: `(id, spec)`.
@@ -160,7 +164,141 @@ pub struct InterceptCfg {
 pub struct HeldFlow {
     pub tx: Option<oneshot::Sender<HoldDecision>>,
     pub meta: FlowRecord,
+    pub phase: String,
+    pub held_at: f64,
+    pub expires_at: f64,
     held_charge: Option<(Arc<AtomicU64>, u64)>,
+}
+
+impl HeldFlow {
+    pub fn lifecycle(&self) -> HeldFlowLifecycle {
+        HeldFlowLifecycle {
+            id: self.meta.id.clone(),
+            phase: self.phase.clone(),
+            state: "held",
+            held_at: self.held_at,
+            expires_at: self.expires_at,
+            client_connected: self.tx.as_ref().is_some_and(|tx| !tx.is_closed()),
+        }
+    }
+
+    pub(crate) fn terminal(&self, state: &'static str, action: Option<&str>) -> TerminalHold {
+        TerminalHold {
+            id: self.meta.id.clone(),
+            phase: self.phase.clone(),
+            state,
+            held_at: self.held_at,
+            expires_at: self.expires_at,
+            terminal_at: events::now_ts(),
+            action: action.map(str::to_string),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HeldFlowLifecycle {
+    pub id: String,
+    pub phase: String,
+    pub state: &'static str,
+    pub held_at: f64,
+    pub expires_at: f64,
+    pub client_connected: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TerminalHold {
+    pub id: String,
+    pub phase: String,
+    /// released | deadline_expired | client_canceled
+    pub state: &'static str,
+    pub held_at: f64,
+    pub expires_at: f64,
+    pub terminal_at: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+}
+
+const TERMINAL_HOLD_HISTORY_CAP: usize = 256;
+
+#[derive(Default)]
+pub struct TerminalHoldHistory {
+    records: HashMap<String, TerminalHold>,
+    order: VecDeque<String>,
+}
+
+impl TerminalHoldHistory {
+    pub fn get(&self, id: &str) -> Option<TerminalHold> {
+        self.records.get(id).cloned()
+    }
+
+    pub fn remove(&mut self, id: &str) {
+        self.records.remove(id);
+        self.order.retain(|candidate| candidate != id);
+    }
+
+    fn record(&mut self, terminal: TerminalHold) {
+        self.remove(&terminal.id);
+        self.order.push_back(terminal.id.clone());
+        self.records.insert(terminal.id.clone(), terminal);
+        while self.order.len() > TERMINAL_HOLD_HISTORY_CAP {
+            if let Some(id) = self.order.pop_front() {
+                self.records.remove(&id);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ReleaseHeldResult {
+    Released(TerminalHold),
+    ClientCanceled(TerminalHold),
+    DeadlineExpired(TerminalHold),
+    Missing,
+}
+
+/// Eagerly retire holds whose deadline elapsed or whose client-side receiver
+/// disappeared. Terminal history and the active map are locked in that order
+/// everywhere, so an action can never observe the entry absent from both.
+pub(crate) fn prune_inactive_holds(
+    held: &Mutex<HashMap<String, HeldFlow>>,
+    terminal_holds: &Mutex<TerminalHoldHistory>,
+) {
+    let now = events::now_ts();
+    let mut terminal_holds = terminal_holds.lock().unwrap();
+    let mut held = held.lock().unwrap();
+    let terminal = held
+        .iter()
+        .filter_map(|(id, flow)| {
+            if now >= flow.expires_at {
+                Some((id.clone(), "deadline_expired"))
+            } else if flow.tx.as_ref().is_none_or(oneshot::Sender::is_closed) {
+                Some((id.clone(), "client_canceled"))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    for (id, state) in terminal {
+        if let Some(flow) = held.remove(&id) {
+            terminal_holds.record(flow.terminal(state, None));
+        }
+    }
+}
+
+fn terminalize_held(
+    held: &Mutex<HashMap<String, HeldFlow>>,
+    terminal_holds: &Mutex<TerminalHoldHistory>,
+    id: &str,
+    state: &'static str,
+) -> bool {
+    let mut terminal_holds = terminal_holds.lock().unwrap();
+    let removed = held.lock().unwrap().remove(id);
+    if let Some(held) = removed {
+        terminal_holds.record(held.terminal(state, None));
+        true
+    } else {
+        false
+    }
 }
 
 impl Drop for HeldFlow {
@@ -1852,11 +1990,18 @@ async fn hold(ctx: &ProxyContext, snap: FlowRecord, phase: &'static str) -> Opti
     let (tx, rx) = oneshot::channel();
     let id = snap.id.clone();
     let charge = held_flow_charge(&snap);
+    let held_at = events::now_ts();
+    let expires_at = held_at + f64::from(cfg.hold_ms.max(1)) / 1000.0;
     {
         // Cap concurrent holds: each pins a FlowRecord (with bodies) until acted
         // on or its deadline. An app hammering a matched endpoint faster than the
         // agent can resume would otherwise grow this map without bound, so past
         // the cap we fail open — let the flow through unheld rather than OOM.
+        // Terminal history is always locked before the active map. A
+        // request-phase hold and a later response-phase hold deliberately reuse
+        // one flow id; publishing the next active phase atomically supersedes
+        // the prior terminal record for that id.
+        let mut terminal_holds = ctx.shared.terminal_holds.lock().unwrap();
         let mut held = ctx.shared.held.lock().unwrap();
         let held_bytes = ctx.shared.held_bytes.load(Ordering::Relaxed);
         if held.len() >= MAX_HELD_FLOWS || held_bytes.saturating_add(charge) > MAX_HELD_BYTES {
@@ -1870,12 +2015,16 @@ async fn hold(ctx: &ProxyContext, snap: FlowRecord, phase: &'static str) -> Opti
             );
             return None;
         }
+        terminal_holds.remove(&id);
         ctx.shared.held_bytes.fetch_add(charge, Ordering::Relaxed);
         held.insert(
             id.clone(),
             HeldFlow {
                 tx: Some(tx),
                 meta: snap.clone(),
+                phase: phase.into(),
+                held_at,
+                expires_at,
                 held_charge: Some((ctx.shared.held_bytes.clone(), charge)),
             },
         );
@@ -1889,6 +2038,7 @@ async fn hold(ctx: &ProxyContext, snap: FlowRecord, phase: &'static str) -> Opti
 
     let decision = resolve_held(
         &ctx.shared.held,
+        &ctx.shared.terminal_holds,
         &id,
         rx,
         Duration::from_millis(cfg.hold_ms.max(1) as u64),
@@ -1907,18 +2057,15 @@ async fn hold(ctx: &ProxyContext, snap: FlowRecord, phase: &'static str) -> Opti
 
 /// Resolve a held flow into the single decision the proxy applies to the device.
 ///
-/// `held.remove` is the **atomic claim**: for a given id, exactly one of {a
-/// release, this deadline} removes the entry and decides the flow. `rx` is kept
-/// alive across the deadline via `select!` rather than a plain
-/// `tokio::time::timeout` (which holds — then drops — `rx` for the whole match):
-/// a release landing in the window between the deadline firing and the fail-open
-/// decision used to `send` successfully (so `net resume` reported `released:true`)
-/// while the device got fail-open. Now the claim decides the single winner, and
-/// a release that wins the claim after the deadline still delivers via the
-/// still-open `rx`. `fail_open` is evaluated only on a genuine timeout / dropped
-/// sender.
+/// Removing the active entry is the atomic claim: exactly one release, deadline,
+/// or cancellation decides the flow. The receiver stays alive across the timer
+/// branch so a release that already claimed the entry is delivered rather than
+/// silently replaced by fail-open. The release path also checks the absolute
+/// wall deadline, so an action at or after `expires_at` cannot win merely because
+/// the timer task had not been scheduled yet.
 pub(crate) async fn resolve_held(
     held: &Mutex<HashMap<String, HeldFlow>>,
+    terminal_holds: &Mutex<TerminalHoldHistory>,
     id: &str,
     mut rx: oneshot::Receiver<HoldDecision>,
     deadline: Duration,
@@ -1926,21 +2073,26 @@ pub(crate) async fn resolve_held(
 ) -> HoldDecision {
     struct Cleanup<'a> {
         held: &'a Mutex<HashMap<String, HeldFlow>>,
+        terminal_holds: &'a Mutex<TerminalHoldHistory>,
         id: &'a str,
     }
     impl Drop for Cleanup<'_> {
         fn drop(&mut self) {
-            self.held.lock().unwrap().remove(self.id);
+            terminalize_held(self.held, self.terminal_holds, self.id, "client_canceled");
         }
     }
     // Also covers cancellation: dropping this future removes the map entry and
     // releases its byte charge instead of leaking interception capacity.
-    let _cleanup = Cleanup { held, id };
+    let _cleanup = Cleanup {
+        held,
+        terminal_holds,
+        id,
+    };
     tokio::select! {
         biased;
         r = &mut rx => r.unwrap_or_else(|_| fail_open()),
         _ = tokio::time::sleep(deadline) => {
-            if held.lock().unwrap().remove(id).is_some() {
+            if terminalize_held(held, terminal_holds, id, "deadline_expired") {
                 // We claimed the entry first → the deadline wins → fail open.
                 fail_open()
             } else {
@@ -1954,21 +2106,41 @@ pub(crate) async fn resolve_held(
 }
 
 /// Hand a held flow its decision, claiming it atomically (the mirror of
-/// [`resolve_held`]'s claim). Returns whether a held flow with that id was
-/// present **and** its receiver still alive — i.e. whether the agent's decision
-/// actually reached the proxy, so `net resume` never reports a delivery that
-/// didn't happen.
+/// [`resolve_held`]'s claim). The result distinguishes delivery, deadline,
+/// client cancellation, and a missing id, so the control plane never reports a
+/// release that did not actually reach the proxy.
 pub(crate) fn release_held(
     held: &Mutex<HashMap<String, HeldFlow>>,
+    terminal_holds: &Mutex<TerminalHoldHistory>,
     id: &str,
+    action: &str,
     decision: HoldDecision,
-) -> bool {
+) -> ReleaseHeldResult {
+    let mut terminal_holds = terminal_holds.lock().unwrap();
     match held.lock().unwrap().remove(id) {
-        Some(mut held) => held
-            .tx
-            .take()
-            .is_some_and(|sender| sender.send(decision).is_ok()),
-        None => false,
+        Some(mut held) => {
+            if events::now_ts() >= held.expires_at {
+                let terminal = held.terminal("deadline_expired", None);
+                terminal_holds.record(terminal.clone());
+                return ReleaseHeldResult::DeadlineExpired(terminal);
+            }
+            let mut terminal = held.terminal("released", Some(action));
+            let delivered = held
+                .tx
+                .take()
+                .is_some_and(|sender| sender.send(decision).is_ok());
+            if !delivered {
+                terminal.state = "client_canceled";
+                terminal.action = None;
+            }
+            terminal_holds.record(terminal.clone());
+            if delivered {
+                ReleaseHeldResult::Released(terminal)
+            } else {
+                ReleaseHeldResult::ClientCanceled(terminal)
+            }
+        }
+        None => ReleaseHeldResult::Missing,
     }
 }
 
@@ -2615,9 +2787,9 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Rewind<T> {
 mod tests {
     use super::{
         ContentEncoding, DecodeFailure, DecodeOutcome, EncodingDisposition, HeldFlow, HoldDecision,
-        decode_capped, decompress_bounded_with_cap, encoding_disposition, frame_stream_body,
-        host_glob_match, release_held, resolve_held, tls_failure_reason, upstream_headers,
-        ws_tls_connector,
+        ReleaseHeldResult, TerminalHoldHistory, decode_capped, decompress_bounded_with_cap,
+        encoding_disposition, frame_stream_body, host_glob_match, release_held, resolve_held,
+        tls_failure_reason, upstream_headers, ws_tls_connector,
     };
     use crate::net::Mutation;
     use crate::net::flow::FlowRecord;
@@ -3167,11 +3339,19 @@ mod tests {
         id: &str,
     ) -> oneshot::Receiver<HoldDecision> {
         let (tx, rx) = oneshot::channel();
+        let meta = FlowRecord {
+            id: id.into(),
+            ..Default::default()
+        };
+        let held_at = crate::events::now_ts();
         held.lock().unwrap().insert(
             id.to_string(),
             HeldFlow {
                 tx: Some(tx),
-                meta: FlowRecord::default(),
+                meta,
+                phase: "request".into(),
+                held_at,
+                expires_at: held_at + 60.0,
                 held_charge: None,
             },
         );
@@ -3182,19 +3362,113 @@ mod tests {
         HoldDecision::Resume(Mutation::default())
     }
 
+    #[test]
+    fn held_lifecycle_carries_actionable_phase_deadline_and_connection() {
+        for phase in ["request", "response"] {
+            let held = Mutex::new(HashMap::new());
+            let _rx = insert_held(&held, "f1");
+            held.lock().unwrap().get_mut("f1").unwrap().phase = phase.into();
+            let lifecycle = held.lock().unwrap().get("f1").unwrap().lifecycle();
+            assert_eq!(lifecycle.id, "f1");
+            assert_eq!(lifecycle.phase, phase);
+            assert_eq!(lifecycle.state, "held");
+            assert!(lifecycle.expires_at > lifecycle.held_at);
+            assert!(lifecycle.client_connected);
+        }
+    }
+
+    #[test]
+    fn release_at_or_after_wall_deadline_reports_expired() {
+        let held = Mutex::new(HashMap::new());
+        let terminal = Mutex::new(TerminalHoldHistory::default());
+        let _rx = insert_held(&held, "f1");
+        held.lock().unwrap().get_mut("f1").unwrap().expires_at = crate::events::now_ts() - 1.0;
+        assert!(matches!(
+            release_held(
+                &held,
+                &terminal,
+                "f1",
+                "resume",
+                HoldDecision::Resume(Mutation::default())
+            ),
+            ReleaseHeldResult::DeadlineExpired(_)
+        ));
+        assert!(held.lock().unwrap().is_empty());
+        assert_eq!(
+            terminal.lock().unwrap().get("f1").unwrap().state,
+            "deadline_expired"
+        );
+    }
+
+    #[test]
+    fn terminal_hold_history_is_bounded_and_replaces_reused_ids() {
+        let mut history = TerminalHoldHistory::default();
+        for index in 0..=super::TERMINAL_HOLD_HISTORY_CAP {
+            history.record(super::TerminalHold {
+                id: format!("f{index}"),
+                phase: "request".into(),
+                state: "deadline_expired",
+                held_at: 1.0,
+                expires_at: 2.0,
+                terminal_at: 2.0,
+                action: None,
+            });
+        }
+        assert!(history.get("f0").is_none());
+        assert!(
+            history
+                .get(&format!("f{}", super::TERMINAL_HOLD_HISTORY_CAP))
+                .is_some()
+        );
+
+        history.record(super::TerminalHold {
+            id: "f1".into(),
+            phase: "response".into(),
+            state: "released",
+            held_at: 3.0,
+            expires_at: 4.0,
+            terminal_at: 3.5,
+            action: Some("respond".into()),
+        });
+        let replaced = history.get("f1").unwrap();
+        assert_eq!(replaced.phase, "response");
+        assert_eq!(replaced.action.as_deref(), Some("respond"));
+    }
+
     /// The core of the held-flow fix: an agent's decision that arrives before the
     /// deadline must reach the proxy — never get silently replaced by fail-open.
     #[tokio::test]
     async fn release_decision_is_delivered_not_dropped() {
         let held = Mutex::new(HashMap::new());
+        let terminal = Mutex::new(TerminalHoldHistory::default());
         let rx = insert_held(&held, "f1");
         // Agent releases with a distinctive decision before the (long) deadline.
-        assert!(release_held(&held, "f1", HoldDecision::Drop(Some(599))));
-        let d = resolve_held(&held, "f1", rx, Duration::from_secs(5), fail_open).await;
+        assert!(matches!(
+            release_held(
+                &held,
+                &terminal,
+                "f1",
+                "drop",
+                HoldDecision::Drop(Some(599))
+            ),
+            ReleaseHeldResult::Released(_)
+        ));
+        let d = resolve_held(
+            &held,
+            &terminal,
+            "f1",
+            rx,
+            Duration::from_secs(5),
+            fail_open,
+        )
+        .await;
         assert!(
             matches!(d, HoldDecision::Drop(Some(599))),
             "the agent's decision must win, not fail-open"
         );
+        let lifecycle = terminal.lock().unwrap().get("f1").unwrap();
+        assert_eq!(lifecycle.state, "released");
+        assert_eq!(lifecycle.action.as_deref(), Some("drop"));
     }
 
     /// The honest-reporting half: when the deadline wins, it claims the entry, so
@@ -3202,8 +3476,17 @@ mod tests {
     #[tokio::test]
     async fn timeout_claims_the_entry_and_a_late_release_reports_false() {
         let held = Mutex::new(HashMap::new());
+        let terminal = Mutex::new(TerminalHoldHistory::default());
         let rx = insert_held(&held, "f1");
-        let d = resolve_held(&held, "f1", rx, Duration::from_millis(0), fail_open).await;
+        let d = resolve_held(
+            &held,
+            &terminal,
+            "f1",
+            rx,
+            Duration::from_millis(0),
+            fail_open,
+        )
+        .await;
         assert!(matches!(d, HoldDecision::Resume(_)), "fail-open on timeout");
         assert!(
             held.lock().unwrap().is_empty(),
@@ -3211,23 +3494,50 @@ mod tests {
         );
         // A release arriving after the timeout finds nothing → must report false.
         assert!(
-            !release_held(&held, "f1", HoldDecision::Drop(Some(1))),
+            matches!(
+                release_held(
+                    &held,
+                    &terminal,
+                    "f1",
+                    "drop",
+                    HoldDecision::Drop(Some(200))
+                ),
+                ReleaseHeldResult::Missing
+            ),
             "a release after the deadline must not claim success"
+        );
+        assert_eq!(
+            terminal.lock().unwrap().get("f1").unwrap().state,
+            "deadline_expired"
         );
     }
 
     #[tokio::test]
     async fn cancelling_a_held_request_removes_its_map_entry() {
         let held = Arc::new(Mutex::new(HashMap::new()));
+        let terminal = Arc::new(Mutex::new(TerminalHoldHistory::default()));
         let rx = insert_held(&held, "f1");
         let task_held = held.clone();
+        let task_terminal = terminal.clone();
         let task = tokio::spawn(async move {
-            resolve_held(&task_held, "f1", rx, Duration::from_secs(60), fail_open).await
+            resolve_held(
+                &task_held,
+                &task_terminal,
+                "f1",
+                rx,
+                Duration::from_secs(60),
+                fail_open,
+            )
+            .await
         });
         tokio::task::yield_now().await;
         task.abort();
         let _ = task.await;
         assert!(held.lock().unwrap().is_empty());
+        assert_eq!(
+            terminal.lock().unwrap().get("f1").unwrap().state,
+            "client_canceled"
+        );
     }
 
     #[test]

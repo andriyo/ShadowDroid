@@ -740,6 +740,24 @@ fn dynamic_next_actions(
         Some("ui dump") => screen_element_actions(map),
         Some("ui find" | "ui wait") => element_actions(map),
         Some("net status") => {
+            if let Some(held) = map
+                .get("daemon")
+                .and_then(|daemon| daemon.get("held_flows"))
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .next()
+                .and_then(|flow| flow.get("id"))
+                .and_then(serde_json::Value::as_str)
+            {
+                let id = shell_token(held);
+                return vec![
+                    format!("shadowdroid net show {id} --body"),
+                    format!("shadowdroid net resume {id}"),
+                    format!("shadowdroid net drop {id}"),
+                    format!("shadowdroid net respond {id}"),
+                ];
+            }
             let running = map.get("running").and_then(serde_json::Value::as_bool);
             let wired = map
                 .get("pointed_at_proxy")
@@ -1722,6 +1740,27 @@ mod tests {
                 "shadowdroid net stop",
                 "shadowdroid net start",
                 "shadowdroid doctor --json"
+            ]
+        );
+    }
+
+    #[test]
+    fn net_status_prioritizes_actions_for_a_currently_held_flow() {
+        let map = serde_json::json!({
+            "running": true,
+            "pointed_at_proxy": true,
+            "daemon": {"held_flows": [{"id": "f19; unsafe"}]}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert_eq!(
+            dynamic_next_actions(Some("net status"), &map),
+            [
+                "shadowdroid net show 'f19; unsafe' --body",
+                "shadowdroid net resume 'f19; unsafe'",
+                "shadowdroid net drop 'f19; unsafe'",
+                "shadowdroid net respond 'f19; unsafe'"
             ]
         );
     }

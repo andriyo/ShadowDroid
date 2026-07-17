@@ -974,7 +974,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "net status" => Some(serde_json::json!({
             "use_when": ["Need to verify whether the proxy daemon is running and both the device http_proxy and adb reverse mapping point at it."],
-            "output": "net_status action JSON with separate http_proxy_matches/adb_reverse_matches wiring checks and dropped_flows backpressure count",
+            "output": "net_status action JSON with separate wiring checks, dropped-flow counters, and actionable held_flows lifecycle entries (phase/state/held_at/expires_at/client_connected)",
             "side_effects": ["none"],
             "next_actions": ["net check <pkg>", "watch", "ui dump"]
         })),
@@ -986,31 +986,31 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "net show" => Some(serde_json::json!({
             "use_when": ["Need headers, bodies, or full detail for a flow id seen in watch or net log."],
-            "output": "flow detail JSON; --har returns a terminal result containing a single-entry HAR under har; --body-file writes the captured response body to a file for large responses",
+            "output": "flow detail JSON; an active held flow includes lifecycle metadata and a recently terminal id returns an exact typed terminal-state error; --har returns a single-entry HAR; --body-file writes the response body",
             "side_effects": ["none"],
             "next_actions": ["net export har <id>", "net export curl <id>", "net log", "watch"]
         })),
         "net intercept" => Some(serde_json::json!({
             "use_when": ["Need the agent to pause matching HTTP flows and decide how to mutate, drop, or respond."],
-            "output": "held flows appear as http_intercept events on watch with exact show/resume/drop/respond actions and a hold deadline",
+            "output": "held flows appear as http_intercept events and net status entries with one stable id, exact actions, phase, held/expiry timestamps, and client connection state",
             "side_effects": ["matching app HTTP calls block until released or timed out"],
             "next_actions": ["watch", "net show <id>", "net resume <id>", "net drop <id>", "net respond <id>"]
         })),
         "net resume" => Some(serde_json::json!({
             "use_when": ["Need to release a held flow, optionally with status/header/body/url mutations."],
-            "output": "release result JSON",
+            "output": "release result JSON with phase and lifecycle timestamps; failures name already_released, deadline_expired, client_canceled, or unknown_id",
             "side_effects": ["unblocks a held HTTP flow"],
             "next_actions": ["watch", "net log", "ui dump"]
         })),
         "net drop" => Some(serde_json::json!({
             "use_when": ["Need the app to experience a held request as a connection failure or explicit status."],
-            "output": "release result JSON",
+            "output": "release result JSON with phase and lifecycle timestamps; terminal races name their exact state",
             "side_effects": ["unblocks a held HTTP flow with failure behavior"],
             "next_actions": ["watch", "ui dump"]
         })),
         "net respond" => Some(serde_json::json!({
             "use_when": ["Need to short-circuit a held request with a canned response without contacting upstream."],
-            "output": "release result JSON",
+            "output": "release result JSON with phase and lifecycle timestamps; terminal races name their exact state",
             "side_effects": ["unblocks a held HTTP flow with a synthetic response"],
             "next_actions": ["watch", "ui dump"]
         })),
