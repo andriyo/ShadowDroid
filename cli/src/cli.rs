@@ -511,6 +511,16 @@ pub enum UiCmd {
         /// is the compact agent shape: selector fields + tap, false flags omitted.
         #[arg(long)]
         full: bool,
+        /// Query Android Studio Layout Inspector for Compose semantics/layout
+        /// nodes that are missing from the accessibility tree.
+        #[arg(long)]
+        deep: bool,
+        /// Android Studio plugin bridge URL for --deep.
+        #[arg(long, env = "SHADOWDROID_STUDIO_DEBUGGER_URL")]
+        studio_url: Option<String>,
+        /// How long --deep waits for Layout Inspector to produce a model.
+        #[arg(long, default_value_t = 5_000)]
+        studio_wait_ms: u64,
     },
     /// Audit the current screen for interactive elements lacking a stable
     /// selector (resource-id / Compose testTag) — the ones that force a test to
@@ -576,6 +586,11 @@ pub enum UiCmd {
         /// Element id from a fresh `ui dump`. Equivalent to positional `ui tap <id>`.
         #[arg(long)]
         id: Option<u32>,
+        /// Compose fallback id (cs:<draw-id> or cl:<draw-id>) from a fresh
+        /// `ui dump --deep`. High-confidence cs: targets may be tapped directly;
+        /// cl: targets require --coordinate-fallback and --if-screen.
+        #[arg(long)]
+        fallback_id: Option<String>,
         /// Element id (from `ui dump`) or X coordinate.
         a: Option<i32>,
         /// Y coordinate (with X for a coordinate tap).
@@ -604,6 +619,12 @@ pub enum UiCmd {
         /// target can perform ACTION_CLICK. Selector taps otherwise fail safely.
         #[arg(long)]
         coordinate_fallback: bool,
+        /// Android Studio plugin bridge URL for --fallback-id.
+        #[arg(long, env = "SHADOWDROID_STUDIO_DEBUGGER_URL")]
+        studio_url: Option<String>,
+        /// How long --fallback-id waits for Layout Inspector to produce a model.
+        #[arg(long, default_value_t = 5_000)]
+        studio_wait_ms: u64,
         #[command(flatten)]
         fusion: crate::fusion::FusionArgs,
     },
@@ -1849,7 +1870,24 @@ async fn dispatch_ui_inner(
     any_apk_version: bool,
 ) -> Result<Outcome> {
     match c {
-        UiCmd::Dump { full } => cmd_screen(serial, apk, any_apk_version, client, full).await,
+        UiCmd::Dump {
+            full,
+            deep,
+            studio_url,
+            studio_wait_ms,
+        } => {
+            cmd_screen(
+                serial,
+                apk,
+                any_apk_version,
+                client,
+                full,
+                deep,
+                studio_url.as_deref(),
+                studio_wait_ms,
+            )
+            .await
+        }
         UiCmd::Audit => {
             let screen = read_screen_with_reconnect(serial, apk, any_apk_version, client).await?;
             let mut body = crate::cmd::authoring::audit_elements(&screen.elements);
@@ -1919,6 +1957,7 @@ async fn dispatch_ui_inner(
         UiCmd::Tap {
             handle,
             id,
+            fallback_id,
             a,
             b,
             text,
@@ -1928,12 +1967,15 @@ async fn dispatch_ui_inner(
             exact,
             clickable,
             coordinate_fallback,
+            studio_url,
+            studio_wait_ms,
             mut fusion,
         } => {
             crate::fusion::bind_element_handle(
                 &mut fusion,
                 handle,
                 id.is_some()
+                    || fallback_id.is_some()
                     || a.is_some()
                     || b.is_some()
                     || text.is_some()
@@ -1949,7 +1991,9 @@ async fn dispatch_ui_inner(
             crate::fusion::run_fused(client, &fusion, Some(hint), |handle_id| {
                 cmd_tap(
                     client,
+                    serial,
                     handle_id.or(id),
+                    fallback_id,
                     a,
                     b,
                     text,
@@ -1959,6 +2003,9 @@ async fn dispatch_ui_inner(
                     exact,
                     clickable,
                     coordinate_fallback,
+                    studio_url.as_deref(),
+                    studio_wait_ms,
+                    fusion.if_screen.is_some(),
                 )
             })
             .await
@@ -2255,9 +2302,19 @@ fn apply_config_defaults(cmd: &mut Cmd, config: &ShadowDroidConfig) {
         Cmd::Collect { app, .. } => fill_app(app, config),
         Cmd::Doctor { app, .. } => fill_app(app, config),
         Cmd::App(args) => apply_app_config(args, config),
+        Cmd::Ui(args) => apply_ui_config(args, config),
         Cmd::Net(args) => apply_net_config(args, config),
         Cmd::Debug(args) => apply_debug_config(args, config),
         Cmd::Layout(args) => apply_layout_config(args, config),
+        _ => {}
+    }
+}
+
+fn apply_ui_config(args: &mut UiCmd, config: &ShadowDroidConfig) {
+    match args {
+        UiCmd::Dump { studio_url, .. } | UiCmd::Tap { studio_url, .. } => {
+            fill_studio_url(studio_url, config);
+        }
         _ => {}
     }
 }
@@ -4002,18 +4059,56 @@ async fn cmd_device_info(client: &ServerClient, serial: &Serial) -> Result<()> {
 /// `ui dump` defaults to the compact agent shape (no bounds, false flags
 /// omitted) — the loop reads this every iteration, so it pays for itself in
 /// tokens. `--full` restores the complete UIAutomator element set.
+#[allow(clippy::too_many_arguments)]
 async fn cmd_screen(
     serial: &Serial,
     apk: Option<&std::path::Path>,
     any_apk_version: bool,
     client: &ServerClient,
     full: bool,
+    deep: bool,
+    studio_url: Option<&str>,
+    studio_wait_ms: u64,
 ) -> Result<Outcome> {
     let screen = read_screen_with_reconnect(serial, apk, any_apk_version, client).await?;
-    if full {
-        return Ok(Outcome::Raw(serde_json::to_value(&screen)?));
+    let mut value = if full {
+        serde_json::to_value(&screen)?
+    } else {
+        crate::fusion::compact_screen_value(&screen)
+    };
+    value["accessibility_completeness"] = json!({
+        "status": "unverified",
+        "may_be_incomplete": true,
+        "reason": "UIAutomator can describe exported accessibility nodes but cannot prove that every visibly drawn control is represented",
+        "deep_command": "shadowdroid ui dump --deep",
+        "deep_sources": ["android_studio_layout_inspector", "compose_semantics", "compose_layout"]
+    });
+    if deep {
+        let discovery =
+            crate::cmd::layout::discover_ui_fallbacks(serial, studio_url, studio_wait_ms, &screen)
+                .await;
+        let missing = discovery.elements.len();
+        value["accessibility_completeness"] = if discovery.available {
+            json!({
+                "status": if missing == 0 { "inspector_compared" } else { "fallback_elements_found" },
+                "may_be_incomplete": missing > 0,
+                "missing_compose_elements": missing,
+                "reason": if missing == 0 {
+                    "Android Studio Layout Inspector exposed no additional Compose semantics/layout nodes"
+                } else {
+                    "Android Studio Layout Inspector exposed Compose nodes not represented by UIAutomator"
+                }
+            })
+        } else {
+            json!({
+                "status": "deep_source_unavailable",
+                "may_be_incomplete": true,
+                "reason": "Layout Inspector could not verify the accessibility tree; inspect fallback.android_studio_layout for recovery",
+            })
+        };
+        value["fallback"] = discovery.to_value();
     }
-    Ok(Outcome::Raw(crate::fusion::compact_screen_value(&screen)))
+    Ok(Outcome::Raw(value))
 }
 
 fn compact_ime(ime: &crate::proto::ImeState) -> serde_json::Value {
@@ -4180,7 +4275,9 @@ fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 #[allow(clippy::too_many_arguments)]
 async fn cmd_tap(
     client: &ServerClient,
+    serial: &Serial,
     id: Option<u32>,
+    fallback_id: Option<String>,
     a: Option<i32>,
     b: Option<i32>,
     text: Option<String>,
@@ -4190,7 +4287,107 @@ async fn cmd_tap(
     exact: bool,
     clickable: bool,
     coordinate_fallback: bool,
+    studio_url: Option<&str>,
+    studio_wait_ms: u64,
+    has_screen_guard: bool,
 ) -> Result<(&'static str, serde_json::Value)> {
+    if let Some(fallback_id) = fallback_id {
+        if id.is_some()
+            || a.is_some()
+            || b.is_some()
+            || text.is_some()
+            || rid.is_some()
+            || desc.is_some()
+            || xpath.is_some()
+        {
+            return Err(crate::diagnostic::DiagnosticError::new(
+                "fallback_target_conflict",
+                "input",
+                "--fallback-id must be the only tap target",
+            )
+            .detail(json!({"fallback_id": fallback_id}))
+            .next_actions(["use exactly one target form from a fresh `ui dump --deep`"])
+            .into());
+        }
+        let screen = client.screen().await?;
+        let discovery =
+            crate::cmd::layout::discover_ui_fallbacks(serial, studio_url, studio_wait_ms, &screen)
+                .await;
+        if !discovery.available {
+            return Err(crate::diagnostic::DiagnosticError::new(
+                "compose_fallback_unavailable",
+                "layout",
+                "Android Studio Layout Inspector is unavailable for fallback-id resolution",
+            )
+            .retryable(true)
+            .detail(discovery.to_value())
+            .next_actions([
+                "run `shadowdroid studio status --json` and attach Layout Inspector",
+                "rerun `shadowdroid ui dump --deep` before tapping a fallback id",
+            ])
+            .into());
+        }
+        let element = discovery
+            .elements
+            .iter()
+            .find(|element| element.id == fallback_id)
+            .ok_or_else(|| {
+                crate::diagnostic::DiagnosticError::new(
+                    "fallback_element_not_found",
+                    "layout",
+                    "fallback id is absent from the current Compose inspector snapshot",
+                )
+                .retryable(true)
+                .detail(json!({
+                    "fallback_id": fallback_id,
+                    "screen_hash": screen.screen_hash,
+                    "available_ids": discovery.elements.iter().map(|element| element.id.as_str()).collect::<Vec<_>>(),
+                }))
+                .next_actions([
+                    "take a fresh `shadowdroid ui dump --deep` and choose a current fallback id",
+                ])
+            })?;
+        if !fallback_action_guard_satisfied(
+            element.requires_coordinate_fallback,
+            coordinate_fallback,
+            has_screen_guard,
+        ) {
+            return Err(crate::diagnostic::DiagnosticError::new(
+                "low_confidence_fallback_requires_guard",
+                "input",
+                "Compose layout-only targets require --coordinate-fallback and --if-screen",
+            )
+            .detail(json!({
+                "fallback_id": element.id,
+                "source": element.source,
+                "confidence": element.confidence,
+                "coordinate_fallback": coordinate_fallback,
+                "if_screen": has_screen_guard,
+            }))
+            .next_actions([
+                "copy screen_hash from the same `ui dump --deep`, then retry with --coordinate-fallback --if-screen HASH",
+            ])
+            .into());
+        }
+        client.tap_xy(element.tap[0], element.tap[1]).await?;
+        return Ok((
+            "tap",
+            json!({
+                "via": "fallback_id",
+                "fallback_id": element.id,
+                "draw_id": element.draw_id,
+                "source": element.source,
+                "confidence": element.confidence,
+                "stable_selector": element.stable_selector,
+                "bounds": element.bounds,
+                "tap": element.tap,
+                "coordinate_fallback": true,
+                "screen_guarded": has_screen_guard,
+                "actionability": element.actionability,
+                "input_delivered": true,
+            }),
+        ));
+    }
     // Selector modes take priority.
     if let Some(query) = xpath {
         let r = client.xpath_tap(&query, coordinate_fallback).await?;
@@ -4268,6 +4465,14 @@ async fn cmd_tap(
             .into())
         }
     }
+}
+
+fn fallback_action_guard_satisfied(
+    requires_coordinate_fallback: bool,
+    coordinate_fallback: bool,
+    has_screen_guard: bool,
+) -> bool {
+    !requires_coordinate_fallback || (coordinate_fallback && has_screen_guard)
 }
 
 fn validate_set_progress_input(value: Option<f64>, percent: Option<f64>) -> Result<()> {
@@ -5692,6 +5897,60 @@ mod tests {
             }
             _ => panic!("expected `ui tap`"),
         }
+    }
+
+    #[test]
+    fn ui_deep_dump_and_fallback_id_tap_parse() {
+        let dump = Cli::try_parse_from([
+            "shadowdroid",
+            "ui",
+            "dump",
+            "--deep",
+            "--studio-wait-ms",
+            "1234",
+        ])
+        .unwrap();
+        assert!(matches!(
+            dump.cmd,
+            Cmd::Ui(UiCmd::Dump {
+                deep: true,
+                studio_wait_ms: 1234,
+                ..
+            })
+        ));
+
+        let tap = Cli::try_parse_from([
+            "shadowdroid",
+            "ui",
+            "tap",
+            "--fallback-id",
+            "cl:900",
+            "--coordinate-fallback",
+            "--if-screen",
+            "abc123",
+        ])
+        .unwrap();
+        assert!(matches!(
+            tap.cmd,
+            Cmd::Ui(UiCmd::Tap {
+                fallback_id: Some(id),
+                coordinate_fallback: true,
+                fusion: crate::fusion::FusionArgs {
+                    if_screen: Some(hash),
+                    ..
+                },
+                ..
+            }) if id == "cl:900" && hash == "abc123"
+        ));
+    }
+
+    #[test]
+    fn low_confidence_fallback_requires_coordinate_opt_in_and_screen_guard() {
+        assert!(fallback_action_guard_satisfied(false, false, false));
+        assert!(!fallback_action_guard_satisfied(true, false, false));
+        assert!(!fallback_action_guard_satisfied(true, true, false));
+        assert!(!fallback_action_guard_satisfied(true, false, true));
+        assert!(fallback_action_guard_satisfied(true, true, true));
     }
 
     #[test]

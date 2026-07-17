@@ -640,6 +640,25 @@ without delivering input. Agent-facing `next_actions` follow the same order:
 stable selector first, handle second, and numeric ids only as a strictly
 `--if-screen`-guarded compatibility fallback.
 
+Every `ui dump` also reports `accessibility_completeness`. UIAutomator cannot
+prove that custom-drawn or unexported Compose controls are represented, so the
+normal tree is explicitly marked `unverified` instead of looking deceptively
+complete. With Android Studio Layout Inspector attached, ask for the deeper
+comparison:
+
+```bash
+shadowdroid ui dump --deep
+shadowdroid ui tap --fallback-id cs:12345 --if-screen <screen-hash>
+```
+
+Missing Compose nodes are returned under `fallback.elements` with an id,
+bounds/tap point, `source` (`compose_semantics` or `compose_layout`), confidence,
+and `stable_selector:false`. High-confidence `cs:` semantics results can be
+targeted directly by fallback id. Layout-only `cl:` results (including custom
+drawing without exported semantics) require both `--coordinate-fallback` and a
+same-snapshot `--if-screen` guard. OCR is not run automatically; direct `X Y`
+taps remain an explicit coordinate target and support the same screen guard.
+
 Platform and Compose sliders expose their accessibility `range` (`type`,
 `min`, `max`, `current`, and nullable `step`) plus stable `actions` in the
 normal `ui dump` shape. Android's range API does not expose a declared discrete
@@ -991,6 +1010,10 @@ Yes — first-class, via AndroidX UI Automator 2.3.0+. Compose nodes appear in t
 same element tree. When Android Studio's Layout Inspector is running,
 `layout snapshot --compose --semantics --source-map` adds Compose semantics and
 source locations, and `layout recompositions` reports recomposition counters.
+If visible Compose cards/custom drawing are absent from the normal tree, use
+`ui dump --deep`; fallback nodes carry source/confidence/stability metadata and
+can be targeted with `ui tap --fallback-id` under the safeguards described
+above.
 
 **When should I use `net` versus `aar`?**
 Use `net` first for proxy-aware HTTP(S): it is built into the host CLI, requires

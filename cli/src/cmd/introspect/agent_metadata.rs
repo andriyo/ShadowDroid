@@ -212,11 +212,12 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "next_actions": ["ui dump", "ui tap --text <label>", "ui text <value>", "ui wait --text <label>"]
         })),
         "ui dump" => Some(serde_json::json!({
-            "use_when": ["Need the current actionable UI state for selector choice before tapping, typing, or waiting."],
-            "avoid_when": ["Need Compose/source/layout inspection or a durable artifact; use layout snapshot."],
-            "output": "compact screen JSON by default, including strict content_hash, actionable interaction_hash, screen-bound handles, snapshot_state, freshness timestamps, window generation, and IME context; --full adds bounds and every UIAutomator flag",
+            "use_when": ["Need the current actionable UI state for selector choice before tapping, typing, or waiting.", "Need --deep fallback discovery when visible Compose content is missing from UIAutomator."],
+            "avoid_when": ["Need a durable source/layout artifact; use layout snapshot."],
+            "output": "compact screen JSON plus explicit accessibility_completeness; --full adds bounds/flags; --deep compares Android Studio Layout Inspector and returns missing Compose fallback elements with id, bounds, source, confidence, and stability metadata",
             "side_effects": ["none"],
-            "next_actions": ["ui tap --rid <resource-id> --if-interaction <hash>", "ui tap --handle <handle>", "ui text <value> --handle <handle>", "ui hide-keyboard", "ui wait"],
+            "prerequisites": ["--deep needs the Studio plugin and Layout Inspector attached to the foreground app"],
+            "next_actions": ["ui tap --rid <resource-id> --if-interaction <hash>", "ui tap --handle <handle>", "ui tap --fallback-id cs:<draw-id> --if-screen <hash>", "ui text <value> --handle <handle>", "ui hide-keyboard", "ui wait"],
             "prefer_over": {
                 "layout snapshot": "when the next step is acting on the UI rather than debugging layout/source structure"
             }

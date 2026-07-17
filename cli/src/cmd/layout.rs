@@ -11,12 +11,54 @@ use crate::ids::Serial;
 use crate::proto::{AppRef, Element, ScreenResponse};
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_LAYOUT_STUDIO_WAIT_MS: u64 = 5_000;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UiFallbackElement {
+    pub id: String,
+    pub draw_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    pub bounds: [i32; 4],
+    pub tap: [i32; 2],
+    pub source: &'static str,
+    pub confidence: f64,
+    pub stable_selector: bool,
+    pub actionability: &'static str,
+    pub requires_coordinate_fallback: bool,
+    pub semantics: Value,
+}
+
+#[derive(Debug)]
+pub struct UiFallbackDiscovery {
+    pub available: bool,
+    pub elements: Vec<UiFallbackElement>,
+    pub inspector: Value,
+}
+
+impl UiFallbackDiscovery {
+    pub fn to_value(&self) -> Value {
+        json!({
+            "requested": true,
+            "available": self.available,
+            "source": "android_studio_layout_inspector",
+            "element_count": self.elements.len(),
+            "elements": self.elements,
+            "android_studio_layout": self.inspector,
+            "ocr": {
+                "available": false,
+                "automatic": false,
+                "reason": "OCR is not run automatically; coordinate actions remain explicit and can be protected with --if-screen"
+            }
+        })
+    }
+}
 
 #[derive(Args)]
 pub struct LayoutArgs {
@@ -425,6 +467,187 @@ async fn studio_layout_snapshot(
     bridge.get(route::LAYOUT_SNAPSHOT, &params).await
 }
 
+pub async fn discover_ui_fallbacks(
+    serial: &Serial,
+    studio_url: Option<&str>,
+    studio_wait_ms: u64,
+    screen: &ScreenResponse,
+) -> UiFallbackDiscovery {
+    let target =
+        LayoutStudioTarget::from_ref(serial, &screen.current_app, None, None, studio_wait_ms);
+    match studio_layout_snapshot(studio_url, &target).await {
+        Ok(inspector) => {
+            let available = inspector
+                .get("available")
+                .and_then(Value::as_bool)
+                .unwrap_or_else(|| {
+                    inspector
+                        .get("ok")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                });
+            let elements = if available {
+                compose_fallback_elements(&inspector, &screen.elements)
+            } else {
+                Vec::new()
+            };
+            UiFallbackDiscovery {
+                available,
+                elements,
+                inspector,
+            }
+        }
+        Err(err) => UiFallbackDiscovery {
+            available: false,
+            elements: Vec::new(),
+            inspector: json!({
+                "available": false,
+                "error": err.to_string(),
+                "next_actions": [
+                    "run `shadowdroid studio status --json` and install/start the Studio plugin if needed",
+                    "attach Android Studio Layout Inspector to the foreground app, then retry `ui dump --deep`"
+                ]
+            }),
+        },
+    }
+}
+
+fn compose_fallback_elements(
+    inspector: &Value,
+    accessibility: &[Element],
+) -> Vec<UiFallbackElement> {
+    let mut elements = Vec::new();
+    let mut seen = BTreeSet::new();
+    let windows = inspector
+        .get("windows")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    for window in windows {
+        let nodes = window
+            .get("nodes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten();
+        for node in nodes {
+            if node.get("kind").and_then(Value::as_str) != Some("compose") {
+                continue;
+            }
+            let Some(draw_id) = node.get("draw_id").and_then(Value::as_i64) else {
+                continue;
+            };
+            if !seen.insert(draw_id) {
+                continue;
+            }
+            let Some(bounds) = inspector_bounds(node.get("bounds")) else {
+                continue;
+            };
+            let text = node
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string);
+            let semantics = node
+                .get("semantics")
+                .cloned()
+                .unwrap_or_else(|| json!({"merged": false, "unmerged": false}));
+            let has_semantics = semantics.get("merged").and_then(Value::as_bool) == Some(true)
+                || semantics.get("unmerged").and_then(Value::as_bool) == Some(true);
+            let has_draw_modifier = node
+                .get("compose")
+                .and_then(|compose| compose.get("has_draw_modifier"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || node
+                    .get("compose")
+                    .and_then(|compose| compose.get("has_child_draw_modifier"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+            if !has_semantics && text.is_none() && !has_draw_modifier {
+                continue;
+            }
+            if represented_by_accessibility(text.as_deref(), bounds, accessibility) {
+                continue;
+            }
+            let (prefix, source, confidence, requires_coordinate_fallback) = if has_semantics {
+                ("cs", "compose_semantics", 1.0, false)
+            } else {
+                ("cl", "compose_layout", 0.75, true)
+            };
+            elements.push(UiFallbackElement {
+                id: format!("{prefix}:{draw_id}"),
+                draw_id,
+                text,
+                bounds,
+                tap: [(bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2],
+                source,
+                confidence,
+                stable_selector: false,
+                actionability: "unverified",
+                requires_coordinate_fallback,
+                semantics,
+            });
+        }
+    }
+    elements.sort_by_key(|element| (element.bounds[1], element.bounds[0], element.draw_id));
+    elements
+}
+
+fn inspector_bounds(value: Option<&Value>) -> Option<[i32; 4]> {
+    let value = value?;
+    let number = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_i64)
+            .and_then(|number| i32::try_from(number).ok())
+    };
+    let bounds = [
+        number("left")?,
+        number("top")?,
+        number("right")?,
+        number("bottom")?,
+    ];
+    (bounds[2] > bounds[0] && bounds[3] > bounds[1]).then_some(bounds)
+}
+
+fn represented_by_accessibility(
+    text: Option<&str>,
+    bounds: [i32; 4],
+    accessibility: &[Element],
+) -> bool {
+    accessibility.iter().any(|element| {
+        let same_text = text.is_some_and(|text| {
+            element
+                .text
+                .as_deref()
+                .or(element.desc.as_deref())
+                .is_some_and(|candidate| candidate.trim().eq_ignore_ascii_case(text))
+        });
+        let same_bounds = element.bounds == Some(bounds);
+        let same_region = element
+            .bounds
+            .is_some_and(|candidate| bounds_overlap(candidate, bounds) >= 0.8);
+        same_bounds || (same_text && same_region)
+    })
+}
+
+fn bounds_overlap(a: [i32; 4], b: [i32; 4]) -> f64 {
+    let left = a[0].max(b[0]);
+    let top = a[1].max(b[1]);
+    let right = a[2].min(b[2]);
+    let bottom = a[3].min(b[3]);
+    let intersection = i64::from((right - left).max(0)) * i64::from((bottom - top).max(0));
+    let area_a = i64::from((a[2] - a[0]).max(0)) * i64::from((a[3] - a[1]).max(0));
+    let area_b = i64::from((b[2] - b[0]).max(0)) * i64::from((b[3] - b[1]).max(0));
+    let union = area_a + area_b - intersection;
+    if union <= 0 {
+        0.0
+    } else {
+        intersection as f64 / union as f64
+    }
+}
+
 async fn studio_layout_source(
     studio_url: Option<&str>,
     element: Option<&Element>,
@@ -803,6 +1026,32 @@ mod tests {
         }
     }
 
+    fn accessibility_element(text: &str, bounds: [i32; 4]) -> Element {
+        Element {
+            id: 1,
+            handle: None,
+            text: Some(text.into()),
+            desc: None,
+            klass: Some("android.widget.TextView".into()),
+            rid: None,
+            bounds: Some(bounds),
+            tap: None,
+            range: None,
+            actions: Vec::new(),
+            clickable: false,
+            long_clickable: false,
+            scrollable: false,
+            checkable: false,
+            focusable: false,
+            enabled: true,
+            selected: false,
+            checked: false,
+            focused: false,
+            password: false,
+            input: false,
+        }
+    }
+
     #[test]
     fn layout_sample_marks_target_and_inspector_failures_invalid() {
         let target = LayoutStudioTarget {
@@ -833,5 +1082,92 @@ mod tests {
         let sample = layout_sample_value(&json!({}), &screen("com.app", 7, 2), None, false);
         assert_eq!(sample["valid"], true);
         assert!(sample["reasons"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn compose_fallback_extracts_merged_lazy_grid_cards_without_resource_ids() {
+        let inspector = json!({
+            "windows": [{
+                "nodes": [
+                    {
+                        "draw_id": 101,
+                        "kind": "compose",
+                        "text": "Profile A",
+                        "bounds": {"left": 20, "top": 200, "right": 300, "bottom": 420},
+                        "semantics": {"merged": true, "unmerged": false},
+                        "compose": {"has_draw_modifier": true}
+                    },
+                    {
+                        "draw_id": 102,
+                        "kind": "compose",
+                        "text": "Profile B",
+                        "bounds": {"left": 320, "top": 200, "right": 600, "bottom": 420},
+                        "semantics": {"merged": false, "unmerged": true},
+                        "compose": {"has_draw_modifier": false}
+                    }
+                ]
+            }]
+        });
+        let elements = compose_fallback_elements(&inspector, &[]);
+        assert_eq!(elements.len(), 2);
+        assert_eq!(elements[0].id, "cs:101");
+        assert_eq!(elements[0].source, "compose_semantics");
+        assert_eq!(elements[0].confidence, 1.0);
+        assert_eq!(elements[0].tap, [160, 310]);
+        assert!(!elements[0].stable_selector);
+        assert!(!elements[0].requires_coordinate_fallback);
+        assert_eq!(elements[1].id, "cs:102");
+    }
+
+    #[test]
+    fn compose_fallback_marks_custom_drawing_as_guarded_layout_target() {
+        let inspector = json!({
+            "windows": [{"nodes": [{
+                "draw_id": 900,
+                "kind": "compose",
+                "text": null,
+                "bounds": {"left": 50, "top": 70, "right": 250, "bottom": 270},
+                "semantics": {"merged": false, "unmerged": false},
+                "compose": {"has_draw_modifier": true}
+            }]}]
+        });
+        let elements = compose_fallback_elements(&inspector, &[]);
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0].id, "cl:900");
+        assert_eq!(elements[0].source, "compose_layout");
+        assert_eq!(elements[0].confidence, 0.75);
+        assert!(elements[0].requires_coordinate_fallback);
+    }
+
+    #[test]
+    fn compose_fallback_omits_nodes_already_exported_to_accessibility() {
+        let inspector = json!({
+            "windows": [{"nodes": [{
+                "draw_id": 7,
+                "kind": "compose",
+                "text": "Edit",
+                "bounds": {"left": 10, "top": 10, "right": 80, "bottom": 60},
+                "semantics": {"merged": true, "unmerged": false}
+            }]}]
+        });
+        let accessibility = [accessibility_element("Edit", [10, 10, 80, 60])];
+        assert!(compose_fallback_elements(&inspector, &accessibility).is_empty());
+    }
+
+    #[test]
+    fn compose_card_remains_when_only_its_inner_label_is_accessible() {
+        let inspector = json!({
+            "windows": [{"nodes": [{
+                "draw_id": 44,
+                "kind": "compose",
+                "text": "Profile A",
+                "bounds": {"left": 20, "top": 200, "right": 500, "bottom": 600},
+                "semantics": {"merged": true, "unmerged": false}
+            }]}]
+        });
+        let accessibility = [accessibility_element("Profile A", [60, 240, 220, 290])];
+        let elements = compose_fallback_elements(&inspector, &accessibility);
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0].id, "cs:44");
     }
 }

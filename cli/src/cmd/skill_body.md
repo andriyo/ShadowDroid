@@ -306,6 +306,14 @@ shadowdroid debug snapshot --depth 1
 shadowdroid layout snapshot --compose --semantics --source-map
 ```
 
+`ui dump` marks accessibility completeness as unverified because UIAutomator
+cannot prove all drawn controls are exported. If visible Compose content is
+missing, attach Android Studio Layout Inspector and run `ui dump --deep`.
+Fallback elements report `id`, bounds, source, confidence, and selector
+stability. Tap a high-confidence semantics result with `ui tap --fallback-id
+cs:<draw-id>`; a lower-confidence `cl:` layout result requires both
+`--coordinate-fallback` and `--if-screen <hash>`. OCR is never implicit.
+
 Debugger commands can attach, pause/resume/step, and mutate breakpoint/watch
 state. Treat expression evaluation as real debugger evaluation: keep it bounded
 and do not assume an arbitrary expression is free of side effects.
