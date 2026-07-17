@@ -62,6 +62,17 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- The ShadowDroid net-check probe: the activity must issue this
+                 exact URL so the proxy can prove app-specific decryption. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:host="example.com"
+                    android:pathPrefix="/.well-known/shadowdroid-canary/"
+                    android:scheme="https" />
+            </intent-filter>
         </activity>
 
         <service

@@ -1,9 +1,10 @@
-//! `net check` — read-only verdict on whether an app is MITM-able.
+//! `net check` — inspect whether an app is likely to be MITM-able and, on
+//! request, run a package-scoped HTTPS canary.
 //!
-//! Host-only (plain `dumpsys`/`pm`), shared by the standalone `net check <pkg>`
-//! command and `doctor --app`. The reliable host-side signals are **debuggable**
-//! and **targetSdk**; together they decide whether a user-installed CA will be
-//! trusted:
+//! Static inspection is host-only (plain `dumpsys`/`pm`) and shared by the
+//! standalone `net check <pkg>` command and `doctor --app`. The useful
+//! host-side signals are **debuggable** and **targetSdk**, but they are only a
+//! heuristic for whether a user-installed CA will be trusted:
 //!   - targetSdk ≤ 23: user CAs trusted by default → interceptable.
 //!   - targetSdk ≥ 24: user CAs trusted **only** if the app's Network Security
 //!     Config opts in (`<debug-overrides>`/trust-anchor `user`). Debug builds
@@ -16,8 +17,13 @@
 use crate::ids::Serial;
 use anyhow::Result;
 use serde::Serialize;
+use std::time::{Duration, Instant};
 
 use crate::device::adb;
+use crate::net::{Matcher, control, store};
+
+const PROBE_ORIGIN: &str = "https://example.com";
+const PROBE_PATH_PREFIX: &str = "/.well-known/shadowdroid-canary/";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CheckReport {
@@ -35,10 +41,40 @@ pub struct CheckReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ca_trusted_by_app: Option<bool>,
     pub ca_trust_basis: String,
-    /// interceptable | conditional | blocked
+    /// interceptable | unverified
     pub verdict: String,
     pub reason: String,
+    pub verified: bool,
+    pub verdict_basis: String,
+    /// The old debuggable + targetSdk heuristic, retained but never presented
+    /// as an app-specific observation.
+    pub static_verdict: String,
+    pub static_reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe: Option<ProbeReport>,
     pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProbeReport {
+    pub url: String,
+    /// accepted | rejected | not_run
+    pub launch: String,
+    /// decrypted_http | tls_error | no_observation | proxy_not_running | launch_rejected
+    pub outcome: String,
+    pub verified: bool,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flow: Option<ProbeFlow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_error: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProbeFlow {
+    pub id: String,
+    pub status: Option<u16>,
+    pub dur_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -91,7 +127,7 @@ pub async fn inspect(
     let device_image = inspect_device_image(serial).await;
     let trust = crate::net::trust::evidence(serial, device_image.play_store_image, tctx).await;
 
-    let (verdict, reason) = verdict(debuggable, target_sdk);
+    let (static_verdict, static_reason) = verdict(debuggable, target_sdk);
     let (ca_trusted_by_app, ca_trust_basis) =
         app_ca_trust_expectation(&trust, debuggable, target_sdk);
 
@@ -102,7 +138,7 @@ pub async fn inspect(
          likely uses one of those."
             .to_string(),
     );
-    if verdict != "interceptable" {
+    if static_verdict != "interceptable" {
         notes.push(
             "Confirm by reading the app's Network Security Config (res/xml referenced by \
              android:networkSecurityConfig): a `user` trust-anchor or `<debug-overrides>` makes it \
@@ -159,8 +195,13 @@ pub async fn inspect(
         trust,
         ca_trusted_by_app,
         ca_trust_basis,
-        verdict,
-        reason,
+        verdict: "unverified".into(),
+        reason: "No active app-specific HTTPS probe was run; see static_verdict for the host-side heuristic.".into(),
+        verified: false,
+        verdict_basis: "not_probed".into(),
+        static_verdict,
+        static_reason,
+        probe: None,
         notes,
     })
 }
@@ -169,12 +210,178 @@ pub async fn inspect(
 pub async fn run(
     serial: &Serial,
     package: &str,
+    probe: bool,
+    probe_timeout_ms: u32,
     tctx: &crate::net::trust::TrustContext,
 ) -> Result<()> {
-    let report = inspect(serial, package, tctx).await?;
+    let mut report = inspect(serial, package, tctx).await?;
+    if probe {
+        let probe_report = run_probe(serial, package, probe_timeout_ms).await;
+        if probe_report.verified {
+            report.verdict = "interceptable".into();
+            report.reason = probe_report.reason.clone();
+            report.verified = true;
+            report.verdict_basis = "active_canary".into();
+            report.ca_trusted_by_app = Some(true);
+            report.ca_trust_basis =
+                "The app issued the unique HTTPS canary and ShadowDroid captured its decrypted HTTP request."
+                    .into();
+            report.notes.retain(|note| {
+                !note.starts_with("Confirm by reading the app's Network Security Config")
+                    && !note.starts_with("Actual per-app CA trust was not proven")
+                    && !note.starts_with("Android denied shell readback")
+            });
+            report.notes.push(
+                "The active canary independently proved decryption for this app and request path; trust-store readback is not needed for this verdict."
+                    .into(),
+            );
+        } else {
+            report.reason = probe_report.reason.clone();
+            report.verdict_basis = "active_canary_inconclusive".into();
+        }
+        report.probe = Some(probe_report);
+    }
     let value = serde_json::to_value(&report).unwrap_or_default();
     crate::events::emit_action("net_check", &value);
     Ok(())
+}
+
+async fn run_probe(serial: &Serial, package: &str, timeout_ms: u32) -> ProbeReport {
+    let url = canary_url();
+    if !control::is_running(serial).await {
+        return ProbeReport {
+            url,
+            launch: "not_run".into(),
+            outcome: "proxy_not_running".into(),
+            verified: false,
+            reason: "The active canary requires a running ShadowDroid proxy. Run `net start`, then retry with `net check --probe`.".into(),
+            flow: None,
+            tls_error: None,
+        };
+    }
+
+    let started_at = crate::events::now_ts();
+    let package = crate::config::quote_device_shell_arg(package);
+    let url_arg = crate::config::quote_device_shell_arg(&url);
+    let launch_output = match adb::shell(
+        serial,
+        format!(
+            "am start -W -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d {url_arg} -p {package}"
+        ),
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            return ProbeReport {
+                url,
+                launch: "rejected".into(),
+                outcome: "launch_rejected".into(),
+                verified: false,
+                reason: format!("Android could not launch the package-scoped canary intent: {error}"),
+                flow: None,
+                tls_error: None,
+            };
+        }
+    };
+    if launch_was_rejected(&launch_output) {
+        return ProbeReport {
+            url,
+            launch: "rejected".into(),
+            outcome: "launch_rejected".into(),
+            verified: false,
+            reason: "The package does not handle ShadowDroid's HTTPS canary intent. No app-specific trust claim can be made.".into(),
+            flow: None,
+            tls_error: None,
+        };
+    }
+
+    let parsed = reqwest::Url::parse(&url).expect("built-in canary URL must parse");
+    let host = parsed.host_str().expect("built-in canary URL has a host");
+    let path = parsed.path();
+    let matcher = Matcher {
+        host: Some(host.into()),
+        path: Some(path.into()),
+        method: None,
+        status: None,
+    };
+    let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
+    loop {
+        if let Ok(flows) = store::read_filtered(serial, &matcher, 8)
+            && let Some(flow) = flows.into_iter().find(|flow| {
+                flow.ts >= started_at
+                    && flow.scheme.eq_ignore_ascii_case("https")
+                    && flow.host.eq_ignore_ascii_case(host)
+                    && flow.path == path
+            })
+        {
+            return ProbeReport {
+                url,
+                launch: "accepted".into(),
+                outcome: "decrypted_http".into(),
+                verified: true,
+                reason: "The app issued the unique HTTPS canary and ShadowDroid captured the exact decrypted HTTP request.".into(),
+                flow: Some(ProbeFlow {
+                    id: flow.id,
+                    status: flow.status,
+                    dur_ms: flow.dur_ms,
+                }),
+                tls_error: None,
+            };
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let tls_error = store::read_tls_errors(serial, Some(host), 8)
+        .ok()
+        .and_then(|events| {
+            events.into_iter().find(|event| {
+                event
+                    .get("ts")
+                    .and_then(serde_json::Value::as_f64)
+                    .is_some_and(|ts| ts >= started_at)
+                    && event
+                        .get("host")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(host))
+            })
+        });
+    if let Some(tls_error) = tls_error {
+        return ProbeReport {
+            url,
+            launch: "accepted".into(),
+            outcome: "tls_error".into(),
+            verified: false,
+            reason: "The proxy observed a TLS rejection for the canary host after launch, but TLS events do not carry an Android package identity; app trust remains unverified.".into(),
+            flow: None,
+            tls_error: Some(tls_error),
+        };
+    }
+
+    ProbeReport {
+        url,
+        launch: "accepted".into(),
+        outcome: "no_observation".into(),
+        verified: false,
+        reason: "Android accepted the canary intent, but no exact decrypted request appeared before the timeout. The app may not have issued it, may bypass the system proxy, or may reject the proxy CA.".into(),
+        flow: None,
+        tls_error: None,
+    }
+}
+
+fn canary_url() -> String {
+    format!(
+        "{PROBE_ORIGIN}{PROBE_PATH_PREFIX}{}",
+        crate::net::new_startup_id()
+    )
+}
+
+fn launch_was_rejected(output: &str) -> bool {
+    let output = output.to_ascii_lowercase();
+    output.contains("error:") || output.contains("unable to resolve intent")
 }
 
 async fn inspect_device_image(serial: &Serial) -> DeviceImage {
@@ -379,5 +586,27 @@ mod tests {
             Some(true)
         );
         assert_eq!(app_ca_trust_expectation(&trust, false, Some(34)).0, None);
+    }
+
+    #[test]
+    fn canary_urls_are_unique_https_paths() {
+        let first = canary_url();
+        let second = canary_url();
+        assert!(first.starts_with(&format!("{PROBE_ORIGIN}{PROBE_PATH_PREFIX}")));
+        assert_ne!(first, second);
+        assert_eq!(reqwest::Url::parse(&first).unwrap().scheme(), "https");
+    }
+
+    #[test]
+    fn detects_android_activity_launch_rejection() {
+        assert!(launch_was_rejected(
+            "Error: Activity not started, unable to resolve Intent"
+        ));
+        assert!(!launch_was_rejected(
+            "Starting: Intent { act=android.intent.action.VIEW }\nStatus: ok"
+        ));
+        assert!(!launch_was_rejected(
+            "Warning: Activity not started, intent has been delivered to currently running top-most instance."
+        ));
     }
 }

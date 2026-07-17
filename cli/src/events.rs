@@ -643,10 +643,14 @@ fn domain_guidance(
             .and_then(|sample| sample.get("next_actions")),
     ));
     guidance.extend(strings(map.get("recommended_command")));
-    guidance.extend(strings(
-        map.get("trust")
-            .and_then(|trust| trust.get("recommended_command")),
-    ));
+    if command_path != Some("net check")
+        || map.get("verified").and_then(serde_json::Value::as_bool) != Some(true)
+    {
+        guidance.extend(strings(
+            map.get("trust")
+                .and_then(|trust| trust.get("recommended_command")),
+        ));
+    }
     if command_path == Some("ui audit") {
         guidance.extend(strings(map.get("recommendation")));
     }
@@ -771,6 +775,40 @@ fn dynamic_next_actions(
                 "shadowdroid net status".to_string(),
             ]);
             actions
+        }
+        Some("net check")
+            if map.get("verified").and_then(serde_json::Value::as_bool) == Some(true) =>
+        {
+            let mut actions = map
+                .get("probe")
+                .and_then(|probe| probe.get("flow"))
+                .and_then(|flow| flow.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .map(|id| vec![format!("shadowdroid net show {} --body", shell_token(id))])
+                .unwrap_or_default();
+            actions.extend([
+                "shadowdroid net log".to_string(),
+                "shadowdroid watch".to_string(),
+            ]);
+            actions
+        }
+        Some("net check")
+            if map
+                .get("probe")
+                .and_then(|probe| probe.get("outcome"))
+                .and_then(serde_json::Value::as_str)
+                == Some("proxy_not_running") =>
+        {
+            let package = map
+                .get("package")
+                .and_then(serde_json::Value::as_str)
+                .map(shell_token)
+                .unwrap_or_else(|| "PACKAGE".into());
+            vec![
+                "shadowdroid net start".into(),
+                format!("shadowdroid net check --probe {package}"),
+                "shadowdroid net status".into(),
+            ]
         }
         Some("net log") => map
             .get("ids")
@@ -1707,6 +1745,27 @@ mod tests {
             ]
         );
         assert!(domain_guidance(Some("net start"), &map).is_empty());
+    }
+
+    #[test]
+    fn verified_net_check_does_not_recommend_reinstalling_trust() {
+        let map = serde_json::json!({
+            "verified": true,
+            "trust": {"recommended_command": "shadowdroid net trust --push"},
+            "probe": {"flow": {"id": "f7"}}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(domain_guidance(Some("net check"), &map).is_empty());
+        assert_eq!(
+            dynamic_next_actions(Some("net check"), &map),
+            [
+                "shadowdroid net show f7 --body",
+                "shadowdroid net log",
+                "shadowdroid watch"
+            ]
+        );
     }
 
     #[test]

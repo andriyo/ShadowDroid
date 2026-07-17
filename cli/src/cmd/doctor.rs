@@ -466,7 +466,7 @@ pub async fn run(
         };
         let check = match inspected {
             Ok(rep) => {
-                let status = match rep.verdict.as_str() {
+                let status = match rep.static_verdict.as_str() {
                     "interceptable" => Status::Ok,
                     "conditional" => Status::Warn,
                     _ => Status::Fail,
@@ -474,7 +474,10 @@ pub async fn run(
                 Check {
                     code: "net_app",
                     status,
-                    detail: format!("{} — {} ({})", rep.package, rep.verdict, rep.reason),
+                    detail: format!(
+                        "{} — unverified; static heuristic: {} ({})",
+                        rep.package, rep.static_verdict, rep.static_reason
+                    ),
                     remedy: None,
                 }
             }

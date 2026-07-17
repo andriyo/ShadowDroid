@@ -59,12 +59,14 @@ class MainActivity : ComponentActivity() {
         render()
         setStatus("Ready: ${intentSummary(intent)}")
         Log.i(TAG, "MainActivity created")
+        runShadowDroidProbe(intent)
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
         setStatus("New intent: ${intentSummary(intent)}")
+        runShadowDroidProbe(intent)
     }
 
     @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
@@ -586,6 +588,18 @@ class MainActivity : ComponentActivity() {
                 setStatus(result)
             }
         }.start()
+    }
+
+    private fun runShadowDroidProbe(intent: Intent) {
+        val uri = intent.data ?: return
+        if (
+            intent.action == Intent.ACTION_VIEW &&
+            uri.scheme == "https" &&
+            uri.host == "example.com" &&
+            uri.path?.startsWith("/.well-known/shadowdroid-canary/") == true
+        ) {
+            runRequest("ShadowDroid canary", "GET", uri.toString())
+        }
     }
 
     private fun performRequest(

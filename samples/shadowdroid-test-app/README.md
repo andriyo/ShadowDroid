@@ -63,3 +63,6 @@ The debug build uses a Network Security Config with `debug-overrides` that trust
 user-installed CAs, so it is suitable for `shadowdroid net trust --auto` on
 rootable emulator images and `shadowdroid net trust --push` followed by manual
 Settings installation on locked devices (a screen-lock credential is required).
+It also handles ShadowDroid's package-scoped HTTPS canary and requests the exact
+unique URL, making it a real target for `net start` followed by
+`net check --probe io.github.andriyo.shadowdroid.sample`.

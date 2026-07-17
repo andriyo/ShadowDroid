@@ -1570,9 +1570,11 @@ fn write_body_file(
 pub async fn check(
     serial: &Serial,
     package: &str,
+    probe: bool,
+    probe_timeout_ms: u32,
     tctx: &crate::net::trust::TrustContext,
 ) -> Result<()> {
-    crate::net::check::run(serial, package, tctx).await
+    crate::net::check::run(serial, package, probe, probe_timeout_ms, tctx).await
 }
 
 pub async fn trust(

@@ -919,10 +919,11 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "next_actions": ["net check <pkg>", "net start", "watch", "net log", "net show <id>", "net intercept"]
         })),
         "net check" => Some(serde_json::json!({
-            "use_when": ["Need to know whether a package is likely interceptable before relying on HTTP(S) events."],
-            "output": "interceptability verdict JSON with device image, CA store evidence (trust.basis: probed|asserted|cached), and recommended trust command",
-            "side_effects": ["none (may write the verify-once trust cache after a positive probe); --fresh ignores proxy.ca_trusted + cache and re-probes"],
-            "next_actions": ["net trust", "net start", "watch"]
+            "use_when": ["Need to know whether a package is likely interceptable, or actively prove that its HTTPS request is decrypted."],
+            "output": "unverified top-level verdict plus a labeled static heuristic; --probe returns active-canary evidence and only marks interceptable after the exact unique HTTPS request is captured",
+            "side_effects": ["static mode may write the verify-once trust cache after positive store evidence; --fresh ignores proxy.ca_trusted + cache and re-probes", "--probe launches a package-scoped HTTPS VIEW intent and the target app may perform one network request"],
+            "prerequisites": ["--probe requires net start and an app that handles the ShadowDroid canary URL and requests that exact URL"],
+            "next_actions": ["net start", "net check --probe <pkg>", "net log", "watch"]
         })),
         "net trust" => Some(serde_json::json!({
             "use_when": ["Need the device/app to trust the proxy CA before expecting decrypted HTTPS traffic. Skipped automatically when proxy.ca_trusted is set or a prior verification is cached."],

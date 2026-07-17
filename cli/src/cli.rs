@@ -820,6 +820,18 @@ pub enum NetCmd {
         /// App package, app alias from config, or installed package name.
         #[arg(value_name = "PACKAGE")]
         package: Option<String>,
+        /// Launch a package-scoped HTTPS canary and wait for its exact decrypted request.
+        /// The app must handle the canary VIEW intent and issue that URL itself.
+        #[arg(long)]
+        probe: bool,
+        /// How long to wait for the canary request, in milliseconds.
+        #[arg(
+            long,
+            default_value_t = 10000,
+            value_parser = clap::value_parser!(u32).range(500..=30000),
+            requires = "probe"
+        )]
+        probe_timeout_ms: u32,
         /// Ignore `proxy.ca_trusted` and the verify-once cache; probe the device.
         #[arg(long)]
         fresh: bool,
@@ -2468,10 +2480,15 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
     };
 
     match c {
-        NetCmd::Check { package, fresh } => {
+        NetCmd::Check {
+            package,
+            probe,
+            probe_timeout_ms,
+            fresh,
+        } => {
             let package = resolve_net_check_package(serial, config, package.clone()).await?;
             let tctx = crate::net::trust::TrustContext::resolve(config, serial, *fresh)?;
-            nc::check(serial, &package, &tctx).await
+            nc::check(serial, &package, *probe, *probe_timeout_ms, &tctx).await
         }
         NetCmd::Trust {
             auto,
@@ -4734,6 +4751,41 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn net_check_probe_is_explicit_and_bounded() {
+        let parsed = Cli::try_parse_from([
+            "shadowdroid",
+            "net",
+            "check",
+            "--probe",
+            "--probe-timeout-ms",
+            "750",
+            "com.example.app",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.cmd,
+            Cmd::Net(NetCmd::Check {
+                package: Some(package),
+                probe: true,
+                probe_timeout_ms: 750,
+                ..
+            }) if package == "com.example.app"
+        ));
+
+        assert!(
+            Cli::try_parse_from([
+                "shadowdroid",
+                "net",
+                "check",
+                "--probe-timeout-ms",
+                "750",
+                "com.example.app",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

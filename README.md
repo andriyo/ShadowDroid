@@ -721,9 +721,13 @@ agent inspects with `net show`, then releases with
 reply). Repeated edits can be promoted to declarative `net rule`s (map-local /
 map-remote / set-status / set-request-header / set-response-header / replace /
 block / delay) or served
-offline from a saved session with `net replay`. `net check <app>` reports
-whether a build is interceptable. `net export har|curl|fixtures` hands flows to
-other tools by writing a durable artifact and returning an actionable summary;
+offline from a saved session with `net replay`. `net check <app>` labels its
+debuggable/targetSdk result as a static heuristic and leaves the app-specific
+verdict unverified. With the proxy running, `net check --probe <app>` launches a
+package-scoped HTTPS canary; it reports verified/interceptable only when the app
+handles that intent, requests its unique URL, and the exact decrypted flow is
+captured. `net export har|curl|fixtures` hands flows to other tools by writing a
+durable artifact and returning an actionable summary;
 HAR defaults to `shadowdroid-network.har`, curl to
 `shadowdroid-network.curl.sh`, and fixtures to `shadowdroid-fixtures` unless
 `--out` selects another path.
