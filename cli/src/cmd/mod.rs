@@ -11,6 +11,7 @@
 pub mod aar;
 pub mod agent;
 pub mod app_install;
+pub mod app_state;
 pub mod artifact;
 pub mod authoring;
 pub mod collect;

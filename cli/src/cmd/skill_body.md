@@ -273,6 +273,9 @@ shadowdroid appops get com.example.app CAMERA
 shadowdroid appops set com.example.app CAMERA ignore --scope uid
 shadowdroid profile apply --preset automation
 shadowdroid files pull /sdcard/report.json /tmp/report.json
+shadowdroid files pull --run-as --app com.example.app files/state.json local.json
+shadowdroid app state snapshot --app com.example.app --out /tmp/app-state --include shared_prefs --include databases/app.db
+shadowdroid app state restore --from /tmp/app-state
 ```
 
 Install, app wait, and `device shell` failures are semantic failures: a failed
@@ -294,6 +297,16 @@ auto-rotation and stylus flags; user rotation `0`–`3`. The file conflicts with
 CLI setting overlays. `files push --mode` is optional: omit it for Android
 shared/FUSE storage, and expect a typed postcondition failure if an explicitly
 requested mode cannot be applied.
+
+Private file and state commands require an installed debuggable package and
+working Android `run-as`. They never print file contents. State snapshots are
+unencrypted sensitive directories protected as `0700`/`0600`; the manifest
+records package/version/signing identity, SHA-256, size, and mode. Restore
+force-stops the app, refuses incompatible package/signature state unless
+explicitly overridden, stages and verifies before deleting rollback data, and
+leaves a marker on interruption. Use `app state recover --app <pkg>` when that
+marker is reported and `app state cleanup --from <snapshot>` for best-effort
+overwrite/delete.
 
 ## Android Studio debugger and layout
 

@@ -170,6 +170,30 @@ pub async fn shell(serial: impl Into<String>, cmd: impl Into<String>) -> Result<
     .await
 }
 
+/// Run a shell command and preserve stdout byte-for-byte. Private debuggable-app
+/// transfer uses this for `run-as ... cat`: routing through [`shell`] would
+/// lossy-decode arbitrary databases, preferences, and session files as UTF-8.
+pub async fn shell_bytes(serial: impl Into<String>, cmd: impl Into<String>) -> Result<Vec<u8>> {
+    let serial = serial.into();
+    let cmd = cmd.into();
+    bounded_blocking("device shell bytes", ADB_TRANSFER_TIMEOUT, move || {
+        let mut device = get_device_sync(&serial)?;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        device
+            .shell_command(&cmd, Some(&mut stdout), Some(&mut stderr))
+            .map_err(|error| anyhow!("adb shell binary command failed: {error}"))?;
+        if !stderr.is_empty() {
+            debug!(
+                "adb shell binary stderr ({serial}): {}",
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+        Ok(stdout)
+    })
+    .await
+}
+
 /// Run a shell command whose effects mutate device state. Once native ADB work
 /// starts, await its definitive result so a host timeout can never be followed
 /// by a late settings/package/process change after caller rollback.

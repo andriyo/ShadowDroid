@@ -372,6 +372,8 @@ pub enum AppCmd {
     Install(AppInstallArgs),
     /// Like `install`, but uninstall any existing copy first.
     Reinstall(AppInstallArgs),
+    /// Snapshot, restore, recover, and clean up private debuggable-app state.
+    State(crate::cmd::app_state::StateArgs),
     /// Clear the app's data.
     Clear {
         /// App package, app alias from config, or installed package name.
@@ -487,9 +489,23 @@ pub enum DeviceCmd {
 #[derive(Subcommand)]
 pub enum FilesCmd {
     /// List a directory on the device.
-    Ls { remote: String },
+    Ls {
+        /// Resolve the path inside this debuggable app's private data directory.
+        #[arg(long, requires = "run_as")]
+        app: Option<String>,
+        /// Access the path through Android run-as instead of shared/server storage.
+        #[arg(long)]
+        run_as: bool,
+        remote: String,
+    },
     /// Push a local file to the device.
     Push {
+        /// Resolve the destination inside this debuggable app's private data directory.
+        #[arg(long, requires = "run_as")]
+        app: Option<String>,
+        /// Access the destination through Android run-as.
+        #[arg(long)]
+        run_as: bool,
         local: String,
         remote: String,
         /// Require Unix permission bits after the push (octal, e.g. 644).
@@ -498,7 +514,34 @@ pub enum FilesCmd {
         mode: Option<u32>,
     },
     /// Pull a device file to the host.
-    Pull { remote: String, local: String },
+    Pull {
+        /// Resolve the source inside this debuggable app's private data directory.
+        #[arg(long, requires = "run_as")]
+        app: Option<String>,
+        /// Access the source through Android run-as.
+        #[arg(long)]
+        run_as: bool,
+        remote: String,
+        local: String,
+    },
+}
+
+impl FilesCmd {
+    fn uses_run_as(&self) -> bool {
+        match self {
+            Self::Ls { run_as, .. } | Self::Push { run_as, .. } | Self::Pull { run_as, .. } => {
+                *run_as
+            }
+        }
+    }
+
+    fn requested_app(&self) -> Option<&str> {
+        match self {
+            Self::Ls { app, .. } | Self::Push { app, .. } | Self::Pull { app, .. } => {
+                app.as_deref()
+            }
+        }
+    }
 }
 
 // ── live UI automation (`ui`) ─────────────────────────────────
@@ -1721,6 +1764,39 @@ async fn run_inner() -> Result<()> {
             let serial = selection.resolve(&config).await?;
             return dispatch_profile(c, &serial).await;
         }
+        Cmd::App(AppCmd::State(args)) => {
+            if !args.needs_device() {
+                return crate::cmd::app_state::run(args, None, None).await;
+            }
+            let serial = selection.resolve(&config).await?;
+            let requested = match &args.cmd {
+                crate::cmd::app_state::StateCmd::Restore { app: None, .. } => None,
+                _ => args
+                    .requested_app()
+                    .map(str::to_string)
+                    .or_else(|| config.default_app()),
+            };
+            let package = resolve_app_package(&config, Some(serial.as_str()), requested).await?;
+            return crate::cmd::app_state::run(args, Some(&serial), package).await;
+        }
+        Cmd::Files(files) if files.uses_run_as() => {
+            let serial = selection.resolve(&config).await?;
+            let requested = files
+                .requested_app()
+                .map(str::to_string)
+                .or_else(|| config.default_app());
+            let package = resolve_app_package(&config, Some(serial.as_str()), requested)
+                .await?
+                .ok_or_else(|| {
+                    crate::diagnostic::DiagnosticError::new(
+                        "app_required",
+                        "files",
+                        "--run-as needs --app or a configured default app",
+                    )
+                    .next_actions(["rerun with `--run-as --app <package>`"])
+                })?;
+            return dispatch_private_files(files, &serial, &package).await;
+        }
         Cmd::App(AppCmd::Install(a)) => {
             let serial = selection.resolve(&config).await?;
             return crate::cmd::app_install::run(&serial, a, false).await;
@@ -2326,7 +2402,7 @@ fn apply_app_config(args: &mut AppCmd, config: &ShadowDroidConfig) {
         | AppCmd::Clear { package }
         | AppCmd::Info { package }
         | AppCmd::Wait { package, .. } => fill_app(package, config),
-        AppCmd::Install(_) | AppCmd::Reinstall(_) | AppCmd::Current { .. } => {}
+        AppCmd::Install(_) | AppCmd::Reinstall(_) | AppCmd::State(_) | AppCmd::Current { .. } => {}
     }
 }
 
@@ -3019,8 +3095,8 @@ async fn dispatch_app_inner(
     serial: &Serial,
 ) -> Result<Outcome> {
     match c {
-        AppCmd::Install(_) | AppCmd::Reinstall(_) => {
-            unreachable!("app install/reinstall handled host-side")
+        AppCmd::Install(_) | AppCmd::Reinstall(_) | AppCmd::State(_) => {
+            unreachable!("host-side app command reached server dispatch")
         }
         AppCmd::Start { package, activity } => {
             let package = require_app_package(client, config, serial, package, "app start").await?;
@@ -3291,7 +3367,11 @@ async fn dispatch_device(c: DeviceCmd, client: &ServerClient, serial: &Serial) -
 
 async fn dispatch_files(c: FilesCmd, client: &ServerClient, serial: &Serial) -> Result<()> {
     match c {
-        FilesCmd::Ls { remote } => {
+        FilesCmd::Ls {
+            app: _,
+            run_as: false,
+            remote,
+        } => {
             // Server first (app-accessible storage); fall back to `adb shell ls`
             // for paths the instrumentation uid can't see (e.g. /sdcard under
             // scoped storage) — mirrors the push/pull fallback below.
@@ -3310,6 +3390,8 @@ async fn dispatch_files(c: FilesCmd, client: &ServerClient, serial: &Serial) -> 
             }
         }
         FilesCmd::Push {
+            app: _,
+            run_as: false,
             local,
             remote,
             mode,
@@ -3354,7 +3436,12 @@ async fn dispatch_files(c: FilesCmd, client: &ServerClient, serial: &Serial) -> 
                 Err(err) => return Err(err),
             }
         }
-        FilesCmd::Pull { remote, local } => {
+        FilesCmd::Pull {
+            app: _,
+            run_as: false,
+            remote,
+            local,
+        } => {
             let local_path = Path::new(&local);
             let server_pull = match client.pull_file_response(&remote).await {
                 Ok(response) => {
@@ -3375,8 +3462,33 @@ async fn dispatch_files(c: FilesCmd, client: &ServerClient, serial: &Serial) -> 
                 &json!({"remote":remote,"local":local,"bytes":bytes,"via":via}),
             );
         }
+        FilesCmd::Ls { run_as: true, .. }
+        | FilesCmd::Push { run_as: true, .. }
+        | FilesCmd::Pull { run_as: true, .. } => {
+            unreachable!("run-as file command reached server dispatch")
+        }
     }
     Ok(())
+}
+
+async fn dispatch_private_files(c: &FilesCmd, serial: &Serial, package: &str) -> Result<()> {
+    match c {
+        FilesCmd::Ls { remote, .. } => {
+            crate::cmd::app_state::private_list(serial, package, remote).await
+        }
+        FilesCmd::Push {
+            local,
+            remote,
+            mode,
+            ..
+        } => {
+            crate::cmd::app_state::private_push(serial, package, Path::new(local), remote, *mode)
+                .await
+        }
+        FilesCmd::Pull { remote, local, .. } => {
+            crate::cmd::app_state::private_pull(serial, package, remote, Path::new(local)).await
+        }
+    }
 }
 
 fn file_mode_postcondition_error(
@@ -5541,6 +5653,83 @@ mod tests {
             Cmd::Files(FilesCmd::Push { mode, .. }) => assert_eq!(mode, None),
             _ => panic!("expected files push"),
         }
+    }
+
+    #[test]
+    fn private_file_and_app_state_workflows_parse() {
+        let pull = Cli::try_parse_from([
+            "shadowdroid",
+            "files",
+            "pull",
+            "--run-as",
+            "--app",
+            "com.example.app",
+            "files/state.json",
+            "local.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            pull.cmd,
+            Cmd::Files(FilesCmd::Pull {
+                app: Some(app),
+                run_as: true,
+                ..
+            }) if app == "com.example.app"
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "shadowdroid",
+                "files",
+                "pull",
+                "--app",
+                "com.example.app",
+                "files/state.json",
+                "local.json",
+            ])
+            .is_err()
+        );
+
+        let snapshot = Cli::try_parse_from([
+            "shadowdroid",
+            "app",
+            "state",
+            "snapshot",
+            "--app",
+            "com.example.app",
+            "--out",
+            "/tmp/state",
+            "--include",
+            "shared_prefs",
+            "--include",
+            "databases/app.db",
+        ])
+        .unwrap();
+        assert!(matches!(
+            snapshot.cmd,
+            Cmd::App(AppCmd::State(crate::cmd::app_state::StateArgs {
+                cmd: crate::cmd::app_state::StateCmd::Snapshot { include, .. }
+            })) if include.len() == 2
+        ));
+
+        let restore = Cli::try_parse_from([
+            "shadowdroid",
+            "app",
+            "state",
+            "restore",
+            "--from",
+            "/tmp/state",
+            "--allow-incompatible",
+        ])
+        .unwrap();
+        assert!(matches!(
+            restore.cmd,
+            Cmd::App(AppCmd::State(crate::cmd::app_state::StateArgs {
+                cmd: crate::cmd::app_state::StateCmd::Restore {
+                    allow_incompatible: true,
+                    ..
+                }
+            }))
+        ));
     }
 
     #[test]

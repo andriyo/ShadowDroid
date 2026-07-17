@@ -9,6 +9,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -550,13 +551,34 @@ class MainActivity : ComponentActivity() {
         val dir = File(filesDir, "shadowdroid-sample").apply { mkdirs() }
         val file = File(dir, "state.json")
         val cacheFile = File(cacheDir, "shadowdroid-sample-cache.txt")
+        val timestamp = System.currentTimeMillis()
         file.writeText(
             """
-            {"counter":$counter,"name":"${nameInput.text}","timestamp":${System.currentTimeMillis()}}
+            {"counter":$counter,"name":"${nameInput.text}","timestamp":$timestamp}
             """.trimIndent(),
         )
-        cacheFile.writeText("cache sample ${System.currentTimeMillis()}\n")
-        setStatus("Wrote ${file.absolutePath} and ${cacheFile.absolutePath}")
+        cacheFile.writeText("cache sample $timestamp\n")
+        getSharedPreferences("shadowdroid-state", MODE_PRIVATE)
+            .edit()
+            .putString("session", "sample-session-$timestamp")
+            .putInt("counter", counter)
+            .commit()
+        val database = openOrCreateDatabase("shadowdroid-state.db", MODE_PRIVATE, null)
+        database.enableWriteAheadLogging()
+        database.execSQL(
+            "CREATE TABLE IF NOT EXISTS state (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+        )
+        database.insertWithOnConflict(
+            "state",
+            null,
+            ContentValues().apply {
+                put("id", 1)
+                put("value", "sample-db-$timestamp")
+            },
+            android.database.sqlite.SQLiteDatabase.CONFLICT_REPLACE,
+        )
+        database.close()
+        setStatus("Wrote private files, SharedPreferences, and SQLite state")
     }
 
     private fun emitLogs() {

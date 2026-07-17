@@ -759,6 +759,37 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "side_effects": ["none"],
             "next_actions": ["app current", "doctor --app <pkg>"]
         })),
+        "app state" => Some(serde_json::json!({
+            "use_when": ["Need deterministic private app state across compatible APK versions without raw run-as shell redirection."],
+            "output": "metadata-only snapshot/restore/recovery/cleanup JSON; private contents are never printed",
+            "side_effects": ["snapshot/restore/recover force-stop the app", "snapshot writes protected host files", "restore mutates selected private roots transactionally", "cleanup overwrites and deletes a host snapshot"],
+            "prerequisites": ["installed debuggable package with working run-as"],
+            "next_actions": ["app state snapshot --app <pkg> --out <dir> --include shared_prefs", "app state restore --from <dir>", "app state recover --app <pkg>", "app state cleanup --from <dir>"]
+        })),
+        "app state snapshot" => Some(serde_json::json!({
+            "use_when": ["Need a protected manifest plus selected private files/directories for cross-version regression state."],
+            "output": "snapshot summary with paths/hashes/modes/counts and sensitive/unencrypted status; no contents",
+            "side_effects": ["force-stops the app", "writes a new 0700 host directory with 0600 files"],
+            "next_actions": ["app state restore --from <dir>", "app state cleanup --from <dir>"]
+        })),
+        "app state restore" => Some(serde_json::json!({
+            "use_when": ["Need to restore selected private state under the app UID across a compatible APK upgrade/downgrade."],
+            "output": "transaction result with compatibility, root/file/directory counts, and hash/mode verification",
+            "side_effects": ["force-stops the app", "atomically replaces selected private roots", "retains rollback data until verification"],
+            "next_actions": ["app start <pkg>", "app wait <pkg> --front", "app state recover --app <pkg>"]
+        })),
+        "app state recover" => Some(serde_json::json!({
+            "use_when": ["A restore reported an interruption/pending marker and selected roots may be partial."],
+            "output": "rollback result without private contents",
+            "side_effects": ["force-stops the app", "restores private backups or removes newly created partial roots"],
+            "next_actions": ["app state restore --from <dir>", "app start <pkg>"]
+        })),
+        "app state cleanup" => Some(serde_json::json!({
+            "use_when": ["Need best-effort overwrite/delete of a sensitive unencrypted host snapshot."],
+            "output": "deleted file/byte counts plus SSD/COW secure-erasure warning",
+            "side_effects": ["irreversibly overwrites and deletes the validated snapshot directory"],
+            "next_actions": ["commands --json --describe 'app state'"]
+        })),
         "perm" => Some(serde_json::json!({
             "use_when": ["Need runtime permission state setup or verification without opening Android settings."],
             "output": "permission action/list JSON",
@@ -899,7 +930,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "next_actions": ["app current", "ui wait", "ui dump"]
         })),
         "files" => Some(serde_json::json!({
-            "use_when": ["Need structured push/pull/list operations for files on the device."],
+            "use_when": ["Need structured push/pull/list operations for shared/device files or private debuggable-app paths through --run-as --app."],
             "output": "file operation JSON",
             "side_effects": ["push/pull write files; ls is read-only"],
             "next_actions": ["files ls <remote>", "files pull <remote> <local>", "files push <local> <remote>"]
@@ -911,14 +942,14 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "next_actions": ["files pull <remote> <local>", "device shell"]
         })),
         "files push" => Some(serde_json::json!({
-            "use_when": ["Need to copy a host file to the device with optional Unix permissions."],
-            "output": "push action JSON",
+            "use_when": ["Need to copy a host file to the device with optional Unix permissions; add --run-as --app for a private app-data destination."],
+            "output": "push action JSON; private mode includes SHA-256 and never prints contents",
             "side_effects": ["writes a remote device file"],
             "next_actions": ["files ls <remote-dir>", "device shell"]
         })),
         "files pull" => Some(serde_json::json!({
-            "use_when": ["Need to copy a device artifact to the host for inspection or handoff."],
-            "output": "pull action JSON",
+            "use_when": ["Need to copy a device artifact to the host; add --run-as --app for a private debuggable-app source."],
+            "output": "pull action JSON; private mode writes 0600, reports SHA-256, and never prints contents",
             "side_effects": ["writes a local host file"],
             "next_actions": ["collect", "files ls <remote-dir>"]
         })),

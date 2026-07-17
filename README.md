@@ -734,11 +734,11 @@ selector (then optionally activates it) — the TV analog of `ui tap` /
 | **Live timeline** | `watch` (screen changes, crashes, ANRs, toasts, watcher actions, and HTTP events when network capture is active) |
 | **Layout / Compose** | `layout snapshot`, `layout diff`, `layout source`, `layout recompositions` |
 | **Debugger** | `debug auto`, `snapshot`, `record`, `replay`, `status`, `sessions`, `clients`, `attach`, `break`, `breakpoints`, `pause`, `resume`, `step-in`, `step-over`, `step-out`, `stop`, `stack`, `threads`, `variables`, `eval`, `inspect`, `coroutines`, `continue-until`, `watch`, `step-until-screen-change`, `step-until-log`, `run-until-crash`, `native`, `tombstones` |
-| **App lifecycle** | `app start`, `stop`, `install`, `reinstall`, `clear`, `info`, `wait`, `current` |
+| **App lifecycle/state** | `app start`, `stop`, `install`, `reinstall`, `clear`, `info`, `wait`, `current`; `app state snapshot`, `restore`, `recover`, `cleanup` |
 | **Permissions/app-ops** | `perm grant`, `revoke`, `list`, `reset`; `appops get`, `set` |
 | **Device/system** | `device info`, `shell`, `wake`, `sleep`, `unlock`, `orientation`, `clipboard`, `notifications`, `quick-settings`, `open-url` |
 | **Display profile** | `profile snapshot`, `apply`, `reset` (animations, font, density, size, rotation) |
-| **Files** | `files ls`, `push`, `pull` |
+| **Files** | `files ls`, `push`, `pull` (add `--run-as --app <pkg>` for private debuggable-app paths) |
 | **Network MITM** | `net check`, `trust`, `ca import/info/reset`, `start`, `stop`, `status`, `log`, `checkpoint`, `show`, `export`, `intercept`, `resume`, `drop`, `respond`, `rule`, `rules`, `replay` |
 | **In-app AAR agent** | `aar install` (`--okhttp`, `--coroutine-probes`, `--build`), `status`, `remove`, `capture`, `intercept`, `resume`, `drop`, `agent`, `coroutines` |
 | **Authoring/testing helpers** | `ui audit` (selector gaps), `ui gen` (Screen Object scaffold), `net export fixtures` (replayable response set + `manifest.json`, GraphQL keyed by operationName), `test` (instrumentation command with the slot freed), `debug replay --repeat --diff` (flake hunting) |
@@ -763,6 +763,44 @@ stylus flags `0`/`1`, and user rotation `0`–`3`. A file conflicts with CLI
 setting overlays so no supplied value is silently ignored. For shared/FUSE
 storage, omit `files push --mode`; when `--mode` is explicit, failure to apply
 it is a typed error even if the bytes were transferred.
+
+Private debuggable-app files are available without raw shell redirection:
+
+```bash
+shadowdroid files pull --run-as --app com.example.app files/state.json local.json
+shadowdroid files push --run-as --app com.example.app --mode 600 local.json files/state.json
+```
+
+Contents are byte-preserving and never printed. For cross-version regression
+state, snapshot selected files or whole directories while the app is
+force-stopped, then restore them under the app UID:
+
+```bash
+shadowdroid app state snapshot --app com.example.app \
+  --out /tmp/example-state \
+  --include shared_prefs \
+  --include files/session-state.json \
+  --include databases/app.db
+
+shadowdroid app state restore --from /tmp/example-state
+shadowdroid app state cleanup --from /tmp/example-state
+```
+
+The protected snapshot directory is `0700`; files and `manifest.json` are
+`0600`. The manifest records package/version, a stable Android signing identity
+digest, every relative path, bytes, SHA-256, mode, selected roots, automatically
+included SQLite `-wal`/`-shm`/`-journal` sidecars, and
+`contains_sensitive_data:true`. It is deliberately marked unencrypted.
+`cleanup` overwrites before deletion but warns that SSD/COW/journaled storage
+cannot guarantee physical erasure.
+
+Restore refuses a package/signature mismatch unless `--allow-incompatible` is
+explicit. It stages all data privately, records a recovery marker, atomically
+swaps each selected root, verifies every hash/mode, and only then deletes the
+backups. If interrupted during the commit, subsequent state commands return
+`state_restore_interrupted` instead of pretending the app is safe; run
+`app state recover --app <pkg>` to roll back. Snapshot, restore, and recovery
+leave the app force-stopped.
 
 `watch` is the streaming workhorse — it emits debounced, hash-diffed `screen`
 events plus `crash`, `toast`, `watcher_fired`, and `http` events when a `net`
