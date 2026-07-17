@@ -277,6 +277,7 @@ mod tests {
     fn el(id: u32, bounds: [i32; 4], focused: bool) -> Element {
         Element {
             id,
+            handle: None,
             text: Some(format!("e{id}")),
             desc: None,
             klass: None,

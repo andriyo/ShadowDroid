@@ -47,6 +47,15 @@ pub struct ScreenResponse {
     /// length-delimited hash are interpreted as v1.
     #[serde(default = "default_screen_hash_version")]
     pub screen_hash_version: u32,
+    /// Explicit strict-content identity. New servers expose `c:<screen_hash>`;
+    /// `screen_hash` remains unchanged for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    /// Actionable structure identity, excluding explicitly volatile content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_hash: Option<String>,
+    #[serde(default = "default_interaction_hash_version")]
+    pub interaction_hash_version: u32,
     #[serde(default = "default_snapshot_state")]
     pub snapshot_state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -64,6 +73,10 @@ pub struct ScreenResponse {
 }
 
 const fn default_screen_hash_version() -> u32 {
+    1
+}
+
+const fn default_interaction_hash_version() -> u32 {
     1
 }
 
@@ -119,6 +132,8 @@ impl ImeState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Element {
     pub id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -409,6 +424,7 @@ mod tests {
     fn sample() -> Element {
         Element {
             id: 3,
+            handle: None,
             text: Some("Go".into()),
             desc: None,
             klass: None,
@@ -443,6 +459,9 @@ mod tests {
         let screen: ScreenResponse = serde_json::from_str(body).unwrap();
         assert!(screen.ime.is_empty());
         assert_eq!(screen.screen_hash_version, 1);
+        assert!(screen.content_hash.is_none());
+        assert!(screen.interaction_hash.is_none());
+        assert_eq!(screen.interaction_hash_version, 1);
         assert_eq!(screen.snapshot_state, "unknown");
         assert!(screen.captured_at_ms.is_none());
         assert!(screen.ui_tree.is_none());

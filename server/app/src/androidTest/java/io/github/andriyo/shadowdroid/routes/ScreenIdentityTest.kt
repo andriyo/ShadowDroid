@@ -77,6 +77,134 @@ class ScreenIdentityTest {
     }
 
     @Test
+    fun interactionIdentityIgnoresTelemetryVideoAndRangeCurrentValue() {
+        val control =
+            element(id = 8, text = null, desc = "Follow target").copy(
+                klass = "SeekBar",
+                clickable = true,
+                range = RangeSemantics("float", 0f, 100f, 20f),
+                interaction_path = listOf(0, 2),
+            )
+        val telemetryA =
+            element(id = 1, text = "Confidence 71%", desc = null).copy(
+                rid = "com.example:id/telemetry",
+                interaction_path = listOf(0, 0),
+            )
+        val telemetryB = telemetryA.copy(text = "Confidence 99%")
+        val video =
+            element(id = 2, text = null, desc = null).copy(
+                klass = "TextureView",
+                rid = null,
+                bounds = listOf(0, 0, 1080, 1200),
+                interaction_path = listOf(0, 1),
+            )
+
+        assertNotEquals(hash(listOf(telemetryA, video, control)), hash(listOf(telemetryB, video, control.copy(range = control.range?.copy(current = 80f)))))
+        assertEquals(
+            interactionHash(listOf(telemetryA, video, control)),
+            interactionHash(
+                listOf(
+                    telemetryB,
+                    video.copy(bounds = listOf(0, 0, 1080, 1600)),
+                    control.copy(range = control.range?.copy(current = 80f)),
+                ),
+            ),
+        )
+        // A display-only sibling may be inserted or removed before the control;
+        // raw accessibility indexes shift, but the actionable hierarchy does not.
+        assertEquals(
+            interactionHash(listOf(control.copy(interaction_path = listOf(0, 1)))),
+            interactionHash(
+                listOf(
+                    telemetryA.copy(interaction_path = listOf(0, 0)),
+                    control.copy(interaction_path = listOf(0, 2)),
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun interactionIdentityTracksActionableHierarchyGeometryAndState() {
+        val control =
+            element(text = "Run", desc = "Run mission").copy(
+                klass = "Button",
+                clickable = true,
+                interaction_path = listOf(0, 1),
+            )
+        val base = interactionHash(listOf(control))
+        for (variant in listOf(
+            control.copy(enabled = false),
+            control.copy(bounds = listOf(10, 20, 100, 120)),
+            control.copy(clickable = false, focusable = true),
+            control.copy(actions = listOf("long_click")),
+        )) {
+            assertNotEquals(base, interactionHash(listOf(variant)))
+        }
+        assertNotEquals(base, interactionHash(listOf(control, control.copy(id = 2, interaction_path = listOf(0, 2)))))
+        val child =
+            control.copy(
+                rid = "com.example:id/child",
+                desc = "Child action",
+                interaction_path = listOf(0, 1, 0),
+            )
+        assertNotEquals(
+            interactionHash(listOf(control, child)),
+            interactionHash(listOf(control, child.copy(interaction_path = listOf(1)))),
+        )
+        // A stable rid/description outranks mutable displayed button copy.
+        assertEquals(base, interactionHash(listOf(control.copy(text = "Running 42%"))))
+        // Text-only actions must retain their label in the interaction identity.
+        val textOnly = control.copy(rid = null, desc = null)
+        assertNotEquals(
+            interactionHash(listOf(textOnly)),
+            interactionHash(listOf(textOnly.copy(text = "Stop"))),
+        )
+    }
+
+    @Test
+    fun interactionHandlesUseActionableOrdinalNotVolatileDumpId() {
+        val telemetry = element(id = 1, text = "Tick 1", desc = null)
+        val control =
+            element(id = 2, text = null, desc = "Run mission").copy(
+                klass = "Button",
+                clickable = true,
+                interaction_path = listOf(0, 1),
+            )
+        val hash = interactionHash(listOf(telemetry, control))
+        val first = TreeWalker.bindInteractionHandles(listOf(telemetry, control), hash)
+        val shifted =
+            TreeWalker.bindInteractionHandles(
+                listOf(telemetry.copy(id = 4, text = "Tick 2"), control.copy(id = 9)),
+                hash,
+            )
+        assertEquals("$hash/e:0", first.last().handle)
+        assertEquals(first.last().handle, shifted.last().handle)
+        assertNotEquals(first.last().id, shifted.last().id)
+        assertEquals(null, first.first().handle)
+    }
+
+    @Test
+    fun navigationWithReusedNumericIdInvalidatesOldHandle() {
+        val source =
+            element(id = 8, text = null, desc = "Open mission").copy(
+                clickable = true,
+                interaction_path = listOf(0, 1),
+            )
+        val destination =
+            source.copy(
+                desc = "Delete mission",
+                rid = "com.example:id/delete",
+            )
+        val sourceHash = interactionHash(listOf(source))
+        val destinationHash = interactionHash(listOf(destination))
+        val oldHandle = TreeWalker.bindInteractionHandles(listOf(source), sourceHash).single().handle
+        val newHandles =
+            TreeWalker.bindInteractionHandles(listOf(destination), destinationHash).mapNotNull(Element::handle)
+        assertNotEquals(sourceHash, destinationHash)
+        assertFalse(oldHandle in newHandles)
+    }
+
+    @Test
     fun focusedActivityParserAcceptsModernAndLegacyDumpsysShapes() {
         val expected = FocusedApp("com.example", "com.example.MainActivity")
         assertEquals(
@@ -310,6 +438,12 @@ class ScreenIdentityTest {
         app: AppRef = AppRef(`package` = "com.example", activity = "com.example.MainActivity", pid = 42),
         ime: ImeState = ImeState(),
     ): String = TreeWalker.hashOf(elements, viewport, app, ime)
+
+    private fun interactionHash(
+        elements: List<Element>,
+        viewport: Viewport = Viewport(1080, 1920),
+        app: AppRef = AppRef(`package` = "com.example", activity = "com.example.MainActivity", pid = 42),
+    ): String = TreeWalker.interactionHashOf(elements, viewport, app)
 
     private fun element(
         id: Int = 1,

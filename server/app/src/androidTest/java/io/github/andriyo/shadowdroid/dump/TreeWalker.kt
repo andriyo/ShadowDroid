@@ -44,7 +44,7 @@ object TreeWalker {
     ): List<WalkedElement> {
         val elements = mutableListOf<WalkedElement>()
         if (root == null) return elements
-        visit(root, elements, viewportW, viewportH)
+        visit(root, elements, viewportW, viewportH, emptyList())
         return elements
     }
 
@@ -53,6 +53,7 @@ object TreeWalker {
         out: MutableList<WalkedElement>,
         vw: Int,
         vh: Int,
+        path: List<Int>,
     ) {
         val text =
             node.text
@@ -135,6 +136,7 @@ object TreeWalker {
                                 focused = node.isFocused || node.isAccessibilityFocused,
                                 password = node.isPassword,
                                 input = isInput,
+                                interaction_path = path,
                             ),
                         node = node,
                     )
@@ -146,7 +148,7 @@ object TreeWalker {
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
             try {
-                visit(child, out, vw, vh)
+                visit(child, out, vw, vh, path + i)
             } finally {
                 // recycle was deprecated in API 33; let GC handle it
             }
@@ -213,7 +215,118 @@ object TreeWalker {
         // First 8 bytes hex to match the public screen_hash length.
         return digest.finish().take(8).joinToString("") { "%02x".format(it) }
     }
+
+    /**
+     * Identity of the controls an agent can act on, deliberately excluding
+     * volatile display content such as telemetry, timers, video surfaces, and
+     * a range's current value. Text participates only when an actionable node
+     * has neither a resource id nor a content description, because its label is
+     * then the only stable selector available.
+     */
+    fun interactionHashOf(
+        elements: List<Element>,
+        viewport: Viewport,
+        currentApp: AppRef,
+    ): String {
+        val digest = CanonicalDigest(MessageDigest.getInstance("SHA-256"))
+        digest.putString("shadowdroid.interaction.v1")
+        digest.putInt(viewport.w)
+        digest.putInt(viewport.h)
+        digest.putNullableString(currentApp.`package`)
+        digest.putNullableString(currentApp.activity)
+        val actionable = canonicalInteractionElements(elements)
+        digest.putInt(actionable.size)
+        for ((element, interactionPath) in actionable) {
+            digest.putNullableIntList(interactionPath)
+            digest.putNullableString(element.klass)
+            digest.putNullableString(element.rid)
+            digest.putNullableString(element.desc)
+            digest.putNullableString(
+                element.text.takeIf { element.rid == null && element.desc == null },
+            )
+            digest.putNullableIntList(element.bounds)
+            digest.putBoolean(element.range != null)
+            element.range?.let { range ->
+                digest.putString(range.type)
+                digest.putFloat(range.min)
+                digest.putFloat(range.max)
+                digest.putNullableFloat(range.step.jsonPrimitive.floatOrNull)
+            }
+            digest.putInt(element.actions.size)
+            element.actions.forEach(digest::putString)
+            digest.putBoolean(element.clickable)
+            digest.putBoolean(element.long_clickable)
+            digest.putBoolean(element.scrollable)
+            digest.putBoolean(element.checkable)
+            digest.putBoolean(element.focusable)
+            digest.putBoolean(element.enabled)
+            digest.putBoolean(element.selected)
+            digest.putBoolean(element.checked)
+            digest.putBoolean(element.focused)
+            digest.putBoolean(element.password)
+            digest.putBoolean(element.input)
+        }
+        return "i:" + digest.finish().take(8).joinToString("") { "%02x".format(it) }
+    }
+
+    /** Bind only actionable nodes to their stable ordinal in this interaction
+     * snapshot. Volatile display-only nodes may shift numeric dump ids without
+     * changing either the handle or the control it resolves to. */
+    fun bindInteractionHandles(
+        elements: List<Element>,
+        interactionHash: String,
+    ): List<Element> {
+        var actionableOrdinal = 0
+        return elements.map { element ->
+            if (element.participatesInInteraction()) {
+                element.copy(handle = "$interactionHash/e:${actionableOrdinal++}")
+            } else {
+                element
+            }
+        }
+    }
 }
+
+private data class CanonicalInteractionElement(
+    val element: Element,
+    val path: List<Int>,
+)
+
+/**
+ * Collapse the raw accessibility path to a hierarchy containing actionable
+ * nodes only. Display-only siblings and layout containers may appear or vanish
+ * without changing a control's identity, while reordering controls or moving a
+ * control beneath another actionable node still changes its canonical path.
+ */
+private fun canonicalInteractionElements(elements: List<Element>): List<CanonicalInteractionElement> {
+    val canonicalByRawPath = mutableMapOf<List<Int>, List<Int>>()
+    val nextOrdinalByParent = mutableMapOf<List<Int>?, Int>()
+    return elements.filter(Element::participatesInInteraction).map { element ->
+        val rawPath = element.interaction_path
+        val parentRawPath =
+            canonicalByRawPath.keys
+                .filter { candidate ->
+                    candidate.size < rawPath.size &&
+                        rawPath.subList(0, candidate.size) == candidate
+                }.maxByOrNull(List<Int>::size)
+        val ordinal = nextOrdinalByParent.getOrDefault(parentRawPath, 0)
+        nextOrdinalByParent[parentRawPath] = ordinal + 1
+        val canonicalPath =
+            (parentRawPath?.let(canonicalByRawPath::get).orEmpty()) + ordinal
+        canonicalByRawPath[rawPath] = canonicalPath
+        CanonicalInteractionElement(element, canonicalPath)
+    }
+}
+
+private fun Element.participatesInInteraction(): Boolean =
+    clickable ||
+        long_clickable ||
+        scrollable ||
+        checkable ||
+        focusable ||
+        input ||
+        range != null ||
+        actions.isNotEmpty()
 
 private fun rangeSemantics(info: AccessibilityNodeInfo.RangeInfo?): RangeSemantics? {
     if (info == null) return null

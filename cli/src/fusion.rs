@@ -60,6 +60,13 @@ pub struct FusionArgs {
     /// instead of re-dumping.
     #[arg(long, value_name = "HASH")]
     pub if_screen: Option<String>,
+    /// Only act if the actionable structure still matches this interaction
+    /// hash. Unlike --if-screen, volatile display content is ignored.
+    #[arg(long, value_name = "INTERACTION_HASH")]
+    pub if_interaction: Option<String>,
+    /// Parsed --handle value, populated by the targeting verb before fusion.
+    #[arg(skip)]
+    pub element_handle: Option<String>,
     /// Include the post-action compact screen in this same response (saves the
     /// follow-up `ui dump` round-trip).
     #[arg(long)]
@@ -100,6 +107,27 @@ pub struct FusionArgs {
     "screen changed since your last read (expected hash {expected}, now {actual}) — not acting; re-plan from detail.screen"
 )]
 pub struct ScreenChanged {
+    pub expected: String,
+    pub actual: String,
+    pub screen: Value,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "interaction structure changed since your last read (expected {expected}, now {actual}) — not acting; re-plan from detail.screen"
+)]
+pub struct InteractionChanged {
+    pub expected: String,
+    pub actual: String,
+    pub screen: Value,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "element handle {handle} belongs to interaction {expected}, but the current interaction is {actual} — not acting"
+)]
+pub struct StaleElement {
+    pub handle: String,
     pub expected: String,
     pub actual: String,
     pub screen: Value,
@@ -203,24 +231,100 @@ impl SelectorHint {
     }
 }
 
+/// Validate and bind an ephemeral element handle to fusion's interaction
+/// precondition. The numeric action id is resolved from the same fresh screen
+/// used by the guard inside [`run_fused`], so volatile display-only elements
+/// cannot shift it between handle parsing and delivery.
+pub fn bind_element_handle(
+    fusion: &mut FusionArgs,
+    handle: Option<String>,
+    conflicting_target: bool,
+) -> Result<()> {
+    let Some(handle) = handle else { return Ok(()) };
+    if conflicting_target {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "handle_target_conflict",
+            "input",
+            "--handle cannot be combined with another element target",
+        )
+        .detail(json!({"handle": handle}))
+        .next_actions(["remove --id, positional coordinates, and selector flags; use the handle as the sole target"])
+        .into());
+    }
+    let (interaction_hash, element_ordinal) = parse_element_handle(&handle)?;
+    if let Some(explicit) = &fusion.if_interaction
+        && !explicit.eq_ignore_ascii_case(&interaction_hash)
+    {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "interaction_guard_conflict",
+            "input",
+            "--handle and --if-interaction refer to different interaction snapshots",
+        )
+        .detail(json!({
+            "handle": handle,
+            "handle_interaction": interaction_hash,
+            "if_interaction": explicit,
+        }))
+        .next_actions([
+            "remove the conflicting --if-interaction value or use a handle from that snapshot",
+        ])
+        .into());
+    }
+    let canonical_handle = format!("{interaction_hash}/e:{element_ordinal}");
+    fusion.if_interaction = Some(interaction_hash);
+    fusion.element_handle = Some(canonical_handle);
+    Ok(())
+}
+
+fn parse_element_handle(handle: &str) -> Result<(String, u32)> {
+    let Some((interaction_hash, element_part)) = handle.split_once("/e:") else {
+        return Err(invalid_handle(handle));
+    };
+    let digest = interaction_hash.strip_prefix("i:").unwrap_or_default();
+    if digest.len() != 16 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid_handle(handle));
+    }
+    let element = element_part
+        .parse::<u32>()
+        .map_err(|_| invalid_handle(handle))?;
+    Ok((format!("i:{}", digest.to_ascii_lowercase()), element))
+}
+
+fn invalid_handle(handle: &str) -> anyhow::Error {
+    crate::diagnostic::DiagnosticError::new(
+        "invalid_element_handle",
+        "input",
+        "element handle must use the form i:<16 hex>/e:<non-negative ordinal>",
+    )
+    .detail(json!({"handle": handle}))
+    .next_actions(["copy an actionable element's handle from a fresh `shadowdroid ui dump`"])
+    .into()
+}
+
 /// Run one action with the fusion contract:
 ///   1. `--if-screen` precondition (fresh screen on mismatch),
 ///   2. the action itself (a lazy future producing `(cmd, body)`),
 ///   3. element_not_found enrichment on failure,
 ///   4. accessibility-idle observation + destination postcondition on success.
-pub async fn run_fused<F>(
+pub async fn run_fused<F, Fut>(
     client: &ServerClient,
     fusion: &FusionArgs,
     hint: Option<SelectorHint>,
     act: F,
 ) -> Result<Outcome>
 where
-    F: std::future::Future<Output = Result<(&'static str, Value)>>,
+    F: FnOnce(Option<u32>) -> Fut,
+    Fut: std::future::Future<Output = Result<(&'static str, Value)>>,
 {
     let postcondition = requested_postcondition(fusion)?;
     validate_observation_args(fusion, postcondition.is_some())?;
     let observe = fusion.observe || postcondition.is_some();
-    let pre_screen = if fusion.if_screen.is_some() || observe {
+    validate_interaction_guard(fusion)?;
+    let pre_screen = if fusion.if_screen.is_some()
+        || fusion.if_interaction.is_some()
+        || fusion.element_handle.is_some()
+        || observe
+    {
         Some(client.screen().await?)
     } else {
         None
@@ -238,10 +342,58 @@ where
         }
     }
 
-    let (cmd, mut body) = match act.await {
+    let mut resolved_handle_id = None;
+    if let Some(expected) = &fusion.if_interaction {
+        let screen = pre_screen
+            .as_ref()
+            .expect("interaction pre-screen requested above");
+        let actual = screen
+            .interaction_hash
+            .clone()
+            .unwrap_or_else(|| "unsupported".to_string());
+        if !actual.eq_ignore_ascii_case(expected) {
+            if let Some(handle) = &fusion.element_handle {
+                return Err(StaleElement {
+                    handle: handle.clone(),
+                    expected: expected.clone(),
+                    actual,
+                    screen: compact_screen_value(screen),
+                }
+                .into());
+            }
+            return Err(InteractionChanged {
+                expected: expected.clone(),
+                actual,
+                screen: compact_screen_value(screen),
+            }
+            .into());
+        }
+        if let Some(handle) = &fusion.element_handle {
+            resolved_handle_id = screen
+                .elements
+                .iter()
+                .find(|element| element.handle.as_deref() == Some(handle))
+                .map(|element| element.id);
+            if resolved_handle_id.is_none() {
+                return Err(StaleElement {
+                    handle: handle.clone(),
+                    expected: expected.clone(),
+                    actual,
+                    screen: compact_screen_value(screen),
+                }
+                .into());
+            }
+        }
+    }
+
+    let (cmd, mut body) = match act(resolved_handle_id).await {
         Ok(result) => result,
         Err(err) => return Err(enrich_not_found(client, hint, err).await),
     };
+    if let Some(handle) = &fusion.element_handle {
+        body["handle"] = json!(handle);
+        body["via"] = json!("handle");
+    }
     // Settlement begins only after the action endpoint confirms delivery;
     // selector resolution and injection latency are a separate phase.
     let action_delivered_at = Instant::now();
@@ -458,6 +610,23 @@ fn validate_observation_args(fusion: &FusionArgs, has_postcondition: bool) -> Re
     Ok(())
 }
 
+fn validate_interaction_guard(fusion: &FusionArgs) -> Result<()> {
+    if let Some(hash) = &fusion.if_interaction {
+        let digest = hash.strip_prefix("i:").unwrap_or_default();
+        if digest.len() != 16 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(crate::diagnostic::DiagnosticError::new(
+                "invalid_interaction_hash",
+                "input",
+                "--if-interaction must use the form i:<16 hex>",
+            )
+            .detail(json!({"if_interaction": hash}))
+            .next_actions(["copy interaction_hash from a fresh `shadowdroid ui dump`"])
+            .into());
+        }
+    }
+    Ok(())
+}
+
 fn attach_screen_change(body: &mut Value, pre_hash: &str, post_hash: &str) {
     body["pre_screen_hash"] = json!(pre_hash);
     body["post_screen_hash"] = json!(post_hash);
@@ -475,6 +644,9 @@ pub fn compact_screen_value(screen: &ScreenResponse) -> Value {
     json!({
         "screen_hash": screen.screen_hash,
         "screen_hash_version": screen.screen_hash_version,
+        "content_hash": screen.content_hash,
+        "interaction_hash": screen.interaction_hash,
+        "interaction_hash_version": screen.interaction_hash_version,
         "snapshot_state": screen.snapshot_state,
         "captured_at_ms": screen.captured_at_ms,
         "viewport": screen.viewport,
@@ -548,6 +720,12 @@ async fn enrich_not_found(
         obj.insert(
             "screen_hash_version".into(),
             json!(screen.screen_hash_version),
+        );
+        obj.insert("content_hash".into(), json!(screen.content_hash));
+        obj.insert("interaction_hash".into(), json!(screen.interaction_hash));
+        obj.insert(
+            "interaction_hash_version".into(),
+            json!(screen.interaction_hash_version),
         );
         obj.insert(
             "hint".into(),
@@ -642,6 +820,7 @@ mod tests {
     fn el(id: u32, text: &str) -> Element {
         Element {
             id,
+            handle: None,
             text: Some(text.into()),
             desc: None,
             klass: None,
@@ -709,6 +888,9 @@ mod tests {
         let screen = ScreenResponse {
             screen_hash: "screen-1".into(),
             screen_hash_version: 2,
+            content_hash: Some("c:screen-1".into()),
+            interaction_hash: Some("i:1111111111111111".into()),
+            interaction_hash_version: 1,
             snapshot_state: "transitioning".into(),
             captured_at_ms: Some(123),
             viewport: crate::proto::Viewport { w: 1080, h: 1920 },
@@ -762,10 +944,90 @@ mod tests {
         assert!(msg.contains("abc") && msg.contains("def"), "{msg}");
     }
 
+    #[test]
+    fn element_handles_bind_their_interaction_guard_and_reject_conflicts() {
+        let mut fusion = FusionArgs::default();
+        bind_element_handle(&mut fusion, Some("i:0123456789abcdef/e:3".into()), false).unwrap();
+        assert_eq!(fusion.if_interaction.as_deref(), Some("i:0123456789abcdef"));
+        assert_eq!(
+            fusion.element_handle.as_deref(),
+            Some("i:0123456789abcdef/e:3")
+        );
+
+        let error = bind_element_handle(
+            &mut FusionArgs::default(),
+            Some("not-a-handle".into()),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(crate::cli::error_code_of(&error), "invalid_element_handle");
+
+        let error = bind_element_handle(
+            &mut FusionArgs::default(),
+            Some("i:0123456789abcdef/e:0".into()),
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(crate::cli::error_code_of(&error), "handle_target_conflict");
+
+        let mut guarded = FusionArgs {
+            if_interaction: Some("i:ffffffffffffffff".into()),
+            ..FusionArgs::default()
+        };
+        let error = bind_element_handle(&mut guarded, Some("i:0123456789abcdef/e:0".into()), false)
+            .unwrap_err();
+        assert_eq!(
+            crate::cli::error_code_of(&error),
+            "interaction_guard_conflict"
+        );
+    }
+
+    #[test]
+    fn interaction_identity_errors_keep_typed_retryable_contract() {
+        let errors = [
+            anyhow::Error::new(StaleElement {
+                handle: "i:0123456789abcdef/e:0".into(),
+                expected: "i:0123456789abcdef".into(),
+                actual: "i:ffffffffffffffff".into(),
+                screen: json!({}),
+            }),
+            anyhow::Error::new(InteractionChanged {
+                expected: "i:0123456789abcdef".into(),
+                actual: "i:ffffffffffffffff".into(),
+                screen: json!({}),
+            }),
+        ];
+        for (error, code) in errors
+            .into_iter()
+            .zip(["stale_element", "interaction_changed"])
+        {
+            assert_eq!(crate::cli::error_code_of(&error), code);
+            assert_eq!(crate::cli::error_stage_of(&error), "run");
+            assert!(crate::cli::error_retryable_of(&error));
+            assert!(!crate::cli::error_uses_fallback(&error));
+        }
+    }
+
+    #[test]
+    fn interaction_guard_rejects_non_versioned_hashes() {
+        let error = validate_interaction_guard(&FusionArgs {
+            if_interaction: Some("0123456789abcdef".into()),
+            ..FusionArgs::default()
+        })
+        .unwrap_err();
+        assert_eq!(
+            crate::cli::error_code_of(&error),
+            "invalid_interaction_hash"
+        );
+    }
+
     fn postcondition_screen() -> ScreenResponse {
         ScreenResponse {
             screen_hash: "destination".into(),
             screen_hash_version: 3,
+            content_hash: Some("c:destination".into()),
+            interaction_hash: Some("i:2222222222222222".into()),
+            interaction_hash_version: 1,
             snapshot_state: "consistent".into(),
             captured_at_ms: Some(500),
             viewport: crate::proto::Viewport { w: 1080, h: 1920 },

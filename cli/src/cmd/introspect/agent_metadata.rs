@@ -194,7 +194,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
                 "Need to correlate UI state with network responses, app crashes, or watcher automation during a flow."
             ],
             "avoid_when": ["Need one immediate actionable element list; use ui dump instead.", "Need a saved layout/source artifact; use layout snapshot instead."],
-            "output": "jsonl event stream: ready, screen_compact/screen (with screen_hash_version), crash, watcher_fired, http/http_intercept, tls_error, warning, and timestamped in-stream error events (not one-shot error envelopes)",
+            "output": "jsonl event stream: ready, screen_compact/screen (with strict content and actionable interaction identities), crash, watcher_fired, http/http_intercept, tls_error, warning, and timestamped in-stream error events (not one-shot error envelopes)",
             "side_effects": ["polls the screen", "tails logcat", "may run watcher actions", "auto-attaches to a running net proxy unless --no-net is passed"],
             "prerequisites": ["shadowdroid connect", "shadowdroid net start for HTTP(S) events"],
             "next_actions": ["ui tap", "ui text", "ui wait", "net start", "net show <id>", "debug snapshot"],
@@ -212,9 +212,9 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         "ui dump" => Some(serde_json::json!({
             "use_when": ["Need the current actionable UI state for selector choice before tapping, typing, or waiting."],
             "avoid_when": ["Need Compose/source/layout inspection or a durable artifact; use layout snapshot."],
-            "output": "compact screen JSON by default, including screen identity, snapshot_state, capture/current-app/UI-tree freshness timestamps, window generation, and IME context; --full adds bounds and every UIAutomator flag",
+            "output": "compact screen JSON by default, including strict content_hash, actionable interaction_hash, screen-bound handles, snapshot_state, freshness timestamps, window generation, and IME context; --full adds bounds and every UIAutomator flag",
             "side_effects": ["none"],
-            "next_actions": ["ui tap --id <id>", "ui tap --text <text>", "ui text --id <id> <value>", "ui hide-keyboard", "ui wait"],
+            "next_actions": ["ui tap --rid <resource-id> --if-interaction <hash>", "ui tap --handle <handle>", "ui text <value> --handle <handle>", "ui hide-keyboard", "ui wait"],
             "prefer_over": {
                 "layout snapshot": "when the next step is acting on the UI rather than debugging layout/source structure"
             }
@@ -242,20 +242,20 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "use_when": ["Need to resolve a selector without tapping it."],
             "output": "matching elements, compact by default",
             "side_effects": ["none"],
-            "next_actions": ["ui tap --id <id>", "ui text --id <id> <value>"]
+            "next_actions": ["ui tap --handle <handle>", "ui text <value> --handle <handle>"]
         })),
         "ui tap" => Some(serde_json::json!({
-            "use_when": ["Need to activate a visible element by selector, fresh ui dump id, or coordinates."],
+            "use_when": ["Need to activate a visible element by stable selector, screen-bound handle, fresh ui dump id, or coordinates."],
             "output": "action JSON separating selector match, activated element, input delivery, observed screen change, and postcondition status",
             "side_effects": ["taps the device UI"],
-            "prerequisites": ["prefer selectors or ids from a fresh ui dump over hard-coded coordinates", "selector taps require an enabled clickable node/ancestor unless --coordinate-fallback is explicit"],
+            "prerequisites": ["prefer stable selectors guarded by --if-interaction, then handles from a fresh ui dump, over numeric ids or coordinates", "selector taps require an enabled clickable node/ancestor unless --coordinate-fallback is explicit"],
             "next_actions": ["ui wait", "ui dump", "watch"]
         })),
         "ui set-progress" => Some(serde_json::json!({
             "use_when": ["Need to set a platform or Compose slider/range control deterministically."],
             "output": "set_progress action JSON with range before/after, applied value, delivery method, and readback verification",
             "side_effects": ["mutates the matched range control through ACTION_SET_PROGRESS; --coordinate-fallback may inject an approximate track click"],
-            "prerequisites": ["target one element by fresh id, resource id/Compose test tag, content description, text, or xpath", "pass exactly one finite --value or --percent", "prefer exposed range plus set_progress action; coordinate fallback is explicit and may be unverified"],
+            "prerequisites": ["target one element by stable selector, screen-bound handle, fresh id, or xpath", "pass exactly one finite --value or --percent", "prefer exposed range plus set_progress action; coordinate fallback is explicit and may be unverified"],
             "next_actions": ["ui dump", "ui wait", "why"]
         })),
         "ui double-tap" => Some(serde_json::json!({
@@ -309,7 +309,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "next_actions": ["ui dump", "ui key", "ui wait"]
         })),
         "ui text" => Some(serde_json::json!({
-            "use_when": ["Need to type into the focused field or a field selected by id/text/rid/desc/xpath."],
+            "use_when": ["Need to type into the focused field or a field selected by handle/id/text/rid/desc/xpath."],
             "output": "action JSON",
             "side_effects": ["changes text in the app UI"],
             "next_actions": ["ui key enter", "ui hide-keyboard", "ui wait", "ui dump"]

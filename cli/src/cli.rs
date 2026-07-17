@@ -530,6 +530,9 @@ pub enum UiCmd {
     },
     /// Tap by element id, coordinates, or a selector (--text/--rid/--desc/--xpath).
     Tap {
+        /// Screen-bound handle from a fresh `ui dump` (i:.../e:...).
+        #[arg(long)]
+        handle: Option<String>,
         /// Element id from a fresh `ui dump`. Equivalent to positional `ui tap <id>`.
         #[arg(long)]
         id: Option<u32>,
@@ -566,6 +569,9 @@ pub enum UiCmd {
     },
     /// Set a slider/range control through Android accessibility and verify readback.
     SetProgress {
+        /// Screen-bound handle from a fresh `ui dump` (i:.../e:...).
+        #[arg(long)]
+        handle: Option<String>,
         /// Element id from a fresh `ui dump`.
         #[arg(long)]
         id: Option<u32>,
@@ -684,6 +690,9 @@ pub enum UiCmd {
         /// Clear the field's existing contents before typing.
         #[arg(long)]
         clear: bool,
+        /// Screen-bound handle from a fresh `ui dump` (i:.../e:...).
+        #[arg(long)]
+        handle: Option<String>,
         /// Element id from a fresh `ui dump` to receive text.
         #[arg(long)]
         id: Option<u32>,
@@ -1681,6 +1690,12 @@ async fn dispatch_ui_inner(
                     "screen_hash_version".into(),
                     json!(screen.screen_hash_version),
                 );
+                m.insert("content_hash".into(), json!(screen.content_hash));
+                m.insert("interaction_hash".into(), json!(screen.interaction_hash));
+                m.insert(
+                    "interaction_hash_version".into(),
+                    json!(screen.interaction_hash_version),
+                );
             }
             Ok(Outcome::Action("ui_audit", body))
         }
@@ -1732,6 +1747,7 @@ async fn dispatch_ui_inner(
             Ok(Outcome::Action("find", body))
         }
         UiCmd::Tap {
+            handle,
             id,
             a,
             b,
@@ -1742,20 +1758,28 @@ async fn dispatch_ui_inner(
             exact,
             clickable,
             coordinate_fallback,
-            fusion,
+            mut fusion,
         } => {
+            crate::fusion::bind_element_handle(
+                &mut fusion,
+                handle,
+                id.is_some()
+                    || a.is_some()
+                    || b.is_some()
+                    || text.is_some()
+                    || rid.is_some()
+                    || desc.is_some()
+                    || xpath.is_some(),
+            )?;
             let hint = crate::fusion::SelectorHint {
                 text: text.clone(),
                 rid: rid.clone(),
                 desc: desc.clone(),
             };
-            crate::fusion::run_fused(
-                client,
-                &fusion,
-                Some(hint),
+            crate::fusion::run_fused(client, &fusion, Some(hint), |handle_id| {
                 cmd_tap(
                     client,
-                    id,
+                    handle_id.or(id),
                     a,
                     b,
                     text,
@@ -1765,11 +1789,12 @@ async fn dispatch_ui_inner(
                     exact,
                     clickable,
                     coordinate_fallback,
-                ),
-            )
+                )
+            })
             .await
         }
         UiCmd::SetProgress {
+            handle,
             id,
             text,
             rid,
@@ -1780,24 +1805,33 @@ async fn dispatch_ui_inner(
             percent,
             clamp,
             coordinate_fallback,
-            fusion,
+            mut fusion,
         } => {
             validate_set_progress_input(value, percent)?;
+            crate::fusion::bind_element_handle(
+                &mut fusion,
+                handle,
+                id.is_some()
+                    || text.is_some()
+                    || rid.is_some()
+                    || desc.is_some()
+                    || xpath.is_some(),
+            )?;
             let hint = crate::fusion::SelectorHint {
                 text: text.clone(),
                 rid: rid.clone(),
                 desc: desc.clone(),
             };
-            let query = SelectorQuery {
-                id,
-                text,
-                rid,
-                desc,
-                xpath,
-                exact,
-                ..Default::default()
-            };
-            crate::fusion::run_fused(client, &fusion, Some(hint), async {
+            crate::fusion::run_fused(client, &fusion, Some(hint), |handle_id| async move {
+                let query = SelectorQuery {
+                    id: handle_id.or(id),
+                    text,
+                    rid,
+                    desc,
+                    xpath,
+                    exact,
+                    ..Default::default()
+                };
                 let response = client
                     .set_progress(&query, value, percent, clamp, coordinate_fallback)
                     .await?;
@@ -1806,7 +1840,7 @@ async fn dispatch_ui_inner(
             .await
         }
         UiCmd::DoubleTap { x, y, fusion } => {
-            crate::fusion::run_fused(client, &fusion, None, async {
+            crate::fusion::run_fused(client, &fusion, None, |_| async {
                 client.double_tap(x, y).await?;
                 Ok(("double_tap", json!({"x":x,"y":y})))
             })
@@ -1818,7 +1852,7 @@ async fn dispatch_ui_inner(
             duration_ms,
             fusion,
         } => {
-            crate::fusion::run_fused(client, &fusion, None, async {
+            crate::fusion::run_fused(client, &fusion, None, |_| async {
                 client.long_tap(x, y, duration_ms).await?;
                 Ok(("long_tap", json!({"x":x,"y":y,"duration_ms":duration_ms})))
             })
@@ -1832,7 +1866,7 @@ async fn dispatch_ui_inner(
             duration_ms,
             fusion,
         } => {
-            crate::fusion::run_fused(client, &fusion, None, async {
+            crate::fusion::run_fused(client, &fusion, None, |_| async {
                 client.swipe(x1, y1, x2, y2, duration_ms).await?;
                 Ok((
                     "swipe",
@@ -1849,7 +1883,7 @@ async fn dispatch_ui_inner(
             duration_ms,
             fusion,
         } => {
-            crate::fusion::run_fused(client, &fusion, None, async {
+            crate::fusion::run_fused(client, &fusion, None, |_| async {
                 client.drag(x1, y1, x2, y2, duration_ms).await?;
                 Ok((
                     "drag",
@@ -1864,7 +1898,7 @@ async fn dispatch_ui_inner(
             duration_ms,
             fusion,
         } => {
-            crate::fusion::run_fused(client, &fusion, None, async {
+            crate::fusion::run_fused(client, &fusion, None, |_| async {
                 client.swipe_ext(&direction, scale, duration_ms).await?;
                 Ok((
                     "swipe_ext",
@@ -1886,7 +1920,7 @@ async fn dispatch_ui_inner(
                 rid: rid.clone(),
                 desc: desc.clone(),
             };
-            crate::fusion::run_fused(client, &fusion, Some(hint), async {
+            crate::fusion::run_fused(client, &fusion, Some(hint), |_| async {
                 client
                     .pinch(
                         rid.as_deref(),
@@ -1908,21 +1942,31 @@ async fn dispatch_ui_inner(
         UiCmd::Text {
             value,
             clear,
+            handle,
             id,
             text,
             rid,
             desc,
             xpath,
             exact,
-            fusion,
+            mut fusion,
         } => {
+            crate::fusion::bind_element_handle(
+                &mut fusion,
+                handle,
+                id.is_some()
+                    || text.is_some()
+                    || rid.is_some()
+                    || desc.is_some()
+                    || xpath.is_some(),
+            )?;
             let hint = crate::fusion::SelectorHint {
                 text: text.clone(),
                 rid: rid.clone(),
                 desc: desc.clone(),
             };
-            let target = text_target_query(id, text, rid, desc, xpath, exact);
-            crate::fusion::run_fused(client, &fusion, Some(hint), async {
+            crate::fusion::run_fused(client, &fusion, Some(hint), |handle_id| async move {
+                let target = text_target_query(handle_id.or(id), text, rid, desc, xpath, exact);
                 client
                     .text_with_target(&value, clear, target.as_ref())
                     .await?;
@@ -1931,7 +1975,7 @@ async fn dispatch_ui_inner(
             .await
         }
         UiCmd::Key { name, fusion } => {
-            crate::fusion::run_fused(client, &fusion, None, async {
+            crate::fusion::run_fused(client, &fusion, None, |_| async {
                 let injected = client.key(&name).await?;
                 Ok(("key", json!({"name":name,"injected":injected})))
             })
@@ -1954,14 +1998,14 @@ async fn dispatch_ui_inner(
             ))
         }
         UiCmd::Back { fusion } => {
-            crate::fusion::run_fused(client, &fusion, None, async {
+            crate::fusion::run_fused(client, &fusion, None, |_| async {
                 let injected = client.key("back").await?;
                 Ok(("key", json!({"name":"back","injected":injected})))
             })
             .await
         }
         UiCmd::Home { fusion } => {
-            crate::fusion::run_fused(client, &fusion, None, async {
+            crate::fusion::run_fused(client, &fusion, None, |_| async {
                 let injected = client.key("home").await?;
                 Ok(("key", json!({"name":"home","injected":injected})))
             })
@@ -3153,7 +3197,7 @@ pub fn report_error(err: &anyhow::Error) {
             json!({
                 "detail": { "candidates": amb.candidates },
                 "next_actions": [
-                    "choose a candidate's unique resource id, content description, or element id",
+                    "choose a candidate's unique resource id or content description; otherwise use its screen-bound handle",
                     "rerun the action with the refined selector"
                 ]
             }),
@@ -3176,6 +3220,49 @@ pub fn report_error(err: &anyhow::Error) {
                 "re-plan from detail.screen instead of issuing another dump",
                 "retry the action with detail.actual as --if-screen"
             ]}),
+        );
+    } else if let Some(stale) = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<crate::fusion::StaleElement>())
+    {
+        emit_error(
+            "run",
+            "stale_element",
+            &stale.to_string(),
+            json!({
+                "retryable": true,
+                "detail": {
+                    "handle": stale.handle,
+                    "expected_interaction": stale.expected,
+                    "actual_interaction": stale.actual,
+                    "screen": stale.screen,
+                },
+                "next_actions": [
+                    "re-plan from detail.screen and prefer a stable resource id or content description",
+                    "otherwise copy the target's new handle from detail.screen and retry"
+                ]
+            }),
+        );
+    } else if let Some(changed) = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<crate::fusion::InteractionChanged>())
+    {
+        emit_error(
+            "run",
+            "interaction_changed",
+            &changed.to_string(),
+            json!({
+                "retryable": true,
+                "detail": {
+                    "expected": changed.expected,
+                    "actual": changed.actual,
+                    "screen": changed.screen,
+                },
+                "next_actions": [
+                    "re-plan from detail.screen instead of issuing another dump",
+                    "retry with detail.actual as --if-interaction"
+                ]
+            }),
         );
     } else if let Some(observation) = err
         .chain()
@@ -3363,7 +3450,7 @@ fn server_error_next_actions(code: &str, command_path: Option<&str>) -> Option<V
             current_contract("ui find"),
         ]),
         "ambiguous_match" => Some(vec![
-            "choose a candidate's unique resource id, content description, or element id"
+            "choose a candidate's unique resource id or content description; otherwise use its screen-bound handle"
                 .to_string(),
             current_contract("ui find"),
         ]),
@@ -3508,6 +3595,16 @@ pub fn error_code_of(err: &anyhow::Error) -> String {
         .any(|e| e.downcast_ref::<crate::fusion::ScreenChanged>().is_some())
     {
         "screen_changed".into()
+    } else if err
+        .chain()
+        .any(|e| e.downcast_ref::<crate::fusion::StaleElement>().is_some())
+    {
+        "stale_element".into()
+    } else if err.chain().any(|e| {
+        e.downcast_ref::<crate::fusion::InteractionChanged>()
+            .is_some()
+    }) {
+        "interaction_changed".into()
     } else if let Some(observation) = err
         .chain()
         .find_map(|e| e.downcast_ref::<crate::fusion::ObservationFailure>())
@@ -3536,6 +3633,15 @@ pub fn error_stage_of(err: &anyhow::Error) -> String {
             .is_some()
     }) {
         "observe".to_string()
+    } else if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::fusion::StaleElement>()
+            .is_some()
+            || cause
+                .downcast_ref::<crate::fusion::InteractionChanged>()
+                .is_some()
+    }) {
+        "run".to_string()
     } else {
         classify_generic_error(err).stage.to_string()
     }
@@ -3558,6 +3664,12 @@ pub fn error_retryable_of(err: &anyhow::Error) -> bool {
             .is_some()
             || cause
                 .downcast_ref::<crate::fusion::ObservationFailure>()
+                .is_some()
+            || cause
+                .downcast_ref::<crate::fusion::StaleElement>()
+                .is_some()
+            || cause
+                .downcast_ref::<crate::fusion::InteractionChanged>()
                 .is_some()
     }) {
         true
@@ -3588,6 +3700,12 @@ pub fn error_uses_fallback(err: &anyhow::Error) -> bool {
                     .is_some()
                 || cause
                     .downcast_ref::<crate::fusion::ObservationFailure>()
+                    .is_some()
+                || cause
+                    .downcast_ref::<crate::fusion::StaleElement>()
+                    .is_some()
+                || cause
+                    .downcast_ref::<crate::fusion::InteractionChanged>()
                     .is_some()
         })
     }
@@ -3703,6 +3821,9 @@ async fn cmd_screenshot(
     if let Ok(screen) = client.screen().await {
         body["screen_hash"] = json!(screen.screen_hash);
         body["screen_hash_version"] = json!(screen.screen_hash_version);
+        body["content_hash"] = json!(screen.content_hash);
+        body["interaction_hash"] = json!(screen.interaction_hash);
+        body["interaction_hash_version"] = json!(screen.interaction_hash_version);
     }
     Ok(Outcome::Action("screenshot", body))
 }
@@ -4024,14 +4145,7 @@ async fn cmd_wait(
     loop {
         let screen = match tokio::time::timeout_at(deadline, client.screen()).await {
             Err(_) => {
-                return Err(wait_timeout_error(
-                    timeout_ms,
-                    gone,
-                    None,
-                    None,
-                    None,
-                    Vec::new(),
-                ));
+                return Err(wait_timeout_error(timeout_ms, gone, None, Vec::new()));
             }
             Ok(result) => match result {
                 Ok(screen) => screen,
@@ -4044,9 +4158,7 @@ async fn cmd_wait(
                         reconnect_after_screen_error(serial, apk, any_apk_version, &err),
                     )
                     .await
-                    .map_err(|_| {
-                        wait_timeout_error(timeout_ms, gone, None, None, None, Vec::new())
-                    })??;
+                    .map_err(|_| wait_timeout_error(timeout_ms, gone, None, Vec::new()))??;
                     continue;
                 }
                 Err(err) => return Err(err),
@@ -4054,6 +4166,9 @@ async fn cmd_wait(
         };
         let outcome = wait_query_matches(&query, &screen.current_app, &screen.elements);
         let matched = outcome.matched;
+        let content_hash = screen.content_hash.clone();
+        let interaction_hash = screen.interaction_hash.clone();
+        let interaction_hash_version = screen.interaction_hash_version;
         let screen_hash = screen.screen_hash;
         let screen_hash_version = screen.screen_hash_version;
         let current_app = json!({
@@ -4066,6 +4181,9 @@ async fn cmd_wait(
                 "gone": gone,
                 "screen_hash": screen_hash,
                 "screen_hash_version": screen_hash_version,
+                "content_hash": content_hash,
+                "interaction_hash": interaction_hash,
+                "interaction_hash_version": interaction_hash_version,
                 "current_app": current_app,
             });
             if let Some(el) = outcome.element {
@@ -4081,9 +4199,14 @@ async fn cmd_wait(
             return Err(wait_timeout_error(
                 timeout_ms,
                 gone,
-                Some(screen_hash),
-                Some(screen_hash_version),
-                Some(current_app),
+                Some(WaitScreenEvidence {
+                    screen_hash,
+                    screen_hash_version,
+                    content_hash,
+                    interaction_hash,
+                    interaction_hash_version,
+                    current_app,
+                }),
                 top_texts,
             ));
         }
@@ -4092,14 +4215,39 @@ async fn cmd_wait(
     }
 }
 
+struct WaitScreenEvidence {
+    screen_hash: String,
+    screen_hash_version: u32,
+    content_hash: Option<String>,
+    interaction_hash: Option<String>,
+    interaction_hash_version: u32,
+    current_app: serde_json::Value,
+}
+
 fn wait_timeout_error(
     timeout_ms: u32,
     gone: bool,
-    screen_hash: Option<String>,
-    screen_hash_version: Option<u32>,
-    current_app: Option<serde_json::Value>,
+    screen: Option<WaitScreenEvidence>,
     top_texts: Vec<String>,
 ) -> anyhow::Error {
+    let screen_detail = match screen {
+        Some(screen) => json!({
+            "screen_hash": screen.screen_hash,
+            "screen_hash_version": screen.screen_hash_version,
+            "content_hash": screen.content_hash,
+            "interaction_hash": screen.interaction_hash,
+            "interaction_hash_version": screen.interaction_hash_version,
+            "current_app": screen.current_app,
+        }),
+        None => json!({
+            "screen_hash": null,
+            "screen_hash_version": null,
+            "content_hash": null,
+            "interaction_hash": null,
+            "interaction_hash_version": null,
+            "current_app": null,
+        }),
+    };
     crate::diagnostic::DiagnosticError::new(
         "wait_timeout",
         "ui",
@@ -4110,14 +4258,13 @@ fn wait_timeout_error(
         },
     )
     .retryable(true)
-    .detail(json!({
-        "timeout_ms": timeout_ms,
-        "gone": gone,
-        "screen_hash": screen_hash,
-        "screen_hash_version": screen_hash_version,
-        "current_app": current_app,
-        "top_texts": top_texts,
-    }))
+    .detail({
+        let mut detail = screen_detail;
+        detail["timeout_ms"] = json!(timeout_ms);
+        detail["gone"] = json!(gone);
+        detail["top_texts"] = json!(top_texts);
+        detail
+    })
     .next_actions(if gone {
         [
             "inspect detail.top_texts; refine an overly broad selector or wait for a stable replacement",
@@ -4980,6 +5127,7 @@ mod tests {
     fn text_el(text: &str) -> Element {
         Element {
             id: 0,
+            handle: None,
             text: Some(text.into()),
             desc: None,
             klass: None,

@@ -218,6 +218,7 @@ mod tests {
     fn el(rid: Option<&str>, text: Option<&str>, desc: Option<&str>, clickable: bool) -> Element {
         Element {
             id: 0,
+            handle: None,
             text: text.map(str::to_string),
             desc: desc.map(str::to_string),
             klass: Some("android.widget.Button".into()),

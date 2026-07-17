@@ -1,6 +1,7 @@
 package io.github.andriyo.shadowdroid.proto
 
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.Transient
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 
@@ -48,6 +49,9 @@ data class AppRef(
 data class ScreenResponse(
     val screen_hash: String,
     val screen_hash_version: Int = 3,
+    val content_hash: String,
+    val interaction_hash: String,
+    val interaction_hash_version: Int = 1,
     val snapshot_state: String = "consistent",
     val captured_at_ms: Long? = null,
     val viewport: Viewport,
@@ -88,6 +92,7 @@ data class ImeState(
 @Serializable
 data class Element(
     val id: Int,
+    val handle: String? = null,
     val text: String? = null,
     val desc: String? = null,
     val klass: String? = null,
@@ -107,6 +112,9 @@ data class Element(
     val focused: Boolean = false,
     val password: Boolean = false,
     val input: Boolean = false,
+    // Internal DFS hierarchy identity used only to calculate interaction_hash.
+    // It is intentionally absent from the public wire payload.
+    @Transient val interaction_path: List<Int> = emptyList(),
 )
 
 @Serializable

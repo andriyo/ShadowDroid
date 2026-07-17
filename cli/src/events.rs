@@ -61,6 +61,9 @@ pub enum Event {
         viewport: Viewport,
         screen_hash: String,
         screen_hash_version: u32,
+        content_hash: Option<String>,
+        interaction_hash: Option<String>,
+        interaction_hash_version: u32,
         element_count: u32,
         ime: ImeState,
         elements: Vec<Element>,
@@ -73,6 +76,9 @@ pub enum Event {
         viewport: Viewport,
         screen_hash: String,
         screen_hash_version: u32,
+        content_hash: Option<String>,
+        interaction_hash: Option<String>,
+        interaction_hash_version: u32,
         element_count: u32,
         ime: CompactIme,
         elements: Vec<CompactElement>,
@@ -183,6 +189,8 @@ pub enum Event {
 pub struct CompactElement {
     pub id: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desc: Option<String>,
@@ -245,6 +253,7 @@ impl From<Element> for CompactElement {
     fn from(el: Element) -> Self {
         Self {
             id: el.id,
+            handle: el.handle,
             text: el.text,
             desc: el.desc,
             rid: el.rid,
@@ -312,6 +321,9 @@ pub fn screen_event(device: &str, screen: ScreenResponse, format: ScreenFormat) 
             viewport: screen.viewport,
             screen_hash: screen.screen_hash,
             screen_hash_version: screen.screen_hash_version,
+            content_hash: screen.content_hash,
+            interaction_hash: screen.interaction_hash,
+            interaction_hash_version: screen.interaction_hash_version,
             element_count: screen.element_count,
             ime: screen.ime,
             elements: screen.elements,
@@ -324,6 +336,9 @@ pub fn screen_event(device: &str, screen: ScreenResponse, format: ScreenFormat) 
             viewport: screen.viewport,
             screen_hash: screen.screen_hash,
             screen_hash_version: screen.screen_hash_version,
+            content_hash: screen.content_hash,
+            interaction_hash: screen.interaction_hash,
+            interaction_hash_version: screen.interaction_hash_version,
             element_count: screen.element_count,
             ime: CompactIme::from(screen.ime),
             elements: screen
@@ -891,11 +906,9 @@ fn range_element_action(
     if !supports || element.get("range").is_none() {
         return None;
     }
-    let id = element.get("id").and_then(serde_json::Value::as_u64)?;
-    let mut command = format!("shadowdroid ui set-progress --id {id} --percent 50");
-    if let Some(hash) = map.get("screen_hash").and_then(serde_json::Value::as_str) {
-        command.push_str(&format!(" --if-screen {}", shell_token(hash)));
-    }
+    let (target, guard) = element_target_clause(element)?;
+    let mut command = format!("shadowdroid ui set-progress {target} --percent 50");
+    append_target_guard(&mut command, map, guard);
     command.push_str(" --observe");
     Some(command)
 }
@@ -911,11 +924,9 @@ fn clickable_element_action(
     {
         return None;
     }
-    let id = element.get("id").and_then(serde_json::Value::as_u64)?;
-    let mut command = format!("shadowdroid ui tap --id {id}");
-    if let Some(hash) = map.get("screen_hash").and_then(serde_json::Value::as_str) {
-        command.push_str(&format!(" --if-screen {}", shell_token(hash)));
-    }
+    let (target, guard) = element_target_clause(element)?;
+    let mut command = format!("shadowdroid ui tap {target}");
+    append_target_guard(&mut command, map, guard);
     command.push_str(" --observe");
     Some(command)
 }
@@ -924,16 +935,74 @@ fn input_element_action(
     map: &serde_json::Map<String, serde_json::Value>,
     element: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<String> {
-    let id = element.get("id").and_then(serde_json::Value::as_u64)?;
-    let mut command = format!("shadowdroid ui text VALUE --id {id}");
-    if let Some(hash) = map.get("screen_hash").and_then(serde_json::Value::as_str) {
-        command.push_str(&format!(" --if-screen {}", shell_token(hash)));
-    }
+    let (target, guard) = element_target_clause(element)?;
+    let mut command = format!("shadowdroid ui text VALUE {target}");
+    append_target_guard(&mut command, map, guard);
     command.push_str(" --observe");
     let command = specialize_action(&command, map);
     Some(format!(
         "replace VALUE with the intended text, then run `{command}`"
     ))
+}
+
+#[derive(Clone, Copy)]
+enum ElementTargetGuard {
+    Interaction,
+    Handle,
+    StrictScreen,
+}
+
+/// Stable selectors are preferable because they survive harmless layout-list
+/// renumbering. A screen-bound handle is the safe fallback; an unqualified
+/// numeric id is emitted only for older payloads and remains strictly guarded.
+fn element_target_clause(
+    element: &serde_json::Map<String, serde_json::Value>,
+) -> Option<(String, ElementTargetGuard)> {
+    if let Some(rid) = element.get("rid").and_then(serde_json::Value::as_str) {
+        return Some((
+            format!("--rid {} --exact", shell_token(rid)),
+            ElementTargetGuard::Interaction,
+        ));
+    }
+    if let Some(desc) = element.get("desc").and_then(serde_json::Value::as_str) {
+        return Some((
+            format!("--desc {} --exact", shell_token(desc)),
+            ElementTargetGuard::Interaction,
+        ));
+    }
+    if let Some(handle) = element.get("handle").and_then(serde_json::Value::as_str) {
+        return Some((
+            format!("--handle {}", shell_token(handle)),
+            ElementTargetGuard::Handle,
+        ));
+    }
+    let id = element.get("id").and_then(serde_json::Value::as_u64)?;
+    Some((format!("--id {id}"), ElementTargetGuard::StrictScreen))
+}
+
+fn append_target_guard(
+    command: &mut String,
+    map: &serde_json::Map<String, serde_json::Value>,
+    guard: ElementTargetGuard,
+) {
+    match guard {
+        ElementTargetGuard::Interaction => {
+            if let Some(hash) = map
+                .get("interaction_hash")
+                .and_then(serde_json::Value::as_str)
+            {
+                command.push_str(&format!(" --if-interaction {}", shell_token(hash)));
+            } else if let Some(hash) = map.get("screen_hash").and_then(serde_json::Value::as_str) {
+                command.push_str(&format!(" --if-screen {}", shell_token(hash)));
+            }
+        }
+        ElementTargetGuard::Handle => {}
+        ElementTargetGuard::StrictScreen => {
+            if let Some(hash) = map.get("screen_hash").and_then(serde_json::Value::as_str) {
+                command.push_str(&format!(" --if-screen {}", shell_token(hash)));
+            }
+        }
+    }
 }
 
 fn debugger_session_actions(map: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
@@ -1247,6 +1316,7 @@ mod tests {
     fn full() -> Element {
         Element {
             id: 1,
+            handle: None,
             text: Some("Hi".into()),
             desc: None,
             klass: Some("android.widget.Button".into()),
@@ -1391,6 +1461,67 @@ mod tests {
         assert_eq!(
             element_actions(&map),
             ["shadowdroid ui tap --id 7 --if-screen abc123 --observe"]
+        );
+    }
+
+    #[test]
+    fn next_actions_prefer_stable_selectors_then_screen_bound_handles() {
+        let rid_map = serde_json::json!({
+            "screen_hash": "strict-1",
+            "interaction_hash": "i:1111111111111111",
+            "element": {
+                "id": 7,
+                "handle": "i:1111111111111111/e:2",
+                "rid": "com.example:id/run",
+                "desc": "Run mission",
+                "clickable": true
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert_eq!(
+            element_actions(&rid_map),
+            [
+                "shadowdroid ui tap --rid com.example:id/run --exact --if-interaction i:1111111111111111 --observe"
+            ]
+        );
+
+        let desc_map = serde_json::json!({
+            "screen_hash": "strict-2",
+            "interaction_hash": "i:2222222222222222",
+            "element": {
+                "id": 9,
+                "handle": "i:2222222222222222/e:0",
+                "desc": "Open settings",
+                "clickable": true
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert_eq!(
+            element_actions(&desc_map),
+            [
+                "shadowdroid ui tap --desc 'Open settings' --exact --if-interaction i:2222222222222222 --observe"
+            ]
+        );
+
+        let handle_map = serde_json::json!({
+            "screen_hash": "strict-3",
+            "interaction_hash": "i:3333333333333333",
+            "element": {
+                "id": 11,
+                "handle": "i:3333333333333333/e:4",
+                "clickable": true
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert_eq!(
+            element_actions(&handle_map),
+            ["shadowdroid ui tap --handle i:3333333333333333/e:4 --observe"]
         );
     }
 

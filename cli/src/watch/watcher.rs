@@ -235,6 +235,7 @@ mod tests {
     fn element(text: &str) -> Element {
         Element {
             id: 1,
+            handle: None,
             text: Some(text.to_string()),
             desc: None,
             klass: Some("Button".to_string()),

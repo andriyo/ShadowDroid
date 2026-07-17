@@ -783,6 +783,9 @@ mod tests {
         ScreenResponse {
             screen_hash: "abc123".into(),
             screen_hash_version: 2,
+            content_hash: Some("c:abc123".into()),
+            interaction_hash: Some("i:1111111111111111".into()),
+            interaction_hash_version: 1,
             snapshot_state: "consistent".into(),
             captured_at_ms: Some(1),
             viewport: Viewport { w: 1, h: 2 },

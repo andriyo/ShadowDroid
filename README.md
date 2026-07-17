@@ -32,6 +32,8 @@ answers the agent's next question *before it's asked*:
 ```jsonc
 $ shadowdroid ui dump
 {"screen_hash":"154e97ff111d4b1e","screen_hash_version":3,
+ "content_hash":"c:154e97ff111d4b1e",
+ "interaction_hash":"i:6b4f20feab9812c3","interaction_hash_version":1,
  "snapshot_state":"consistent","captured_at_ms":1760000000123,
  "viewport":{"w":1080,"h":2424},
  "current_app":{"package":"com.example.app","activity":".MainActivity","pid":5170,
@@ -39,7 +41,8 @@ $ shadowdroid ui dump
  "ui_tree":{"package":"com.example.app","window_id":42,
             "sampled_at_ms":1760000000121,"age_ms":2},
  "element_count":39,"ime":{"keyboard_visible":false},
- "elements":[{"id":7,"text":"Sign in","rid":"btn_sign_in","tap":[540,1200],"clickable":true}, …]}
+ "elements":[{"id":7,"handle":"i:6b4f20feab9812c3/e:2","text":"Sign in",
+              "rid":"btn_sign_in","tap":[540,1200],"clickable":true}, …]}
 
 // Act + wait for a quiet accessibility state in ONE call. A destination
 // postcondition makes the observation transactional and implies --observe.
@@ -53,16 +56,27 @@ $ shadowdroid ui tap --text "Sign in" --expect-text "Welcome" --timeout-ms 3000
  "postcondition":{"kind":"text","expected":"Welcome","matched":true},
  "postcondition_satisfied":true,
  "screen":{"screen_hash":"9c01d2aa87b3e544","screen_hash_version":3,
+           "content_hash":"c:9c01d2aa87b3e544",
+           "interaction_hash":"i:72f4e31cb098a6d5","interaction_hash_version":1,
            "snapshot_state":"consistent","captured_at_ms":1760000000440,
            "element_count":24,"elements":[…]}}
 
-// Only act if the screen is still the one you read (optimistic concurrency):
+// Strict guard: any content change, including telemetry, refuses the action.
 $ shadowdroid ui tap --text "Buy" --if-screen 154e97ff111d4b1e
 {"type":"error","ok":false,"stage":"run","code":"screen_changed",
  "msg":"screen changed since your last read (expected hash 154e97ff…, now 9c01d2aa…) — not acting; re-plan from detail.screen",
  "retryable":false,
  "next_actions":["re-plan from detail.screen instead of issuing another dump"],
  "detail":{"expected":"154e97ff111d4b1e","actual":"9c01d2aa87b3e544","screen":{…fresh compact dump…}}}
+
+// Interaction guard: display-only telemetry/video may change, but controls,
+// their hierarchy, bounds, selectors, enabled state, and actions must match.
+$ shadowdroid ui tap --rid btn_sign_in --exact --if-interaction i:6b4f20feab9812c3
+
+// A handle is bound to that same interaction snapshot and resolves its current
+// numeric id atomically. Navigation/recomposition makes an old handle fail with
+// code=stale_element and returns the fresh screen without acting.
+$ shadowdroid ui tap --handle i:6b4f20feab9812c3/e:2 --observe
 
 // If the app crashed since your previous command, your NEXT response says so —
 // success or error, no watcher required:
@@ -100,8 +114,10 @@ $ shadowdroid why
 - **Fewer round-trips** — `--observe` fuses act + accessibility-idle re-read
   into one call, while `--expect-text`/`--expect-rid`/`--expect-desc`/
   `--expect-package`/`--expect-activity` prove the stable destination;
-  `--if-screen` refuses to act on a stale read and hands back the fresh screen
-  in the failure. Every round-trip an agent saves is an LLM inference saved.
+  `--if-screen` strictly guards all content, while `--if-interaction` and
+  screen-bound element handles tolerate display-only telemetry/video changes
+  but refuse changed controls. Both hand back the fresh screen on failure.
+  Every round-trip an agent saves is an LLM inference saved.
 - **Failures explain themselves** — a missed selector returns what *is* on
   screen (`top_texts`) and the closest candidates ranked; a timeout reports what
   the screen became; a crash since your last command rides the next response as
@@ -420,16 +436,19 @@ costs as few round-trips as possible.
 3. **Connect.** `shadowdroid connect`; if it fails, `shadowdroid doctor --json`,
    then `doctor --fix` only when repair side effects are acceptable.
 4. **Read by dumping.** `shadowdroid ui dump` returns the actionable tree as a
-   compact element list plus screen identity and freshness metadata. Act only
+   compact element list plus strict content identity, actionable interaction
+   identity, screen-bound handles, and freshness metadata. Act only
    from `snapshot_state: "consistent"`; a lifecycle race is retried within a
    bounded window, then returned as `transitioning` with a warning. Cache the
-   hash/version pair; invalidate a cached hash if its version changes.
+   hash/version pairs; invalidate a cached hash if its version changes.
 5. **Act by selector, not coordinates.** Prefer `--rid`, then `--desc`/exact
    `--text`. Add `--observe` to wait for an accessibility quiet period and get
    the post-action screen in the same response. Prefer one `--expect-*`
    destination condition when the outcome is known; it implies observation.
-   Add `--if-screen <hash>` to refuse acting on a screen that changed under you
-   (the failure returns the fresh screen — that *is* your re-read).
+   Add `--if-interaction <hash>` to stable selectors on dynamic screens, or use
+   a returned `--handle` when no stable selector exists. Use `--if-screen
+   <hash>` when even display-only content must remain identical. A mismatch
+   returns the fresh screen — that *is* your re-read.
 6. **Confirm.** `ui wait --text/--rid/--pkg` blocks until the expected state and
    echoes the matched element; a timeout returns `top_texts` so you see what the
    screen became instead of guessing.
@@ -548,8 +567,15 @@ then compare error rate and p95 by version.
 Automation commands are JSON-first, and selectors are consistent across
 commands: `--text`, `--rid` (resource id), `--desc` (content description), and
 `--xpath`. A typical agent reads `ui dump` once, acts by `--rid`/`--text`, and
-caches `screen_hash` together with `screen_hash_version`. A hash is comparable
-only within the same version; invalidate it when the version changes.
+caches strict `content_hash` and actionable `interaction_hash` together with
+their versions. Legacy `screen_hash` remains the unprefixed strict identity for
+backward compatibility. A hash is comparable only within the same version;
+invalidate it when the version changes. `content_hash` changes for any visible
+or actionable snapshot detail. `interaction_hash` ignores display-only content
+(telemetry, timers, video surfaces) and a slider's current value, but includes
+actionable hierarchy, bounds, stable selectors, enabled/selected/checked state,
+range shape, and supported actions. Text participates when it is the control's
+only selector.
 `snapshot_state`, `captured_at_ms`, `current_app.sampled_at_ms`, and `ui_tree`
 make lifecycle freshness explicit. Do not derive an action from a
 `transitioning` snapshot; retry or wait for the expected package/activity.
@@ -567,6 +593,16 @@ the most reliable target when a stable resource id exists. Matching is
 themselves, with no wildcards or regex (a value starting with `-` needs the
 `--text=-50%` equals form so it isn't read as a flag).
 
+Each actionable element also has a screen-bound `handle` such as
+`i:6b4f20feab9812c3/e:2`. Prefer a stable `--rid` or `--desc` plus
+`--if-interaction`; use `--handle` when no stable selector exists. Handles are
+accepted by `ui tap`, `ui set-progress`, and `ui text`. They are resolved to the
+fresh numeric element id only after validating their embedded interaction hash,
+so stale navigation/recomposition or reused numeric ids fail as `stale_element`
+without delivering input. Agent-facing `next_actions` follow the same order:
+stable selector first, handle second, and numeric ids only as a strictly
+`--if-screen`-guarded compatibility fallback.
+
 Platform and Compose sliders expose their accessibility `range` (`type`,
 `min`, `max`, `current`, and nullable `step`) plus stable `actions` in the
 normal `ui dump` shape. Android's range API does not expose a declared discrete
@@ -575,7 +611,8 @@ prove it. Set a slider semantically and verify the resulting range readback:
 
 ```bash
 shadowdroid ui set-progress --desc "Follow stand-off slider" --value 0.45 --observe
-shadowdroid ui set-progress --rid distance_slider --percent 80 --if-screen <hash>
+shadowdroid ui set-progress --rid distance_slider --percent 80 --if-interaction <interaction-hash>
+shadowdroid ui set-progress --handle <handle> --percent 50 --observe
 ```
 
 Out-of-range values fail unless `--clamp` is explicit. Missing range semantics
@@ -601,8 +638,9 @@ undelivered input.
 Loop-fusion action verbs (`ui tap`, `ui set-progress`, coordinate gestures, `ui pinch`, `ui text`,
 `ui key`, `ui back`, and `ui home`) accept `--observe` (wait for a 500 ms
 accessibility-event quiet period, then return the stable compact screen) and
-`--if-screen <hash>` (optimistic concurrency — refuse to act if the screen
-changed, and return the fresh one). A single `--expect-text`, `--expect-desc`,
+`--if-screen <hash>` (strict optimistic concurrency) and `--if-interaction
+<hash>` (ignore display-only volatility while guarding actionable structure).
+Both refuse changed state and return the fresh screen. A single `--expect-text`, `--expect-desc`,
 `--expect-rid`, `--expect-package`, or `--expect-activity` postcondition implies
 observation; `--expect-exact`, `--observe-delay-ms`, and `--timeout-ms` refine
 matching and timing. An unmet condition fails with `postcondition_timeout`; a
@@ -623,7 +661,7 @@ selector (then optionally activates it) — the TV analog of `ui tap` /
 | --- | --- |
 | **Discovery/setup** | `commands --json --depth 1`, `commands --json --describe '<path>'`, `config paths` / `schema` / `explain` / `init` / `validate`, `skill`, `studio status` / `install`, `init`, `update`, `usage` |
 | **Session/diagnostics** | `devices`, `connect`, `disconnect`, `test`, `doctor`, `collect`, `why`, `log` |
-| **UI automation** | `ui dump`, `ui audit`, `ui gen`, `ui screenshot`, `ui find`, `ui tap`, `ui set-progress`, `ui double-tap`, `ui long-tap`, `ui swipe`, `ui drag`, `ui swipe-ext`, `ui pinch`, `ui scroll-to`, `ui focus`, `ui text`, `ui key`, `ui hide-keyboard`, `ui back`, `ui home`, `ui wait`, `ui toast` (tap/gesture/text/key/back/home/progress verbs take `--observe` / `--if-screen`) |
+| **UI automation** | `ui dump`, `ui audit`, `ui gen`, `ui screenshot`, `ui find`, `ui tap`, `ui set-progress`, `ui double-tap`, `ui long-tap`, `ui swipe`, `ui drag`, `ui swipe-ext`, `ui pinch`, `ui scroll-to`, `ui focus`, `ui text`, `ui key`, `ui hide-keyboard`, `ui back`, `ui home`, `ui wait`, `ui toast` (action verbs take `--observe`, `--if-screen`, and `--if-interaction`; tap/progress/text also accept `--handle`) |
 | **Triage** | `why` (one-read verdict + evidence), `log` (structured app-scoped logcat + parsed crashes) |
 | **Live timeline** | `watch` (screen changes, crashes, ANRs, toasts, watcher actions, and HTTP events when network capture is active) |
 | **Layout / Compose** | `layout snapshot`, `layout diff`, `layout source`, `layout recompositions` |

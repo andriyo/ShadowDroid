@@ -146,8 +146,13 @@ private fun CapturedScreen.toResponse(): ScreenResponse {
             pid = enrichment.pid,
             sampled_at_ms = enrichment.sampledAtMs.takeIf { it > 0L },
         )
+    val strictHash = TreeWalker.hashOf(elements, viewport, currentApp, ime)
+    val interactionHash = TreeWalker.interactionHashOf(elements, viewport, currentApp)
+    val boundElements = TreeWalker.bindInteractionHandles(elements, interactionHash)
     return ScreenResponse(
-        screen_hash = TreeWalker.hashOf(elements, viewport, currentApp, ime),
+        screen_hash = strictHash,
+        content_hash = "c:$strictHash",
+        interaction_hash = interactionHash,
         snapshot_state = assessment.state,
         captured_at_ms = capturedAtMs,
         viewport = viewport,
@@ -162,7 +167,7 @@ private fun CapturedScreen.toResponse(): ScreenResponse {
         warning = assessment.warning,
         element_count = elements.size,
         ime = ime,
-        elements = elements,
+        elements = boundElements,
     )
 }
 
