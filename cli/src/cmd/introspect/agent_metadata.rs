@@ -315,6 +315,13 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "side_effects": ["changes text in the app UI"],
             "next_actions": ["ui key enter", "ui hide-keyboard", "ui wait", "ui dump"]
         })),
+        "ui pin" => Some(serde_json::json!({
+            "use_when": ["Need to enter a numeric PIN on a visible accessibility-backed keypad without exposing the value in JSON output."],
+            "output": "redacted PIN action JSON with digit count, delivery status, and submission status",
+            "side_effects": ["activates the visible digit buttons in order and presses Enter unless --no-submit is set"],
+            "prerequisites": ["the PIN pad must expose one unambiguous text node for every required digit", "prefer --if-interaction from a fresh ui dump", "the PIN remains visible to the local shell/process invocation even though ShadowDroid output redacts it"],
+            "next_actions": ["ui wait", "ui back"]
+        })),
         "ui key" => Some(serde_json::json!({
             "use_when": ["Need to press a named Android key/keycode such as enter, back, home, dpad, or media keys."],
             "output": "key action JSON",

@@ -635,6 +635,18 @@ coordinates). Tap results separate `selector_matched`, `actionable_resolved`,
 `postcondition_satisfied`, so a valid no-op action is not confused with an
 undelivered input.
 
+Numeric system keypads can be driven without returning the secret in action
+JSON: `shadowdroid ui pin "$DEVICE_PIN" --if-interaction <interaction-hash>`.
+The command preflights every required digit before entering anything, activates
+each label through its clickable ancestor, and presses Enter by default;
+`--no-submit` leaves the digits entered for controlled validation. Its output
+contains only a digit count and delivery/submission state. Unlike ordinary
+loop-fusion actions, `ui pin` intentionally exposes only the pre-action
+`--if-screen` / `--if-interaction` guards—not `--observe` or postconditions,
+whose returned screen could reveal an unmasked keypad value. The PIN is still
+present in the local process invocation, so use the host's normal shell-history
+and process-visibility protections.
+
 Loop-fusion action verbs (`ui tap`, `ui set-progress`, coordinate gestures, `ui pinch`, `ui text`,
 `ui key`, `ui back`, and `ui home`) accept `--observe` (wait for a 500 ms
 accessibility-event quiet period, then return the stable compact screen) and
@@ -661,7 +673,7 @@ selector (then optionally activates it) — the TV analog of `ui tap` /
 | --- | --- |
 | **Discovery/setup** | `commands --json --depth 1`, `commands --json --describe '<path>'`, `config paths` / `schema` / `explain` / `init` / `validate`, `skill`, `studio status` / `install`, `init`, `update`, `usage` |
 | **Session/diagnostics** | `devices`, `connect`, `disconnect`, `test`, `doctor`, `collect`, `why`, `log` |
-| **UI automation** | `ui dump`, `ui audit`, `ui gen`, `ui screenshot`, `ui find`, `ui tap`, `ui set-progress`, `ui double-tap`, `ui long-tap`, `ui swipe`, `ui drag`, `ui swipe-ext`, `ui pinch`, `ui scroll-to`, `ui focus`, `ui text`, `ui key`, `ui hide-keyboard`, `ui back`, `ui home`, `ui wait`, `ui toast` (action verbs take `--observe`, `--if-screen`, and `--if-interaction`; tap/progress/text also accept `--handle`) |
+| **UI automation** | `ui dump`, `ui audit`, `ui gen`, `ui screenshot`, `ui find`, `ui tap`, `ui set-progress`, `ui double-tap`, `ui long-tap`, `ui swipe`, `ui drag`, `ui swipe-ext`, `ui pinch`, `ui scroll-to`, `ui focus`, `ui text`, `ui pin`, `ui key`, `ui hide-keyboard`, `ui back`, `ui home`, `ui wait`, `ui toast` (action verbs take `--observe`, `--if-screen`, and `--if-interaction`; tap/progress/text also accept `--handle`) |
 | **Triage** | `why` (one-read verdict + evidence), `log` (structured app-scoped logcat + parsed crashes) |
 | **Live timeline** | `watch` (screen changes, crashes, ANRs, toasts, watcher actions, and HTTP events when network capture is active) |
 | **Layout / Compose** | `layout snapshot`, `layout diff`, `layout source`, `layout recompositions` |

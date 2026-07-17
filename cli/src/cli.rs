@@ -739,6 +739,24 @@ pub enum UiCmd {
         #[command(flatten)]
         fusion: crate::fusion::FusionArgs,
     },
+    /// Enter a numeric PIN through visible keypad buttons without echoing it in JSON output.
+    Pin {
+        /// Numeric PIN to enter. The value is never included in command output or diagnostics.
+        #[arg(value_name = "DIGITS")]
+        digits: String,
+        /// Enter the digits without pressing Enter afterward.
+        #[arg(long)]
+        no_submit: bool,
+        /// Explicitly allow center-coordinate injection when a digit label has no clickable ancestor.
+        #[arg(long)]
+        coordinate_fallback: bool,
+        /// Only act if the screen still matches this screen_hash.
+        #[arg(long, value_name = "HASH")]
+        if_screen: Option<String>,
+        /// Only act if the actionable structure still matches this interaction hash.
+        #[arg(long, value_name = "INTERACTION_HASH")]
+        if_interaction: Option<String>,
+    },
     /// Press a named key or keycode.
     Key {
         name: String,
@@ -2075,6 +2093,26 @@ async fn dispatch_ui_inner(
                 Ok(("text", json!({"value":value,"clear":clear,"target":target})))
             })
             .await
+        }
+        UiCmd::Pin {
+            digits,
+            no_submit,
+            coordinate_fallback,
+            if_screen,
+            if_interaction,
+        } => {
+            validate_pin(&digits)?;
+            validate_pin_interaction_guard(if_interaction.as_deref())?;
+            let (cmd, body) = cmd_pin(
+                client,
+                &digits,
+                !no_submit,
+                coordinate_fallback,
+                if_screen.as_deref(),
+                if_interaction.as_deref(),
+            )
+            .await?;
+            Ok(Outcome::Action(cmd, body))
         }
         UiCmd::Key { name, fusion } => {
             crate::fusion::run_fused(client, &fusion, None, |_| async {
@@ -4174,6 +4212,218 @@ fn validate_set_progress_input(value: Option<f64>, percent: Option<f64>) -> Resu
     )
 }
 
+fn validate_pin(digits: &str) -> Result<()> {
+    if digits.is_empty() || digits.len() > 32 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "invalid_pin",
+            "input",
+            "PIN must contain 1 to 32 ASCII digits",
+        )
+        .detail(json!({"pin_redacted": true}))
+        .next_actions([
+            "rerun with 1 to 32 digits",
+            "use `ui text` for non-numeric input fields",
+        ])
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_pin_interaction_guard(hash: Option<&str>) -> Result<()> {
+    let Some(hash) = hash else { return Ok(()) };
+    let digest = hash.strip_prefix("i:").unwrap_or_default();
+    if digest.len() != 16 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "invalid_interaction_hash",
+            "input",
+            "--if-interaction must use the form i:<16 hex>",
+        )
+        .detail(json!({"if_interaction": hash, "pin_redacted": true}))
+        .next_actions(["copy interaction_hash from a fresh `shadowdroid ui dump`"])
+        .into());
+    }
+    Ok(())
+}
+
+async fn cmd_pin(
+    client: &ServerClient,
+    digits: &str,
+    submit: bool,
+    coordinate_fallback: bool,
+    if_screen: Option<&str>,
+    if_interaction: Option<&str>,
+) -> Result<(&'static str, serde_json::Value)> {
+    // Preflight every distinct key against one coherent screen before entering
+    // anything. This avoids leaving a partial PIN when a required digit is not
+    // represented by an unambiguous accessibility node.
+    let screen = client.screen().await?;
+    if let Some(expected) = if_screen
+        && screen.screen_hash != expected
+    {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "screen_changed",
+            "ui",
+            "screen changed since the PIN pad was read; no PIN digits were entered",
+        )
+        .retryable(true)
+        .detail(json!({
+            "expected": expected,
+            "actual": screen.screen_hash,
+            "pin_redacted": true,
+            "digits_entered": 0,
+        }))
+        .next_actions(["read the intended PIN pad again before retrying"])
+        .into());
+    }
+    if let Some(expected) = if_interaction {
+        let actual = screen.interaction_hash.as_deref().unwrap_or("unsupported");
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(crate::diagnostic::DiagnosticError::new(
+                "interaction_changed",
+                "ui",
+                "PIN-pad interaction structure changed since it was read; no PIN digits were entered",
+            )
+            .retryable(true)
+            .detail(json!({
+                "expected": expected,
+                "actual": actual,
+                "pin_redacted": true,
+                "digits_entered": 0,
+            }))
+            .next_actions(["read the intended PIN pad again before retrying"])
+            .into());
+        }
+    }
+    let mut required = [false; 10];
+    for byte in digits.bytes() {
+        required[usize::from(byte - b'0')] = true;
+    }
+    let mut targets: [Option<SelectorQuery>; 10] = std::array::from_fn(|_| None);
+    let mut unavailable = 0usize;
+    for (digit, needed) in required.into_iter().enumerate() {
+        if !needed {
+            continue;
+        }
+        let label = digit.to_string();
+        let matches: Vec<_> = screen
+            .elements
+            .iter()
+            .filter(|element| {
+                element.enabled
+                    && crate::selector::text_matches(element.text.as_deref(), Some(&label), true)
+            })
+            .collect();
+        if matches.len() != 1 {
+            unavailable += 1;
+            continue;
+        }
+        let element = matches[0];
+        // Combine the label with a stable element attribute where possible so
+        // a result/display node containing the same digit cannot become an
+        // ambiguous match after earlier digits have been entered. The fresh
+        // element id is only the fallback for keypads that expose no stable
+        // resource id, description, or class.
+        let has_stable_attribute =
+            element.rid.is_some() || element.desc.is_some() || element.klass.is_some();
+        targets[digit] = Some(SelectorQuery {
+            id: (!has_stable_attribute).then_some(element.id),
+            text: Some(label),
+            rid: element.rid.clone(),
+            desc: element.desc.clone(),
+            klass: element.klass.clone(),
+            exact: true,
+            enabled: Some(true),
+            coordinate_fallback,
+            ..Default::default()
+        });
+    }
+    if unavailable > 0 {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "pin_pad_incomplete",
+            "ui",
+            "the visible screen does not expose one unambiguous button for every required digit; no PIN digits were entered",
+        )
+        .detail(json!({
+            "pin_redacted": true,
+            "digits_entered": 0,
+            "unavailable_required_buttons": unavailable,
+        }))
+        .next_actions([
+            "inspect `ui dump` and retry when the numeric PIN pad is visible",
+            "add --coordinate-fallback only when the digit labels are visible but have no clickable ancestor",
+        ])
+        .into());
+    }
+
+    let mut completed = 0usize;
+    let mut used_coordinate_fallback = false;
+    for byte in digits.bytes() {
+        let target = targets[usize::from(byte - b'0')]
+            .as_ref()
+            .expect("all required PIN targets were preflighted");
+        let response = match client.find_tap(target).await {
+            Ok(response) => response,
+            Err(_) => {
+                return Err(crate::diagnostic::DiagnosticError::new(
+                    "pin_digit_failed",
+                    "ui",
+                    "PIN entry stopped because a digit button could not be activated",
+                )
+                .detail(json!({
+                    "pin_redacted": true,
+                    "digits_entered": completed,
+                    "submitted": false,
+                }))
+                .next_actions([
+                    "clear or dismiss the partial PIN before retrying",
+                    "inspect `ui dump` and guard the retry with --if-interaction",
+                ])
+                .into());
+            }
+        };
+        let delivered = response.input_delivered.unwrap_or(true);
+        if !delivered {
+            return Err(crate::diagnostic::DiagnosticError::new(
+                "pin_digit_not_delivered",
+                "ui",
+                "PIN entry stopped because the keypad did not confirm input delivery",
+            )
+            .detail(json!({
+                "pin_redacted": true,
+                "digits_entered": completed,
+                "submitted": false,
+            }))
+            .next_actions([
+                "clear or dismiss the partial PIN before retrying",
+                "inspect `ui dump` and retry on a stable PIN pad",
+            ])
+            .into());
+        }
+        used_coordinate_fallback |= matches!(
+            response.action.as_deref(),
+            Some("coordinate_fallback" | "coordinate")
+        );
+        completed += 1;
+    }
+
+    let submit_injection_reported = if submit {
+        Some(client.key("enter").await?)
+    } else {
+        None
+    };
+    Ok((
+        "pin",
+        json!({
+            "pin_redacted": true,
+            "digits_entered": completed,
+            "submitted": submit,
+            "submit_injection_reported": submit_injection_reported,
+            "input_delivered": true,
+            "coordinate_fallback": used_coordinate_fallback,
+        }),
+    ))
+}
+
 async fn tap_element_id(
     client: &ServerClient,
     id: u32,
@@ -5314,6 +5564,50 @@ mod tests {
                 assert_eq!(text.as_deref(), Some("Allow"));
             }
             _ => panic!("expected `ui tap`"),
+        }
+    }
+
+    #[test]
+    fn ui_pin_parses_redacted_keypad_options() {
+        let cli = Cli::try_parse_from([
+            "shadowdroid",
+            "ui",
+            "pin",
+            "012340",
+            "--no-submit",
+            "--coordinate-fallback",
+            "--if-interaction",
+            "i:0123456789abcdef",
+        ])
+        .expect("`ui pin` should parse");
+        match cli.cmd {
+            Cmd::Ui(UiCmd::Pin {
+                digits,
+                no_submit,
+                coordinate_fallback,
+                if_screen,
+                if_interaction,
+            }) => {
+                assert_eq!(digits, "012340");
+                assert!(no_submit);
+                assert!(coordinate_fallback);
+                assert!(if_screen.is_none());
+                assert_eq!(if_interaction.as_deref(), Some("i:0123456789abcdef"));
+            }
+            _ => panic!("expected `ui pin`"),
+        }
+    }
+
+    #[test]
+    fn pin_validation_rejects_non_ascii_and_never_echoes_input() {
+        assert!(validate_pin("0123456789").is_ok());
+        for secret in ["", "12a4", "１２３４", "123456789012345678901234567890123"] {
+            let error = validate_pin(secret).expect_err("invalid PIN should fail");
+            assert_eq!(error_code_of(&error), "invalid_pin");
+            assert!(
+                !error.to_string().contains(secret) || secret.is_empty(),
+                "validation error exposed the PIN value"
+            );
         }
     }
 

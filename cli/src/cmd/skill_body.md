@@ -218,6 +218,7 @@ Useful UI commands:
 ```bash
 shadowdroid ui text "alice@example.com" --rid email
 shadowdroid ui hide-keyboard
+shadowdroid ui pin "$DEVICE_PIN" --if-interaction <interaction-hash>
 shadowdroid ui key enter
 shadowdroid ui scroll-to --text "Privacy" --tap
 shadowdroid ui wait --pkg com.android.chrome
