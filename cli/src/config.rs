@@ -97,7 +97,8 @@ pub struct ProxyConfig {
     /// Default host allowlist (globs) for `net start`/`net log`/`intercept`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hosts: Vec<String>,
-    /// Preferred device trust store for `net trust`: `system`, `user`, or `ui`.
+    /// Preferred device trust path for `net trust`: `system`, `user`, or `push`.
+    /// The legacy value `ui` is accepted as an alias for `push`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_store: Option<String>,
     /// Default for `net start --verify-upstream`.

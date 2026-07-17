@@ -16,8 +16,8 @@
 //!     ([ca], installed by [trust]).
 //!
 //! `net` is **host-only**: like `doctor`/`perm`, it composes `adb` + the daemon
-//! and never needs the on-device UI server — except `trust --ui`, which drives
-//! the Settings cert-install flow with ShadowDroid's own UI automation.
+//! and never needs the on-device UI server. `trust --push` stages the CA through
+//! adb and opens Settings, but the credential-protected install remains manual.
 
 pub mod ca;
 pub mod check;

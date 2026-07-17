@@ -10,9 +10,10 @@
 //!     trust-anchors (common for debug builds, e.g. Livd's `<debug-overrides>`).
 //!     Writable via root, no apex fight — the pragmatic path on Android 14+.
 //!
-//! `--system` forces the system store only; `--ui` drives the Settings flow on a
-//! non-root device. Verify-by-readback throughout: `<hash>` is the OpenSSL
-//! `subject_hash_old` (the filename Android keys CAs by).
+//! `--system` forces the system store only; `--push` stages the certificate and
+//! opens Settings for a manual install on a locked device. Verify-by-readback
+//! throughout: `<hash>` is the OpenSSL `subject_hash_old` (the filename Android
+//! keys CAs by).
 
 use crate::ids::Serial;
 use anyhow::{Result, bail};
@@ -146,22 +147,31 @@ pub(crate) fn clear_trust_cache(serial: &Serial) {
     }
 }
 
-/// `net trust [--system|--ui] [--fresh]`.
+/// `net trust [--system|--push] [--fresh]`.
 pub async fn run(
     serial: &Serial,
     auto: bool,
     system: bool,
-    ui: bool,
+    push: bool,
+    legacy_ui: bool,
     tctx: &TrustContext,
 ) -> Result<()> {
-    let selected = [auto, system, ui].into_iter().filter(|v| *v).count();
+    let selected = [auto, system, push || legacy_ui]
+        .into_iter()
+        .filter(|v| *v)
+        .count();
     if selected > 1 {
         return Err(crate::diagnostic::DiagnosticError::new(
             "trust_mode_conflict",
             "input",
-            "choose only one trust mode: --auto, --system, or --ui",
+            "choose only one trust mode: --auto, --system, or --push",
         )
-        .detail(json!({"auto": auto, "system": system, "ui": ui}))
+        .detail(json!({
+            "auto": auto,
+            "system": system,
+            "push": push,
+            "legacy_ui": legacy_ui,
+        }))
         .next_actions(["remove all but one trust-mode flag, then retry `shadowdroid net trust`"])
         .into());
     }
@@ -192,8 +202,8 @@ pub async fn run(
         return Ok(());
     }
 
-    if ui {
-        return ui_install(serial, &tctx.ca).await;
+    if push || legacy_ui {
+        return stage_for_manual_install(serial, &tctx.ca, legacy_ui).await;
     }
 
     let hash = ca_subject_hash_of(&tctx.ca.cert)?;
@@ -202,7 +212,7 @@ pub async fn run(
             "installed": false,
             "store": "none",
             "basis": "probed",
-            "reason": "adbd is not root. On an emulator run `adb root` then retry, or use `net trust --ui` on a real device.",
+            "reason": "adbd is not root. On an emulator run `adb root` then retry, or use `net trust --push` to stage the CA for manual installation on a locked device (screen-lock credential required).",
         }));
         return Ok(());
     }
@@ -241,7 +251,7 @@ pub async fn run(
         "note": if installed {
             "trusted. Restart the app under test so it re-reads the trust store (net start force-stops it)."
         } else {
-            "system store is APEX-locked (Android 14+) and the user-store push failed; try `net trust --ui`."
+            "system store is APEX-locked (Android 14+) and the user-store push failed; use `net trust --push` to stage the CA for manual installation (screen-lock credential required)."
         },
     }));
     Ok(())
@@ -333,8 +343,8 @@ pub async fn evidence(
 
     let (recommended_command, recommendation_reason) = if play_store_image || !adbd_root {
         (
-            "shadowdroid net trust --ui".to_string(),
-            "device does not expose root adbd (common on Play Store/locked images), so install the CA through Android Settings".to_string(),
+            "shadowdroid net trust --push".to_string(),
+            "device does not expose root adbd (common on Play Store/locked images), so stage the CA and finish installation manually in Android Settings with the device screen-lock credential".to_string(),
         )
     } else {
         (
@@ -489,20 +499,29 @@ pub(crate) fn certificate_der(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
-async fn ui_install(serial: &Serial, ca: &CaPaths) -> Result<()> {
+async fn stage_for_manual_install(serial: &Serial, ca: &CaPaths, legacy_ui: bool) -> Result<()> {
     let dest = "/sdcard/Download/shadowdroid-ca.crt";
     adb::push(serial, ca.cert.as_path(), dest.to_string()).await?;
-    let _ = adb::shell(serial, "am start -a android.settings.SECURITY_SETTINGS").await;
+    let settings_opened = adb::shell(serial, "am start -a android.settings.SECURITY_SETTINGS")
+        .await
+        .is_ok();
     emit(json!({
-        "store": "ui",
-        "pushed": dest,
-        "installed": null,
+        "store": "user",
+        "basis": "staged_not_installed",
+        "staged": true,
+        "staged_path": dest,
+        "installed": false,
+        "settings_opened": settings_opened,
+        "screen_lock_required": true,
+        "action_required": "manual_certificate_install",
+        "legacy_ui_alias_used": legacy_ui,
         "instructions": [
             "Settings → Security → Encryption & credentials → Install a certificate → CA certificate",
             format!("choose the pushed file: {dest}"),
+            "authenticate with the device screen-lock credential when prompted",
             "accept the 'your network may be monitored' warning (expected for a debug MITM CA)",
         ],
-        "note": "Requires a screen-lock credential. Re-run `net check <pkg>` to confirm trust once installed.",
+        "note": "The CA is staged, not installed. Complete the Settings flow manually, then re-run `net check <pkg>` to verify trust.",
     }));
     Ok(())
 }

@@ -926,7 +926,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         "net trust" => Some(serde_json::json!({
             "use_when": ["Need the device/app to trust the proxy CA before expecting decrypted HTTPS traffic. Skipped automatically when proxy.ca_trusted is set or a prior verification is cached."],
             "output": "certificate trust/install JSON (basis: asserted|cached|probed)",
-            "side_effects": ["pushes/installs the resolved CA (project or global); --auto chooses the best path; --system may require emulator/root; --ui drives Settings UI; --fresh forces a real install/verify; caches a positive result per device"],
+            "side_effects": ["pushes/installs the resolved CA (project or global); --auto chooses the best path; --system may require emulator/root; --push only stages the CA and opens Settings for manual credential-protected installation; --fresh forces a real install/verify; caches a positive result per device"],
             "next_actions": ["net check <pkg>", "net start", "watch"]
         })),
         "net ca" => Some(serde_json::json!({

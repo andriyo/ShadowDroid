@@ -61,5 +61,5 @@ and every coroutine shows up named in `shadowdroid aar coroutines`.
 
 The debug build uses a Network Security Config with `debug-overrides` that trusts
 user-installed CAs, so it is suitable for `shadowdroid net trust --auto` on
-rootable emulator images and `shadowdroid net trust --ui` on locked devices.
-
+rootable emulator images and `shadowdroid net trust --push` followed by manual
+Settings installation on locked devices (a screen-lock credential is required).

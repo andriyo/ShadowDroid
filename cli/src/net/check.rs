@@ -369,7 +369,7 @@ mod tests {
             system_store_status: "asserted".into(),
             user_store_status: "asserted".into(),
             basis: "asserted".into(),
-            recommended_command: "shadowdroid net trust --ui".into(),
+            recommended_command: "shadowdroid net trust --push".into(),
             recommendation_reason: "asserted".into(),
         };
         // Asserted + old SDK is definitely trusted; asserted + modern SDK is

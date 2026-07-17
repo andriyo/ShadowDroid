@@ -571,7 +571,7 @@ fn schema_value() -> Value {
             "ca_trusted": {"type": "boolean", "optional": true, "description": "Assert the CA is already trusted on the device: net trust/net check skip the adb install + readback and report basis 'asserted'. Does not override the app's Network-Security-Config verdict."},
             "port": {"type": "integer", "optional": true, "description": "Default device-facing proxy port for net start (default 8080)."},
             "hosts": {"type": "array", "optional": true, "description": "Default host allowlist (globs) for net start/log/intercept."},
-            "trust_store": {"type": "string", "optional": true, "enum": ["system", "user", "ui"], "description": "Preferred device trust store for net trust."},
+            "trust_store": {"type": "string", "optional": true, "enum": ["system", "user", "push", "ui"], "description": "Preferred device trust path for net trust. push stages the CA for manual Settings installation; ui is a legacy alias."},
             "verify_upstream": {"type": "boolean", "optional": true, "description": "Default for net start --verify-upstream."},
             "anticache": {"type": "boolean", "optional": true, "description": "Default for net start --anticache."},
             "anticomp": {"type": "boolean", "optional": true, "description": "Default for net start --anticomp."},
@@ -809,10 +809,10 @@ fn validate_proxy(path: &Path, proxy: &ProxyConfig, errors: &mut Vec<String>) {
         _ => {}
     }
     if let Some(store) = proxy.trust_store.as_deref()
-        && !matches!(store, "system" | "user" | "ui")
+        && !matches!(store, "system" | "user" | "push" | "ui")
     {
         errors.push(format!(
-            "{}: proxy.trust_store must be one of system, user, ui (got {store:?})",
+            "{}: proxy.trust_store must be one of system, user, push (legacy ui is also accepted; got {store:?})",
             path.display()
         ));
     }

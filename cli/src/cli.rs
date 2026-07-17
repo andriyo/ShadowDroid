@@ -807,8 +807,12 @@ pub enum NetCmd {
         /// Push into the system trust store (emulator/root).
         #[arg(long)]
         system: bool,
-        /// Drive the Settings "Install a certificate" UI (real device, non-root).
+        /// Stage the CA in Downloads and open Settings for manual installation.
+        /// A device screen-lock credential is required to finish the install.
         #[arg(long)]
+        push: bool,
+        /// Legacy alias for --push. This does not automate certificate install.
+        #[arg(long, hide = true, conflicts_with = "push")]
         ui: bool,
         /// Ignore `proxy.ca_trusted` and the verify-once cache; install/verify
         /// against the device for real.
@@ -1540,7 +1544,7 @@ async fn run_inner() -> Result<()> {
             return crate::cmd::app_install::run(&serial, a, true).await;
         }
         // `net` is host-only: the proxy is a host-side daemon driven over adb.
-        // (`trust --ui` brings up the UI server on demand internally.)
+        // (`trust --push` only stages through adb and opens Android Settings.)
         Cmd::Net(c) => {
             // The detached daemon carries its own `--serial` and must not depend
             // on a live device being attached; everything else resolves one.
@@ -2116,11 +2120,15 @@ fn apply_net_config(args: &mut NetCmd, config: &ShadowDroidConfig) {
             *redact |= proxy.redact.unwrap_or(false);
         }
         NetCmd::Trust {
-            auto, system, ui, ..
-        } if !*auto && !*system && !*ui => {
+            auto,
+            system,
+            push,
+            ui,
+            ..
+        } if !*auto && !*system && !*push && !*ui => {
             match proxy.trust_store.as_deref() {
                 Some("system") => *system = true,
-                Some("ui") => *ui = true,
+                Some("push" | "ui") => *push = true,
                 // "user" has no dedicated flag; the default auto path installs
                 // system-then-user, so leave the flags unset.
                 _ => {}
@@ -2431,6 +2439,7 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
         NetCmd::Trust {
             auto,
             system,
+            push,
             ui,
             fresh,
         } => {
@@ -2441,7 +2450,7 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
                 crate::net::ca::ensure_ca(&tctx.ca)?;
                 tctx.refresh_ca_lease()?;
             }
-            nc::trust(serial, *auto, *system, *ui, &tctx).await
+            nc::trust(serial, *auto, *system, *push, *ui, &tctx).await
         }
         NetCmd::Ca(sub) => match sub {
             NetCaCmd::Import { cert, key, scope } => {
@@ -4655,6 +4664,40 @@ pub(crate) async fn resolve_serial(explicit: Option<&str>) -> Result<Serial> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn net_trust_push_is_honest_and_ui_remains_hidden_legacy_alias() {
+        let mut command = Cli::command();
+        let trust = command
+            .find_subcommand_mut("net")
+            .unwrap()
+            .find_subcommand_mut("trust")
+            .unwrap();
+        let help = trust.render_long_help().to_string();
+        assert!(help.contains("--push"), "{help}");
+        assert!(help.contains("screen-lock credential"), "{help}");
+        assert!(!help.contains("--ui"), "{help}");
+
+        let parsed = Cli::try_parse_from(["shadowdroid", "net", "trust", "--push"]).unwrap();
+        assert!(matches!(
+            parsed.cmd,
+            Cmd::Net(NetCmd::Trust {
+                push: true,
+                ui: false,
+                ..
+            })
+        ));
+
+        let legacy = Cli::try_parse_from(["shadowdroid", "net", "trust", "--ui"]).unwrap();
+        assert!(matches!(
+            legacy.cmd,
+            Cmd::Net(NetCmd::Trust {
+                push: false,
+                ui: true,
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn device_selection_precedence_and_host_filter_use_stable_target_identity() {

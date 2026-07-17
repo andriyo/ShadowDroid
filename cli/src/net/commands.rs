@@ -1579,10 +1579,11 @@ pub async fn trust(
     serial: &Serial,
     auto: bool,
     system: bool,
-    ui: bool,
+    push: bool,
+    legacy_ui: bool,
     tctx: &crate::net::trust::TrustContext,
 ) -> Result<()> {
-    crate::net::trust::run(serial, auto, system, ui, tctx).await
+    crate::net::trust::run(serial, auto, system, push, legacy_ui, tctx).await
 }
 
 // ── CA management (`net ca`) ──────────────────────────────────
