@@ -1856,7 +1856,7 @@ pub async fn override_local(serial: &Serial, url_glob: &str, file: &Path) -> Res
     let matcher = matcher_from_url_glob(url_glob);
     let spec = RuleSpec {
         kind: "map-local".into(),
-        matcher,
+        matcher: matcher.clone(),
         content_type: None,
         args: vec![file.display().to_string()],
     };
@@ -1868,6 +1868,7 @@ pub async fn override_local(serial: &Serial, url_glob: &str, file: &Path) -> Res
         "net_override",
         json!({
             "url": url_glob,
+            "effective_matcher": matcher,
             "file": file.display().to_string(),
             "rule": reply,
             "hint": "equivalent to `net rule add map-local <file> --host <host> --path <path>`",

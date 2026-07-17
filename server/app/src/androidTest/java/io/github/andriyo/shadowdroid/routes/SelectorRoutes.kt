@@ -121,11 +121,17 @@ object SelectorRoutes {
             // Detect the target with the canonical normalized matcher (the same
             // one `/find` uses) — not `By.textContains`, which is case-sensitive
             // and unnormalized. A match with a usable tap point is on-screen.
-            val selector = SelectorReq(text = r.text, rid = r.rid, desc = r.desc)
+            val selector =
+                SelectorReq(
+                    text = r.text,
+                    rid = r.rid,
+                    desc = r.desc,
+                    exact = r.exact,
+                    all = true,
+                )
 
             fun visibleHit(): ElementMatch? =
-                findElementMatches(selector, uiDevice, instr)
-                    .firstOrNull { it.element.tap != null }
+                chooseVisibleScrollTarget(findElementMatches(selector, uiDevice, instr), selector)
 
             var found = visibleHit()
             var swipes = 0
@@ -180,6 +186,18 @@ internal fun chooseUnique(
             }
         }
     }
+
+/**
+ * Return no target while it is off-screen; once visible, enforce the same
+ * strict ambiguity contract as every other action selector.
+ */
+internal fun chooseVisibleScrollTarget(
+    matches: List<ElementMatch>,
+    request: SelectorReq,
+): ElementMatch? {
+    val visible = matches.filter { it.element.tap != null }
+    return if (visible.isEmpty()) null else chooseUnique(visible, request)
+}
 
 private fun candidatesDetail(matches: List<ElementMatch>): JsonElement =
     buildJsonArray {
@@ -273,6 +291,7 @@ private data class ScrollReq(
     val container_rid: String? = null,
     val max_swipes: Int = 12,
     val tap: Boolean = false,
+    val exact: Boolean = false,
 )
 
 @Serializable

@@ -228,6 +228,7 @@ impl ServerClient {
         container_rid: Option<&str>,
         max_swipes: u32,
         tap: bool,
+        exact: bool,
     ) -> Result<ScrollResp> {
         let mut body = serde_json::Map::new();
         if let Some(v) = rid {
@@ -245,6 +246,7 @@ impl ServerClient {
         body.insert("direction".into(), direction.into());
         body.insert("max_swipes".into(), max_swipes.into());
         body.insert("tap".into(), tap.into());
+        body.insert("exact".into(), exact.into());
         self.post("/scroll", &serde_json::Value::Object(body)).await
     }
 

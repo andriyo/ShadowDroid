@@ -99,6 +99,7 @@ impl FlowRecord {
             scheme: self.scheme.clone(),
             host: self.host.clone(),
             path: self.path.clone(),
+            url: format!("{}://{}{}", self.scheme, self.host, self.path),
             status: self.status,
             ok: self.ok(),
             dur_ms: self.dur_ms,
@@ -354,6 +355,9 @@ mod tests {
             method: Some("GET".into()),
             ..Default::default()
         }));
+        let event =
+            serde_json::to_value(rec.http_event(&crate::ids::Serial::new("device"))).unwrap();
+        assert_eq!(event["url"], "https://api.livd.app/v1/login");
         rec.status = Some(204);
         assert!(rec.ok());
     }

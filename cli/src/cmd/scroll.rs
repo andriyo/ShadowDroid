@@ -34,6 +34,9 @@ pub struct ScrollArgs {
     /// Tap the element once found.
     #[arg(long)]
     pub tap: bool,
+    /// Require the selector field to match the complete value.
+    #[arg(long)]
+    pub exact: bool,
     /// Swipe duration in milliseconds.
     #[arg(long, default_value_t = 250)]
     pub duration_ms: u32,
@@ -55,6 +58,7 @@ pub async fn run(client: &ServerClient, args: &ScrollArgs) -> Result<Outcome> {
             args.container_rid.as_deref(),
             args.max_swipes,
             args.tap,
+            args.exact,
         )
         .await;
     if let Ok(resp) = server {
@@ -71,10 +75,16 @@ pub async fn run(client: &ServerClient, args: &ScrollArgs) -> Result<Outcome> {
     let mut last_hash = String::new();
     loop {
         let screen = client.screen().await?;
-        if let Some(el) = screen.elements.iter().find(|e| selector.matches(e, false)) {
+        if let Some(el) = screen
+            .elements
+            .iter()
+            .find(|e| selector.matches(e, args.exact))
+        {
             let mut el = el.clone();
             if args.tap {
-                el = client.find_tap(&selector.query()).await?.matched;
+                let mut query = selector.query();
+                query.exact = args.exact;
+                el = client.find_tap(&query).await?.matched;
             }
             return emit(&selector, true, swipes, "found", Some(&el), args.tap);
         }

@@ -121,6 +121,7 @@ pub enum Event {
         scheme: String,
         host: String,
         path: String,
+        url: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<u16>,
         ok: bool,

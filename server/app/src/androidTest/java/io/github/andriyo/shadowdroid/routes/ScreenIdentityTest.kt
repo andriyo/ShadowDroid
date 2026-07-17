@@ -419,6 +419,35 @@ class ScreenIdentityTest {
         }
     }
 
+    @Suppress("DEPRECATION")
+    @Test
+    fun scrollTapRejectsAmbiguousVisibleMatches() {
+        val first = AccessibilityNodeInfo.obtain()
+        val second = AccessibilityNodeInfo.obtain()
+        try {
+            val matches =
+                listOf(
+                    ElementMatch(element(text = "Encryption"), first),
+                    ElementMatch(element(id = 2, text = "Encryption settings"), second),
+                )
+            val error =
+                assertThrows(BadRequest::class.java) {
+                    chooseVisibleScrollTarget(matches, SelectorReq(text = "Encrypt", all = true))
+                }
+            assertEquals("ambiguous_match", error.code)
+
+            val exact =
+                chooseVisibleScrollTarget(
+                    matches,
+                    SelectorReq(text = "Encryption", exact = true, all = true),
+                )
+            assertEquals("Encryption", exact?.element?.text)
+        } finally {
+            first.recycle()
+            second.recycle()
+        }
+    }
+
     @Test
     fun healthTrackerToleratesTransientRootLossAndResets() {
         val health = UiAutomationHealthTracker(failureLimit = 3)
