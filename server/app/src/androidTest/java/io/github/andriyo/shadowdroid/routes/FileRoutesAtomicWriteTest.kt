@@ -21,7 +21,7 @@ import java.io.IOException
 @RunWith(AndroidJUnit4::class)
 class FileRoutesAtomicWriteTest {
     @Test
-    fun streamedWriteReplacesDestinationAndReportsBytes() =
+    fun streamedWriteReplacesDestinationAndReportsBytes(): Unit =
         runBlocking {
             val dir = testDirectory("success")
             val destination = File(dir, "payload.bin").apply { writeText("old") }
@@ -37,7 +37,7 @@ class FileRoutesAtomicWriteTest {
         }
 
     @Test
-    fun interruptedWriteKeepsPreviousDestination() =
+    fun interruptedWriteKeepsPreviousDestination(): Unit =
         runBlocking {
             val dir = testDirectory("interrupted")
             val destination = File(dir, "payload.bin").apply { writeText("old") }
@@ -58,7 +58,7 @@ class FileRoutesAtomicWriteTest {
         }
 
     @Test
-    fun longDestinationNameStillUsesBoundedTemporaryComponent() =
+    fun longDestinationNameStillUsesBoundedTemporaryComponent(): Unit =
         runBlocking {
             val dir = testDirectory("long-name")
             val destination = File(dir, "x".repeat(240))
@@ -71,7 +71,7 @@ class FileRoutesAtomicWriteTest {
         }
 
     @Test
-    fun nonRegularDestinationsAreRejectedWithoutChangingTheirTargets() =
+    fun nonRegularDestinationsAreRejectedWithoutChangingTheirTargets(): Unit =
         runBlocking {
             val dir = testDirectory("non-regular")
             val target = File(dir, "target.bin").apply { writeText("keep") }

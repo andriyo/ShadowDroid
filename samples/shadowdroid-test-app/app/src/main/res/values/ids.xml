@@ -17,6 +17,7 @@
     <item name="disabled_card" type="id" />
     <item name="disabled_card_label" type="id" />
     <item name="noop_button" type="id" />
+    <item name="unstable_updates_button" type="id" />
     <item name="platform_continuous_slider" type="id" />
     <item name="platform_discrete_slider" type="id" />
     <item name="platform_disabled_slider" type="id" />
@@ -29,6 +30,7 @@
     <item name="camera_permission_button" type="id" />
     <item name="notification_button" type="id" />
     <item name="detail_button" type="id" />
+    <item name="delayed_detail_button" type="id" />
     <item name="deep_link_button" type="id" />
     <item name="clipboard_button" type="id" />
     <item name="file_button" type="id" />

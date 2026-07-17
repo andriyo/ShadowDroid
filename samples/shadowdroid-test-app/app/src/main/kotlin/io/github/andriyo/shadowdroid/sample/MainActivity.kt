@@ -214,6 +214,26 @@ class MainActivity : ComponentActivity() {
                 // remain distinct in `ui tap --observe`.
             },
         )
+        root.addView(
+            button(
+                R.id.unstable_updates_button,
+                "Start unstable updates",
+                "Start unstable accessibility updates",
+            ) {
+                var update = 0
+                val updater =
+                    object : Runnable {
+                        override fun run() {
+                            update += 1
+                            setStatus("Unstable accessibility update $update")
+                            if (update < UNSTABLE_UPDATE_COUNT) {
+                                mainHandler.postDelayed(this, UNSTABLE_UPDATE_INTERVAL_MS)
+                            }
+                        }
+                    }
+                mainHandler.post(updater)
+            },
+        )
 
         addSection(root, "Popups And Permissions")
         root.addView(button(R.id.dialog_button, "Show dialog", "Show alert dialog button") { showDialog() })
@@ -233,6 +253,24 @@ class MainActivity : ComponentActivity() {
         root.addView(button(R.id.detail_button, "Open detail activity", "Open detail activity button") {
             startActivity(Intent(this, DetailActivity::class.java).putExtra("source", "main-button"))
         })
+        root.addView(
+            button(
+                R.id.delayed_detail_button,
+                "Open delayed detail activity",
+                "Open delayed detail activity button",
+            ) {
+                setStatus("Delayed detail navigation scheduled")
+                mainHandler.postDelayed(
+                    {
+                        startActivity(
+                            Intent(this, DetailActivity::class.java)
+                                .putExtra("source", "delayed-button"),
+                        )
+                    },
+                    DELAYED_NAVIGATION_MS,
+                )
+            },
+        )
         root.addView(button(R.id.deep_link_button, "Open deep link", "Open deep link button") {
             startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("shadowdroid://sample/deeplink/from-main?value=42")))
         })
@@ -358,7 +396,7 @@ class MainActivity : ComponentActivity() {
         )
         root.addView(
             composeSliderFixtures(this) { message -> setStatus(message) },
-            fullWidth().apply { height = 620.dp },
+            fullWidth().apply { height = 720.dp },
         )
     }
 
@@ -649,6 +687,9 @@ class MainActivity : ComponentActivity() {
         private const val CHANNEL_ID = "shadowdroid-sample-events"
         private const val REQ_CAMERA = 2001
         private const val REQ_NOTIFICATIONS = 2002
+        private const val DELAYED_NAVIGATION_MS = 350L
+        private const val UNSTABLE_UPDATE_COUNT = 40
+        private const val UNSTABLE_UPDATE_INTERVAL_MS = 50L
         private const val DEFAULT_HTTPS_URL = "https://httpbin.org/anything/shadowdroid"
         private const val DEFAULT_HTTP_URL = "http://httpbin.org/anything/shadowdroid-cleartext"
         private const val DEFAULT_GRAPHQL_BODY =

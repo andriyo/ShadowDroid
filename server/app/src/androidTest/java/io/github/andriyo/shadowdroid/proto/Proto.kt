@@ -60,6 +60,14 @@ data class ScreenResponse(
 )
 
 @Serializable
+data class StableScreenResponse(
+    val stable: Boolean,
+    val settle_ms: Long,
+    val quiet_period_ms: Long,
+    val screen: ScreenResponse,
+)
+
+@Serializable
 data class UiTreeSnapshot(
     val sampled_at_ms: Long,
     val age_ms: Long,

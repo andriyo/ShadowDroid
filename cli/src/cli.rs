@@ -3177,6 +3177,27 @@ pub fn report_error(err: &anyhow::Error) {
                 "retry the action with detail.actual as --if-screen"
             ]}),
         );
+    } else if let Some(observation) = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<crate::fusion::ObservationFailure>())
+    {
+        // `detail.screen` is deliberately nested diagnostic evidence. Keeping
+        // it out of the top-level `screen` field prevents next-action synthesis
+        // from proposing ephemeral ids from an unproven destination.
+        emit_error(
+            "observe",
+            observation.code,
+            &observation.message,
+            json!({
+                "retryable": true,
+                "detail": observation.detail,
+                "next_actions": [
+                    "inspect detail.screen as diagnostic evidence only; do not act from its element ids",
+                    "retry with the strongest available --expect-* postcondition and a longer --timeout-ms",
+                    "run `shadowdroid ui dump` to start a fresh interaction cycle"
+                ]
+            }),
+        );
     } else {
         let class = classify_generic_error(err);
         emit_error(
@@ -3487,6 +3508,11 @@ pub fn error_code_of(err: &anyhow::Error) -> String {
         .any(|e| e.downcast_ref::<crate::fusion::ScreenChanged>().is_some())
     {
         "screen_changed".into()
+    } else if let Some(observation) = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<crate::fusion::ObservationFailure>())
+    {
+        observation.code.into()
     } else {
         classify_generic_error(err).code.into()
     }
@@ -3504,6 +3530,12 @@ pub fn error_stage_of(err: &anyhow::Error) -> String {
             .is_some()
     }) {
         "run".to_string()
+    } else if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::fusion::ObservationFailure>()
+            .is_some()
+    }) {
+        "observe".to_string()
     } else {
         classify_generic_error(err).stage.to_string()
     }
@@ -3524,6 +3556,9 @@ pub fn error_retryable_of(err: &anyhow::Error) -> bool {
         cause
             .downcast_ref::<crate::fusion::ScreenChanged>()
             .is_some()
+            || cause
+                .downcast_ref::<crate::fusion::ObservationFailure>()
+                .is_some()
     }) {
         true
     } else {
@@ -3550,6 +3585,9 @@ pub fn error_uses_fallback(err: &anyhow::Error) -> bool {
                 .is_some()
                 || cause
                     .downcast_ref::<crate::fusion::ScreenChanged>()
+                    .is_some()
+                || cause
+                    .downcast_ref::<crate::fusion::ObservationFailure>()
                     .is_some()
         })
     }

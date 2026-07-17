@@ -81,6 +81,14 @@ pub struct UiTreeSnapshot {
     pub window_id: Option<i32>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StableScreenResponse {
+    pub stable: bool,
+    pub settle_ms: u64,
+    pub quiet_period_ms: u64,
+    pub screen: ScreenResponse,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImeState {
     #[serde(default)]

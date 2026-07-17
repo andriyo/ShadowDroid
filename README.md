@@ -41,13 +41,17 @@ $ shadowdroid ui dump
  "element_count":39,"ime":{"keyboard_visible":false},
  "elements":[{"id":7,"text":"Sign in","rid":"btn_sign_in","tap":[540,1200],"clickable":true}, …]}
 
-// Act + re-observe in ONE call: --observe returns the post-action screen.
-$ shadowdroid ui tap --text "Sign in" --observe
+// Act + wait for a quiet accessibility state in ONE call. A destination
+// postcondition makes the observation transactional and implies --observe.
+$ shadowdroid ui tap --text "Sign in" --expect-text "Welcome" --timeout-ms 3000
 {"type":"action","cmd":"tap","ok":true,"via":"selector","matched":true,
  "selector_matched":true,"actionable_resolved":true,"input_delivered":true,
  "matched_element":{"id":7,"text":"Sign in","tap":[540,1200]},
  "activated_element":{"id":7,"text":"Sign in","clickable":true},
- "action":"accessibility_click","screen_changed":true,"postcondition_satisfied":null,
+ "action":"accessibility_click","action_delivered":true,"stable":true,
+ "settle_ms":684,"quiet_period_ms":500,"screen_changed":true,
+ "postcondition":{"kind":"text","expected":"Welcome","matched":true},
+ "postcondition_satisfied":true,
  "screen":{"screen_hash":"9c01d2aa87b3e544","screen_hash_version":3,
            "snapshot_state":"consistent","captured_at_ms":1760000000440,
            "element_count":24,"elements":[…]}}
@@ -93,7 +97,9 @@ $ shadowdroid why
 
 - **A fast warm path** — a persistent on-device service answers core UI reads
   in tens of milliseconds instead of starting a fresh UI dump process each time.
-- **Fewer round-trips** — `--observe` fuses act + re-read into one call;
+- **Fewer round-trips** — `--observe` fuses act + accessibility-idle re-read
+  into one call, while `--expect-text`/`--expect-rid`/`--expect-desc`/
+  `--expect-package`/`--expect-activity` prove the stable destination;
   `--if-screen` refuses to act on a stale read and hands back the fresh screen
   in the failure. Every round-trip an agent saves is an LLM inference saved.
 - **Failures explain themselves** — a missed selector returns what *is* on
@@ -419,9 +425,11 @@ costs as few round-trips as possible.
    bounded window, then returned as `transitioning` with a warning. Cache the
    hash/version pair; invalidate a cached hash if its version changes.
 5. **Act by selector, not coordinates.** Prefer `--rid`, then `--desc`/exact
-   `--text`. Add `--observe` to get the post-action screen back in the same
-   response, and `--if-screen <hash>` to refuse acting on a screen that changed
-   under you (the failure returns the fresh screen — that *is* your re-read).
+   `--text`. Add `--observe` to wait for an accessibility quiet period and get
+   the post-action screen in the same response. Prefer one `--expect-*`
+   destination condition when the outcome is known; it implies observation.
+   Add `--if-screen <hash>` to refuse acting on a screen that changed under you
+   (the failure returns the fresh screen — that *is* your re-read).
 6. **Confirm.** `ui wait --text/--rid/--pkg` blocks until the expected state and
    echoes the matched element; a timeout returns `top_texts` so you see what the
    screen became instead of guessing.
@@ -591,9 +599,16 @@ coordinates). Tap results separate `selector_matched`, `actionable_resolved`,
 undelivered input.
 
 Loop-fusion action verbs (`ui tap`, `ui set-progress`, coordinate gestures, `ui pinch`, `ui text`,
-`ui key`, `ui back`, and `ui home`) accept `--observe` (return the post-action
-compact screen in the same response) and `--if-screen <hash>` (optimistic
-concurrency — refuse to act if the screen changed, and return the fresh one).
+`ui key`, `ui back`, and `ui home`) accept `--observe` (wait for a 500 ms
+accessibility-event quiet period, then return the stable compact screen) and
+`--if-screen <hash>` (optimistic concurrency — refuse to act if the screen
+changed, and return the fresh one). A single `--expect-text`, `--expect-desc`,
+`--expect-rid`, `--expect-package`, or `--expect-activity` postcondition implies
+observation; `--expect-exact`, `--observe-delay-ms`, and `--timeout-ms` refine
+matching and timing. An unmet condition fails with `postcondition_timeout`; a
+screen that never settles fails with `observation_unstable`. Both preserve the
+freshest screen under `detail.screen` as diagnostic evidence only, so start a
+new interaction cycle instead of reusing its element ids.
 `ui wait` also syncs on the foreground app, not just elements: `--pkg <package>`
 blocks until that app reaches the foreground (e.g. a Custom Tab or share sheet
 opened), and `--pkg-not <package>` blocks until the screen leaves it.

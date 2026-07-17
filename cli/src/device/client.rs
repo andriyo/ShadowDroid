@@ -134,6 +134,17 @@ impl ServerClient {
             .await
     }
 
+    pub async fn stable_screen(
+        &self,
+        quiet_ms: u32,
+        timeout_ms: u32,
+    ) -> Result<StableScreenResponse> {
+        self.get(&format!(
+            "/screen/stable?quiet_ms={quiet_ms}&timeout_ms={timeout_ms}"
+        ))
+        .await
+    }
+
     pub async fn screenshot_png(&self) -> Result<Vec<u8>> {
         self.screenshot(None, None, None).await
     }

@@ -1,8 +1,11 @@
 package io.github.andriyo.shadowdroid.sample
 
 import android.app.Activity
+import android.view.View
+import android.widget.FrameLayout
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
@@ -26,19 +29,52 @@ import androidx.compose.ui.unit.dp
 fun composeSliderFixtures(
     activity: Activity,
     onStatus: (String) -> Unit,
-): ComposeView =
-    ComposeView(activity).apply {
-        id = R.id.compose_slider_fixtures
-        setContent {
-            MaterialTheme {
-                SliderFixtures(onStatus)
+): FrameLayout {
+    val container = FrameLayout(activity).apply { id = R.id.compose_slider_fixtures }
+    val controls = ComposeView(activity)
+    val destination = ComposeView(activity).apply { visibility = View.GONE }
+    val childLayout =
+        FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.MATCH_PARENT,
+        )
+    destination.setContent {
+        MaterialTheme {
+            DelayedDestination {
+                destination.visibility = View.GONE
+                controls.visibility = View.VISIBLE
             }
         }
     }
+    controls.setContent {
+        MaterialTheme {
+            SliderFixtures(
+                onStatus = onStatus,
+                onDelayedNavigation = {
+                    onStatus("Compose delayed navigation scheduled")
+                    controls.postDelayed(
+                        {
+                            onStatus("Compose delayed destination ready")
+                            controls.visibility = View.GONE
+                            destination.visibility = View.VISIBLE
+                        },
+                        DELAYED_COMPOSE_NAVIGATION_MS,
+                    )
+                },
+            )
+        }
+    }
+    container.addView(controls, childLayout)
+    container.addView(destination, childLayout)
+    return container
+}
 
 @Composable
 @OptIn(ExperimentalComposeUiApi::class)
-private fun SliderFixtures(onStatus: (String) -> Unit) {
+private fun SliderFixtures(
+    onStatus: (String) -> Unit,
+    onDelayedNavigation: () -> Unit,
+) {
     var continuous by remember { mutableStateOf(0.38f) }
     var discrete by remember { mutableStateOf(50f) }
     var rtl by remember { mutableStateOf(25f) }
@@ -98,5 +134,41 @@ private fun SliderFixtures(onStatus: (String) -> Unit) {
                         .semantics { contentDescription = "Compose RTL slider" },
             )
         }
+
+        Button(
+            onClick = onDelayedNavigation,
+            modifier =
+                Modifier
+                    .testTag("compose_delayed_navigation")
+                    .semantics { contentDescription = "Open delayed Compose destination" },
+        ) {
+            Text("Open delayed Compose destination")
+        }
     }
 }
+
+@Composable
+@OptIn(ExperimentalComposeUiApi::class)
+private fun DelayedDestination(onReturn: () -> Unit) {
+    Column(
+        Modifier
+            .semantics { testTagsAsResourceId = true }
+            .padding(8.dp),
+    ) {
+        Text(
+            "Compose delayed destination ready",
+            Modifier.testTag("compose_delayed_destination"),
+        )
+        Button(
+            onClick = onReturn,
+            modifier =
+                Modifier
+                    .testTag("compose_return_from_destination")
+                    .semantics { contentDescription = "Return from Compose destination" },
+        ) {
+            Text("Return to Compose controls")
+        }
+    }
+}
+
+private const val DELAYED_COMPOSE_NAVIGATION_MS = 350L

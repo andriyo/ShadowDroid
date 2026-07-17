@@ -153,7 +153,7 @@ Start each UI decision from the structured tree:
 ```bash
 shadowdroid ui dump
 shadowdroid ui find --rid btn_sign_in
-shadowdroid ui tap --rid btn_sign_in --observe
+shadowdroid ui tap --rid btn_sign_in --expect-text "Welcome" --timeout-ms 3000
 shadowdroid ui set-progress --rid distance_slider --percent 80 --observe
 shadowdroid ui wait --text "Welcome" --timeout-ms 8000
 ```
@@ -174,9 +174,10 @@ resolves to its nearest enabled clickable ancestor; the response reports both
 `matched_element` and `activated_element`. Disabled targets fail with
 `element_disabled`, and labels without a safe ancestor fail with
 `element_not_clickable`. Use `--coordinate-fallback` only when raw center
-injection is explicitly intended. With `--observe`, read `input_delivered` and
-`screen_changed` separately because a valid action may intentionally leave the
-screen unchanged.
+injection is explicitly intended. With `--observe`, read `input_delivered`,
+`stable`, and `screen_changed` separately because a valid action may
+intentionally leave the screen unchanged. Observation waits for an
+accessibility-event quiet period rather than sleeping for a fixed delay.
 
 Range controls expose `range` (`type`, `min`, `max`, `current`, nullable
 `step`) and stable accessibility `actions` in `ui dump`. Set them semantically
@@ -197,9 +198,16 @@ shadowdroid ui tap --text "Buy" --if-screen <hash> --observe
 ```
 
 `--if-screen` prevents an action when the UI changed and returns the fresh
-screen under `detail.screen`. `--observe` returns the post-action compact screen
-in the same action response. Together they implement check-act-observe in one
-round trip.
+screen under `detail.screen`. `--observe` returns a stable post-action compact
+screen in the same action response. When the destination is known, pass exactly
+one of `--expect-text`, `--expect-desc`, `--expect-rid`, `--expect-package`, or
+`--expect-activity`; it implies observation and can be refined with
+`--expect-exact`. Use `--timeout-ms` for the overall post-delivery deadline and
+`--observe-delay-ms` for the required quiet period. An unmet destination is a
+non-zero `postcondition_timeout`; a tree that never settles is a non-zero
+`observation_unstable`. Their `detail.screen` is diagnostic evidence only—do
+not reuse element ids from an unproven destination. Together these flags
+implement check-act-observe in one round trip.
 
 `ui wait` uses a real wall-clock deadline. A timeout is a non-zero typed
 `wait_timeout`, with current app, visible texts, and recovery commands. Do not

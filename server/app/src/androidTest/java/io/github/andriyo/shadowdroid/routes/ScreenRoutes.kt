@@ -12,6 +12,7 @@ import io.github.andriyo.shadowdroid.proto.AppRef
 import io.github.andriyo.shadowdroid.proto.Element
 import io.github.andriyo.shadowdroid.proto.ImeState
 import io.github.andriyo.shadowdroid.proto.ScreenResponse
+import io.github.andriyo.shadowdroid.proto.StableScreenResponse
 import io.github.andriyo.shadowdroid.proto.UiTreeSnapshot
 import io.github.andriyo.shadowdroid.proto.Viewport
 import io.ktor.http.ContentType
@@ -29,6 +30,7 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.TimeoutException
 
 object ScreenRoutes {
     /** GET /v1/screen?format=elements|xml and GET /v1/screenshot.png. */
@@ -53,32 +55,35 @@ object ScreenRoutes {
                 return@get
             }
             val snapshot = captureScreen(uiDevice, instr, enrichmentCache)
-            val ime = detectImeState(snapshot.elements, snapshot.enrichment)
-            val currentApp =
-                AppRef(
-                    `package` = snapshot.foregroundPackage,
-                    activity = snapshot.enrichment.activity,
-                    pid = snapshot.enrichment.pid,
-                    sampled_at_ms = snapshot.enrichment.sampledAtMs.takeIf { it > 0L },
-                )
+            call.respond(snapshot.toResponse())
+        }
+
+        // Accessibility-event-backed post-action observation. waitForIdle
+        // requires a real quiet period, so delayed Compose/navigation events
+        // reset the clock instead of a fixed host sleep capturing the source
+        // tree as the destination.
+        route.get("/screen/stable") {
+            val quietMs =
+                (call.request.queryParameters["quiet_ms"]?.toLongOrNull() ?: DEFAULT_OBSERVE_QUIET_MS)
+                    .coerceIn(MIN_OBSERVE_QUIET_MS, MAX_OBSERVE_QUIET_MS)
+            val timeoutMs =
+                (call.request.queryParameters["timeout_ms"]?.toLongOrNull() ?: DEFAULT_OBSERVE_TIMEOUT_MS)
+                    .coerceIn(MIN_OBSERVE_TIMEOUT_MS, MAX_OBSERVE_TIMEOUT_MS)
+            val started = SystemClock.elapsedRealtime()
+            val idle =
+                try {
+                    instr.uiAutomation.waitForIdle(quietMs, timeoutMs)
+                    true
+                } catch (_: TimeoutException) {
+                    false
+                }
+            val snapshot = captureScreen(uiDevice, instr, enrichmentCache)
             call.respond(
-                ScreenResponse(
-                    screen_hash = TreeWalker.hashOf(snapshot.elements, snapshot.viewport, currentApp, ime),
-                    snapshot_state = snapshot.assessment.state,
-                    captured_at_ms = snapshot.capturedAtMs,
-                    viewport = snapshot.viewport,
-                    current_app = currentApp,
-                    ui_tree =
-                        UiTreeSnapshot(
-                            sampled_at_ms = snapshot.treeSampledAtMs,
-                            age_ms = (snapshot.capturedAtMs - snapshot.treeSampledAtMs).coerceAtLeast(0L),
-                            `package` = snapshot.treePackage,
-                            window_id = snapshot.treeWindowId,
-                        ),
-                    warning = snapshot.assessment.warning,
-                    element_count = snapshot.elements.size,
-                    ime = ime,
-                    elements = snapshot.elements,
+                StableScreenResponse(
+                    stable = idle && snapshot.assessment.state == "consistent",
+                    settle_ms = (SystemClock.elapsedRealtime() - started).coerceAtLeast(0L),
+                    quiet_period_ms = quietMs,
+                    screen = snapshot.toResponse(),
                 ),
             )
         }
@@ -130,6 +135,35 @@ object ScreenRoutes {
             }
         }
     }
+}
+
+private fun CapturedScreen.toResponse(): ScreenResponse {
+    val ime = detectImeState(elements, enrichment)
+    val currentApp =
+        AppRef(
+            `package` = foregroundPackage,
+            activity = enrichment.activity,
+            pid = enrichment.pid,
+            sampled_at_ms = enrichment.sampledAtMs.takeIf { it > 0L },
+        )
+    return ScreenResponse(
+        screen_hash = TreeWalker.hashOf(elements, viewport, currentApp, ime),
+        snapshot_state = assessment.state,
+        captured_at_ms = capturedAtMs,
+        viewport = viewport,
+        current_app = currentApp,
+        ui_tree =
+            UiTreeSnapshot(
+                sampled_at_ms = treeSampledAtMs,
+                age_ms = (capturedAtMs - treeSampledAtMs).coerceAtLeast(0L),
+                `package` = treePackage,
+                window_id = treeWindowId,
+            ),
+        warning = assessment.warning,
+        element_count = elements.size,
+        ime = ime,
+        elements = elements,
+    )
 }
 
 private data class CapturedScreen(
@@ -261,6 +295,12 @@ internal fun assessSnapshot(
 private const val SNAPSHOT_CONVERGENCE_MS = 800L
 private const val ENRICHMENT_WAIT_SLICE_MS = 250L
 private const val SNAPSHOT_RETRY_MS = 40L
+private const val MIN_OBSERVE_QUIET_MS = 50L
+private const val MAX_OBSERVE_QUIET_MS = 2_000L
+private const val DEFAULT_OBSERVE_QUIET_MS = 500L
+private const val DEFAULT_OBSERVE_TIMEOUT_MS = 3_000L
+private const val MIN_OBSERVE_TIMEOUT_MS = 1L
+private const val MAX_OBSERVE_TIMEOUT_MS = 10_000L
 
 private fun detectImeState(
     elements: List<Element>,
