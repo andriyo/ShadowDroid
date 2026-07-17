@@ -1039,13 +1039,14 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "next_actions": ["net rule add", "net rule list", "watch"]
         })),
         "net rule add" => Some(serde_json::json!({
-            "use_when": ["Need to add one explicit request- or response-phase mutation rule. Use set-request-header or set-response-header; the ambiguous set-header kind is rejected."],
-            "output": "rule add JSON with rule id",
+            "use_when": ["Need to add one explicit request- or response-phase mutation rule.", "Need one atomic synthetic response matched by GraphQL operation without contacting upstream. Use kind respond."],
+            "output": "rule add JSON with rule id, phase, effective matcher, and body-safe response metadata",
             "side_effects": ["mutates active proxy rules"],
             "next_actions": ["net rule list", "watch", "net rule rm <id>"],
             "examples": [
                 "net rule add map-local response.json --host api.example.com --path /v1/dict",
                 "net rule add set-status 503 --host api.example.com",
+                "net rule add respond --host api.example.com --method POST --operation-name currentSession --status 401 --header content-type=application/json --body '{\"errors\":[{\"message\":\"Unauthorized\"}]}'",
                 "net rule add set-request-header x-debug 1 --host api.example.com",
                 "net rule add set-response-header cache-control no-store --host api.example.com"
             ]

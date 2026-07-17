@@ -132,12 +132,25 @@ impl Mutation {
 /// A declarative rule (P3). `kind` selects the transform; `args` are
 /// kind-specific positionals (e.g. map-local → `[path]`, set-status → `[code]`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SyntheticResponseSpec {
+    pub status: u16,
+    #[serde(default)]
+    pub headers: Vec<(String, String)>,
+    #[serde(default)]
+    pub body: Vec<u8>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RuleSpec {
     pub kind: String,
     #[serde(default)]
     pub matcher: Matcher,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<SyntheticResponseSpec>,
     #[serde(default)]
     pub args: Vec<String>,
 }

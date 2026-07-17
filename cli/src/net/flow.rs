@@ -66,6 +66,8 @@ pub struct FlowRecord {
     pub rule_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub modified: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub upstream_bypassed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// The response body was streamed through (SSE / oversized), not buffered, so
@@ -123,6 +125,7 @@ impl FlowRecord {
             rule_id: self.rule_id.clone(),
             rule_ids: self.rule_ids.clone(),
             modified: self.modified,
+            upstream_bypassed: self.upstream_bypassed,
             error: self.error.clone(),
             streamed: self.streamed,
             req_streamed: self.req_streamed,
@@ -156,6 +159,7 @@ impl FlowRecord {
             "rule_id": self.rule_id,
             "rule_ids": self.rule_ids,
             "modified": self.modified,
+            "upstream_bypassed": self.upstream_bypassed,
             "error": self.error,
             "streamed": self.streamed,
             "req_streamed": self.req_streamed,
@@ -363,6 +367,7 @@ mod tests {
             rule_id: None,
             rule_ids: vec![],
             modified: false,
+            upstream_bypassed: false,
             error: None,
             streamed: false,
             req_streamed: false,

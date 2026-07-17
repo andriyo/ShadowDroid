@@ -2111,6 +2111,8 @@ pub async fn override_local(serial: &Serial, url_glob: &str, file: &Path) -> Res
         kind: "map-local".into(),
         matcher: matcher.clone(),
         content_type: None,
+        operation_name: None,
+        response: None,
         args: vec![file.display().to_string()],
     };
     let reply = checked_control_reply(
@@ -2459,6 +2461,8 @@ mod tests {
             kind: kind.into(),
             matcher: Matcher::default(),
             content_type: None,
+            operation_name: None,
+            response: None,
             args: vec![arg.into()],
         }
     }

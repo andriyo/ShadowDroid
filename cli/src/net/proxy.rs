@@ -967,7 +967,7 @@ async fn proxy_request(
         } else {
             Bytes::new()
         };
-        capture(
+        capture_bypassed(
             &ctx,
             FlowParts {
                 id: &id,
@@ -1000,6 +1000,7 @@ async fn proxy_request(
             method.as_str(),
             &host,
             &path,
+            &req_bytes,
             &mut url,
             &mut req_headers,
         );
@@ -1020,7 +1021,7 @@ async fn proxy_request(
             } else {
                 Bytes::new()
             };
-            capture(
+            capture_bypassed(
                 &ctx,
                 FlowParts {
                     id: &id,
@@ -1085,7 +1086,7 @@ async fn proxy_request(
                     } else {
                         Bytes::new()
                     };
-                    capture(
+                    capture_bypassed(
                         &ctx,
                         FlowParts {
                             id: &id,
@@ -1867,6 +1868,7 @@ fn make_flow(p: FlowParts<'_>) -> FlowRecord {
         rule_id: p.rule_ids.last().cloned(),
         rule_ids: p.rule_ids.to_vec(),
         modified: p.modified,
+        upstream_bypassed: false,
         error: p.error,
         streamed: false,
         req_streamed: p.req_streamed,
@@ -1915,7 +1917,16 @@ fn error_flow<'a>(
 
 /// Build the final flow record and push it to the daemon (store + broadcast).
 fn capture(ctx: &ProxyContext, parts: FlowParts<'_>) {
+    finish_capture(ctx, make_flow(parts));
+}
+
+fn capture_bypassed(ctx: &ProxyContext, parts: FlowParts<'_>) {
     let mut rec = make_flow(parts);
+    rec.upstream_bypassed = true;
+    finish_capture(ctx, rec);
+}
+
+fn finish_capture(ctx: &ProxyContext, mut rec: FlowRecord) {
     stamp_capture_context(ctx, &mut rec);
     if ctx.shared.redact {
         redact_headers(&mut rec.req_headers);
@@ -2383,11 +2394,51 @@ fn rule_matches(
             .unwrap_or(true)
 }
 
+fn graphql_operation_matches(wanted: &str, path: &str, body: &[u8]) -> bool {
+    let path = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    if reqwest::Url::parse(&format!("http://shadowdroid.invalid{path}"))
+        .ok()
+        .into_iter()
+        .flat_map(|url| {
+            url.query_pairs()
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect::<Vec<_>>()
+        })
+        .any(|(key, value)| key == "operationName" && value == wanted)
+    {
+        return true;
+    }
+
+    fn json_matches(value: &serde_json::Value, wanted: &str) -> bool {
+        match value {
+            serde_json::Value::Object(object) => {
+                object
+                    .get("operationName")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(wanted)
+            }
+            serde_json::Value::Array(values) => {
+                values.iter().any(|value| json_matches(value, wanted))
+            }
+            _ => false,
+        }
+    }
+
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .is_some_and(|value| json_matches(&value, wanted))
+}
+
 fn apply_request_rules(
     shared: &SharedState,
     method: &str,
     host: &str,
     path: &str,
+    body: &[u8],
     url: &mut String,
     headers: &mut Vec<(String, String)>,
 ) -> ReqRules {
@@ -2399,10 +2450,27 @@ fn apply_request_rules(
         rule_ids: Vec::new(),
     };
     for (id, spec) in rules.iter() {
-        if !rule_matches(spec, method, host, path, None, None) {
+        if !rule_matches(spec, method, host, path, None, None)
+            || spec
+                .operation_name
+                .as_deref()
+                .is_some_and(|wanted| !graphql_operation_matches(wanted, path, body))
+        {
             continue;
         }
         match spec.kind.as_str() {
+            "respond" => {
+                if let Some(response) = &spec.response {
+                    out.short_circuit = Some((
+                        response.status,
+                        response.headers.clone(),
+                        Bytes::copy_from_slice(&response.body),
+                    ));
+                    out.modified = true;
+                    out.rule_ids.push(id.clone());
+                    return out;
+                }
+            }
             "block" => {
                 let status = spec
                     .args
@@ -2847,8 +2915,8 @@ mod tests {
     use super::{
         ContentEncoding, DecodeFailure, DecodeOutcome, EncodingDisposition, HeldFlow, HoldDecision,
         ReleaseHeldResult, TerminalHoldHistory, decode_capped, decompress_bounded_with_cap,
-        encoding_disposition, frame_stream_body, host_glob_match, release_held, resolve_held,
-        tls_failure_reason, upstream_headers, ws_tls_connector,
+        encoding_disposition, frame_stream_body, graphql_operation_matches, host_glob_match,
+        release_held, resolve_held, tls_failure_reason, upstream_headers, ws_tls_connector,
     };
     use crate::net::Mutation;
     use crate::net::flow::FlowRecord;
@@ -2901,6 +2969,35 @@ mod tests {
     async fn verify_upstream_applies_to_websocket_tls() {
         assert!(self_signed_tls_handshake(false).await);
         assert!(!self_signed_tls_handshake(true).await);
+    }
+
+    #[test]
+    fn graphql_operation_matches_url_json_and_batch_bodies() {
+        assert!(graphql_operation_matches(
+            "currentSession",
+            "/graphql?operationName=currentSession",
+            b""
+        ));
+        assert!(graphql_operation_matches(
+            "current Session",
+            "/graphql?operationName=current%20Session",
+            b""
+        ));
+        assert!(graphql_operation_matches(
+            "currentSession",
+            "/graphql",
+            br#"{"operationName":"currentSession","variables":{}}"#
+        ));
+        assert!(graphql_operation_matches(
+            "currentSession",
+            "/graphql",
+            br#"[{"operationName":"other"},{"operationName":"currentSession"}]"#
+        ));
+        assert!(!graphql_operation_matches(
+            "currentSession",
+            "/graphql?operationName=other",
+            br#"{"operationName":"alsoOther"}"#
+        ));
     }
 
     fn gzip(plain: &[u8]) -> Vec<u8> {
@@ -3626,6 +3723,8 @@ mod tests {
                 ..Default::default()
             },
             content_type: None,
+            operation_name: None,
+            response: None,
             args: vec!["201".into()],
         };
         assert!(super::rule_matches(

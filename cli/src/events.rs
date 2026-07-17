@@ -143,6 +143,8 @@ pub enum Event {
         rule_ids: Vec<String>,
         #[serde(default, skip_serializing_if = "is_false")]
         modified: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        upstream_bypassed: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
         /// Response body was streamed (SSE/oversized), not captured; `resp_len` is a hint.

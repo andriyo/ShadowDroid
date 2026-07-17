@@ -1141,9 +1141,9 @@ pub struct CaScopeArgs {
 #[derive(Subcommand)]
 pub enum NetRuleCmd {
     /// Add a rule. Request-phase kinds: block, delay, map-local, map-remote,
-    /// set-request-header. Response-phase kinds: set-status, set-response-header,
-    /// replace.
-    Add(NetRuleAddArgs),
+    /// respond, set-request-header. Response-phase kinds: set-status,
+    /// set-response-header, replace.
+    Add(Box<NetRuleAddArgs>),
     /// List active rules.
     List,
     /// Remove a rule by id.
@@ -1154,8 +1154,8 @@ pub enum NetRuleCmd {
 
 #[derive(clap::Args)]
 pub struct NetRuleAddArgs {
-    /// block | delay | map-local | map-remote | set-request-header | set-status
-    /// | set-response-header | replace
+    /// block | delay | map-local | map-remote | respond | set-request-header |
+    /// set-status | set-response-header | replace
     pub kind: String,
     /// Match flows whose host contains this (substring).
     #[arg(long)]
@@ -1169,8 +1169,23 @@ pub struct NetRuleAddArgs {
     /// Match flows with this response content-type (substring).
     #[arg(long)]
     pub content_type: Option<String>,
+    /// Match a GraphQL operationName in the URL query or JSON request body (respond only).
+    #[arg(long, value_name = "NAME")]
+    pub operation_name: Option<String>,
+    /// Synthetic response status (respond only; default 200).
+    #[arg(long, value_name = "CODE")]
+    pub status: Option<u16>,
+    /// Synthetic response header as NAME=VALUE; repeatable (respond only).
+    #[arg(long, value_name = "NAME=VALUE")]
+    pub header: Vec<String>,
+    /// Synthetic response body literal (respond only).
+    #[arg(long, conflicts_with = "body_file")]
+    pub body: Option<String>,
+    /// Read the synthetic response body from a file (respond only).
+    #[arg(long, value_name = "PATH", conflicts_with = "body")]
+    pub body_file: Option<PathBuf>,
     /// Kind-specific positionals: block [status], delay <ms>, map-local <file>,
-    /// map-remote <host:port>, set-request-header <name> <value>,
+    /// map-remote <host:port>, respond (use flags), set-request-header <name> <value>,
     /// set-response-header <name> <value>, set-status <code>, replace <regex> <repl>.
     #[arg(value_name = "ARGS")]
     pub args: Vec<String>,
@@ -2716,6 +2731,30 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
         }
         NetCmd::Rule(rc) => match rc {
             NetRuleCmd::Add(a) => {
+                let respond_options = a.operation_name.is_some()
+                    || a.status.is_some()
+                    || !a.header.is_empty()
+                    || a.body.is_some()
+                    || a.body_file.is_some();
+                if a.kind != "respond" && respond_options {
+                    return Err(crate::diagnostic::DiagnosticError::new(
+                        "invalid_net_rule_options",
+                        "input",
+                        "--operation-name, --status, --header, --body, and --body-file are only valid for a `respond` rule",
+                    )
+                    .detail(json!({"kind": a.kind}))
+                    .next_actions(["use `shadowdroid net rule add respond --help`"])
+                    .into());
+                }
+                let response = if a.kind == "respond" {
+                    Some(crate::net::SyntheticResponseSpec {
+                        status: a.status.unwrap_or(200),
+                        headers: parse_header_pairs(&a.header)?,
+                        body: read_body_arg(&a.body, &a.body_file)?.unwrap_or_default(),
+                    })
+                } else {
+                    None
+                };
                 let spec = RuleSpec {
                     kind: a.kind.clone(),
                     matcher: Matcher {
@@ -2725,6 +2764,8 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
                         status: None,
                     },
                     content_type: a.content_type.clone(),
+                    operation_name: a.operation_name.clone(),
+                    response,
                     args: a.args.clone(),
                 };
                 nc::rule_add(serial, spec).await

@@ -335,6 +335,7 @@ mod tests {
             rule_id: None,
             rule_ids: vec![],
             modified: false,
+            upstream_bypassed: false,
             error: None,
             streamed: false,
             req_streamed: false,

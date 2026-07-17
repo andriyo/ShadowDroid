@@ -52,6 +52,56 @@ pub struct DaemonState {
     pub events: broadcast::Sender<Arc<Event>>,
 }
 
+fn public_rule(id: &str, spec: &RuleSpec) -> Value {
+    let phase = match spec.kind.as_str() {
+        "block" | "delay" | "map-local" | "map-remote" | "respond" | "set-request-header" => {
+            "request"
+        }
+        "set-status" | "set-response-header" | "replace" => "response",
+        _ => "unknown",
+    };
+    let mut matcher = serde_json::to_value(&spec.matcher).unwrap_or_else(|_| json!({}));
+    if let Value::Object(fields) = &mut matcher {
+        fields.retain(|_, value| !value.is_null());
+        if let Some(operation_name) = &spec.operation_name {
+            fields.insert("graphql_operation".into(), json!(operation_name));
+        }
+    }
+    let mut value = json!({
+        "id": id,
+        "kind": spec.kind,
+        "phase": phase,
+        "matcher": matcher,
+    });
+    let Value::Object(fields) = &mut value else {
+        return value;
+    };
+    if let Some(content_type) = &spec.content_type {
+        fields.insert("content_type".into(), json!(content_type));
+    }
+    if !spec.args.is_empty() {
+        fields.insert("args".into(), json!(spec.args));
+    }
+    if let Some(response) = &spec.response {
+        let content_type = response
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value);
+        fields.insert(
+            "response".into(),
+            json!({
+                "status": response.status,
+                "headers": response.headers,
+                "content_type": content_type,
+                "body_bytes": response.body.len(),
+                "upstream_bypassed": true,
+            }),
+        );
+    }
+    value
+}
+
 fn request_u32_field(req: &Value, field: &str, default: u32) -> Result<u32> {
     let Some(value) = req.get(field).filter(|value| !value.is_null()) else {
         return Ok(default);
@@ -401,8 +451,12 @@ pub async fn serve_client(
                     Err(e) => write_json(&mut wr, &json!({"ok": false, "error": e})).await?,
                     Ok(()) => {
                         let id = next_rule_id();
+                        let mut reply = public_rule(&id, &spec);
                         shared.rules.write().unwrap().push((id.clone(), spec));
-                        write_json(&mut wr, &json!({"ok": true, "id": id})).await?;
+                        if let Value::Object(fields) = &mut reply {
+                            fields.insert("ok".into(), json!(true));
+                        }
+                        write_json(&mut wr, &reply).await?;
                     }
                 },
             }
@@ -413,13 +467,7 @@ pub async fn serve_client(
                 .read()
                 .unwrap()
                 .iter()
-                .map(|(id, spec)| {
-                    let mut v = serde_json::to_value(spec).unwrap_or_default();
-                    if let Value::Object(m) = &mut v {
-                        m.insert("id".into(), json!(id));
-                    }
-                    v
-                })
+                .map(|(id, spec)| public_rule(id, spec))
                 .collect();
             write_json(&mut wr, &json!({"ok": true, "rules": rules})).await?;
         }
@@ -752,7 +800,44 @@ fn validate_rule(spec: &RuleSpec) -> Result<(), String> {
             "invalid status matcher {status}; expected 100..=599"
         ));
     }
+    if spec.kind != "respond" && (spec.operation_name.is_some() || spec.response.is_some()) {
+        return Err(format!(
+            "rule `{}` cannot use a GraphQL operation or synthetic response; use kind `respond`",
+            spec.kind
+        ));
+    }
     match spec.kind.as_str() {
+        "respond" => {
+            validate_request_rule_filters(spec)?;
+            exact(0)?;
+            if spec
+                .operation_name
+                .as_deref()
+                .is_some_and(|operation| operation.trim().is_empty())
+            {
+                return Err("respond rule GraphQL operation name must not be empty".into());
+            }
+            let response = spec
+                .response
+                .as_ref()
+                .ok_or_else(|| "respond rule is missing its synthetic response".to_string())?;
+            validate_final_status(response.status)?;
+            if response.body.len() > 8 * 1024 * 1024 {
+                return Err(format!(
+                    "respond rule body is {} bytes; maximum is 8388608",
+                    response.body.len()
+                ));
+            }
+            for (name, value) in &response.headers {
+                validate_header(name, value)?;
+                if is_managed_response_header(name) {
+                    return Err(format!(
+                        "response framing header {name:?} is managed by the proxy and cannot be set by a rule"
+                    ));
+                }
+            }
+            Ok(())
+        }
         "block" => {
             validate_request_rule_filters(spec)?;
             match spec.args.as_slice() {
@@ -824,7 +909,7 @@ fn validate_rule(spec: &RuleSpec) -> Result<(), String> {
                 .map_err(|error| format!("invalid replacement regex {:?}: {error}", spec.args[0]))
         }
         other => Err(format!(
-            "unknown rule kind {other:?} (block|delay|map-local|map-remote|set-status|set-request-header|set-response-header|replace)"
+            "unknown rule kind {other:?} (block|delay|map-local|map-remote|respond|set-status|set-request-header|set-response-header|replace)"
         )),
     }
 }
@@ -1046,13 +1131,15 @@ async fn write_request(wr: &mut OwnedWriteHalf, req: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::net::{Matcher, RuleSpec};
+    use crate::net::{Matcher, RuleSpec, SyntheticResponseSpec};
 
     fn spec(kind: &str, args: &[&str]) -> RuleSpec {
         RuleSpec {
             kind: kind.into(),
             matcher: Matcher::default(),
             content_type: None,
+            operation_name: None,
+            response: None,
             args: args.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -1069,6 +1156,40 @@ mod tests {
         // The old umbrella `set-header` is gone — it now reads as unknown so a
         // stale rule fails loudly instead of silently applying to the wrong phase.
         assert!(validate_rule(&spec("set-header", &["a", "b"])).is_err());
+    }
+
+    #[test]
+    fn respond_rule_is_atomic_validated_and_publicly_summarized() {
+        let spec = RuleSpec {
+            kind: "respond".into(),
+            matcher: Matcher {
+                host: Some("api.example.com".into()),
+                method: Some("POST".into()),
+                ..Default::default()
+            },
+            content_type: None,
+            operation_name: Some("currentSession".into()),
+            response: Some(SyntheticResponseSpec {
+                status: 401,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: br#"{"error":"unauthorized"}"#.to_vec(),
+            }),
+            args: vec![],
+        };
+        assert!(validate_rule(&spec).is_ok());
+
+        let public = public_rule("r12", &spec);
+        assert_eq!(public["phase"], "request");
+        assert_eq!(public["matcher"]["graphql_operation"], "currentSession");
+        assert_eq!(public["response"]["status"], 401);
+        assert_eq!(public["response"]["content_type"], "application/json");
+        assert_eq!(public["response"]["upstream_bypassed"], true);
+        assert_eq!(public["response"]["body_bytes"], 24);
+        assert!(public["response"].get("body").is_none());
+
+        let mut invalid = spec;
+        invalid.response.as_mut().unwrap().headers = vec![("content-length".into(), "1".into())];
+        assert!(validate_rule(&invalid).is_err());
     }
 
     #[test]

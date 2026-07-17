@@ -731,8 +731,11 @@ agent inspects with `net show`, then releases with
 `net resume --set-status/--body/…`, `net drop`, or `net respond` (a canned
 reply). Repeated edits can be promoted to declarative `net rule`s (map-local /
 map-remote / set-status / set-request-header / set-response-header / replace /
-block / delay) or served
-offline from a saved session with `net replay`. `net check <app>` labels its
+block / delay). A `respond` rule atomically returns a synthetic status, headers,
+and literal or file-backed body without contacting upstream; it can match a
+GraphQL `operationName` from either the URL query or JSON POST body. Captured
+flows name the rule and report `upstream_bypassed:true`; saved sessions can be
+served offline with `net replay`. `net check <app>` labels its
 debuggable/targetSdk result as a static heuristic and leaves the app-specific
 verdict unverified. With the proxy running, `net check --probe <app>` launches a
 package-scoped HTTPS canary; it reports verified/interceptable only when the app

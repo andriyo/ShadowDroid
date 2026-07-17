@@ -357,7 +357,17 @@ Rules have an explicit phase. The ambiguous old `set-header` name is rejected:
 shadowdroid net rule add set-request-header x-debug 1 --host api.example.com
 shadowdroid net rule add set-response-header cache-control no-store --host api.example.com
 shadowdroid net rule add set-status 503 --host api.example.com
+shadowdroid net rule add respond --host api.example.com --method POST \
+  --operation-name currentSession --status 401 \
+  --header content-type=application/json \
+  --body '{"errors":[{"message":"Unauthorized"}]}'
 ```
+
+`respond` is a request-phase atomic rule: GraphQL `operationName` is matched in
+the URL query or JSON POST body, status/headers/body are returned together, and
+upstream is bypassed. `--body-file` is the binary-safe alternative to `--body`.
+The rule summary reports body length without echoing its contents; captured
+flows include the rule id and `upstream_bypassed:true`.
 
 ## Optional in-app AAR
 
