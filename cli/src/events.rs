@@ -295,9 +295,7 @@ pub fn now_ts() -> f64 {
 
 pub fn screen_event(device: &str, screen: ScreenResponse, format: ScreenFormat) -> Event {
     let AppRef {
-        package,
-        activity,
-        pid: _,
+        package, activity, ..
     } = screen.current_app;
     match format {
         ScreenFormat::Full => Event::Screen {

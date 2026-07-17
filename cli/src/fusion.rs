@@ -159,8 +159,12 @@ pub fn compact_screen_value(screen: &ScreenResponse) -> Value {
     json!({
         "screen_hash": screen.screen_hash,
         "screen_hash_version": screen.screen_hash_version,
+        "snapshot_state": screen.snapshot_state,
+        "captured_at_ms": screen.captured_at_ms,
         "viewport": screen.viewport,
         "current_app": screen.current_app,
+        "ui_tree": screen.ui_tree,
+        "warning": screen.warning,
         "element_count": screen.element_count,
         "ime": crate::events::CompactIme::from(screen.ime.clone()),
         "elements": elements,
@@ -380,6 +384,40 @@ mod tests {
     fn top_texts_dedupes_and_caps() {
         let elements = vec![el(1, "A"), el(2, "A"), el(3, "B"), el(4, " "), el(5, "C")];
         assert_eq!(top_screen_texts(&elements, 2), vec!["A", "B"]);
+    }
+
+    #[test]
+    fn compact_screen_preserves_snapshot_freshness_metadata() {
+        let screen = ScreenResponse {
+            screen_hash: "screen-1".into(),
+            screen_hash_version: 2,
+            snapshot_state: "transitioning".into(),
+            captured_at_ms: Some(123),
+            viewport: crate::proto::Viewport { w: 1080, h: 1920 },
+            current_app: crate::proto::AppRef {
+                package: Some("com.example".into()),
+                activity: None,
+                pid: None,
+                sampled_at_ms: Some(120),
+            },
+            ui_tree: Some(crate::proto::UiTreeSnapshot {
+                sampled_at_ms: 121,
+                age_ms: 2,
+                package: Some("com.example".into()),
+                window_id: Some(7),
+            }),
+            warning: Some("still converging".into()),
+            element_count: 1,
+            ime: crate::proto::ImeState::default(),
+            elements: vec![el(1, "Loading")],
+        };
+
+        let compact = compact_screen_value(&screen);
+        assert_eq!(compact["snapshot_state"], "transitioning");
+        assert_eq!(compact["captured_at_ms"], 123);
+        assert_eq!(compact["current_app"]["sampled_at_ms"], 120);
+        assert_eq!(compact["ui_tree"]["window_id"], 7);
+        assert_eq!(compact["warning"], "still converging");
     }
 
     #[test]

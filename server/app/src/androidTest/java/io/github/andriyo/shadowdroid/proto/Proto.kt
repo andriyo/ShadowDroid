@@ -37,6 +37,7 @@ data class AppRef(
     val `package`: String? = null,
     val activity: String? = null,
     val pid: Int? = null,
+    val sampled_at_ms: Long? = null,
 )
 
 // ── /v1/screen ──────────────────────────────────────────────────────
@@ -45,11 +46,23 @@ data class AppRef(
 data class ScreenResponse(
     val screen_hash: String,
     val screen_hash_version: Int = 2,
+    val snapshot_state: String = "consistent",
+    val captured_at_ms: Long? = null,
     val viewport: Viewport,
     val current_app: AppRef,
+    val ui_tree: UiTreeSnapshot? = null,
+    val warning: String? = null,
     val element_count: Int,
     val ime: ImeState = ImeState(),
     val elements: List<Element>,
+)
+
+@Serializable
+data class UiTreeSnapshot(
+    val sampled_at_ms: Long,
+    val age_ms: Long,
+    val `package`: String? = null,
+    val window_id: Int? = null,
 )
 
 @Serializable

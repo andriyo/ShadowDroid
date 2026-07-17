@@ -53,7 +53,16 @@ object StateRoutes {
 
         route.get("/state") {
             val pkg = uiDevice.currentPackageName
-            val enrichment = enrichmentCache.snapshot(pkg)
+            // Keep the lightweight state probe non-blocking. The screen route
+            // applies the stricter bounded convergence policy when it also
+            // returns a UI tree that must agree with this metadata.
+            val enrichment =
+                enrichmentCache.snapshot(
+                    currentPackage = pkg,
+                    treeWindowId = null,
+                    requireComplete = false,
+                    waitMs = 0L,
+                )
 
             val state =
                 ServerState(
@@ -63,7 +72,13 @@ object StateRoutes {
                     android_sdk = Build.VERSION.SDK_INT,
                     android_release = Build.VERSION.RELEASE ?: "",
                     viewport = Viewport(uiDevice.displayWidth, uiDevice.displayHeight),
-                    current_app = AppRef(`package` = pkg, activity = enrichment.activity, pid = enrichment.pid),
+                    current_app =
+                        AppRef(
+                            `package` = pkg,
+                            activity = enrichment.activity,
+                            pid = enrichment.pid,
+                            sampled_at_ms = enrichment.sampledAtMs.takeIf { it > 0L },
+                        ),
                     is_television = isTelevision(instr),
                 )
             call.respond(state)

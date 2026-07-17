@@ -212,7 +212,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         "ui dump" => Some(serde_json::json!({
             "use_when": ["Need the current actionable UI state for selector choice before tapping, typing, or waiting."],
             "avoid_when": ["Need Compose/source/layout inspection or a durable artifact; use layout snapshot."],
-            "output": "compact screen JSON by default, including screen_hash + screen_hash_version and ime.keyboard_visible/focused input context; --full adds bounds and every UIAutomator flag",
+            "output": "compact screen JSON by default, including screen identity, snapshot_state, capture/current-app/UI-tree freshness timestamps, window generation, and IME context; --full adds bounds and every UIAutomator flag",
             "side_effects": ["none"],
             "next_actions": ["ui tap --id <id>", "ui tap --text <text>", "ui text --id <id> <value>", "ui hide-keyboard", "ui wait"],
             "prefer_over": {

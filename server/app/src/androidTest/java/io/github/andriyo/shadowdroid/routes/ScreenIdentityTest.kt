@@ -72,6 +72,106 @@ class ScreenIdentityTest {
         assertNotEquals(base, hash(elements, ime = ImeState(keyboard_visible = true)))
     }
 
+    @Test
+    fun focusedActivityParserAcceptsModernAndLegacyDumpsysShapes() {
+        val expected = FocusedApp("com.example", "com.example.MainActivity")
+        assertEquals(
+            expected,
+            parseFocusedApp(
+                "topResumedActivity=ActivityRecord{123 u0 com.example/.MainActivity t8}",
+            ),
+        )
+        assertEquals(
+            expected,
+            parseFocusedApp(
+                "mResumedActivity: ActivityRecord{123 u0 com.example/.MainActivity t8}",
+            ),
+        )
+        assertEquals(
+            expected,
+            parseFocusedApp(
+                "ResumedActivity: ActivityRecord{123 u0 com.example/.MainActivity t8}",
+            ),
+        )
+        assertEquals(
+            expected,
+            parseFocusedApp(
+                """
+                mResumedActivity: null
+                topResumedActivity=ActivityRecord{123 u0 com.example/.MainActivity t8}
+                """.trimIndent(),
+            ),
+        )
+    }
+
+    @Test
+    fun populatedTreeRequiresMatchingCompleteForegroundMetadata() {
+        val pending =
+            ScreenEnrichment(
+                `package` = "com.example",
+                activity = null,
+                pid = null,
+                keyboardVisible = null,
+                keyboardDetectionAvailable = false,
+                keyboardReason = null,
+                windowId = null,
+                sampledAtMs = 0,
+                refreshedAtElapsedMs = 0,
+            )
+        assertEquals(
+            "transitioning",
+            assessSnapshot("com.example", 7, true, 3, "com.example", pending).state,
+        )
+        assertEquals(
+            "transitioning",
+            assessSnapshot("com.previous", 7, true, 3, "com.example", pending).state,
+        )
+
+        val complete =
+            pending.copy(
+                activity = "com.example.MainActivity",
+                pid = 42,
+                windowId = 7,
+                sampledAtMs = 1,
+                refreshedAtElapsedMs = 1,
+            )
+        assertEquals(
+            "consistent",
+            assessSnapshot("com.example", 7, true, 3, "com.example", complete).state,
+        )
+        assertEquals(
+            "transitioning",
+            assessSnapshot("com.example", 8, true, 3, "com.example", complete).state,
+        )
+    }
+
+    @Test
+    fun slowFirstDrawWithoutAccessibleContentIsTransitioning() {
+        val enrichment =
+            ScreenEnrichment(
+                `package` = "com.example",
+                activity = "com.example.MainActivity",
+                pid = 42,
+                keyboardVisible = null,
+                keyboardDetectionAvailable = false,
+                keyboardReason = null,
+                windowId = 7,
+                sampledAtMs = 1,
+                refreshedAtElapsedMs = 1,
+            )
+        val assessment =
+            assessSnapshot(
+                treePackage = "com.example",
+                treeWindowId = 7,
+                treeReady = false,
+                elementCount = 0,
+                foregroundPackage = "com.example",
+                enrichment = enrichment,
+            )
+        assertEquals("transitioning", assessment.state)
+        assertTrue(assessment.warning?.contains("accessible content") == true)
+    }
+
     @Suppress("DEPRECATION")
     @Test
     fun xpathActionRejectsAmbiguousMatches() {

@@ -34,6 +34,8 @@ pub struct AppRef {
     pub package: Option<String>,
     pub activity: Option<String>,
     pub pid: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampled_at_ms: Option<u64>,
 }
 
 // ── /v1/screen ───────────────────────────────────────────────────────
@@ -45,8 +47,16 @@ pub struct ScreenResponse {
     /// length-delimited hash are interpreted as v1.
     #[serde(default = "default_screen_hash_version")]
     pub screen_hash_version: u32,
+    #[serde(default = "default_snapshot_state")]
+    pub snapshot_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_at_ms: Option<u64>,
     pub viewport: Viewport,
     pub current_app: AppRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_tree: Option<UiTreeSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
     pub element_count: u32,
     #[serde(default, skip_serializing_if = "ImeState::is_empty")]
     pub ime: ImeState,
@@ -55,6 +65,20 @@ pub struct ScreenResponse {
 
 const fn default_screen_hash_version() -> u32 {
     1
+}
+
+fn default_snapshot_state() -> String {
+    "unknown".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiTreeSnapshot {
+    pub sampled_at_ms: u64,
+    pub age_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_id: Option<i32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -355,6 +379,9 @@ mod tests {
         let screen: ScreenResponse = serde_json::from_str(body).unwrap();
         assert!(screen.ime.is_empty());
         assert_eq!(screen.screen_hash_version, 1);
+        assert_eq!(screen.snapshot_state, "unknown");
+        assert!(screen.captured_at_ms.is_none());
+        assert!(screen.ui_tree.is_none());
 
         let json = serde_json::to_string(&screen).unwrap();
         assert!(!json.contains("\"ime\""), "{json}");

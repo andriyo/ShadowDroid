@@ -783,12 +783,17 @@ mod tests {
         ScreenResponse {
             screen_hash: "abc123".into(),
             screen_hash_version: 2,
+            snapshot_state: "consistent".into(),
+            captured_at_ms: Some(1),
             viewport: Viewport { w: 1, h: 2 },
             current_app: AppRef {
                 package: Some(package.into()),
                 activity: Some(format!("{package}/.MainActivity")),
                 pid: Some(pid),
+                sampled_at_ms: Some(1),
             },
+            ui_tree: None,
+            warning: None,
             element_count,
             ime: ImeState::default(),
             elements: Vec::new(),

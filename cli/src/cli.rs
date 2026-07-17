@@ -3479,21 +3479,7 @@ async fn cmd_screen(
     if full {
         return Ok(Outcome::Raw(serde_json::to_value(&screen)?));
     }
-    let ime = compact_ime(&screen.ime);
-    let elements: Vec<CompactElement> = screen
-        .elements
-        .into_iter()
-        .map(CompactElement::from)
-        .collect();
-    Ok(Outcome::Raw(json!({
-        "screen_hash": screen.screen_hash,
-        "screen_hash_version": screen.screen_hash_version,
-        "viewport": screen.viewport,
-        "current_app": screen.current_app,
-        "element_count": screen.element_count,
-        "ime": ime,
-        "elements": elements,
-    })))
+    Ok(Outcome::Raw(crate::fusion::compact_screen_value(&screen)))
 }
 
 fn compact_ime(ime: &crate::proto::ImeState) -> serde_json::Value {
@@ -4742,6 +4728,7 @@ mod tests {
             package: package.map(Into::into),
             activity: None,
             pid: None,
+            sampled_at_ms: None,
         }
     }
 

@@ -148,6 +148,10 @@ pub async fn run(
                     "current_app": screen.current_app,
                     "screen_hash": screen.screen_hash,
                     "screen_hash_version": screen.screen_hash_version,
+                    "snapshot_state": screen.snapshot_state,
+                    "captured_at_ms": screen.captured_at_ms,
+                    "ui_tree": screen.ui_tree,
+                    "warning": screen.warning,
                     "top_texts": top_screen_texts(&screen.elements, 12),
                     "keyboard_visible": screen.ime.keyboard_visible,
                 }));

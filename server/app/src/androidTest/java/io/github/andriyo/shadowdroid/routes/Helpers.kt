@@ -9,17 +9,39 @@ import io.github.andriyo.shadowdroid.BadRequest
  * regex in every place that needs current_app info.
  */
 
-/** Activity FQN of whatever has window focus, via `dumpsys activity activities`. */
-internal fun currentFocusedActivity(ui: UiDevice): String? {
+internal data class FocusedApp(
+    val `package`: String,
+    val activity: String,
+)
+
+/** Foreground package/activity parsed across current and legacy dumpsys shapes. */
+internal fun currentFocusedApp(ui: UiDevice): FocusedApp? {
     val out =
         runCatching { ui.executeShellCommand("dumpsys activity activities") }.getOrNull()
             ?: return null
-    val resumed = out.lineSequence().firstOrNull { it.contains("ResumedActivity:") } ?: return null
-    val regex = Regex("""([A-Za-z0-9_.]+)/([A-Za-z0-9_.${'$'}]+)""")
-    val m = regex.find(resumed) ?: return null
-    val activity = m.groupValues[2]
-    return if (activity.startsWith(".")) m.groupValues[1] + activity else activity
+    return parseFocusedApp(out)
 }
+
+internal fun parseFocusedApp(dumpsys: String): FocusedApp? {
+    val regex = Regex("""([A-Za-z0-9_.]+)/([A-Za-z0-9_.${'$'}]+)""")
+    val m =
+        listOf("topResumedActivity=", "mResumedActivity:", "ResumedActivity:")
+            .firstNotNullOfOrNull { marker ->
+                dumpsys.lineSequence()
+                    .filter { it.contains(marker) }
+                    .mapNotNull(regex::find)
+                    .firstOrNull()
+            } ?: return null
+    val pkg = m.groupValues[1]
+    val activity = m.groupValues[2]
+    return FocusedApp(
+        `package` = pkg,
+        activity = if (activity.startsWith(".")) pkg + activity else activity,
+    )
+}
+
+/** Activity FQN of whatever has window focus, via `dumpsys activity activities`. */
+internal fun currentFocusedActivity(ui: UiDevice): String? = currentFocusedApp(ui)?.activity
 
 /** PID of the given package's foreground process, or null. */
 internal fun pidForPackage(

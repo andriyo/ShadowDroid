@@ -93,6 +93,7 @@ object AppRoutes {
                 } else {
                     null
                 }
+            ScreenEnrichmentCache.shared(uiDevice, instr).invalidate()
             call.respond(
                 AppStartResp(
                     activity = launchedActivity,
@@ -131,6 +132,7 @@ object AppRoutes {
                         ),
                 )
             }
+            ScreenEnrichmentCache.shared(uiDevice, instr).invalidate()
             call.respond(OkResponse())
         }
         route.post("/app/clear") {
@@ -156,6 +158,7 @@ object AppRoutes {
                         ),
                 )
             }
+            ScreenEnrichmentCache.shared(uiDevice, instr).invalidate()
             call.respond(OkResponse())
         }
         route.post("/app/wait") {

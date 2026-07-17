@@ -168,8 +168,12 @@ Selector actions are strict. Multiple non-exact matches produce
 `ambiguous_match` with candidates instead of choosing one. Narrow the selector
 or inspect all matches with `ui find`.
 
-Every screen payload includes `screen_hash` and `screen_hash_version`. Cache a
-hash only with its version; invalidate it if the version changes. Use:
+Every screen payload includes `screen_hash`, `screen_hash_version`,
+`snapshot_state`, `captured_at_ms`, `current_app.sampled_at_ms`, and `ui_tree`
+freshness metadata. Cache a hash only with its version and only act from a
+`consistent` snapshot. A `transitioning` snapshot means the bounded lifecycle
+consistency check did not converge; retry or wait for the expected app state.
+Use:
 
 ```bash
 shadowdroid ui tap --text "Buy" --if-screen <hash> --observe

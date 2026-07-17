@@ -32,8 +32,12 @@ answers the agent's next question *before it's asked*:
 ```jsonc
 $ shadowdroid ui dump
 {"screen_hash":"154e97ff111d4b1e","screen_hash_version":2,
+ "snapshot_state":"consistent","captured_at_ms":1760000000123,
  "viewport":{"w":1080,"h":2424},
- "current_app":{"package":"com.example.app","activity":".MainActivity","pid":5170},
+ "current_app":{"package":"com.example.app","activity":".MainActivity","pid":5170,
+                "sampled_at_ms":1760000000118},
+ "ui_tree":{"package":"com.example.app","window_id":42,
+            "sampled_at_ms":1760000000121,"age_ms":2},
  "element_count":39,"ime":{"keyboard_visible":false},
  "elements":[{"id":7,"text":"Sign in","rid":"btn_sign_in","tap":[540,1200],"clickable":true}, …]}
 
@@ -42,6 +46,7 @@ $ shadowdroid ui tap --text "Sign in" --observe
 {"type":"action","cmd":"tap","ok":true,"via":"selector","x":540,"y":1200,"matched":true,
  "element":{"id":7,"text":"Sign in","tap":[540,1200]},
  "screen":{"screen_hash":"9c01d2aa87b3e544","screen_hash_version":2,
+           "snapshot_state":"consistent","captured_at_ms":1760000000440,
            "element_count":24,"elements":[…]}}
 
 // Only act if the screen is still the one you read (optimistic concurrency):
@@ -406,8 +411,10 @@ costs as few round-trips as possible.
 3. **Connect.** `shadowdroid connect`; if it fails, `shadowdroid doctor --json`,
    then `doctor --fix` only when repair side effects are acceptable.
 4. **Read by dumping.** `shadowdroid ui dump` returns the actionable tree as a
-   compact element list plus `screen_hash` and `screen_hash_version`. Cache the
-   pair; invalidate a cached hash if its version changes.
+   compact element list plus screen identity and freshness metadata. Act only
+   from `snapshot_state: "consistent"`; a lifecycle race is retried within a
+   bounded window, then returned as `transitioning` with a warning. Cache the
+   hash/version pair; invalidate a cached hash if its version changes.
 5. **Act by selector, not coordinates.** Prefer `--rid`, then `--desc`/exact
    `--text`. Add `--observe` to get the post-action screen back in the same
    response, and `--if-screen <hash>` to refuse acting on a screen that changed
@@ -532,6 +539,9 @@ commands: `--text`, `--rid` (resource id), `--desc` (content description), and
 `--xpath`. A typical agent reads `ui dump` once, acts by `--rid`/`--text`, and
 caches `screen_hash` together with `screen_hash_version`. A hash is comparable
 only within the same version; invalidate it when the version changes.
+`snapshot_state`, `captured_at_ms`, `current_app.sampled_at_ms`, and `ui_tree`
+make lifecycle freshness explicit. Do not derive an action from a
+`transitioning` snapshot; retry or wait for the expected package/activity.
 
 Text/desc selectors match as a **normalized, case-insensitive substring** by
 default: before comparing, surrounding whitespace is collapsed, curly
