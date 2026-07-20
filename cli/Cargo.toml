@@ -1,6 +1,6 @@
 [package]
 name = "shadowdroid"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
 # Intentionally tracks the standard-library APIs used by the CLI (not merely
 # dependency metadata). CI compiles this floor separately from the pinned

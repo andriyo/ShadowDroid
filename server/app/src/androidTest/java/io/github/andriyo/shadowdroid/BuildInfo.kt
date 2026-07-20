@@ -12,7 +12,7 @@ package io.github.andriyo.shadowdroid
  * UI_AUTOMATOR_VERSION don't track the release version and are authoritative here.
  */
 object BuildInfo {
-    const val SERVER_VERSION: String = "0.13.0"
+    const val SERVER_VERSION: String = "0.14.0"
     const val API_VERSION: String = "1"
     const val UI_AUTOMATOR_VERSION: String = "2.3.0"
 }
