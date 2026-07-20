@@ -10,15 +10,17 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         "commands" => Some(serde_json::json!({
             "use_when": [
                 "Discover ShadowDroid's command tree, flags, output contracts, and agent decision hints without scraping human help text.",
-                "Inspect one command before constructing it, or fetch a shallow catalog when the full tree would cost unnecessary context."
+                "Inspect one command before constructing it, or fetch a shallow catalog when the full tree would cost unnecessary context.",
+                "Read a domain driving guide (--guide net|debugger|state) before first use of that domain."
             ],
-            "output": "schema_version 3 JSON catalog with command paths, complete argument construction data, output contracts, and normalized next_actions; a positional path or --describe returns one command, --search finds relevant contracts, and --compact removes long guidance",
+            "output": "schema_version 3 JSON catalog with command paths, complete argument construction data, output contracts, and normalized next_actions; a positional path or --describe returns one command, --search finds relevant contracts, --guide returns one domain driving guide, and --compact removes long guidance",
             "side_effects": ["none"],
-            "next_actions": ["commands --json --depth 1", "commands --json --describe 'ui tap'", "config schema --json"],
+            "next_actions": ["commands --json --depth 1", "commands --json --describe 'ui tap'", "commands --guide net --json", "config schema --json"],
             "examples": [
                 "commands --json --depth 1",
                 "commands net rule add --json --compact",
-                "commands --search 'response body' --json"
+                "commands --search 'response body' --json",
+                "commands --guide net --json"
             ]
         })),
         "devices" => Some(serde_json::json!({
@@ -162,7 +164,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "use_when": ["Need Android Studio plugin installation/status for debugger, Layout Inspector, source mapping, or recomposition features."],
             "output": "Studio/plugin/bridge status or install report",
             "side_effects": ["install subcommand writes plugin files into Android Studio's plugin directory"],
-            "next_actions": ["studio status --json", "studio install", "debug snapshot", "layout snapshot --compose"]
+            "next_actions": ["studio status --json", "studio install", "debug snapshot", "layout snapshot --compose", "commands --guide debugger --json"]
         })),
         "studio status" => Some(serde_json::json!({
             "use_when": ["Need to know whether Android Studio, the ShadowDroid plugin, and the local bridge are present/running."],
@@ -366,7 +368,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "use_when": ["Need visual/layout/source structure artifacts rather than immediate UI actions."],
             "output": "layout JSON artifacts and diffs",
             "side_effects": ["snapshot can write files and screenshots"],
-            "next_actions": ["layout snapshot", "layout diff", "layout source", "layout recompositions"]
+            "next_actions": ["layout snapshot", "layout diff", "layout source", "layout recompositions", "commands --guide debugger --json"]
         })),
         "layout snapshot" => Some(serde_json::json!({
             "use_when": ["Need a saved UI structure artifact, layout diff input, screenshot pairing, Compose semantics, or source mapping."],
@@ -407,7 +409,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "use_when": ["Need runtime causality, stack/variable state, breakpoints, replay, or Android Studio debugger control."],
             "output": "bounded JSON debug state or JSONL timelines depending on subcommand",
             "side_effects": ["attach/break/resume/step commands affect debugger/app execution"],
-            "next_actions": ["debug auto", "debug snapshot", "debug record", "debug run-until-crash"]
+            "next_actions": ["debug auto", "debug snapshot", "debug record", "debug run-until-crash", "commands --guide debugger --json"]
         })),
         "debug auto" => Some(serde_json::json!({
             "use_when": ["Need the fastest agent entrypoint for launching/configuring the app, attaching the debugger when available, and returning a useful snapshot."],
@@ -708,7 +710,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "use_when": ["Need app lifecycle, foreground, install, or metadata control for the target Android app."],
             "output": "one JSON action/result per command",
             "side_effects": ["start/stop/install/clear/reinstall mutate app/device state"],
-            "next_actions": ["app current", "app start <pkg>", "app wait <pkg> --front", "ui dump"]
+            "next_actions": ["app current", "app start <pkg>", "app wait <pkg> --front", "ui dump", "commands --guide state --json"]
         })),
         "app current" => Some(serde_json::json!({
             "use_when": ["Need to confirm the foreground package/activity/pid before trusting UI, layout, debug, or recomposition samples."],
@@ -764,7 +766,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "output": "metadata-only snapshot/restore/recovery/cleanup JSON; private contents are never printed",
             "side_effects": ["snapshot/restore/recover force-stop the app", "snapshot writes protected host files", "restore mutates selected private roots transactionally", "cleanup overwrites and deletes a host snapshot"],
             "prerequisites": ["installed debuggable package with working run-as"],
-            "next_actions": ["app state snapshot --app <pkg> --out <dir> --include shared_prefs", "app state restore --from <dir>", "app state recover --app <pkg>", "app state cleanup --from <dir>"]
+            "next_actions": ["app state snapshot --app <pkg> --out <dir> --include shared_prefs", "app state restore --from <dir>", "app state recover --app <pkg>", "app state cleanup --from <dir>", "commands --guide state --json"]
         })),
         "app state snapshot" => Some(serde_json::json!({
             "use_when": ["Need a protected manifest plus selected private files/directories for cross-version regression state."],
@@ -794,7 +796,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "use_when": ["Need runtime permission state setup or verification without opening Android settings."],
             "output": "permission action/list JSON",
             "side_effects": ["grant/revoke/reset mutate runtime permission state"],
-            "next_actions": ["perm list <pkg>", "perm grant <pkg> <permission>", "app start <pkg>"]
+            "next_actions": ["perm list <pkg>", "perm grant <pkg> <permission>", "app start <pkg>", "commands --guide state --json"]
         })),
         "perm grant" => Some(serde_json::json!({
             "use_when": ["Need to pre-grant one or more runtime permissions for a deterministic test flow."],
@@ -824,7 +826,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "use_when": ["Need to inspect or change Android app-op modes such as location, notification, or background behavior."],
             "output": "app-op get/set JSON with separate UID/package modes and effective precedence",
             "side_effects": ["set mutates app-op mode"],
-            "next_actions": ["appops get <pkg> <op>", "appops set <pkg> <op> <mode> --scope uid|package", "app start <pkg>"]
+            "next_actions": ["appops get <pkg> <op>", "appops set <pkg> <op> <mode> --scope uid|package", "app start <pkg>", "commands --guide state --json"]
         })),
         "appops get" => Some(serde_json::json!({
             "use_when": ["Need current UID/package app-op modes and the governing effective mode before changing policy or for diagnostics."],
@@ -843,7 +845,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "use_when": ["Need deterministic emulator/device display state: animations, font scale, density, size, or rotation."],
             "output": "profile snapshot/apply/reset JSON",
             "side_effects": ["apply/reset mutate device display/settings"],
-            "next_actions": ["profile snapshot", "profile apply --preset automation", "ui dump"]
+            "next_actions": ["profile snapshot", "profile apply --preset automation", "ui dump", "commands --guide state --json"]
         })),
         "profile snapshot" => Some(serde_json::json!({
             "use_when": ["Need to capture current display/profile settings before changing them or for evidence."],
@@ -867,7 +869,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "use_when": ["Need device/system controls outside app UI: shell, power, orientation, clipboard, notifications, URLs."],
             "output": "one JSON action/result per command",
             "side_effects": ["subcommands may mutate device/system state"],
-            "next_actions": ["device info", "device shell <cmd>", "ui dump"]
+            "next_actions": ["device info", "device shell <cmd>", "ui dump", "commands --guide state --json"]
         })),
         "device info" => Some(serde_json::json!({
             "use_when": ["Need model/build/locale/density facts for bug reports or environment checks."],
@@ -933,7 +935,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "use_when": ["Need structured push/pull/list operations for shared/device files or private debuggable-app paths through --run-as --app."],
             "output": "file operation JSON",
             "side_effects": ["push/pull write files; ls is read-only"],
-            "next_actions": ["files ls <remote>", "files pull <remote> <local>", "files push <local> <remote>"]
+            "next_actions": ["files ls <remote>", "files pull <remote> <local>", "files push <local> <remote>", "commands --guide state --json"]
         })),
         "files ls" => Some(serde_json::json!({
             "use_when": ["Need to inspect a remote device directory before pulling or debugging artifacts."],
@@ -957,7 +959,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "use_when": ["Need to enable, inspect, intercept, mutate, export, or replay HTTP(S) traffic."],
             "output": "one JSON object per command; live HTTP events appear on watch after net start",
             "side_effects": ["start/stop/trust/rule/intercept/resume/drop/respond change device proxy, trust, or flow behavior"],
-            "next_actions": ["net check <pkg>", "net start", "watch", "net log", "net show <id>", "net intercept"]
+            "next_actions": ["net check <pkg>", "net start", "watch", "net log", "net show <id>", "net intercept", "commands --guide net --json"]
         })),
         "net check" => Some(serde_json::json!({
             "use_when": ["Need to know whether a package is likely interceptable, or actively prove that its HTTPS request is decrypted."],
@@ -1129,7 +1131,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "use_when": ["Need the debug-only in-app agent for apps you can build: process/coroutine diagnostics, or above-TLS OkHttp capture/interception through the optional companion interceptor (including pinned OkHttp traffic)."],
             "output": "AAR install/status/capture/intercept/coroutines JSON or human setup reports",
             "side_effects": ["install/remove mutate project files; intercept/resume/drop affect in-app flows"],
-            "next_actions": ["aar status", "aar install", "aar agent", "aar capture", "aar coroutines"]
+            "next_actions": ["aar status", "aar install", "aar agent", "aar capture", "aar coroutines", "commands --guide net --json"]
         })),
         "aar install" => Some(serde_json::json!({
             "use_when": ["Need to wire the debug-only core AAR into a Gradle app project; add --okhttp for the optional companion, then explicitly add ShadowDroidCaptureInterceptor() to each debug OkHttpClient."],

@@ -429,8 +429,9 @@ The loop is **read → act → confirm**, and ShadowDroid is built so each step
 costs as few round-trips as possible.
 
 1. **Discover the surface once.** Start with `shadowdroid commands --json
-   --depth 1`; use `commands --json --describe 'ui tap'` for one command, or
-   omit `--depth` for the full tree. Schema version 2 contains canonical paths,
+   --depth 1`; use `commands --json --describe 'ui tap'` for one command,
+   `commands --guide net|debugger|state` for a domain driving guide, or
+   omit `--depth` for the full tree. Schema version 3 contains canonical paths,
    complete argument construction data (aliases, conflicts, requirements,
    groups, arity, and trailing/hyphen-value behavior), output contracts, and
    agent decision hints. Do not invent command names from memory or scrape
@@ -727,7 +728,7 @@ selector (then optionally activates it) — the TV analog of `ui tap` /
 
 | Group | Commands |
 | --- | --- |
-| **Discovery/setup** | `commands --json --depth 1`, `commands --json --describe '<path>'`, `config paths` / `schema` / `explain` / `init` / `validate`, `skill`, `studio status` / `install`, `init`, `update`, `usage` |
+| **Discovery/setup** | `commands --json --depth 1`, `commands --json --describe '<path>'`, `commands --guide '<topic>'`, `config paths` / `schema` / `explain` / `init` / `validate`, `skill`, `studio status` / `install`, `init`, `update`, `usage` |
 | **Session/diagnostics** | `devices`, `connect`, `disconnect`, `test`, `doctor`, `collect`, `why`, `log` |
 | **UI automation** | `ui dump`, `ui audit`, `ui gen`, `ui screenshot`, `ui find`, `ui tap`, `ui set-progress`, `ui double-tap`, `ui long-tap`, `ui swipe`, `ui drag`, `ui swipe-ext`, `ui pinch`, `ui scroll-to`, `ui focus`, `ui text`, `ui pin`, `ui key`, `ui hide-keyboard`, `ui back`, `ui home`, `ui wait`, `ui toast` (action verbs take `--observe`, `--if-screen`, and `--if-interaction`; tap/progress/text also accept `--handle`) |
 | **Triage** | `why` (one-read verdict + evidence), `log` (structured app-scoped logcat + parsed crashes) |
@@ -952,8 +953,10 @@ command surface.
 
 ShadowDroid is self-describing. `shadowdroid commands --json --depth 1` emits a
 low-context top-level catalog; `commands --json --describe '<path>'` returns one
-command with complete construction data; omitting `--depth` emits the full tree.
-Schema version 2 carries canonical paths, global/command args, constraints,
+command with complete construction data; `commands --guide <topic>` returns the
+driving guide for a whole domain (`net`, `debugger`, or `state` — covered
+command groups alias to their guide); omitting `--depth` emits the full tree.
+Schema version 3 carries canonical paths, global/command args, constraints,
 output contracts, and agent decision hints straight from the CLI definition.
 
 `shadowdroid init` installs/updates user-scoped agent skills automatically.

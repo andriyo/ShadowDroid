@@ -14,22 +14,27 @@ use std::sync::LazyLock;
 use crate::cli::Cli;
 
 mod agent_metadata;
+mod guides;
 use agent_metadata::agent_metadata;
 
 static CLI_COMMAND_TEMPLATE: LazyLock<Command> = LazyLock::new(Cli::command);
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     json: bool,
     depth: Option<usize>,
     describe: Option<&str>,
     path: &[String],
     search: Option<&str>,
+    guide: Option<&str>,
     compact: bool,
 ) -> Result<()> {
     let root = &*CLI_COMMAND_TEMPLATE;
     let positional_path = (!path.is_empty()).then(|| path.join(" "));
     let requested_path = describe.or(positional_path.as_deref());
-    let mut catalog = if let Some(query) = search {
+    let mut catalog = if let Some(topic) = guide {
+        guide_catalog(topic)?
+    } else if let Some(query) = search {
         search_catalog(root, query, compact)?
     } else if let Some(path) = requested_path {
         describe_catalog(root, path).ok_or_else(|| command_not_found(root, path))?
@@ -41,6 +46,8 @@ pub fn run(
     }
     if json {
         crate::events::emit_result(&catalog);
+    } else if guide.is_some() {
+        print!("{}", catalog["content"].as_str().unwrap_or_default());
     } else if search.is_some() {
         print_search_results(&catalog);
     } else if requested_path.is_some() {
@@ -91,6 +98,49 @@ fn describe_catalog(root: &Command, raw_path: &str) -> Option<serde_json::Value>
         "command": command_json(command, &parent, Some(1)),
         "next_actions": next_actions_for_path("commands"),
     }))
+}
+
+/// One driving guide as a bounded catalog response. Topic resolution accepts
+/// the canonical topic or any covered command group (`--guide layout` returns
+/// the debugger guide).
+fn guide_catalog(topic: &str) -> Result<serde_json::Value> {
+    let Some(guide) = guides::find_guide(topic) else {
+        let available = guides::GUIDES
+            .iter()
+            .map(|guide| serde_json::json!({"topic": guide.topic, "covers": guide.covers}))
+            .collect::<Vec<_>>();
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "guide_not_found",
+            "commands",
+            format!("no driving guide covers {topic:?}"),
+        )
+        .detail(serde_json::json!({"topic": topic, "available": available}))
+        .next_actions(
+            guides::GUIDES
+                .iter()
+                .map(|guide| format!("shadowdroid commands --guide {} --json", guide.topic)),
+        )
+        .into());
+    };
+    let next_actions = guide
+        .covers
+        .iter()
+        .map(|group| format!("shadowdroid commands {group} --json --compact"))
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "schema_version": 3,
+        "guide": guide.topic,
+        "covers": guide.covers,
+        "content": guide.content,
+        "next_actions": next_actions,
+    }))
+}
+
+/// Canonical driving-guide topics; keeps the skill body's pointer stubs in
+/// lockstep with the guides actually served.
+#[cfg(test)]
+pub(crate) fn guide_topics() -> Vec<&'static str> {
+    guides::GUIDES.iter().map(|guide| guide.topic).collect()
 }
 
 fn command_not_found(root: &Command, path: &str) -> anyhow::Error {
@@ -956,6 +1006,66 @@ mod tests {
         let nearest = nearest_command_paths(&root, "net ruel add", 5);
         assert_eq!(nearest.first().map(String::as_str), Some("net rule add"));
         assert!(nearest.iter().all(|path| path != "net daemon"));
+    }
+
+    #[test]
+    fn driving_guides_resolve_by_topic_and_by_covered_group() {
+        // Canonical topics resolve and carry their moved skill-body depth.
+        for (topic, marker) in [
+            ("net", "net check"),
+            ("debugger", "debug sessions"),
+            ("state", "--scope uid"),
+        ] {
+            let guide = guide_catalog(topic).unwrap();
+            assert_eq!(guide["guide"], topic);
+            let content = guide["content"].as_str().unwrap();
+            assert!(content.contains(marker), "{topic}: {content}");
+        }
+
+        // Every covered command group is accepted as an alias for its guide.
+        for (alias, topic) in [("aar", "net"), ("layout", "debugger"), ("files", "state")] {
+            assert_eq!(guide_catalog(alias).unwrap()["guide"], topic, "{alias}");
+        }
+
+        // Guide next_actions are runnable catalog commands.
+        let guide = guide_catalog("net").unwrap();
+        for action in guide["next_actions"].as_array().unwrap() {
+            let action = action.as_str().unwrap();
+            assert!(action_template_parses(action), "{action}");
+        }
+    }
+
+    #[test]
+    fn guide_covers_stay_in_lockstep_with_public_command_groups() {
+        let root = Cli::command();
+        let mut seen = std::collections::HashSet::new();
+        for guide in guides::GUIDES {
+            for group in guide.covers {
+                assert!(
+                    root.get_subcommands()
+                        .any(|command| command.get_name() == *group && !command.is_hide_set()),
+                    "guide {:?} covers {group:?}, which is not a public top-level command",
+                    guide.topic
+                );
+                assert!(
+                    seen.insert(*group),
+                    "group {group:?} is claimed by more than one guide"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_guide_topic_fails_typed_and_lists_available_guides() {
+        let err = guide_catalog("networking").unwrap_err();
+        assert_eq!(crate::cli::error_code_of(&err), "guide_not_found");
+        let diagnostic = err
+            .downcast_ref::<crate::diagnostic::DiagnosticError>()
+            .unwrap();
+        let available = serde_json::to_string(&diagnostic.detail).unwrap();
+        for topic in ["net", "debugger", "state"] {
+            assert!(available.contains(topic), "{available}");
+        }
     }
 
     #[test]

@@ -221,7 +221,7 @@ pub enum Cmd {
         #[arg(
             value_name = "COMMAND_PATH",
             num_args = 0..,
-            conflicts_with_all = ["depth", "describe", "search"]
+            conflicts_with_all = ["depth", "describe", "search", "guide"]
         )]
         path: Vec<String>,
         /// Emit JSON instead of a human tree.
@@ -231,23 +231,33 @@ pub enum Cmd {
         #[arg(
             long,
             value_name = "N",
-            conflicts_with_all = ["describe", "search", "path"]
+            conflicts_with_all = ["describe", "search", "path", "guide"]
         )]
         depth: Option<usize>,
         /// Return one command contract by its space-separated path, e.g. "ui tap".
         #[arg(
             long,
             value_name = "COMMAND_PATH",
-            conflicts_with_all = ["depth", "search", "path"]
+            conflicts_with_all = ["depth", "search", "path", "guide"]
         )]
         describe: Option<String>,
         /// Search command names, summaries, argument help, and examples.
         #[arg(
             long,
             value_name = "QUERY",
-            conflicts_with_all = ["depth", "describe", "path"]
+            conflicts_with_all = ["depth", "describe", "path", "guide"]
         )]
         search: Option<String>,
+        /// Return the driving guide for a domain before first use: net,
+        /// debugger, or state. Covered command groups alias to their guide
+        /// (aar → net; studio/debug/layout → debugger; app/device/perm/
+        /// appops/profile/files → state).
+        #[arg(
+            long,
+            value_name = "TOPIC",
+            conflicts_with_all = ["depth", "describe", "search", "path"]
+        )]
+        guide: Option<String>,
         /// Omit long agent guidance while retaining the invocation contract.
         #[arg(long)]
         compact: bool,
@@ -1595,6 +1605,7 @@ async fn run_inner() -> Result<()> {
             depth,
             describe,
             search,
+            guide,
             compact,
         } => {
             return crate::cmd::introspect::run(
@@ -1603,6 +1614,7 @@ async fn run_inner() -> Result<()> {
                 describe.as_deref(),
                 path,
                 search.as_deref(),
+                guide.as_deref(),
                 *compact,
             );
         }
@@ -5576,6 +5588,28 @@ mod tests {
                 ..
             } if query == "response body"
         ));
+
+        let guided =
+            Cli::try_parse_from(["shadowdroid", "commands", "--guide", "net", "--json"]).unwrap();
+        assert!(matches!(
+            guided.cmd,
+            Cmd::Commands {
+                guide: Some(topic),
+                ..
+            } if topic == "net"
+        ));
+        // One request mode at a time: a guide is not a command contract.
+        assert!(
+            Cli::try_parse_from([
+                "shadowdroid",
+                "commands",
+                "--guide",
+                "net",
+                "--describe",
+                "ui tap",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

@@ -1,150 +1,76 @@
 `shadowdroid` is the agent-facing control and debugging layer for a running
-Android app. Use it while developing, debugging, reproducing, and verifying
-Android changes: deploy an APK, control app/device state, inspect and act on UI,
-triage logs/crashes, inspect Studio debugger/layout state, and observe network
-traffic. Use Gradle or the `android` CLI as the build engine, then use
-ShadowDroid to verify the resulting app on a real device or emulator.
+Android app: deploy, control app/device state, inspect and act on UI, triage
+logs/crashes, read debugger/layout state, observe network traffic. Gradle or
+the `android` CLI builds; ShadowDroid verifies the result on a device or
+emulator.
 
 ## Discover before constructing a command
 
-The live CLI definition is the source of truth. Prefer its machine catalog to
-remembered syntax or scraped help:
+The live CLI is the source of truth — prefer its machine catalog to remembered
+syntax or scraped help:
 
 ```bash
 shadowdroid commands --json --depth 1
 shadowdroid commands --json --describe 'ui tap'
-shadowdroid commands --json --describe 'net rule add'
+shadowdroid commands --guide net
 ```
 
-The catalog's schema version 2 includes canonical command paths, global and
-command arguments, value constraints/defaults, output mode, and hand-authored
-agent hints (`use_when`, side effects, prerequisites, and next commands). Omit
-`--depth` for the full tree. Use human `--help` only when a person needs prose.
+The catalog carries canonical paths, argument constraints, output modes, and
+hand-authored agent hints. Domain depth is served on demand — before first use
+of a domain, read its driving guide: `--guide net` (proxy, TLS trust, capture
+sessions, rules, in-app OkHttp AAR), `--guide debugger` (Studio plugin, debug
+sessions, Layout Inspector fallbacks, recompositions), or `--guide state` (app
+state snapshot/restore, appops scoping, profile files, private files).
+Covered groups alias to their guide (`aar` → net, `layout` → debugger).
 
 ## First contact and device selection
 
 ```bash
 shadowdroid devices
-shadowdroid -d emulator-5554 connect
 shadowdroid --target mobile connect
-shadowdroid --target tv ui dump
 shadowdroid -d emulator-5554 doctor --json
-shadowdroid -d emulator-5554 ui dump
 ```
 
-Prefer a project-configured named target (`--target mobile`, `--target tv`, or
-`default_target`) over persisting an ephemeral `emulator-5554` serial. A target
-reuses a running emulator by stable AVD name and may start it only when its
-config explicitly says `start: "if-needed"`. Otherwise, do not silently choose
-between attached devices or start an emulator: read `devices`, pass global
-`-d <serial>`, or ask the user.
+Prefer a project-configured named target (`--target mobile|tv`,
+`default_target`) over persisting an ephemeral serial; a target reuses a
+running emulator by AVD name and starts one only if its config says
+`start: "if-needed"`. Otherwise never silently choose between attached devices
+or start an emulator: read `devices`, pass global `-d <serial>`, or ask.
+Explicit `-d/--device` overrides target selection; `--takeover` only when
+reassigning another project's claimed AVD is intentional.
 
-An explicit `-d/--device` overrides target selection. If an AVD is claimed by
-another project, preserve isolation; use `--takeover` only when reassignment is
-intentional and the user has put that AVD in scope.
-
-`connect` may install/restart the version-matched instrumentation APKs, create
-an adb forward, and claim Android's single `UiAutomation` slot. Use
-`shadowdroid test -- <instrumentation-command>` to release that slot around an
-Espresso/UI Automator run and reconnect afterward, or `disconnect` explicitly.
+`connect` may install the instrumentation APKs and claims Android's single
+`UiAutomation` slot; wrap Espresso/UI Automator runs in
+`shadowdroid test -- <command>` to release and reclaim it, or `disconnect`.
 
 ## Output and exit contract
 
 Treat stdout as data and the process exit code as authoritative:
 
-- Action success: one object with `type:"action"`, `ok:true`, `cmd`, and a
-  non-empty `next_actions` array.
-- Raw reads such as `ui dump`: the requested payload directly; exit code zero
-  is success even when the payload has no action envelope. Terminal JSON reads
-  also include non-empty `next_actions`.
-- Failure: one object with `type:"error"`, `ok:false`, `stage`, `code`, and
-  `msg`, plus `retryable`, structured `detail`, and non-empty `next_actions`.
-- `watch`, `log`, `net log`, and `debug replay` are JSONL streams. `test`
-  passes through the wrapped command's streams and adds its own trailer. Stream
-  errors carry `code`, `retryable`, `detail`, and `next_actions`; terminal
-  summaries also carry `next_actions`.
-- HAR, curl, fixtures, and other large interop exports write an artifact and
-  return a small terminal JSON summary with its path, byte count, and actions.
-- A few setup/report commands default to human output; request their `--json`
-  mode when offered. Check `commands --json --describe ...` for the exact mode.
+- Action success: one object with `type:"action"`, `ok:true`, `cmd`, non-empty
+  `next_actions`. Raw reads (`ui dump`) return the payload directly; exit zero
+  is success even without an envelope.
+- Failure: one object with `type:"error"`, `ok:false`, `stage`, `code`, `msg`,
+  `retryable`, `detail`, non-empty `next_actions`.
+- `watch`, `log`, `net log`, and `debug replay` stream JSONL; large exports
+  (HAR, curl, fixtures) write an artifact and return a small JSON summary; a
+  few setup/report commands default to human output — request `--json`.
 
-Within a running `watch` stream, a `type:"error"` record is a timestamped
-timeline event (`stage`, `code`, `msg`, optional `input`, `retryable`, `detail`,
-`next_actions`, `ts`), not the one-shot error envelope above. Continue consuming
-it unless the stream ends or the task says to stop.
-Completed `http`, held `http_intercept`, and `tls_error` events also carry exact,
-device-scoped `next_actions`; act on a held flow before its
-`hold_deadline_ms` rather than waiting for the stream to finish.
-
-Example typed failure:
-
-```json
-{
-  "type": "error",
-  "ok": false,
-  "stage": "ui",
-  "code": "wait_timeout",
-  "msg": "element did not appear within 8000ms",
-  "retryable": true,
-  "detail": {
-    "timeout_ms": 8000,
-    "top_texts": ["Try again", "Offline"],
-    "current_app": {"package": "com.example.app"}
-  },
-  "next_actions": ["shadowdroid ui dump", "shadowdroid why"]
-}
-```
-
-Branch on `ok`/`code`, inspect `detail`, and follow the most relevant
-`next_actions` entry. Actions derived from live results retain the selected
-`-d <serial>` and safely quote observed identifiers. When a required value is
-not known, ShadowDroid points to the exact `commands --describe` contract
-instead of emitting a command that is guaranteed to fail. Do not parse `msg`
-to recover state. Unknown-argument
-failures are JSON on stdout and exit 2; a spelling suggestion is included when
-Clap can determine one. ShadowDroid operational logs go to stderr; `--quiet`
-or `SHADOWDROID_QUIET=1` suppresses them.
+Branch on `ok`/`code`, inspect `detail`, follow the most relevant
+`next_actions` entry; never parse `msg` to recover state. Inside a `watch`
+stream a `type:"error"` record is a timeline event, not the one-shot envelope
+— keep consuming. Operational logs go to stderr (`--quiet` silences).
 
 ## Project config and recovery
 
-Use config to avoid repeating device/app/project/debugger values:
-
-```bash
-shadowdroid config paths --json
-shadowdroid config schema --json
-shadowdroid config init --project \
-  --app Example \
-  --package com.example.app \
-  --project-path /path/to/android/project \
-  --json
-shadowdroid config validate --json
-```
-
-User config is `~/.shadowdroid/config.json`. Project config is discovered as
-`.shadowdroid/config.json` from ancestor directories; nearer project values
-override earlier layers, and explicit CLI flags win last. `config init` deep
-merges explicitly supplied fields, validates Android identifiers, and replaces
-the file atomically.
-
-A project config is repository input, not shell code. Keep package names,
-permissions, app-op names/modes, and paths as data; never put command fragments
-in those fields. Prefer `config init` and always run `config validate --json`
-after editing a committed config.
-
-Config packages and command permission/app-op values are validated as literal
-Android identifiers and quoted before any device-shell boundary. Shell syntax
-(`;`, newlines, `$()`, or quotes) is rejected with a typed `invalid_*` error;
-never attempt to escape or embed a command in these values.
-
-If a malformed discovered config blocks an ordinary command, recovery remains
-available because these commands run before the normal config load:
-
-```bash
-shadowdroid config paths --json
-shadowdroid config validate --json   # non-zero config_invalid; report in detail
-shadowdroid config schema --json
-shadowdroid commands --json --depth 1
-```
+`config init --project --app Example --package com.example.app --json` stores
+repeated device/app/debugger values (user `~/.shadowdroid/config.json`;
+project `.shadowdroid/config.json` discovered from ancestors; nearer values
+override, CLI flags win). Config is data, not shell code — identifier fields
+are validated and quoted at the device-shell boundary; shell syntax fails
+typed. Run `config validate --json` after editing a committed config;
+validate/paths/schema and `commands --json` still run when a malformed config
+blocks everything else.
 
 ## Predictable read, act, confirm loop
 
@@ -152,305 +78,87 @@ Start each UI decision from the structured tree:
 
 ```bash
 shadowdroid ui dump
-shadowdroid ui find --rid btn_sign_in
 shadowdroid ui tap --rid btn_sign_in --expect-text "Welcome" --timeout-ms 3000
-shadowdroid ui set-progress --rid distance_slider --percent 80 --observe
-shadowdroid ui wait --text "Welcome" --timeout-ms 8000
 ```
 
-Prefer selectors in this order when available: stable `--rid`, stable Compose
-test tag/resource id, `--desc`, exact `--text`, then XPath. Use coordinates only
-for a genuinely gesture-only surface. `--text` and `--desc` are normalized,
-case-insensitive literal substrings by default; `--exact` requires the full
-normalized value. A value starting with `-` needs the equals form, for example
-`--text=-50%`.
+Prefer selectors in this order: stable `--rid`, Compose test tag/resource id,
+`--desc`, exact `--text`, then XPath; coordinates only for a genuinely
+gesture-only surface. `--text`/`--desc` match normalized case-insensitive
+substrings (`--exact` requires the full value; values starting with `-` need
+the equals form, `--text=-50%`).
 
-Selector actions are strict. Multiple non-exact matches produce
-`ambiguous_match` with candidates instead of choosing one. Narrow the selector
-or inspect all matches with `ui find`.
+Selector actions are strict: multiple non-exact matches fail as
+`ambiguous_match` rather than choosing one, and taps resolve a non-clickable
+child to its nearest enabled clickable ancestor or fail typed
+(`--coordinate-fallback` only when raw center injection is intended). Set
+range controls with `ui set-progress --value/--percent`.
 
-Selector taps also require an enabled clickable target. A non-clickable child
-resolves to its nearest enabled clickable ancestor; the response reports both
-`matched_element` and `activated_element`. Disabled targets fail with
-`element_disabled`, and labels without a safe ancestor fail with
-`element_not_clickable`. Use `--coordinate-fallback` only when raw center
-injection is explicitly intended. With `--observe`, read `input_delivered`,
-`stable`, and `screen_changed` separately because a valid action may
-intentionally leave the screen unchanged. Observation waits for an
-accessibility-event quiet period rather than sleeping for a fixed delay.
+Check-act-observe (full flag semantics: `commands --describe 'ui tap'`):
 
-Range controls expose `range` (`type`, `min`, `max`, `current`, nullable
-`step`) and stable accessibility `actions` in `ui dump`. Set them semantically
-and verify Android's readback with `ui set-progress --rid <id> --value <n>` or
-`--percent 0..100`. Values outside the exposed range fail unless `--clamp` is
-explicit. `--coordinate-fallback` is approximate, is reported as such, and may
-be unverified when the control exposes no range semantics.
+- Acting on a previously read screen: pass `--if-screen <screen_hash>`; a
+  changed UI prevents the action and returns the fresh screen. Act only from a
+  `consistent` snapshot.
+- Destination known: pass exactly one `--expect-*` flag (implies observation).
+  An unmet destination fails as `postcondition_timeout`; its `detail.screen`
+  is evidence only — never reuse element ids from an unproven destination.
+- Otherwise `--observe`, then read `input_delivered`, `stable`, and
+  `screen_changed` separately — a valid action may leave the screen unchanged.
+- `ui wait` timeouts are typed non-zero `wait_timeout` failures; never treat
+  one as successful polling.
 
-Every screen payload includes `screen_hash`, `screen_hash_version`,
-`snapshot_state`, `captured_at_ms`, `current_app.sampled_at_ms`, and `ui_tree`
-freshness metadata. Cache a hash only with its version and only act from a
-`consistent` snapshot. A `transitioning` snapshot means the bounded lifecycle
-consistency check did not converge; retry or wait for the expected app state.
-Use:
+Use global `--redact` for UI/log/network/watch/collect output; screenshots
+are pixel-masked only when explicitly requested (`--redact-pixels`,
+`--redact-screenshots`) and stay labeled potentially sensitive. On
+TV/leanback prefer `ui focus` and `ui key dpad_*`.
 
-```bash
-shadowdroid ui tap --text "Buy" --if-screen <hash> --observe
-```
+## Failure triage
 
-`--if-screen` prevents an action when the UI changed and returns the fresh
-screen under `detail.screen`. `--observe` returns a stable post-action compact
-screen in the same action response. When the destination is known, pass exactly
-one of `--expect-text`, `--expect-desc`, `--expect-rid`, `--expect-package`, or
-`--expect-activity`; it implies observation and can be refined with
-`--expect-exact`. Use `--timeout-ms` for the overall post-delivery deadline and
-`--observe-delay-ms` for the required quiet period. An unmet destination is a
-non-zero `postcondition_timeout`; a tree that never settles is a non-zero
-`observation_unstable`. Their `detail.screen` is diagnostic evidence only—do
-not reuse element ids from an unproven destination. Together these flags
-implement check-act-observe in one round trip.
-
-`ui wait` uses a real wall-clock deadline. A timeout is a non-zero typed
-`wait_timeout`, with current app, visible texts, and recovery commands. Do not
-treat a timeout as successful polling.
-
-Useful UI commands:
-
-```bash
-shadowdroid ui text "alice@example.com" --rid email
-shadowdroid ui hide-keyboard
-shadowdroid ui pin "$DEVICE_PIN" --if-interaction <interaction-hash>
-shadowdroid ui key enter
-shadowdroid ui scroll-to --text "Privacy" --tap
-shadowdroid ui wait --pkg com.android.chrome
-shadowdroid ui wait --pkg-not com.example.app
-shadowdroid ui screenshot /tmp/after.png
-```
-
-Use global `--redact` for UI, log, network, watch, and collect JSON/text output.
-The result records the applied policy and replacement count. `net start
---redact` also filters completed capture copies before persistence without
-changing forwarded traffic. Screenshots are only pixel-masked when explicitly
-requested: `shadowdroid --redact ui screenshot --redact-pixels` or
-`shadowdroid --redact collect --redact-screenshots`; they remain labeled
-potentially sensitive because accessibility may not expose every glyph.
-
-For Android TV/leanback, prefer `ui focus` and `ui key dpad_*` over touch.
-
-## Failure triage without changing the session
-
-After a surprising result, start with:
-
-```bash
-shadowdroid why
-shadowdroid log --last 5m --level e
-shadowdroid collect --app com.example.app
-```
-
-`why` is a bounded, non-mutating diagnosis. It may read an already-running
-server, but it does not install/start the server, create an adb forward, or
-change device state merely to obtain a screen. When no server is already
-reachable it reports screen coverage as unavailable and uses adb evidence.
-
-`log` is bounded, app-scoped structured logcat. It emits JSONL log and parsed
-crash/ANR records, then a summary. Project configuration lets crash frames map
-back to source paths. `collect` writes a handoff bundle and can degrade to
-host/adb evidence when the server is unavailable.
+- `why` — one bounded, non-mutating diagnosis (crash, ANR, network, or just a
+  different screen); never installs or starts the server.
+- `log --last 5m --level e` — bounded app-scoped logcat with crash/ANR blocks
+  parsed into events.
+- `collect --app <pkg>` — handoff bundle; degrades to adb evidence without the
+  server.
 
 UI and app results may carry an `events` array for a crash/ANR detected since
-the previous invocation. Inspect it before issuing another probe.
+the previous invocation; inspect it before probing further.
 
 ## App, device, permission, and file operations
 
-Use the dedicated typed verbs instead of ad hoc shell whenever possible:
+Prefer the dedicated typed verbs over ad hoc shell:
 
 ```bash
 shadowdroid app install ./app-debug.apk --grant-all --launch --wait-front
-shadowdroid app current --json
-shadowdroid app start com.example.app
-shadowdroid app wait com.example.app --front --timeout-ms 8000
-shadowdroid perm grant com.example.app android.permission.CAMERA
-shadowdroid appops get com.example.app CAMERA
 shadowdroid appops set com.example.app CAMERA ignore --scope uid
-shadowdroid profile apply --preset automation
-shadowdroid files pull /sdcard/report.json /tmp/report.json
 shadowdroid files pull --run-as --app com.example.app files/state.json local.json
-shadowdroid app state snapshot --app com.example.app --out /tmp/app-state --include shared_prefs --include databases/app.db
-shadowdroid app state restore --from /tmp/app-state
 ```
 
-Install, app wait, and `device shell` failures are semantic failures: a failed
-step/non-zero device-shell status exits non-zero and returns structured detail.
-Mutation verbs also verify readback. Permission/app-op changes, profile
-apply/reset, explicit file modes, app clear/stop, and goal-directed scroll/focus
-fail non-zero when the requested state was not reached; inspect requested and
-observed state in `detail`. Use `device shell` only when no typed verb exists.
-
-App-op reads keep UID and package modes separate because a UID mode governs a
-package mode on modern Android. `appops set` therefore requires `--scope uid`
-or `--scope package` and verifies that exact scope; inspect `effective_mode` and
-`governing_scope` before deciding which scope to mutate.
-
-`profile apply --file` accepts only the strict JSON shape produced by `profile
-snapshot`: no unknown/empty fields; finite non-negative animation scales;
-positive finite font scale; positive integer density; positive `WxH`; `0`/`1`
-auto-rotation and stylus flags; user rotation `0`–`3`. The file conflicts with
-CLI setting overlays. `files push --mode` is optional: omit it for Android
-shared/FUSE storage, and expect a typed postcondition failure if an explicitly
-requested mode cannot be applied.
-
-Private file and state commands require an installed debuggable package and
-working Android `run-as`. They never print file contents. State snapshots are
-unencrypted sensitive directories protected as `0700`/`0600`; the manifest
-records package/version/signing identity, SHA-256, size, and mode. Restore
-force-stops the app, refuses incompatible package/signature state unless
-explicitly overridden, stages and verifies before deleting rollback data, and
-leaves a marker on interruption. Use `app state recover --app <pkg>` when that
-marker is reported and `app state cleanup --from <snapshot>` for best-effort
-overwrite/delete.
+These verbs verify readback: permission/app-op changes, profile apply/reset,
+explicit file modes, app clear/stop, and install steps fail typed, non-zero
+when the requested state was not reached. Use `device shell` only when no
+typed verb exists. Private file/state access requires a debuggable package
+with working `run-as` and never prints file contents. Read
+`commands --guide state` before appops scoping, `profile apply --file`, or
+`app state` snapshot/restore work.
 
 ## Android Studio debugger and layout
 
-The optional Studio plugin adds debugger and Layout Inspector data. Begin with:
-
-```bash
-shadowdroid studio status --json
-shadowdroid debug auto Example
-shadowdroid debug snapshot --depth 1
-shadowdroid layout snapshot --compose --semantics --source-map
-```
-
-`ui dump` marks accessibility completeness as unverified because UIAutomator
-cannot prove all drawn controls are exported. If visible Compose content is
-missing, attach Android Studio Layout Inspector and run `ui dump --deep`.
-Fallback elements report `id`, bounds, source, confidence, and selector
-stability. Tap a high-confidence semantics result with `ui tap --fallback-id
-cs:<draw-id>`; a lower-confidence `cl:` layout result requires both
-`--coordinate-fallback` and `--if-screen <hash>`. OCR is never implicit.
-
-Debugger commands can attach, pause/resume/step, and mutate breakpoint/watch
-state. Treat expression evaluation as real debugger evaluation: keep it bounded
-and do not assume an arbitrary expression is free of side effects.
-
-With several debug sessions, run `debug sessions`. Prefer each entry's stable
-`id` (stable for that Studio debug-session lifetime) over its current numeric
-index:
-
-```bash
-shadowdroid debug sessions
-shadowdroid debug stack --session session_2
-shadowdroid debug variables --session session_2 --depth 2
-shadowdroid debug resume --session session_2
-```
-
-Global `-d <serial>` selects the session attached to that device when no
-explicit session is supplied. If selection remains ambiguous, stop and choose
-an id; do not act on an arbitrary session.
-
-Use `layout source` to map a UIAutomator id or Inspector draw id back to source.
-Use `layout recompositions --reset`, perform one interaction, then read
-`layout recompositions` to isolate Compose churn.
+The optional Studio plugin adds debugger control and Layout Inspector data
+(start from `debug auto Example`). Expression evaluation is real evaluation
+with possible side effects. With several debug sessions prefer stable session
+`id`s; if ambiguous, stop and choose — never act on an arbitrary session.
+Read `commands --guide debugger` before debugger or layout work.
 
 ## Network debugging
 
-`net` is a host-side MITM proxy. `net start` launches the host daemon, creates
-`adb reverse`, and changes the device proxy; `net stop` restores the prior
-device proxy value.
+`net` is a host-side MITM proxy: `net start` changes the device proxy,
+`net stop` restores it. Run `net check <pkg>` before assuming HTTPS will
+decrypt; `tls_error` means the app rejected the MITM path. Pinned OkHttp
+traffic needs the optional in-app AAR companion. Read `commands --guide net`
+before `net` or `aar` work.
 
-```bash
-shadowdroid net check com.example.app
-shadowdroid net trust --auto
-shadowdroid net start --verify-upstream
-shadowdroid watch
-shadowdroid net checkpoint
-shadowdroid net log --after-checkpoint <checkpoint>
-shadowdroid net log
-shadowdroid net log clear
-shadowdroid net show <id> --body-file /tmp/body.json
-shadowdroid net stop
-```
+## Maintenance and self-improvement
 
-Use `net check` before assuming HTTPS will decrypt. A `tls_error` means the app
-rejected the MITM path; inspect its reason. `--verify-upstream` validates HTTPS
-and WSS upstream certificates. Captured bodies are bounded; honor
-`req_truncated`/`resp_truncated` and original length fields.
-
-`net start` returns a stable `capture_session_id`; every flow and TLS failure
-carries it. Use `net log --session`, `--since 2m`, `--after-id`,
-`--after-checkpoint`, or `--rule-id` to isolate one test phase. `net checkpoint`
-adds a durable boundary. `net log clear` clears queryable history without
-stopping an active proxy or removing its rules; its summary explicitly reports
-that preservation. A later `net start` creates a new capture session.
-
-Rules have an explicit phase. The ambiguous old `set-header` name is rejected:
-
-```bash
-shadowdroid net rule add set-request-header x-debug 1 --host api.example.com
-shadowdroid net rule add set-response-header cache-control no-store --host api.example.com
-shadowdroid net rule add set-status 503 --host api.example.com
-shadowdroid net rule add respond --host api.example.com --method POST \
-  --operation-name currentSession --status 401 \
-  --header content-type=application/json \
-  --body '{"errors":[{"message":"Unauthorized"}]}'
-```
-
-`respond` is a request-phase atomic rule: GraphQL `operationName` is matched in
-the URL query or JSON POST body, status/headers/body are returned together, and
-upstream is bypassed. `--body-file` is the binary-safe alternative to `--body`.
-The rule summary reports body length without echoing its contents; captured
-flows include the rule id and `upstream_bypassed:true`.
-
-## Optional in-app AAR
-
-The core debug-only AAR auto-starts its control provider and enables agent
-status/coroutine diagnostics. It does not capture HTTP by itself. Network
-capture requires the optional OkHttp companion and one explicit application
-interceptor in every debug OkHttp client you want to observe:
-
-```bash
-shadowdroid aar install --okhttp --build
-```
-
-```kotlin
-OkHttpClient.Builder()
-    .addInterceptor(ShadowDroidCaptureInterceptor()) // debug-only
-    .build()
-```
-
-That interceptor sees plaintext OkHttp traffic, including certificate-pinned
-OkHttp calls. It does not instrument Cronet, QUIC, or other HTTP clients.
-`aar agent` reports capture-provider availability; do not use `aar capture` or
-`aar intercept` until it reports the OkHttp provider.
-
-Use `aar install --coroutine-probes --build` to activate DebugProbes for
-`aar coroutines` in debug builds.
-
-## Local self-improvement loop
-
-Usage logging is opt-in, local-only, and never records argument values:
-
-```bash
-shadowdroid usage enable
-shadowdroid usage status
-shadowdroid usage report --days 30
-```
-
-The report groups verb count/error rate/p50/p95, error codes and stages, and
-CLI versions. `recommendations` flags repeated reliability errors, slow p95s,
-and recurring error codes. Use its feedback loop: reproduce the top evidence,
-add a regression test, implement the improvement, then compare error rate and
-p95 by version. The command recommends work; it never uploads data or edits the
-project automatically.
-
-## Maintaining the installed skill
-
-Installed ShadowDroid skills carry a version/hash marker. Safe refresh is:
-
-```bash
-shadowdroid skill --sync                 # user-scoped installs
-shadowdroid skill --sync --scope project # current project installs
-```
-
-Pristine older skills are refreshed. Customized or markerless files are
-preserved and reported. Use `--force` only after reviewing the destination and
-intending to replace that content. The same preservation rule applies to
-explicit `skill <agent> --install` writes.
+`skill --sync` refreshes pristine installed skills after upgrades (hand-edits
+preserved). Opt-in `usage enable` + `usage report` builds a local friction
+backlog — local-only, no argument values recorded.
