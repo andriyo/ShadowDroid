@@ -273,6 +273,19 @@ fn strip_marker(content: &str) -> &str {
     }
 }
 
+/// Content after the marker's closing `-->`, or `""` when there is no marker
+/// (or its closing is missing). Non-whitespace here is user content the body
+/// hash can't see, so writers must treat it as a customization.
+fn trailing_after_marker(content: &str) -> &str {
+    let Some(idx) = content.rfind(MARKER_PREFIX) else {
+        return "";
+    };
+    match content[idx..].find("-->") {
+        Some(end) => &content[idx + end + 3..],
+        None => "",
+    }
+}
+
 /// Returns `(body, version, body_hash)` from a marked file, or `None` if the
 /// marker (or either field) is absent.
 fn split_marker(content: &str) -> Option<(&str, String, String)> {
@@ -386,7 +399,8 @@ enum Decision {
     NormalizeMarker,
     /// Unmodified since ShadowDroid wrote it, but an older version.
     StalePristine(Option<String>),
-    /// Hand-edited (marker hash no longer matches the body).
+    /// Hand-edited (marker hash no longer matches the body, or content was
+    /// appended after the marker line).
     Customized,
     /// No marker — can't prove it's unmodified.
     Untracked,
@@ -399,11 +413,14 @@ fn inspect(agent: &str, path: &Path) -> Result<(Decision, String)> {
     if installed == expected {
         return Ok((Decision::UpToDate, expected));
     }
-    if strip_marker(&installed) == strip_marker(&expected) {
+    // Content appended after the marker line is invisible to the body hash;
+    // never let it read as pristine or as a marker-only difference.
+    let trailing_edit = !trailing_after_marker(&installed).trim().is_empty();
+    if !trailing_edit && strip_marker(&installed) == strip_marker(&expected) {
         return Ok((Decision::NormalizeMarker, expected));
     }
     let decision = match split_marker(&installed) {
-        Some((body, ver, stored)) if body_hash(body) == stored => {
+        Some((body, ver, stored)) if body_hash(body) == stored && !trailing_edit => {
             Decision::StalePristine(Some(ver))
         }
         Some(_) => Decision::Customized,
@@ -743,6 +760,42 @@ mod tests {
             "personal instructions\n"
         );
 
+        write_skill_checked("claude-code", &path, &generated, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), generated);
+    }
+
+    #[test]
+    fn checked_writer_treats_content_after_marker_as_customization() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("SKILL.md");
+        let generated = generated_content("claude-code").unwrap();
+
+        // Same-version install with text appended after the marker line: the
+        // body hash can't see it, so without this guard it read as a
+        // marker-only difference and a plain sync silently deleted it.
+        let appended = format!("{generated}\nMY EDIT\n");
+        std::fs::write(&path, &appended).unwrap();
+        let (decision, _) = inspect("claude-code", &path).unwrap();
+        assert!(matches!(decision, Decision::Customized));
+        let err = write_skill_checked("claude-code", &path, &generated, false).unwrap_err();
+        assert_eq!(crate::cli::error_code_of(&err), "skill_customized");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), appended);
+
+        // Same append on a pristine-but-stale body (marker hashes its own
+        // body): must read as customized, not stale-pristine.
+        let stale = format!("{}\nMY EDIT\n", append_marker("older curated body\n"));
+        std::fs::write(&path, &stale).unwrap();
+        let (decision, _) = inspect("claude-code", &path).unwrap();
+        assert!(matches!(decision, Decision::Customized));
+
+        // Whitespace-only trailing content is still a marker-level difference,
+        // not a customization — sync may normalize it away.
+        std::fs::write(&path, format!("{generated}\n\n")).unwrap();
+        let (decision, _) = inspect("claude-code", &path).unwrap();
+        assert!(matches!(decision, Decision::NormalizeMarker));
+
+        // --force remains the explicit escape hatch.
+        std::fs::write(&path, &appended).unwrap();
         write_skill_checked("claude-code", &path, &generated, true).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), generated);
     }
