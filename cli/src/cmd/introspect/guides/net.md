@@ -60,9 +60,10 @@ retained); `permessage-deflate` payloads are inflated and marked
 
 `net log` shows WebSocket **lifecycle** (`ws_open`/`ws_close`) inline with HTTP
 by default but withholds the per-message firehose; add `--protocol websocket`
-(messages only) or `--protocol all` to include `ws_msg`, or `--protocol http` to
-hide WebSockets. `--redact`, capture-session scoping, `--since`, and checkpoints
-apply to WebSocket records exactly as to flows. On `watch`, `ws_open`, `ws_msg`,
+(WebSocket records only — no HTTP) or `--protocol all` to include `ws_msg`, or
+`--protocol http` to hide WebSockets. `--redact` (text frames, handshake headers,
+close reasons), capture-session scoping, `--since`, and checkpoints apply to
+WebSocket records exactly as to flows. On `watch`, `ws_open`, `ws_msg`,
 and `ws_close` interleave live with `screen`/`http`.
 
 Limitations: capture requires the connection to traverse the proxy and be

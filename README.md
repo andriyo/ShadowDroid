@@ -870,15 +870,16 @@ and decodes a copy of the frame stream. Inspect it hierarchically so an agent
 spends tokens only on the frames it needs: `net ws` lists sessions (id, url,
 per-direction message/byte counts), `net ws <id>` lists that session's messages
 (compact `dir`/`opcode`/`preview`, filterable by `--dir`/`--opcode`/`--grep`/
-`--since`), and `net show <message-id>` reveals a full reassembled payload
-(`--body-file` writes it binary-safe). Fragmented messages are reassembled and
-`permessage-deflate` payloads inflated (marked `compressed`/`decompressed`, with
-`wire_len` vs `payload_len`). `net log` shows `ws_open`/`ws_close` lifecycle
-inline with HTTP by default; `--protocol websocket|all` adds per-message
-`ws_msg` events, which also stream live on `watch`. `net export jsonl` writes a
-durable line-per-record dump. Payload retention is bounded (`truncated`),
-`--redact` applies to text frames, and an engine that bypasses the proxy or pins
-its certificate is reported (`tls_error`) rather than silently dropped.
+`--since`), and `net show <message-id> --body` reveals a full reassembled
+payload (`--body-file` writes it binary-safe; bare `net show` returns metadata +
+`preview`). Fragmented messages are reassembled and `permessage-deflate`
+payloads inflated (marked `compressed`/`decompressed`, with `wire_len` vs
+`payload_len`). `net log` shows `ws_open`/`ws_close` lifecycle inline with HTTP
+by default; `--protocol websocket|all` adds per-message `ws_msg` events, which
+also stream live on `watch`. `net export jsonl` writes a durable line-per-record
+dump. Payload retention is bounded (`truncated`), `--redact` scrubs text frames,
+the handshake headers, and close reasons, and an engine that bypasses the proxy
+or pins its certificate is reported (`tls_error`) rather than silently dropped.
 Global `--redact` on `net start` applies the built-in/configured policy to
 authorization/cookie headers, nested JSON/GraphQL body fields, JWTs, email/IP
 values, and configured patterns before completed captures are persisted (the

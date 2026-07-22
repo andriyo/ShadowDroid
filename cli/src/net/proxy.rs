@@ -406,7 +406,8 @@ async fn handle(
     }
     // A WebSocket upgrade can't go through the buffered request path (the body is
     // a bidirectional frame stream that never "completes"). Relay the handshake
-    // and raw-tunnel the two upgraded connections instead.
+    // and splice the two upgraded connections through a frame-capturing tap
+    // (in-scope) or a blind tunnel (out-of-scope).
     if is_websocket_upgrade(req.headers()) {
         return Ok(proxy_websocket(ctx, req, tunnel).await);
     }
@@ -568,10 +569,12 @@ fn is_websocket_upgrade(headers: &http::HeaderMap) -> bool {
 trait IoStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> IoStream for T {}
 
-/// Relay a WebSocket handshake to the real server and, on `101`, raw-tunnel the
-/// two upgraded connections until either side closes. In-scope handshakes are
-/// captured as a flow (frames aren't decoded) — the goal is that wss *works*
-/// while the proxy is scoped to the host instead of silently breaking.
+/// Relay a WebSocket handshake to the real server and, on `101`, splice the two
+/// upgraded connections until either side closes. For an in-scope host the splice
+/// runs through [ws::tap] — every byte forwarded verbatim while a copy of each
+/// frame is decoded into `ws_open`/`ws_msg`/`ws_close`; an out-of-scope host is
+/// blind-tunnelled (no capture). A declined (`≠101`) or errored handshake is
+/// captured as an ordinary flow.
 async fn proxy_websocket(
     ctx: Arc<ProxyContext>,
     mut req: Request<Incoming>,
