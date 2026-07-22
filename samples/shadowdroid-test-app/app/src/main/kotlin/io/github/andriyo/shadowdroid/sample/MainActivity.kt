@@ -302,6 +302,9 @@ class MainActivity : ComponentActivity() {
             contentDescription = "Network request progress"
         }
         root.addView(progress, fullWidth())
+        root.addView(button(R.id.websocket_chat_button, "Open WebSocket chat", "Open WebSocket chat button") {
+            startActivity(Intent(this, WebSocketChatActivity::class.java))
+        })
         root.addView(button(R.id.https_get_button, "HTTPS GET", "HTTPS GET button") {
             runRequest("https-get", "GET", primaryUrl())
         })

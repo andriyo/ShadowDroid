@@ -765,7 +765,7 @@ fn example_tokens(arg: &Arg) -> Vec<String> {
 fn output_mode(path: &[String]) -> &'static str {
     let joined = path.join(" ");
     match joined.as_str() {
-        "watch" | "log" | "net log" | "debug replay" => "jsonl",
+        "watch" | "log" | "net log" | "net ws" | "debug replay" => "jsonl",
         "test" => "passthrough_with_json_trailer",
         "ui gen" => "source_text",
         "skill" => "source_text_or_json_action",

@@ -6,7 +6,7 @@
 use crate::ids::Serial;
 use anyhow::{Context, Result};
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::Path;
@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use crate::events::Event;
 use crate::net::flow::FlowRecord;
+use crate::net::ws::{WsCloseRecord, WsMessageRecord, WsSessionRecord};
 use crate::net::{Matcher, paths};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -38,10 +39,42 @@ pub struct ClearRecord {
     pub after_flow_sequence: u64,
 }
 
+/// Which protocols `net log` interleaves. WebSocket per-message frames are a
+/// firehose, so the default shows session lifecycle (`ws_open`/`ws_close`)
+/// alongside HTTP but withholds `ws_msg` until asked (`WebSocket`/`All`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Protocol {
+    /// HTTP flows + TLS errors + WebSocket lifecycle (no per-message frames).
+    #[default]
+    Default,
+    /// HTTP flows + TLS errors only.
+    Http,
+    /// WebSocket only: upgrades, messages, and closes.
+    WebSocket,
+    /// Everything, including every WebSocket message.
+    All,
+}
+
+impl Protocol {
+    fn include_http(self) -> bool {
+        matches!(self, Protocol::Default | Protocol::Http | Protocol::All)
+    }
+    fn include_ws_lifecycle(self) -> bool {
+        matches!(
+            self,
+            Protocol::Default | Protocol::WebSocket | Protocol::All
+        )
+    }
+    fn include_ws_msg(self) -> bool {
+        matches!(self, Protocol::WebSocket | Protocol::All)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LogQuery {
     pub matcher: Matcher,
     pub limit: usize,
+    pub protocol: Protocol,
     pub capture_session_id: Option<String>,
     pub since_ts: Option<f64>,
     pub after_flow_sequence: Option<u64>,
@@ -72,6 +105,21 @@ pub fn append(serial: &Serial, rec: &FlowRecord) -> Result<()> {
 /// compact HTTP events for `net log`.
 pub fn append_event(serial: &Serial, ev: &Event) -> Result<()> {
     append_line(serial, &serde_json::to_string(ev)?)
+}
+
+/// Append a WebSocket upgrade (`ws_open`) line.
+pub fn append_ws_session(serial: &Serial, rec: &WsSessionRecord) -> Result<()> {
+    append_line(serial, &serde_json::to_string(rec)?)
+}
+
+/// Append one reassembled WebSocket message (`ws_msg`) line.
+pub fn append_ws_message(serial: &Serial, rec: &WsMessageRecord) -> Result<()> {
+    append_line(serial, &serde_json::to_string(rec)?)
+}
+
+/// Append a WebSocket teardown (`ws_close`) line with per-direction totals.
+pub fn append_ws_close(serial: &Serial, rec: &WsCloseRecord) -> Result<()> {
+    append_line(serial, &serde_json::to_string(rec)?)
 }
 
 pub fn append_checkpoint(serial: &Serial, checkpoint: &CheckpointRecord) -> Result<()> {
@@ -201,6 +249,9 @@ fn acquire_log_lock_mode(path: &Path, exclusive: bool) -> Result<File> {
 enum StoredLine {
     Flow(serde_json::Value),
     TlsError(serde_json::Value),
+    WsOpen(serde_json::Value),
+    WsMsg(serde_json::Value),
+    WsClose(serde_json::Value),
     Checkpoint(CheckpointRecord),
     Clear(ClearRecord),
 }
@@ -237,6 +288,9 @@ fn visit_records(path: &Path, mut visit: impl FnMut(StoredLine)) -> Result<()> {
             };
             match value.get("type").and_then(serde_json::Value::as_str) {
                 Some("tls_error") => visit(StoredLine::TlsError(value)),
+                Some("ws_open") => visit(StoredLine::WsOpen(value)),
+                Some("ws_msg") => visit(StoredLine::WsMsg(value)),
+                Some("ws_close") => visit(StoredLine::WsClose(value)),
                 Some("capture_checkpoint") => {
                     if let Ok(checkpoint) = serde_json::from_value(value) {
                         visit(StoredLine::Checkpoint(checkpoint));
@@ -293,7 +347,11 @@ fn read_all_from(path: &Path) -> Result<Vec<FlowRecord>> {
             floor = clear.after_flow_sequence;
             flows.clear();
         }
-        StoredLine::TlsError(_) | StoredLine::Checkpoint(_) => {}
+        StoredLine::TlsError(_)
+        | StoredLine::WsOpen(_)
+        | StoredLine::WsMsg(_)
+        | StoredLine::WsClose(_)
+        | StoredLine::Checkpoint(_) => {}
     })?;
     Ok(flows)
 }
@@ -330,7 +388,11 @@ pub fn read_filtered(serial: &Serial, m: &Matcher, limit: usize) -> Result<Vec<F
             floor = clear.after_flow_sequence;
             recent.clear();
         }
-        StoredLine::TlsError(_) | StoredLine::Checkpoint(_) => {}
+        StoredLine::TlsError(_)
+        | StoredLine::WsOpen(_)
+        | StoredLine::WsMsg(_)
+        | StoredLine::WsClose(_)
+        | StoredLine::Checkpoint(_) => {}
     })?;
     Ok(recent.into_iter().collect())
 }
@@ -351,7 +413,11 @@ fn find_by_id_from(path: &Path, id: &str) -> Result<Option<FlowRecord>> {
             floor = clear.after_flow_sequence;
             found = None;
         }
-        StoredLine::TlsError(_) | StoredLine::Checkpoint(_) => {}
+        StoredLine::TlsError(_)
+        | StoredLine::WsOpen(_)
+        | StoredLine::WsMsg(_)
+        | StoredLine::WsClose(_)
+        | StoredLine::Checkpoint(_) => {}
     })?;
     Ok(found)
 }
@@ -424,6 +490,61 @@ fn read_recent_timeline_from(
     .items)
 }
 
+/// A WS record joins the timeline only when host (and, for `ws_open`, path)
+/// match and no HTTP-only filter (method/status) is set.
+fn ws_value_matches(value: &serde_json::Value, matcher: &Matcher, has_path: bool) -> bool {
+    if matcher.method.is_some() || matcher.status.is_some() {
+        return false;
+    }
+    let host_ok = matcher.host.as_deref().is_none_or(|needle| {
+        value
+            .get("host")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|host| host.to_lowercase().contains(&needle.to_lowercase()))
+    });
+    let path_ok = match matcher.path.as_deref() {
+        None => true,
+        Some(needle) => {
+            has_path
+                && value
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|path| path.to_lowercase().contains(&needle.to_lowercase()))
+        }
+    };
+    host_ok && path_ok
+}
+
+/// Shared checkpoint/clear/since boundary test for WS records (they carry the
+/// same `flow_sequence`/`ts` as flows).
+fn ws_before_boundary(value: &serde_json::Value, floor: u64, query: &LogQuery) -> bool {
+    let ts = value
+        .get("ts")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    let sequence = value
+        .get("flow_sequence")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    (floor > 0 && sequence <= floor)
+        || query
+            .after_flow_sequence
+            .is_some_and(|after| sequence <= after)
+        || query.since_ts.is_some_and(|since| ts < since)
+        || query.after_ts.is_some_and(|after| ts <= after)
+}
+
+/// WS records never carry a rule id, and honor a `--session` restriction.
+fn ws_session_excluded(value: &serde_json::Value, query: &LogQuery) -> bool {
+    query.rule_id.is_some()
+        || query.capture_session_id.as_deref().is_some_and(|session| {
+            value
+                .get("capture_session_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(session)
+        })
+}
+
 fn read_recent_timeline_query_from(
     path: &Path,
     serial: &Serial,
@@ -445,9 +566,9 @@ fn read_recent_timeline_query_from(
     let mut older_events_excluded = false;
     let mut logical_clear_applied = false;
     visit_records(path, |record| {
-        let entry =
-            match record {
-                StoredLine::Flow(value) => serde_json::from_value::<FlowRecord>(value)
+        let entry = match record {
+            StoredLine::Flow(value) if query.protocol.include_http() => {
+                serde_json::from_value::<FlowRecord>(value)
                     .ok()
                     .and_then(|flow| {
                         if !flow.matches(&query.matcher) {
@@ -484,50 +605,127 @@ fn read_recent_timeline_query_from(
                                 sequence,
                                 value,
                             })
-                    }),
-                StoredLine::TlsError(value)
-                    if tls_host_matches(&value, query.matcher.host.as_deref()) =>
-                {
-                    let ts = value
-                        .get("ts")
-                        .and_then(serde_json::Value::as_f64)
-                        .unwrap_or(0.0);
-                    let before_boundary = (query.after_flow_sequence.is_some()
-                        && query.after_ts.is_none())
-                        || query.since_ts.is_some_and(|since| ts < since)
-                        || query.after_ts.is_some_and(|after| ts <= after);
-                    if before_boundary {
-                        excluded_count = excluded_count.saturating_add(1);
-                        older_events_excluded = true;
-                        None
-                    } else if query.rule_id.is_some()
-                        || query.capture_session_id.as_deref().is_some_and(|session| {
-                            value
-                                .get("capture_session_id")
-                                .and_then(serde_json::Value::as_str)
-                                != Some(session)
-                        })
-                    {
-                        None
-                    } else {
-                        Some(RankedEvent {
-                            ts,
-                            kind: 1,
-                            sequence,
-                            value,
-                        })
-                    }
-                }
-                StoredLine::Clear(clear) => {
-                    floor = clear.after_flow_sequence;
-                    excluded_count = excluded_count.saturating_add(recent.len());
+                    })
+            }
+            StoredLine::TlsError(value)
+                if query.protocol.include_http()
+                    && tls_host_matches(&value, query.matcher.host.as_deref()) =>
+            {
+                let ts = value
+                    .get("ts")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0);
+                let before_boundary = (query.after_flow_sequence.is_some()
+                    && query.after_ts.is_none())
+                    || query.since_ts.is_some_and(|since| ts < since)
+                    || query.after_ts.is_some_and(|after| ts <= after);
+                if before_boundary {
+                    excluded_count = excluded_count.saturating_add(1);
                     older_events_excluded = true;
-                    logical_clear_applied = true;
-                    recent.clear();
                     None
+                } else if query.rule_id.is_some()
+                    || query.capture_session_id.as_deref().is_some_and(|session| {
+                        value
+                            .get("capture_session_id")
+                            .and_then(serde_json::Value::as_str)
+                            != Some(session)
+                    })
+                {
+                    None
+                } else {
+                    Some(RankedEvent {
+                        ts,
+                        kind: 1,
+                        sequence,
+                        value,
+                    })
                 }
-                StoredLine::TlsError(_) | StoredLine::Checkpoint(_) => None,
-            };
+            }
+            StoredLine::WsOpen(value) if query.protocol.include_ws_lifecycle() => {
+                if !ws_value_matches(&value, &query.matcher, true) {
+                    None
+                } else if ws_before_boundary(&value, floor, query) {
+                    excluded_count = excluded_count.saturating_add(1);
+                    older_events_excluded = true;
+                    None
+                } else if ws_session_excluded(&value, query) {
+                    None
+                } else {
+                    serde_json::from_value::<WsSessionRecord>(value)
+                        .ok()
+                        .and_then(|record| {
+                            let ts = record.ts;
+                            serde_json::to_value(record.open_event(serial))
+                                .ok()
+                                .map(|value| RankedEvent {
+                                    ts,
+                                    kind: 2,
+                                    sequence,
+                                    value,
+                                })
+                        })
+                }
+            }
+            StoredLine::WsMsg(value) if query.protocol.include_ws_msg() => {
+                if !ws_value_matches(&value, &query.matcher, false) {
+                    None
+                } else if ws_before_boundary(&value, floor, query) {
+                    excluded_count = excluded_count.saturating_add(1);
+                    older_events_excluded = true;
+                    None
+                } else if ws_session_excluded(&value, query) {
+                    None
+                } else {
+                    serde_json::from_value::<WsMessageRecord>(value)
+                        .ok()
+                        .and_then(|record| {
+                            let ts = record.ts;
+                            serde_json::to_value(record.msg_event(serial))
+                                .ok()
+                                .map(|value| RankedEvent {
+                                    ts,
+                                    kind: 3,
+                                    sequence,
+                                    value,
+                                })
+                        })
+                }
+            }
+            StoredLine::WsClose(value) if query.protocol.include_ws_lifecycle() => {
+                if !ws_value_matches(&value, &query.matcher, false) {
+                    None
+                } else if ws_before_boundary(&value, floor, query) {
+                    excluded_count = excluded_count.saturating_add(1);
+                    older_events_excluded = true;
+                    None
+                } else if ws_session_excluded(&value, query) {
+                    None
+                } else {
+                    serde_json::from_value::<WsCloseRecord>(value)
+                        .ok()
+                        .and_then(|record| {
+                            let ts = record.ts;
+                            serde_json::to_value(record.close_event(serial))
+                                .ok()
+                                .map(|value| RankedEvent {
+                                    ts,
+                                    kind: 4,
+                                    sequence,
+                                    value,
+                                })
+                        })
+                }
+            }
+            StoredLine::Clear(clear) => {
+                floor = clear.after_flow_sequence;
+                excluded_count = excluded_count.saturating_add(recent.len());
+                older_events_excluded = true;
+                logical_clear_applied = true;
+                recent.clear();
+                None
+            }
+            _ => None,
+        };
         sequence = sequence.saturating_add(1);
         if let Some(entry) = entry {
             recent.push(Reverse(entry));
@@ -589,7 +787,12 @@ fn read_checkpoint_from(path: &Path, checkpoint_id: &str) -> Result<Option<Check
             cleared_at = clear.cleared_at;
             found = None;
         }
-        StoredLine::Flow(_) | StoredLine::TlsError(_) | StoredLine::Checkpoint(_) => {}
+        StoredLine::Flow(_)
+        | StoredLine::TlsError(_)
+        | StoredLine::WsOpen(_)
+        | StoredLine::WsMsg(_)
+        | StoredLine::WsClose(_)
+        | StoredLine::Checkpoint(_) => {}
     })?;
     Ok(found)
 }
@@ -615,7 +818,12 @@ fn read_tls_errors_from(
             }
         }
         StoredLine::Clear(_) => errors.clear(),
-        StoredLine::Flow(_) | StoredLine::TlsError(_) | StoredLine::Checkpoint(_) => {}
+        StoredLine::Flow(_)
+        | StoredLine::TlsError(_)
+        | StoredLine::WsOpen(_)
+        | StoredLine::WsMsg(_)
+        | StoredLine::WsClose(_)
+        | StoredLine::Checkpoint(_) => {}
     })?;
     Ok(errors.into_iter().collect())
 }
@@ -631,14 +839,509 @@ pub fn read_tls_errors(
     read_tls_errors_from(&paths::session_log_path(serial)?, host, limit)
 }
 
+// ── WebSocket recall (backs `net ws` and WS `net show`) ───────────────────────
+
+#[derive(Debug, Clone, Default)]
+pub struct WsSessionQuery {
+    pub host: Option<String>,
+    pub capture_session_id: Option<String>,
+    pub since_ts: Option<f64>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct WsMessageQuery {
+    pub session_id: Option<String>,
+    pub host: Option<String>,
+    pub dir: Option<String>,
+    pub opcode: Option<String>,
+    pub grep: Option<String>,
+    pub since_ts: Option<f64>,
+    pub after_ts: Option<f64>,
+    pub after_flow_sequence: Option<u64>,
+    pub capture_session_id: Option<String>,
+    pub limit: usize,
+}
+
+/// One row of `net ws`: an upgrade plus its running/final per-direction totals.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WsSessionSummary {
+    pub id: String,
+    pub capture_session_id: String,
+    pub ts: f64,
+    pub scheme: String,
+    pub host: String,
+    pub path: String,
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subprotocol: Option<String>,
+    pub permessage_deflate: bool,
+    /// No `ws_close` seen yet — still open, or the daemon exited mid-session.
+    pub open: bool,
+    /// The upgrade (`ws_open`) predates a `net log clear`, so only its later
+    /// frames survive; url/scheme/path are unknown here.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partial: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dur_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_code: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_reason: Option<String>,
+    pub c2s_msgs: u64,
+    pub s2c_msgs: u64,
+    pub c2s_bytes: u64,
+    pub s2c_bytes: u64,
+    pub dropped: u64,
+}
+
+fn record_after_floor(value: &serde_json::Value, floor: u64) -> bool {
+    let sequence = value
+        .get("flow_sequence")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    floor == 0 || sequence > floor
+}
+
+/// Everything the log tells us about one session id, in first-seen order.
+#[derive(Default)]
+struct WsSessionAgg {
+    open: Option<WsSessionRecord>,
+    close: Option<WsCloseRecord>,
+    /// Host from the open, else the first message/close (for orphaned sessions).
+    host: Option<String>,
+    capture_session_id: Option<String>,
+    first_ts: f64,
+    live: (u64, u64, u64, u64),
+}
+
+fn read_ws_sessions_from(path: &Path, query: &WsSessionQuery) -> Result<Vec<WsSessionSummary>> {
+    // One aggregate per session id; `order` preserves first-seen order so a
+    // session whose `ws_open` was cleared still appears where its frames land.
+    let mut aggs: HashMap<String, WsSessionAgg> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    let mut floor = 0_u64;
+    let touch = |aggs: &mut HashMap<String, WsSessionAgg>,
+                 order: &mut Vec<String>,
+                 id: &str,
+                 ts: f64|
+     -> bool {
+        let fresh = !aggs.contains_key(id);
+        if fresh {
+            order.push(id.to_string());
+        }
+        let agg = aggs.entry(id.to_string()).or_default();
+        if fresh || ts < agg.first_ts {
+            agg.first_ts = ts;
+        }
+        fresh
+    };
+    visit_records(path, |record| match record {
+        StoredLine::WsOpen(value) if record_after_floor(&value, floor) => {
+            if let Ok(open) = serde_json::from_value::<WsSessionRecord>(value) {
+                touch(&mut aggs, &mut order, &open.id, open.ts);
+                let agg = aggs.get_mut(&open.id).unwrap();
+                agg.host = Some(open.host.clone());
+                agg.capture_session_id = Some(open.capture_session_id.clone());
+                agg.open = Some(open);
+            }
+        }
+        StoredLine::WsClose(value) if record_after_floor(&value, floor) => {
+            if let Ok(close) = serde_json::from_value::<WsCloseRecord>(value) {
+                touch(&mut aggs, &mut order, &close.session_id, close.ts);
+                let agg = aggs.get_mut(&close.session_id).unwrap();
+                agg.host.get_or_insert_with(|| close.host.clone());
+                agg.capture_session_id
+                    .get_or_insert_with(|| close.capture_session_id.clone());
+                agg.close = Some(close);
+            }
+        }
+        StoredLine::WsMsg(value) if record_after_floor(&value, floor) => {
+            let session = value
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let ts = value
+                .get("ts")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0);
+            touch(&mut aggs, &mut order, &session, ts);
+            let agg = aggs.get_mut(&session).unwrap();
+            if agg.host.is_none() {
+                agg.host = value
+                    .get("host")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+            }
+            if agg.capture_session_id.is_none() {
+                agg.capture_session_id = value
+                    .get("capture_session_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+            }
+            let dir = value.get("dir").and_then(serde_json::Value::as_str);
+            let len = value
+                .get("payload_len")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            if dir == Some("c2s") {
+                agg.live.0 += 1;
+                agg.live.2 += len;
+            } else {
+                agg.live.1 += 1;
+                agg.live.3 += len;
+            }
+        }
+        StoredLine::Clear(clear) => {
+            floor = clear.after_flow_sequence;
+            aggs.clear();
+            order.clear();
+        }
+        _ => {}
+    })?;
+
+    let host = query.host.as_deref().map(str::to_lowercase);
+    let mut summaries: Vec<WsSessionSummary> = order
+        .into_iter()
+        .filter_map(|id| aggs.remove(&id).map(|agg| (id, agg)))
+        .filter(|(_, agg)| {
+            host.as_deref().is_none_or(|needle| {
+                agg.host
+                    .as_deref()
+                    .is_some_and(|host| host.to_lowercase().contains(needle))
+            }) && query
+                .capture_session_id
+                .as_deref()
+                .is_none_or(|session| agg.capture_session_id.as_deref() == Some(session))
+                && query.since_ts.is_none_or(|since| agg.first_ts >= since)
+        })
+        .map(|(id, agg)| {
+            let close = agg.close.as_ref();
+            let live = agg.live;
+            let host = agg.host.unwrap_or_default();
+            let counts = |c: Option<u64>, l: u64| c.unwrap_or(l);
+            match agg.open {
+                Some(open) => WsSessionSummary {
+                    url: open.url(),
+                    open: close.is_none(),
+                    dur_ms: close.map(|c| c.dur_ms),
+                    close_code: close.and_then(|c| c.close_code),
+                    close_reason: close.and_then(|c| c.close_reason.clone()),
+                    c2s_msgs: counts(close.map(|c| c.c2s_msgs), live.0),
+                    s2c_msgs: counts(close.map(|c| c.s2c_msgs), live.1),
+                    c2s_bytes: counts(close.map(|c| c.c2s_bytes), live.2),
+                    s2c_bytes: counts(close.map(|c| c.s2c_bytes), live.3),
+                    dropped: close.map(|c| c.dropped).unwrap_or(0),
+                    id: open.id,
+                    capture_session_id: open.capture_session_id,
+                    ts: open.ts,
+                    scheme: open.scheme,
+                    host: open.host,
+                    path: open.path,
+                    subprotocol: open.subprotocol,
+                    permessage_deflate: open.permessage_deflate,
+                    partial: false,
+                },
+                // Orphaned: the `ws_open` predates a clear; surface what's left so
+                // `net log`'s `net ws <id>` follow-up still resolves.
+                None => WsSessionSummary {
+                    id,
+                    capture_session_id: agg.capture_session_id.unwrap_or_default(),
+                    ts: agg.first_ts,
+                    scheme: String::new(),
+                    host,
+                    path: String::new(),
+                    url: String::new(),
+                    subprotocol: None,
+                    permessage_deflate: false,
+                    open: close.is_none(),
+                    partial: true,
+                    dur_ms: close.map(|c| c.dur_ms),
+                    close_code: close.and_then(|c| c.close_code),
+                    close_reason: close.and_then(|c| c.close_reason.clone()),
+                    c2s_msgs: counts(close.map(|c| c.c2s_msgs), live.0),
+                    s2c_msgs: counts(close.map(|c| c.s2c_msgs), live.1),
+                    c2s_bytes: counts(close.map(|c| c.c2s_bytes), live.2),
+                    s2c_bytes: counts(close.map(|c| c.s2c_bytes), live.3),
+                    dropped: close.map(|c| c.dropped).unwrap_or(0),
+                },
+            }
+        })
+        .collect();
+    if query.limit > 0 && summaries.len() > query.limit {
+        summaries.drain(..summaries.len() - query.limit);
+    }
+    Ok(summaries)
+}
+
+/// WebSocket session summaries (oldest first), most recent `limit`.
+pub fn read_ws_sessions(serial: &Serial, query: &WsSessionQuery) -> Result<Vec<WsSessionSummary>> {
+    read_ws_sessions_from(&paths::session_log_path(serial)?, query)
+}
+
+fn read_ws_messages_from(path: &Path, query: &WsMessageQuery) -> Result<Vec<WsMessageRecord>> {
+    if query.limit == 0 {
+        return Ok(Vec::new());
+    }
+    let host = query.host.as_deref().map(str::to_lowercase);
+    let grep = query.grep.as_deref().map(str::to_lowercase);
+    let mut recent = VecDeque::new();
+    let mut floor = 0_u64;
+    visit_records(path, |record| match record {
+        StoredLine::WsMsg(value) if record_after_floor(&value, floor) => {
+            let Ok(message) = serde_json::from_value::<WsMessageRecord>(value) else {
+                return;
+            };
+            let matches = query
+                .session_id
+                .as_deref()
+                .is_none_or(|id| message.session_id == id)
+                && host
+                    .as_deref()
+                    .is_none_or(|needle| message.host.to_lowercase().contains(needle))
+                && query.dir.as_deref().is_none_or(|dir| message.dir == dir)
+                && query
+                    .opcode
+                    .as_deref()
+                    .is_none_or(|opcode| message.opcode == opcode)
+                && query.since_ts.is_none_or(|since| message.ts >= since)
+                && query.after_ts.is_none_or(|after| message.ts > after)
+                && query
+                    .after_flow_sequence
+                    .is_none_or(|after| message.flow_sequence > after)
+                && query
+                    .capture_session_id
+                    .as_deref()
+                    .is_none_or(|session| message.capture_session_id == session)
+                && grep.as_deref().is_none_or(|needle| {
+                    message
+                        .text
+                        .as_deref()
+                        .is_some_and(|text| text.to_lowercase().contains(needle))
+                        || message
+                            .preview
+                            .as_deref()
+                            .is_some_and(|preview| preview.to_lowercase().contains(needle))
+                });
+            if matches {
+                recent.push_back(message);
+                if recent.len() > query.limit {
+                    recent.pop_front();
+                }
+            }
+        }
+        StoredLine::Clear(clear) => {
+            floor = clear.after_flow_sequence;
+            recent.clear();
+        }
+        _ => {}
+    })?;
+    Ok(recent.into_iter().collect())
+}
+
+/// WebSocket messages (oldest first), most recent `limit` after filtering.
+pub fn read_ws_messages(serial: &Serial, query: &WsMessageQuery) -> Result<Vec<WsMessageRecord>> {
+    read_ws_messages_from(&paths::session_log_path(serial)?, query)
+}
+
+fn find_ws_session_from(
+    path: &Path,
+    id: &str,
+) -> Result<Option<(WsSessionRecord, Option<WsCloseRecord>)>> {
+    let mut open = None;
+    let mut close = None;
+    // Fallback identity (host, ts, capture_session_id) from a surviving
+    // message/close when the `ws_open` itself predates a clear, so `net show
+    // <id>` resolves the orphan the same way `net ws` lists it.
+    let mut orphan: Option<(String, f64, String)> = None;
+    let mut floor = 0_u64;
+    visit_records(path, |record| match record {
+        StoredLine::WsOpen(value) if record_after_floor(&value, floor) => {
+            if let Ok(record) = serde_json::from_value::<WsSessionRecord>(value)
+                && record.id == id
+            {
+                open = Some(record);
+            }
+        }
+        StoredLine::WsClose(value) if record_after_floor(&value, floor) => {
+            if let Ok(record) = serde_json::from_value::<WsCloseRecord>(value)
+                && record.session_id == id
+            {
+                orphan.get_or_insert((
+                    record.host.clone(),
+                    record.ts,
+                    record.capture_session_id.clone(),
+                ));
+                close = Some(record);
+            }
+        }
+        StoredLine::WsMsg(value) if record_after_floor(&value, floor) => {
+            if value.get("session_id").and_then(serde_json::Value::as_str) == Some(id)
+                && orphan.is_none()
+            {
+                let host = value
+                    .get("host")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let ts = value
+                    .get("ts")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0);
+                let capture_session_id = value
+                    .get("capture_session_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                orphan = Some((host, ts, capture_session_id));
+            }
+        }
+        StoredLine::Clear(clear) => {
+            floor = clear.after_flow_sequence;
+            open = None;
+            close = None;
+            orphan = None;
+        }
+        _ => {}
+    })?;
+    if let Some(open) = open {
+        return Ok(Some((open, close)));
+    }
+    // Synthesize a partial session from the surviving frames.
+    Ok(orphan.map(|(host, ts, capture_session_id)| {
+        (
+            WsSessionRecord {
+                kind: "ws_open".to_string(),
+                id: id.to_string(),
+                flow_sequence: 0,
+                capture_session_id,
+                ts,
+                scheme: String::new(),
+                host,
+                path: String::new(),
+                status: 0,
+                subprotocol: None,
+                permessage_deflate: false,
+                req_headers: Vec::new(),
+                resp_headers: Vec::new(),
+                redaction_policy: None,
+                redaction_policy_version: None,
+            },
+            close,
+        )
+    }))
+}
+
+/// The session record (with its close, if any) for `net show <session-id>`.
+pub fn find_ws_session(
+    serial: &Serial,
+    id: &str,
+) -> Result<Option<(WsSessionRecord, Option<WsCloseRecord>)>> {
+    find_ws_session_from(&paths::session_log_path(serial)?, id)
+}
+
+fn find_ws_message_from(path: &Path, id: &str) -> Result<Option<WsMessageRecord>> {
+    let mut found = None;
+    let mut floor = 0_u64;
+    visit_records(path, |record| match record {
+        StoredLine::WsMsg(value) if record_after_floor(&value, floor) => {
+            if let Ok(record) = serde_json::from_value::<WsMessageRecord>(value)
+                && record.id == id
+            {
+                found = Some(record);
+            }
+        }
+        StoredLine::Clear(clear) => {
+            floor = clear.after_flow_sequence;
+            found = None;
+        }
+        _ => {}
+    })?;
+    Ok(found)
+}
+
+/// The message record for `net show <message-id>`.
+pub fn find_ws_message(serial: &Serial, id: &str) -> Result<Option<WsMessageRecord>> {
+    find_ws_message_from(&paths::session_log_path(serial)?, id)
+}
+
+fn export_jsonl_from(
+    path: &Path,
+    protocol: Protocol,
+    capture_session: Option<&str>,
+) -> Result<Vec<serde_json::Value>> {
+    let session_ok = |value: &serde_json::Value| {
+        capture_session.is_none_or(|session| {
+            value
+                .get("capture_session_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(session)
+        })
+    };
+    let mut out = Vec::new();
+    let mut floor = 0_u64;
+    visit_records(path, |record| match record {
+        StoredLine::Flow(value)
+            if protocol.include_http()
+                && record_after_floor(&value, floor)
+                && session_ok(&value) =>
+        {
+            out.push(value);
+        }
+        StoredLine::TlsError(value) if protocol.include_http() && session_ok(&value) => {
+            out.push(value);
+        }
+        StoredLine::WsOpen(value)
+            if protocol.include_ws_lifecycle()
+                && record_after_floor(&value, floor)
+                && session_ok(&value) =>
+        {
+            out.push(value);
+        }
+        StoredLine::WsMsg(value)
+            if protocol.include_ws_msg()
+                && record_after_floor(&value, floor)
+                && session_ok(&value) =>
+        {
+            out.push(value);
+        }
+        StoredLine::WsClose(value)
+            if protocol.include_ws_lifecycle()
+                && record_after_floor(&value, floor)
+                && session_ok(&value) =>
+        {
+            out.push(value);
+        }
+        StoredLine::Clear(clear) => {
+            floor = clear.after_flow_sequence;
+            out.clear();
+        }
+        _ => {}
+    })?;
+    Ok(out)
+}
+
+/// The durable records (full flows + WS lines) for `net export jsonl`, in append
+/// order after the last logical clear, filtered by protocol and capture session.
+pub fn read_export_jsonl(
+    serial: &Serial,
+    protocol: Protocol,
+    capture_session: Option<&str>,
+) -> Result<Vec<serde_json::Value>> {
+    export_jsonl_from(&paths::session_log_path(serial)?, protocol, capture_session)
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
     use super::secure_existing_log;
     use super::{
-        CheckpointRecord, ClearRecord, LogQuery, acquire_log_lock, acquire_log_read_lock,
-        find_by_id_from, read_all_from, read_checkpoint_from, read_recent_timeline_from,
-        read_recent_timeline_query_from, read_tls_errors_from,
+        CheckpointRecord, ClearRecord, LogQuery, Protocol, WsMessageQuery, WsSessionQuery,
+        acquire_log_lock, acquire_log_read_lock, export_jsonl_from, find_by_id_from,
+        find_ws_message_from, find_ws_session_from, read_all_from, read_checkpoint_from,
+        read_recent_timeline_from, read_recent_timeline_query_from, read_tls_errors_from,
+        read_ws_messages_from, read_ws_sessions_from,
     };
     use crate::ids::Serial;
     use crate::net::Matcher;
@@ -996,5 +1699,500 @@ mod tests {
                 .as_deref(),
             Some("f3")
         );
+    }
+
+    // ── WebSocket recall ──────────────────────────────────────────────────
+
+    fn ws_open(id: &str, seq: u64, ts: f64, host: &str, path: &str) -> serde_json::Value {
+        json!({
+            "type": "ws_open", "id": id, "flow_sequence": seq,
+            "capture_session_id": "n-one", "ts": ts, "scheme": "wss",
+            "host": host, "path": path, "status": 101,
+            "permessage_deflate": true
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ws_msg(
+        id: &str,
+        session: &str,
+        seq: u64,
+        ts: f64,
+        host: &str,
+        dir: &str,
+        opcode: &str,
+        text: &str,
+    ) -> serde_json::Value {
+        json!({
+            "type": "ws_msg", "id": id, "session_id": session, "flow_sequence": seq,
+            "capture_session_id": "n-one", "ts": ts, "host": host, "dir": dir,
+            "seq": 1, "opcode": opcode, "payload_len": text.len(),
+            "wire_len": text.len(), "retained_len": text.len(), "frame_count": 1,
+            "text": text, "preview": text
+        })
+    }
+
+    fn ws_close(id: &str, seq: u64, ts: f64, host: &str) -> serde_json::Value {
+        json!({
+            "type": "ws_close", "id": id, "session_id": id, "flow_sequence": seq,
+            "capture_session_id": "n-one", "ts": ts, "started_ts": ts - 1.0,
+            "dur_ms": 1000, "host": host, "close_code": 1000, "close_reason": "bye",
+            "close_initiator": "c2s", "c2s_msgs": 1, "s2c_msgs": 1,
+            "c2s_bytes": 5, "s2c_bytes": 5
+        })
+    }
+
+    fn ws_log(dir: &Path) -> std::path::PathBuf {
+        let path = dir.join("device.jsonl");
+        write_lines(
+            &path,
+            &[
+                line(flow("f1", 5.0, "api.example.com", "/rest")),
+                line(ws_open("w1", 1, 10.0, "ws.example.com", "/socket")),
+                line(ws_msg(
+                    "w1.1",
+                    "w1",
+                    2,
+                    11.0,
+                    "ws.example.com",
+                    "c2s",
+                    "text",
+                    "hello server",
+                )),
+                line(ws_msg(
+                    "w1.2",
+                    "w1",
+                    3,
+                    12.0,
+                    "ws.example.com",
+                    "s2c",
+                    "text",
+                    "hello client",
+                )),
+                line(ws_msg(
+                    "w1.3",
+                    "w1",
+                    4,
+                    13.0,
+                    "ws.example.com",
+                    "s2c",
+                    "binary",
+                    "PNGdata",
+                )),
+                line(ws_close("w1", 5, 20.0, "ws.example.com")),
+            ],
+            true,
+        );
+        path
+    }
+
+    #[test]
+    fn timeline_default_shows_ws_lifecycle_not_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = ws_log(dir.path());
+        let serial = Serial::new("emulator-5554");
+        let result = read_recent_timeline_query_from(
+            &path,
+            &serial,
+            &LogQuery {
+                limit: 50,
+                protocol: Protocol::Default,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let types: Vec<&str> = result
+            .items
+            .iter()
+            .map(|item| item["type"].as_str().unwrap())
+            .collect();
+        // Default: HTTP flow + ws_open + ws_close, but no per-message ws_msg.
+        assert_eq!(types, ["http", "ws_open", "ws_close"]);
+    }
+
+    #[test]
+    fn timeline_protocol_websocket_includes_messages_and_hides_http() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = ws_log(dir.path());
+        let serial = Serial::new("emulator-5554");
+        let result = read_recent_timeline_query_from(
+            &path,
+            &serial,
+            &LogQuery {
+                limit: 50,
+                protocol: Protocol::WebSocket,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let types: Vec<&str> = result
+            .items
+            .iter()
+            .map(|item| item["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, ["ws_open", "ws_msg", "ws_msg", "ws_msg", "ws_close"]);
+        // The compact ws_msg event carries a preview and direction but no payload.
+        let msg = result
+            .items
+            .iter()
+            .find(|item| item["type"] == "ws_msg")
+            .unwrap();
+        assert_eq!(msg["dir"], "c2s");
+        assert_eq!(msg["preview"], "hello server");
+        assert!(msg.get("text").is_none());
+    }
+
+    #[test]
+    fn timeline_protocol_http_hides_websockets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = ws_log(dir.path());
+        let serial = Serial::new("emulator-5554");
+        let result = read_recent_timeline_query_from(
+            &path,
+            &serial,
+            &LogQuery {
+                limit: 50,
+                protocol: Protocol::Http,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0]["type"], "http");
+    }
+
+    #[test]
+    fn ws_sessions_summarize_closed_and_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.jsonl");
+        write_lines(
+            &path,
+            &[
+                line(ws_open("w1", 1, 10.0, "ws.example.com", "/a")),
+                line(ws_msg(
+                    "w1.1",
+                    "w1",
+                    2,
+                    11.0,
+                    "ws.example.com",
+                    "c2s",
+                    "text",
+                    "hi",
+                )),
+                line(ws_close("w1", 3, 20.0, "ws.example.com")),
+                // Second session, still open (no ws_close), 2 live messages.
+                line(ws_open("w2", 4, 30.0, "other.example.com", "/b")),
+                line(ws_msg(
+                    "w2.1",
+                    "w2",
+                    5,
+                    31.0,
+                    "other.example.com",
+                    "s2c",
+                    "text",
+                    "x",
+                )),
+                line(ws_msg(
+                    "w2.2",
+                    "w2",
+                    6,
+                    32.0,
+                    "other.example.com",
+                    "s2c",
+                    "text",
+                    "yy",
+                )),
+            ],
+            true,
+        );
+        let sessions = read_ws_sessions_from(
+            &path,
+            &WsSessionQuery {
+                limit: 50,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(sessions.len(), 2);
+        let closed = &sessions[0];
+        assert_eq!(closed.id, "w1");
+        assert!(!closed.open);
+        assert_eq!(closed.close_code, Some(1000));
+        assert_eq!(closed.c2s_msgs, 1);
+        let open = &sessions[1];
+        assert_eq!(open.id, "w2");
+        assert!(open.open);
+        // Live counts derived from ws_msg lines (no ws_close yet).
+        assert_eq!(open.s2c_msgs, 2);
+        assert_eq!(open.s2c_bytes, 3);
+
+        // Host filter narrows the list.
+        let filtered = read_ws_sessions_from(
+            &path,
+            &WsSessionQuery {
+                host: Some("other".into()),
+                limit: 50,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "w2");
+    }
+
+    #[test]
+    fn ws_messages_filter_by_dir_opcode_and_grep() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = ws_log(dir.path());
+        let all = read_ws_messages_from(
+            &path,
+            &WsMessageQuery {
+                session_id: Some("w1".into()),
+                limit: 50,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(all.len(), 3);
+
+        let s2c = read_ws_messages_from(
+            &path,
+            &WsMessageQuery {
+                session_id: Some("w1".into()),
+                dir: Some("s2c".into()),
+                limit: 50,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(s2c.len(), 2);
+        assert!(s2c.iter().all(|m| m.dir == "s2c"));
+
+        let binary = read_ws_messages_from(
+            &path,
+            &WsMessageQuery {
+                session_id: Some("w1".into()),
+                opcode: Some("binary".into()),
+                limit: 50,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(binary.len(), 1);
+        assert_eq!(binary[0].id, "w1.3");
+
+        let grepped = read_ws_messages_from(
+            &path,
+            &WsMessageQuery {
+                session_id: Some("w1".into()),
+                grep: Some("server".into()),
+                limit: 50,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(grepped.len(), 1);
+        assert_eq!(grepped[0].id, "w1.1");
+    }
+
+    #[test]
+    fn find_ws_session_and_message_return_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = ws_log(dir.path());
+        let (open, close) = find_ws_session_from(&path, "w1").unwrap().unwrap();
+        assert_eq!(open.id, "w1");
+        assert_eq!(open.status, 101);
+        assert_eq!(close.unwrap().close_code, Some(1000));
+
+        let message = find_ws_message_from(&path, "w1.2").unwrap().unwrap();
+        assert_eq!(message.dir, "s2c");
+        assert_eq!(message.text.as_deref(), Some("hello client"));
+        assert!(find_ws_message_from(&path, "w1.99").unwrap().is_none());
+    }
+
+    #[test]
+    fn ws_records_honor_the_clear_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.jsonl");
+        let clear = ClearRecord {
+            kind: "capture_clear".into(),
+            capture_session_id: "n-one".into(),
+            cleared_at: 15.0,
+            after_flow_id: Some("w1.3".into()),
+            after_flow_sequence: 3,
+        };
+        write_lines(
+            &path,
+            &[
+                line(ws_open("w1", 1, 10.0, "ws.example.com", "/socket")),
+                line(ws_msg(
+                    "w1.1",
+                    "w1",
+                    2,
+                    11.0,
+                    "ws.example.com",
+                    "c2s",
+                    "text",
+                    "old",
+                )),
+                line(clear),
+                line(ws_open("w2", 4, 20.0, "ws.example.com", "/socket")),
+                line(ws_msg(
+                    "w2.1",
+                    "w2",
+                    5,
+                    21.0,
+                    "ws.example.com",
+                    "c2s",
+                    "text",
+                    "new",
+                )),
+            ],
+            true,
+        );
+        // The pre-clear session/message are gone; only the post-clear ones remain.
+        let sessions = read_ws_sessions_from(
+            &path,
+            &WsSessionQuery {
+                limit: 50,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "w2");
+        assert!(find_ws_session_from(&path, "w1").unwrap().is_none());
+        assert!(find_ws_message_from(&path, "w1.1").unwrap().is_none());
+        assert!(find_ws_message_from(&path, "w2.1").unwrap().is_some());
+    }
+
+    #[test]
+    fn clearing_mid_session_surfaces_the_orphan_as_partial() {
+        // Finding #6: ws_open before a clear, but its later frames survive.
+        // `net ws` / `net show` must still surface the session so the
+        // `net log`→`net ws <id>` follow-up stays consistent.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.jsonl");
+        let clear = ClearRecord {
+            kind: "capture_clear".into(),
+            capture_session_id: "n-one".into(),
+            cleared_at: 11.5,
+            after_flow_id: Some("w1.1".into()),
+            after_flow_sequence: 2,
+        };
+        write_lines(
+            &path,
+            &[
+                line(ws_open("w1", 1, 10.0, "chat.example.com", "/s")),
+                line(ws_msg(
+                    "w1.1",
+                    "w1",
+                    2,
+                    11.0,
+                    "chat.example.com",
+                    "c2s",
+                    "text",
+                    "pre",
+                )),
+                line(clear),
+                line(ws_msg(
+                    "w1.2",
+                    "w1",
+                    3,
+                    12.0,
+                    "chat.example.com",
+                    "s2c",
+                    "text",
+                    "post",
+                )),
+                line(ws_close("w1", 4, 13.0, "chat.example.com")),
+            ],
+            true,
+        );
+        let sessions = read_ws_sessions_from(
+            &path,
+            &WsSessionQuery {
+                limit: 50,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(sessions.len(), 1, "the orphaned session is still listed");
+        assert_eq!(sessions[0].id, "w1");
+        assert!(sessions[0].partial, "flagged partial (open was cleared)");
+        assert_eq!(sessions[0].host, "chat.example.com");
+        assert!(!sessions[0].open, "a post-clear ws_close makes it closed");
+
+        // `net show w1` resolves via a synthesized record instead of erroring.
+        let (open, close) = find_ws_session_from(&path, "w1").unwrap().unwrap();
+        assert_eq!(open.id, "w1");
+        assert_eq!(open.status, 0, "synthesized (no real upgrade retained)");
+        assert_eq!(open.host, "chat.example.com");
+        assert_eq!(open.capture_session_id, "n-one");
+        assert!(close.is_some());
+    }
+
+    #[test]
+    fn message_only_orphan_recovers_capture_session_id() {
+        // Finding B: an orphan with a surviving message but no close must recover
+        // capture_session_id (from the message), matching `net ws`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.jsonl");
+        let clear = ClearRecord {
+            kind: "capture_clear".into(),
+            capture_session_id: "n-one".into(),
+            cleared_at: 10.5,
+            after_flow_id: Some("w1".into()),
+            after_flow_sequence: 1,
+        };
+        write_lines(
+            &path,
+            &[
+                line(ws_open("w1", 1, 10.0, "chat.example.com", "/s")),
+                line(clear),
+                line(ws_msg(
+                    "w1.1",
+                    "w1",
+                    2,
+                    11.0,
+                    "chat.example.com",
+                    "s2c",
+                    "text",
+                    "x",
+                )),
+            ],
+            true,
+        );
+        let (open, close) = find_ws_session_from(&path, "w1").unwrap().unwrap();
+        assert_eq!(open.status, 0, "synthesized");
+        assert_eq!(
+            open.capture_session_id, "n-one",
+            "recovered from the message"
+        );
+        assert!(close.is_none());
+    }
+
+    #[test]
+    fn export_jsonl_filters_by_protocol_and_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = ws_log(dir.path());
+        // websocket protocol → open + 3 msgs + close (no http flow).
+        let ws_only = export_jsonl_from(&path, Protocol::WebSocket, None).unwrap();
+        let kinds: Vec<&str> = ws_only
+            .iter()
+            .map(|value| value["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["ws_open", "ws_msg", "ws_msg", "ws_msg", "ws_close"]);
+        // The full record keeps the payload (unlike the compact log event).
+        let first_msg = ws_only.iter().find(|v| v["type"] == "ws_msg").unwrap();
+        assert_eq!(first_msg["text"], "hello server");
+
+        // all protocol → includes the http flow too.
+        let all = export_jsonl_from(&path, Protocol::All, None).unwrap();
+        assert_eq!(all.len(), 6);
+
+        // capture-session filter that matches nothing yields an empty export.
+        let none = export_jsonl_from(&path, Protocol::All, Some("n-other")).unwrap();
+        assert!(none.is_empty());
     }
 }

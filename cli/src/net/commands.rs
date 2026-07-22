@@ -1458,6 +1458,7 @@ fn parse_ping_check(host: &str, output: &str) -> PingCheck {
 pub struct LogOpts {
     pub matcher: Matcher,
     pub limit: usize,
+    pub protocol: store::Protocol,
     pub capture_session_id: Option<String>,
     pub since: Option<String>,
     pub after_id: Option<String>,
@@ -1498,6 +1499,7 @@ pub async fn log(serial: &Serial, opts: LogOpts) -> Result<()> {
     let LogOpts {
         matcher,
         limit,
+        protocol,
         mut capture_session_id,
         since,
         after_id,
@@ -1595,6 +1597,7 @@ pub async fn log(serial: &Serial, opts: LogOpts) -> Result<()> {
         &store::LogQuery {
             matcher,
             limit,
+            protocol,
             capture_session_id: capture_session_id.clone(),
             since_ts,
             after_flow_sequence,
@@ -1674,6 +1677,85 @@ fn attach_recalled_tls_actions(serial: &Serial, event: &mut serde_json::Value) {
     }
 }
 
+/// WebSocket ids route to WS-specific detail: `w1` is a session, `w1.3` a
+/// message. Everything else is an HTTP flow id.
+enum WsIdKind {
+    Session,
+    Message,
+}
+
+fn classify_ws_id(id: &str) -> Option<WsIdKind> {
+    let rest = id.strip_prefix('w')?;
+    if let Some((session, message)) = rest.split_once('.') {
+        let ok = !session.is_empty()
+            && session.bytes().all(|b| b.is_ascii_digit())
+            && !message.is_empty()
+            && message.bytes().all(|b| b.is_ascii_digit());
+        return ok.then_some(WsIdKind::Message);
+    }
+    (!rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())).then_some(WsIdKind::Session)
+}
+
+fn show_ws_session(serial: &Serial, id: &str) -> Result<()> {
+    let Some((open, close)) = store::find_ws_session(serial, id)? else {
+        return Err(ws_not_found(id, "session"));
+    };
+    let mut detail = open.detail();
+    detail["open"] = json!(close.is_none());
+    // A synthesized orphan (upgrade cleared) has no status/scheme.
+    if open.status == 0 && open.scheme.is_empty() {
+        detail["partial"] = json!(true);
+    }
+    if let Some(close) = &close {
+        detail["close"] = close.detail();
+    }
+    detail["next_actions"] = json!(crate::net::ws_session_next_actions(serial, id));
+    events::emit_result(&detail);
+    Ok(())
+}
+
+fn show_ws_message(serial: &Serial, id: &str, body: bool, body_file: Option<&Path>) -> Result<()> {
+    let Some(record) = store::find_ws_message(serial, id)? else {
+        return Err(ws_not_found(id, "message"));
+    };
+    if let Some(path) = body_file {
+        let Some(bytes) = record.raw_payload() else {
+            bail!("WebSocket message `{id}` has no retained payload (empty or control frame)");
+        };
+        let written = crate::cmd::artifact::write_bytes(path, &bytes)?;
+        emit(
+            "net_show",
+            json!({
+                "id": id,
+                "session_id": record.session_id,
+                "opcode": record.opcode,
+                "artifact": path.display().to_string(),
+                "bytes": written,
+                "payload_len": record.payload_len,
+                "retained_len": record.retained_len,
+                "truncated": record.truncated,
+            }),
+        );
+        return Ok(());
+    }
+    events::emit_result(&record.detail(body));
+    Ok(())
+}
+
+fn ws_not_found(id: &str, kind: &str) -> anyhow::Error {
+    crate::diagnostic::DiagnosticError::new(
+        "net_ws_not_found",
+        "net",
+        format!("no WebSocket {kind} `{id}` exists in the session log"),
+    )
+    .detail(json!({"id": id}))
+    .next_actions([
+        "run `shadowdroid net ws` to list captured WebSocket sessions",
+        "run `shadowdroid net ws <session-id>` to list a session's messages",
+    ])
+    .into()
+}
+
 pub async fn show(
     serial: &Serial,
     id: &str,
@@ -1681,6 +1763,26 @@ pub async fn show(
     har: bool,
     body_file: Option<&Path>,
 ) -> Result<()> {
+    // WebSocket ids (`w…`) resolve to session/message detail, not flows.
+    match classify_ws_id(id) {
+        Some(WsIdKind::Session) => {
+            if har {
+                bail!(
+                    "`--har` applies to HTTP flows; use `net export jsonl` for WebSocket sessions"
+                );
+            }
+            return show_ws_session(serial, id);
+        }
+        Some(WsIdKind::Message) => {
+            if har {
+                bail!(
+                    "`--har` applies to HTTP flows; use `net export jsonl` for WebSocket messages"
+                );
+            }
+            return show_ws_message(serial, id, body, body_file);
+        }
+        None => {}
+    }
     // Completed flows live in the session log; a *held* (in-flight) flow lives
     // only in the daemon — try the store first, then ask the daemon.
     if let Some(flow) = store::find_by_id(serial, id)? {
@@ -1950,12 +2052,114 @@ pub async fn ca_reset(serial: &Serial, dir: &Path, origin: &str) -> Result<()> {
     Ok(())
 }
 
+pub struct WsOpts {
+    /// A WebSocket session id (`w1`) to list its messages; `None` lists sessions.
+    pub session_id: Option<String>,
+    pub host: Option<String>,
+    pub dir: Option<String>,
+    pub opcode: Option<String>,
+    pub grep: Option<String>,
+    pub capture_session_id: Option<String>,
+    pub since: Option<String>,
+    pub limit: usize,
+}
+
+/// The WebSocket-native inspection surface: `net ws` lists sessions (cheapest
+/// orientation), `net ws <id>` lists that session's messages. Both emit compact
+/// events plus a `net_ws` summary — the same low-token contract as `net log`.
+pub async fn ws(serial: &Serial, opts: WsOpts) -> Result<()> {
+    let since_ts = opts
+        .since
+        .as_deref()
+        .map(parse_since_duration)
+        .transpose()?
+        .map(|duration| events::now_ts() - duration.as_secs_f64());
+
+    let Some(session_id) = opts.session_id.clone() else {
+        let sessions = store::read_ws_sessions(
+            serial,
+            &store::WsSessionQuery {
+                host: opts.host.clone(),
+                capture_session_id: opts.capture_session_id.clone(),
+                since_ts,
+                limit: opts.limit,
+            },
+        )?;
+        for session in &sessions {
+            let mut value = serde_json::to_value(session)?;
+            value["type"] = json!("ws_session");
+            value["next_actions"] = json!(crate::net::ws_session_next_actions(serial, &session.id));
+            events::emit(&value);
+        }
+        emit(
+            "net_ws",
+            json!({
+                "mode": "sessions",
+                "count": sessions.len(),
+                "ids": sessions.iter().map(|session| &session.id).collect::<Vec<_>>(),
+                "host": opts.host,
+                "capture_session_id": opts.capture_session_id,
+                "since": opts.since,
+            }),
+        );
+        return Ok(());
+    };
+
+    let messages = store::read_ws_messages(
+        serial,
+        &store::WsMessageQuery {
+            session_id: Some(session_id.clone()),
+            host: opts.host.clone(),
+            dir: opts.dir.clone(),
+            opcode: opts.opcode.clone(),
+            grep: opts.grep.clone(),
+            since_ts,
+            after_ts: None,
+            after_flow_sequence: None,
+            capture_session_id: opts.capture_session_id.clone(),
+            limit: opts.limit,
+        },
+    )?;
+    // Distinguish "session has no matching messages" from "no such session".
+    if messages.is_empty() && store::find_ws_session(serial, &session_id)?.is_none() {
+        return Err(ws_not_found(&session_id, "session"));
+    }
+    for message in &messages {
+        events::emit(&message.msg_event(serial));
+    }
+    emit(
+        "net_ws",
+        json!({
+            "mode": "messages",
+            "session_id": session_id,
+            "count": messages.len(),
+            "ids": messages.iter().map(|message| &message.id).collect::<Vec<_>>(),
+            "dir": opts.dir,
+            "opcode": opts.opcode,
+            "grep": opts.grep,
+            "since": opts.since,
+        }),
+    );
+    Ok(())
+}
+
 pub async fn export(
     serial: &Serial,
     format: &str,
     id: Option<String>,
     out: Option<PathBuf>,
+    protocol: Option<store::Protocol>,
+    session: Option<String>,
 ) -> Result<()> {
+    if format == "jsonl" {
+        return export_jsonl(
+            serial,
+            out,
+            protocol.unwrap_or(store::Protocol::All),
+            session,
+        )
+        .await;
+    }
     let mut flows = match &id {
         Some(id) => store::find_by_id(serial, id)?
             .map(|f| vec![f])
@@ -2040,8 +2244,95 @@ pub async fn export(
             let summary = crate::net::export::write_fixtures(&flows, &out)?;
             events::emit_result(&summary);
         }
-        other => bail!("unknown export format {other:?} (curl|har|fixtures)"),
+        other => bail!("unknown export format {other:?} (curl|har|fixtures|jsonl)"),
     }
+    Ok(())
+}
+
+/// Apply typed redaction to one exported record, dispatching on its `type` tag
+/// so header arrays and payloads are redacted the same way the live capture
+/// would have with `--redact`. Falls back to the generic value redactor.
+fn redact_export_record(
+    value: serde_json::Value,
+    policy: &crate::redaction::Policy,
+) -> serde_json::Value {
+    fn typed<T, F>(value: serde_json::Value, redact: F) -> serde_json::Value
+    where
+        T: serde::de::DeserializeOwned + serde::Serialize,
+        F: FnOnce(&mut T),
+    {
+        match serde_json::from_value::<T>(value.clone()) {
+            Ok(mut record) => {
+                redact(&mut record);
+                serde_json::to_value(&record).unwrap_or(value)
+            }
+            Err(_) => value,
+        }
+    }
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("ws_open") => {
+            typed::<crate::net::ws::WsSessionRecord, _>(value, |r| r.redact_headers(policy))
+        }
+        Some("ws_msg") => typed::<crate::net::ws::WsMessageRecord, _>(value, |r| r.redact(policy)),
+        Some("ws_close") => typed::<crate::net::ws::WsCloseRecord, _>(value, |r| r.redact(policy)),
+        // HTTP flows have no `type` tag; everything else (tls_error) → generic.
+        None => typed::<crate::net::flow::FlowRecord, _>(value, |r| policy.redact_flow_record(r)),
+        Some(_) => policy.redact_output(value),
+    }
+}
+
+/// Durable line-per-record export (the machine-readable WebSocket format). Full
+/// flows and WS session/message/close records, filtered by protocol + capture
+/// session, written to `--out` (default `shadowdroid-network.jsonl`).
+async fn export_jsonl(
+    serial: &Serial,
+    out: Option<PathBuf>,
+    protocol: store::Protocol,
+    session: Option<String>,
+) -> Result<()> {
+    let mut records = store::read_export_jsonl(serial, protocol, session.as_deref())?;
+    if records.is_empty() {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "net_export_empty",
+            "net",
+            "no records match this jsonl export".to_string(),
+        )
+        .detail(json!({"format": "jsonl", "session": session}))
+        .next_actions([
+            "run `shadowdroid net log --protocol all` to see what was captured",
+            "generate traffic while the proxy is running, then retry the export",
+        ])
+        .into());
+    }
+    // Re-redact on the way out in case the proxy captured without `--redact`.
+    // Typed per record so header arrays ([["Cookie","…"]]) are name-redacted —
+    // the generic value redactor can't reach those.
+    if let Some(policy) = crate::redaction::active_policy() {
+        for record in &mut records {
+            *record = redact_export_record(record.take(), &policy);
+        }
+    }
+    let out = out.unwrap_or_else(|| PathBuf::from("shadowdroid-network.jsonl"));
+    let mut text = String::new();
+    for record in &records {
+        text.push_str(&serde_json::to_string(record)?);
+        text.push('\n');
+    }
+    let bytes = crate::cmd::artifact::write_bytes(&out, text.as_bytes())?;
+    let token = crate::events::shell_token(&out.display().to_string());
+    emit(
+        "net_export",
+        json!({
+            "format": "jsonl",
+            "artifact": out.display().to_string(),
+            "bytes": bytes,
+            "count": records.len(),
+            "next_actions": [
+                format!("jq -c 'select(.type==\"ws_msg\")' {token}"),
+                "shadowdroid net ws"
+            ],
+        }),
+    );
     Ok(())
 }
 

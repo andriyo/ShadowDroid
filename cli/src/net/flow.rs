@@ -199,6 +199,13 @@ pub fn sequence_from_id(id: &str) -> Option<u64> {
         .and_then(|value| u64::from_str_radix(value, 16).ok())
 }
 
+/// Reserve the next global capture sequence. Shared with WebSocket records
+/// ([crate::net::ws]) so a checkpoint boundary — which snapshots
+/// [last_sequence] — orders HTTP flows and WS sessions/messages on one timeline.
+pub fn next_sequence() -> u64 {
+    FLOW_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Last flow sequence assigned in this daemon process. A checkpoint uses the
 /// assignment boundary rather than persistence order, so an older in-flight
 /// flow that completes later remains correctly before the checkpoint.

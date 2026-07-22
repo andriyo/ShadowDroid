@@ -8,7 +8,7 @@ ShadowDroid commands end to end.
 From this directory:
 
 ```bash
-./gradlew :app:assembleDebug
+./gradlew :chat-server:test :app:assembleDebug
 ```
 
 Or from the repository root:
@@ -35,6 +35,37 @@ The package is:
 io.github.andriyo.shadowdroid.sample
 ```
 
+## Run The WebSocket Chat Server
+
+The `chat-server` module is a real Ktor server with a shared chat room, a
+health endpoint, server-initiated greetings, ping/pong traffic, and
+`permessage-deflate`. It starts cleartext and self-signed TLS connectors:
+
+```bash
+./gradlew :chat-server:run
+curl http://shadowdroid.localhost:18080/health
+```
+
+The Android fixture uses these endpoints:
+
+```text
+ws://shadowdroid.localhost:18080/chat?name=android
+wss://shadowdroid.localhost:18443/chat?name=android
+```
+
+`shadowdroid.localhost` deliberately has a dot so Android's proxy selector does
+not treat it as an unproxied loopback URL. The host-side proxy resolves the
+special-use `.localhost` name back to the local Ktor process.
+
+Start ShadowDroid's proxy with that host in scope, then open the exported
+`WebSocketChatActivity` or tap **Open WebSocket chat** in the Network section:
+
+```bash
+shadowdroid net start --host shadowdroid.localhost
+shadowdroid app start io.github.andriyo.shadowdroid.sample \
+  --activity .WebSocketChatActivity
+```
+
 ## What It Exercises
 
 | Area | App surface | Useful commands |
@@ -51,6 +82,7 @@ io.github.andriyo.shadowdroid.sample
 | Clipboard | Writes a sample clip | `device clipboard` |
 | Logs/crashes/ANR | Log spam, deliberate crash, deliberate main-thread block | `watch`, `collect`, `debug run-until-crash`, `doctor` |
 | Network MITM | HTTP GET, HTTPS GET, JSON POST, GraphQL-shaped POST, error status, slow response, large body | `net check`, `net trust`, `net start`, `net log`, `net show`, `net export fixtures`, `net rule`, `net override` |
+| WebSocket proxy | Native chat UI backed by a local Ktor WS/WSS room; client and server messages, ping/pong, compression, and normal close | `net log --protocol websocket`, `net ws`, `net show w1.1`, `watch` |
 | WebView | Loads the configured URL into a platform WebView | `net log`, `ui dump`, `watch` |
 | Coroutine dumps | `CoroutinesActivity` starts a misbehaving coroutine zoo: a leaked heartbeat, parked channel workers, a clogged no-buffer `SharedFlow` (slow collector + suspended emitter), plus a button that grows the pool | `aar coroutines`, `aar agent` |
 

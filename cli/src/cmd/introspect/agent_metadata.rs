@@ -1023,9 +1023,15 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "net log" => Some(serde_json::json!({
             "use_when": ["Need recent HTTP flows from the session log without watching live UI.", "Need to isolate a test phase by session, duration, flow/checkpoint boundary, or applied rule."],
-            "output": "line-delimited JSON: filtered http/tls_error events in ts order, then a net_log summary with the effective boundary and older_events_excluded",
+            "output": "line-delimited JSON: filtered http/tls_error events and WebSocket lifecycle (ws_open/ws_close) in ts order, then a net_log summary with the effective boundary and older_events_excluded. --protocol websocket adds per-message ws_msg events; --protocol http hides WebSockets",
             "side_effects": ["none"],
-            "next_actions": ["net checkpoint", "net show <id>", "net export har <id>", "watch"]
+            "next_actions": ["net checkpoint", "net show <id>", "net ws", "net export har <id>", "watch"]
+        })),
+        "net ws" => Some(serde_json::json!({
+            "use_when": ["Need to inspect WebSocket (WS/WSS) traffic captured by the proxy.", "Bare `net ws` lists sessions cheaply; `net ws <session-id>` lists that session's messages, filterable by --dir/--opcode/--grep/--since to keep output small."],
+            "output": "line-delimited JSON: ws_session summary rows (bare) or compact ws_msg events (with a session id), then a net_ws summary with the matching ids. Full payloads are fetched on demand via net show <message-id>",
+            "side_effects": ["none"],
+            "next_actions": ["net show <id>", "net ws <session-id>", "net export jsonl --protocol websocket", "watch"]
         })),
         "net checkpoint" => Some(serde_json::json!({
             "use_when": ["Need a durable boundary before performing one test action while keeping the proxy and rules active."],
@@ -1034,10 +1040,10 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "next_actions": ["net log --after-checkpoint <checkpoint>", "net log clear"]
         })),
         "net show" => Some(serde_json::json!({
-            "use_when": ["Need headers, bodies, or full detail for a flow id seen in watch or net log."],
-            "output": "flow detail JSON; an active held flow includes lifecycle metadata and a recently terminal id returns an exact typed terminal-state error; --har returns a single-entry HAR; --body-file writes the response body",
+            "use_when": ["Need headers, bodies, or full detail for a flow id seen in watch or net log.", "Need a WebSocket session (id like w1) or message (id like w1.3) full detail/payload."],
+            "output": "flow detail JSON; a WebSocket session id returns its upgrade + close + totals, a message id returns the reassembled payload (text or base64) with frame metadata; an active held flow includes lifecycle metadata and a recently terminal id returns an exact typed terminal-state error; --har returns a single-entry HAR; --body-file writes the response/message body binary-safe",
             "side_effects": ["none"],
-            "next_actions": ["net export har <id>", "net export curl <id>", "net log", "watch"]
+            "next_actions": ["net export har <id>", "net export curl <id>", "net ws", "net log", "watch"]
         })),
         "net intercept" => Some(serde_json::json!({
             "use_when": ["Need the agent to pause matching HTTP flows and decide how to mutate, drop, or respond."],
@@ -1064,10 +1070,10 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "next_actions": ["watch", "ui dump"]
         })),
         "net export" => Some(serde_json::json!({
-            "use_when": ["Need to turn captured flows into HAR, curl, or deterministic response fixtures for replay/testing."],
+            "use_when": ["Need to turn captured flows into HAR, curl, or deterministic response fixtures for replay/testing.", "Need a durable line-per-record dump (jsonl) of flows and/or WebSocket messages for offline analysis."],
             "output": "terminal action naming a durable artifact, byte/flow counts, safe inspection actions, and a confirmation-gated replay command for curl exports",
-            "side_effects": ["writes HAR to --out or shadowdroid-network.har, curl to --out or shadowdroid-network.curl.sh, and fixtures to --out or shadowdroid-fixtures"],
-            "next_actions": ["net replay", "net rules", "collect"]
+            "side_effects": ["writes HAR to --out or shadowdroid-network.har, curl to --out or shadowdroid-network.curl.sh, fixtures to --out or shadowdroid-fixtures, and jsonl to --out or shadowdroid-network.jsonl"],
+            "next_actions": ["net ws", "net replay", "collect"]
         })),
         "net replay" => Some(serde_json::json!({
             "use_when": ["Need to serve saved responses without the real backend for deterministic app testing."],

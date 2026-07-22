@@ -199,6 +199,79 @@ pub enum Event {
         reason: String,
         next_actions: Vec<String>,
     },
+    /// A WebSocket connection completed its upgrade (`101`) through the proxy.
+    /// One per session; the bidirectional frames arrive as `ws_msg` events and
+    /// the teardown as `ws_close`.
+    WsOpen {
+        ts: f64,
+        id: String,
+        flow_sequence: u64,
+        capture_session_id: String,
+        scheme: String,
+        host: String,
+        path: String,
+        url: String,
+        status: u16,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        subprotocol: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        permessage_deflate: bool,
+        next_actions: Vec<String>,
+    },
+    /// One reassembled WebSocket message (or control frame). Compact by design —
+    /// only a bounded `preview` travels; the full payload is fetched via `net
+    /// show <id> --body`.
+    WsMsg {
+        ts: f64,
+        id: String,
+        session_id: String,
+        capture_session_id: String,
+        host: String,
+        /// `c2s` (app→server) or `s2c` (server→app).
+        dir: String,
+        seq: u64,
+        /// text | binary | ping | pong | close.
+        opcode: String,
+        /// Application payload length (decompressed).
+        len: u64,
+        /// On-wire (compressed) length — only when `compressed`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        wire_len: Option<u64>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        compressed: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        truncated: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        close_code: Option<u16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        preview: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        body_redacted: bool,
+        next_actions: Vec<String>,
+    },
+    /// A WebSocket session closed. Carries the close code/reason (when a close
+    /// frame was seen) and per-direction message/byte totals.
+    WsClose {
+        ts: f64,
+        id: String,
+        session_id: String,
+        capture_session_id: String,
+        host: String,
+        dur_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        close_code: Option<u16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        close_reason: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        close_initiator: Option<String>,
+        c2s_msgs: u64,
+        s2c_msgs: u64,
+        c2s_bytes: u64,
+        s2c_bytes: u64,
+        #[serde(default, skip_serializing_if = "is_zero_u64")]
+        dropped: u64,
+        next_actions: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -289,6 +362,10 @@ impl From<Element> for CompactElement {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -691,6 +768,15 @@ fn domain_guidance(
     guidance
 }
 
+/// The WebSocket session id an id belongs to: `w1` → `w1`, `w1.3` → `w1`, and
+/// `None` for HTTP flow ids (`f…`). Keeps `net show` follow-ups protocol-correct.
+fn ws_session_of(id: &str) -> Option<String> {
+    let rest = id.strip_prefix('w')?;
+    let session = rest.split('.').next().unwrap_or(rest);
+    (!session.is_empty() && session.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| format!("w{session}"))
+}
+
 fn dynamic_next_actions(
     command_path: Option<&str>,
     map: &serde_json::Map<String, serde_json::Value>,
@@ -902,6 +988,13 @@ fn dynamic_next_actions(
                     vec![
                         format!("shadowdroid net resume {}", shell_token(id)),
                         format!("shadowdroid net drop {}", shell_token(id)),
+                    ]
+                } else if let Some(session) = ws_session_of(id) {
+                    // HAR/curl are HTTP concepts; a WebSocket id drills to its
+                    // session and the jsonl dump instead.
+                    vec![
+                        format!("shadowdroid net ws {}", shell_token(&session)),
+                        "shadowdroid net export jsonl --protocol websocket".to_string(),
                     ]
                 } else {
                     vec![

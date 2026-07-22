@@ -48,7 +48,7 @@ use tokio_util::task::TaskTracker;
 use crate::events::{self, Event};
 use crate::net::ca::CertAuthority;
 use crate::net::flow::{self, FlowRecord};
-use crate::net::{Matcher, Mutation, RuleSpec};
+use crate::net::{Matcher, Mutation, RuleSpec, store, ws};
 
 /// The response body we hand the device: either a buffered `Full` (the common
 /// case) or a live `StreamBody` for streamed responses — unified as one boxed
@@ -626,35 +626,34 @@ async fn proxy_websocket(
         }
     };
 
-    if in_scope {
-        // The handshake itself is a capturable flow; frames aren't decoded.
-        capture(
-            &ctx,
-            FlowParts {
-                id: &id,
-                method: req.method().as_str(),
-                scheme: &scheme,
-                host: &host,
-                path: &path,
-                req_headers: &req_headers,
-                req_bytes: &[],
-                req_streamed: false,
-                status: Some(status),
-                resp_headers: &resp_headers,
-                resp_bytes: &[],
-                dur_ms: 0,
-                error: None,
-                matched: Some("websocket".into()),
-                modified: false,
-                rule_ids: &[],
-            },
-        );
-    }
-
     if status != 101 {
-        // Server declined the upgrade — stream its response straight back. A
-        // rejection body may be arbitrarily large (or long-lived), so it must
-        // never go through an unbounded `collect()`.
+        // Server declined the upgrade — this is a completed HTTP transaction,
+        // captured as a flow. Then stream its response straight back; a rejection
+        // body may be arbitrarily large (or long-lived), so it must never go
+        // through an unbounded `collect()`.
+        if in_scope {
+            capture(
+                &ctx,
+                FlowParts {
+                    id: &id,
+                    method: req.method().as_str(),
+                    scheme: &scheme,
+                    host: &host,
+                    path: &path,
+                    req_headers: &req_headers,
+                    req_bytes: &[],
+                    req_streamed: false,
+                    status: Some(status),
+                    resp_headers: &resp_headers,
+                    resp_bytes: &[],
+                    dur_ms: 0,
+                    error: None,
+                    matched: Some("websocket".into()),
+                    modified: false,
+                    rule_ids: &[],
+                },
+            );
+        }
         return response_with_body(
             status,
             &resp_headers,
@@ -672,18 +671,83 @@ async fn proxy_websocket(
             );
         }
     };
-    // Once the device sees our 101 it upgrades; copy bytes both ways until close.
     let shutdown = ctx.shutdown.clone();
+
+    if !in_scope {
+        // Out-of-scope host: preserve the working blind tunnel, no capture.
+        drop(ctx.tasks.spawn(async move {
+            tokio::select! {
+                result = hyper::upgrade::on(&mut req) => match result {
+                    Ok(device_io) => {
+                        let mut a = TokioIo::new(device_io);
+                        let mut b = TokioIo::new(upstream_io);
+                        tokio::select! {
+                            _ = copy_bidirectional(&mut a, &mut b) => {}
+                            _ = shutdown.cancelled() => {}
+                        }
+                    }
+                    Err(e) => tracing::debug!("device ws upgrade: {e}"),
+                },
+                _ = shutdown.cancelled() => {}
+            }
+        }));
+        return ws_switching_response(&resp_headers);
+    }
+
+    // In-scope: record the upgrade as a WebSocket session and tap its frames.
+    let ws_scheme = if scheme == "https" { "wss" } else { "ws" };
+    let deflate =
+        ws::parse_deflate_params(flow::header_get(&resp_headers, "sec-websocket-extensions"));
+    let mut session = ws::WsSessionRecord {
+        kind: "ws_open".to_string(),
+        id: ws::next_session_id(),
+        flow_sequence: flow::next_sequence(),
+        capture_session_id: ctx.capture_session_id.clone(),
+        ts: events::now_ts(),
+        scheme: ws_scheme.to_string(),
+        host: host.clone(),
+        path: path.clone(),
+        status,
+        subprotocol: flow::header_get(&resp_headers, "sec-websocket-protocol").map(str::to_string),
+        permessage_deflate: deflate.enabled,
+        req_headers: req_headers.clone(),
+        resp_headers: resp_headers.clone(),
+        redaction_policy: None,
+        redaction_policy_version: None,
+    };
+    // The handshake carries Cookie/Authorization; redact them like HTTP flows.
+    if let Some(policy) = &ctx.shared.redaction {
+        session.redact_headers(policy);
+    }
+    let meta = ws::WsSessionMeta {
+        id: session.id.clone(),
+        capture_session_id: session.capture_session_id.clone(),
+        host: host.clone(),
+        started_ts: session.ts,
+        deflate,
+    };
+    let ctx_tap = ctx.clone();
     drop(ctx.tasks.spawn(async move {
         tokio::select! {
             result = hyper::upgrade::on(&mut req) => match result {
                 Ok(device_io) => {
-                    let mut a = TokioIo::new(device_io);
-                    let mut b = TokioIo::new(upstream_io);
-                    tokio::select! {
-                        _ = copy_bidirectional(&mut a, &mut b) => {}
-                        _ = shutdown.cancelled() => {}
+                    // Record the session only once the device side actually
+                    // upgraded — a dropped/failed upgrade must not leave an
+                    // orphan `ws_open` that never gets a `ws_close`.
+                    if let Err(error) = store::append_ws_session(&ctx_tap.serial, &session) {
+                        ctx_tap.shared.record_persistence_error("ws_open", &error);
                     }
+                    let _ = ctx_tap
+                        .shared
+                        .events
+                        .send(Arc::new(session.open_event(&ctx_tap.serial)));
+                    ws::tap(
+                        ctx_tap,
+                        meta,
+                        TokioIo::new(device_io),
+                        TokioIo::new(upstream_io),
+                    )
+                    .await;
                 }
                 Err(e) => tracing::debug!("device ws upgrade: {e}"),
             },

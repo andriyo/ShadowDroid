@@ -37,6 +37,20 @@
     <item name="log_button" type="id" />
     <item name="crash_button" type="id" />
     <item name="anr_button" type="id" />
+    <item name="websocket_chat_button" type="id" />
+    <item name="websocket_chat_root" type="id" />
+    <item name="websocket_url_input" type="id" />
+    <item name="websocket_message_input" type="id" />
+    <item name="websocket_status" type="id" />
+    <item name="websocket_transcript" type="id" />
+    <item name="websocket_use_ws_button" type="id" />
+    <item name="websocket_use_wss_button" type="id" />
+    <item name="websocket_connect_button" type="id" />
+    <item name="websocket_send_button" type="id" />
+    <item name="websocket_send_binary_button" type="id" />
+    <item name="websocket_send_large_button" type="id" />
+    <item name="websocket_disconnect_button" type="id" />
+    <item name="websocket_clear_button" type="id" />
     <item name="https_get_button" type="id" />
     <item name="http_get_button" type="id" />
     <item name="json_post_button" type="id" />

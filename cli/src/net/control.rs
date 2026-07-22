@@ -586,7 +586,27 @@ fn event_matches(ev: &Event, m: &Matcher) -> bool {
             .as_deref()
             .map(|x| host.to_lowercase().contains(&x.to_lowercase()))
             .unwrap_or(true),
-        // Only HTTP + TLS-error events flow over network stream clients.
+        // A WebSocket upgrade carries host + path; method/status are HTTP-only
+        // filters, so their presence excludes WS from that stream.
+        Event::WsOpen { host, path, .. } => {
+            let sub = |hay: &str, n: &Option<String>| {
+                n.as_deref()
+                    .map(|x| hay.to_lowercase().contains(&x.to_lowercase()))
+                    .unwrap_or(true)
+            };
+            m.method.is_none() && m.status.is_none() && sub(host, &m.host) && sub(path, &m.path)
+        }
+        // Messages/closes carry only host; a path/method/status filter excludes them.
+        Event::WsMsg { host, .. } | Event::WsClose { host, .. } => {
+            m.method.is_none()
+                && m.status.is_none()
+                && m.path.is_none()
+                && m.host
+                    .as_deref()
+                    .map(|x| host.to_lowercase().contains(&x.to_lowercase()))
+                    .unwrap_or(true)
+        }
+        // Non-network events never flow over network stream clients.
         _ => false,
     }
 }

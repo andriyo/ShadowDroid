@@ -861,9 +861,24 @@ The decrypted leg negotiates **HTTP/2 or HTTP/1.1** (h2 apps aren't
 downgraded), streams **SSE / large bodies** through instead of buffering them —
 both response and request (a big upload streams chunked; marked
 `streamed`/`req_streamed` in the flow) — decodes `gzip`/`deflate`/`br`/`zstd`,
-and raw-tunnels **WebSocket** upgrades. `net start --verify-upstream` validates
-the real server certificate for both HTTPS and WSS (off by default for
+and **captures WebSocket (WS/WSS) frames**. `net start --verify-upstream`
+validates the real server certificate for both HTTPS and WSS (off by default for
 self-signed dev backends);
+
+Once an in-scope connection upgrades, the proxy forwards every byte unchanged
+and decodes a copy of the frame stream. Inspect it hierarchically so an agent
+spends tokens only on the frames it needs: `net ws` lists sessions (id, url,
+per-direction message/byte counts), `net ws <id>` lists that session's messages
+(compact `dir`/`opcode`/`preview`, filterable by `--dir`/`--opcode`/`--grep`/
+`--since`), and `net show <message-id>` reveals a full reassembled payload
+(`--body-file` writes it binary-safe). Fragmented messages are reassembled and
+`permessage-deflate` payloads inflated (marked `compressed`/`decompressed`, with
+`wire_len` vs `payload_len`). `net log` shows `ws_open`/`ws_close` lifecycle
+inline with HTTP by default; `--protocol websocket|all` adds per-message
+`ws_msg` events, which also stream live on `watch`. `net export jsonl` writes a
+durable line-per-record dump. Payload retention is bounded (`truncated`),
+`--redact` applies to text frames, and an engine that bypasses the proxy or pins
+its certificate is reported (`tls_error`) rather than silently dropped.
 Global `--redact` on `net start` applies the built-in/configured policy to
 authorization/cookie headers, nested JSON/GraphQL body fields, JWTs, email/IP
 values, and configured patterns before completed captures are persisted (the

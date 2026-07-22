@@ -33,6 +33,45 @@ adds a durable boundary. `net log clear` clears queryable history without
 stopping an active proxy or removing its rules; its summary explicitly reports
 that preservation. A later `net start` creates a new capture session.
 
+## WebSocket (WS/WSS) capture
+
+Once an in-scope decryptable connection upgrades to a WebSocket, the proxy
+forwards every byte unchanged and decodes a copy of the frame stream. Inspect it
+hierarchically — cheapest first — so you spend tokens only on the frames you
+need:
+
+```bash
+shadowdroid net ws                       # list sessions (id, url, msg/byte counts)
+shadowdroid net ws w1                     # that session's messages (compact)
+shadowdroid net ws w1 --dir s2c --opcode text --grep '"error"'
+shadowdroid net show w1                   # session detail: upgrade + close + totals
+shadowdroid net show w1.3 --body          # one message's full reassembled payload
+shadowdroid net show w1.3 --body-file /tmp/frame.bin   # binary-safe artifact
+shadowdroid net export jsonl --protocol websocket --out ws.jsonl
+```
+
+Ids: a session is `w1`, its messages `w1.1`, `w1.2`, …. Each message carries a
+`dir` (`c2s` app→server / `s2c` server→app), `opcode` (text/binary/ping/pong/
+close), `payload_len`, and a short `preview`; `net show` returns the full text
+(or base64 for binary). Fragmented messages are reassembled (`frame_count`
+retained); `permessage-deflate` payloads are inflated and marked
+`compressed`/`decompressed` with `wire_len` (on-wire) vs `payload_len`
+(decompressed). Payload retention is bounded — honor `truncated`.
+
+`net log` shows WebSocket **lifecycle** (`ws_open`/`ws_close`) inline with HTTP
+by default but withholds the per-message firehose; add `--protocol websocket`
+(messages only) or `--protocol all` to include `ws_msg`, or `--protocol http` to
+hide WebSockets. `--redact`, capture-session scoping, `--since`, and checkpoints
+apply to WebSocket records exactly as to flows. On `watch`, `ws_open`, `ws_msg`,
+and `ws_close` interleave live with `screen`/`http`.
+
+Limitations: capture requires the connection to traverse the proxy and be
+decryptable. An engine that ignores the system proxy (some Cronet/QUIC clients)
+or a certificate-pinned WSS handshake produces a `tls_error` (or nothing) rather
+than frames — the socket is outside capture, not silently dropped. If frame
+decoding ever desyncs, forwarding continues untapped (the app is never
+affected).
+
 Rules have an explicit phase. The ambiguous old `set-header` name is rejected:
 
 ```bash

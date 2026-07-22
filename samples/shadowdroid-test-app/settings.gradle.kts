@@ -16,4 +16,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "shadowdroid-test-app"
 include(":app")
-
+include(":chat-server")

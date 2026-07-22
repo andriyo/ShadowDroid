@@ -48,6 +48,7 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.9.3")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")
+    implementation("com.squareup.okhttp3:okhttp:5.3.0")
 }
 
 // >>> shadowdroid coroutine probes (managed by `shadowdroid aar`) — do not edit

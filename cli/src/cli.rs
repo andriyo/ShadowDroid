@@ -920,6 +920,29 @@ pub enum UiCmd {
 
 // ── network proxy (`net`) ─────────────────────────────────────
 
+/// Protocol filter for `net log`/`net export`. Absent on `net log` means the
+/// default view (HTTP + WebSocket lifecycle, no per-message frames).
+#[derive(Copy, Clone, Debug, clap::ValueEnum)]
+pub enum ProtocolArg {
+    /// HTTP flows + TLS errors only.
+    Http,
+    /// WebSocket only: upgrades, messages, and closes.
+    #[value(alias = "ws")]
+    Websocket,
+    /// Everything, including every WebSocket message.
+    All,
+}
+
+impl ProtocolArg {
+    pub fn to_store(self) -> crate::net::store::Protocol {
+        match self {
+            ProtocolArg::Http => crate::net::store::Protocol::Http,
+            ProtocolArg::Websocket => crate::net::store::Protocol::WebSocket,
+            ProtocolArg::All => crate::net::store::Protocol::All,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub enum NetCmd {
     /// Verdict: is this app interceptable (debuggable, NSC trusts user CA, engine proxy-aware)?
@@ -1057,6 +1080,11 @@ pub enum NetCmd {
         /// Restrict results to flows modified by this rule id.
         #[arg(long, value_name = "RULE_ID")]
         rule_id: Option<String>,
+        /// Which protocols to show. Default: HTTP + WebSocket lifecycle (no
+        /// per-message frames). `websocket` shows WS messages too; `http` hides
+        /// WebSockets; `all` shows everything.
+        #[arg(long, value_enum, conflicts_with = "action")]
+        protocol: Option<ProtocolArg>,
     },
     /// Mark the current capture boundary without stopping the proxy.
     Checkpoint,
@@ -1079,13 +1107,51 @@ pub enum NetCmd {
     /// GraphQL POSTs are keyed by operationName). Framework-specific setups are
     /// generated from the neutral fixtures manifest by your own tooling.
     Export {
-        /// Export format: har, curl, or fixtures.
-        #[arg(value_parser = ["har", "curl", "fixtures"])]
+        /// Export format: har, curl, fixtures, or jsonl (durable line-per-record
+        /// stream; the machine-readable format for WebSocket messages).
+        #[arg(value_parser = ["har", "curl", "fixtures", "jsonl"])]
         format: String,
         id: Option<String>,
-        /// Output directory for `fixtures` (default: ./shadowdroid-fixtures).
+        /// Output path: directory for `fixtures`, file for `jsonl` (stdout if
+        /// omitted for `jsonl`).
         #[arg(short = 'o', long)]
         out: Option<PathBuf>,
+        /// jsonl only: which protocol to export (http | websocket | all).
+        /// Default: all.
+        #[arg(long, value_enum)]
+        protocol: Option<ProtocolArg>,
+        /// jsonl only: restrict to one capture session id.
+        #[arg(long, value_name = "SESSION")]
+        session: Option<String>,
+    },
+    /// Inspect captured WebSocket traffic: sessions, then messages. Cheapest
+    /// first — bare `net ws` lists sessions; `net ws <id>` lists that session's
+    /// messages; `net show <message-id>` reveals a full payload.
+    Ws {
+        /// A session id (e.g. `w1`) to list its messages; omit to list sessions.
+        #[arg(value_name = "SESSION_ID")]
+        id: Option<String>,
+        /// Filter by host (substring).
+        #[arg(long)]
+        host: Option<String>,
+        /// Only one direction: `c2s` (app→server) or `s2c` (server→app).
+        #[arg(long, value_parser = ["c2s", "s2c"])]
+        dir: Option<String>,
+        /// Only this frame type.
+        #[arg(long, value_parser = ["text", "binary", "ping", "pong", "close"])]
+        opcode: Option<String>,
+        /// Only messages whose text/preview contains this (substring).
+        #[arg(long)]
+        grep: Option<String>,
+        /// Restrict to one capture session id from `net start`.
+        #[arg(long, value_name = "SESSION")]
+        session: Option<String>,
+        /// Restrict to a recent duration, e.g. 500ms, 2m, 1h.
+        #[arg(long, value_name = "DURATION")]
+        since: Option<String>,
+        /// Max rows to return (most recent first).
+        #[arg(short = 'n', long, default_value_t = 50)]
+        limit: usize,
     },
     /// Pause matching flows for agent-in-the-loop editing.
     Intercept {
@@ -2863,6 +2929,7 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
             after_id,
             after_checkpoint,
             rule_id,
+            protocol,
         } => {
             if action.as_deref() == Some("clear") {
                 nc::log_clear(serial).await
@@ -2872,6 +2939,7 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
                     nc::LogOpts {
                         matcher: matcher(host, path, method, status),
                         limit: *limit,
+                        protocol: protocol.map(ProtocolArg::to_store).unwrap_or_default(),
                         capture_session_id: session.clone(),
                         since: since.clone(),
                         after_id: after_id.clone(),
@@ -2883,14 +2951,53 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
             }
         }
         NetCmd::Checkpoint => nc::checkpoint(serial).await,
+        NetCmd::Ws {
+            id,
+            host,
+            dir,
+            opcode,
+            grep,
+            session,
+            since,
+            limit,
+        } => {
+            nc::ws(
+                serial,
+                nc::WsOpts {
+                    session_id: id.clone(),
+                    host: host.clone(),
+                    dir: dir.clone(),
+                    opcode: opcode.clone(),
+                    grep: grep.clone(),
+                    capture_session_id: session.clone(),
+                    since: since.clone(),
+                    limit: *limit,
+                },
+            )
+            .await
+        }
         NetCmd::Show {
             id,
             body,
             body_file,
             har,
         } => nc::show(serial, id, *body, *har, body_file.as_deref()).await,
-        NetCmd::Export { format, id, out } => {
-            nc::export(serial, format, id.clone(), out.clone()).await
+        NetCmd::Export {
+            format,
+            id,
+            out,
+            protocol,
+            session,
+        } => {
+            nc::export(
+                serial,
+                format,
+                id.clone(),
+                out.clone(),
+                protocol.map(ProtocolArg::to_store),
+                session.clone(),
+            )
+            .await
         }
         NetCmd::Intercept {
             host,

@@ -45,6 +45,11 @@
             android:label="@string/coroutines_activity_name" />
 
         <activity
+            android:name=".WebSocketChatActivity"
+            android:exported="true"
+            android:label="WebSocket Chat" />
+
+        <activity
             android:name=".AltLauncherActivity"
             android:exported="true"
             android:label="@string/alt_launcher_activity_name">

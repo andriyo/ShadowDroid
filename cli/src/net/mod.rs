@@ -30,6 +30,7 @@ pub mod paths;
 pub mod proxy;
 pub mod store;
 pub mod trust;
+pub mod ws;
 
 /// Default proxy listen/forward port (device `http_proxy` → host proxy).
 pub const DEFAULT_PROXY_PORT: u16 = 8080;
@@ -79,6 +80,24 @@ pub(crate) fn flow_next_actions(serial: &crate::ids::Serial, id: &str) -> Vec<St
         scoped_action(serial, &format!("show {id} --body")),
         scoped_action(serial, &format!("export har {id}")),
         scoped_action(serial, &format!("export curl {id}")),
+    ]
+}
+
+/// A WebSocket session's drill-in actions: its message list, then its detail.
+pub(crate) fn ws_session_next_actions(serial: &crate::ids::Serial, id: &str) -> Vec<String> {
+    let token = crate::events::shell_token(id);
+    vec![
+        scoped_action(serial, &format!("ws {token}")),
+        scoped_action(serial, &format!("show {token}")),
+    ]
+}
+
+/// A WebSocket message's actions: full payload inline, then binary-safe to file.
+pub(crate) fn ws_message_next_actions(serial: &crate::ids::Serial, id: &str) -> Vec<String> {
+    let token = crate::events::shell_token(id);
+    vec![
+        scoped_action(serial, &format!("show {token} --body")),
+        scoped_action(serial, &format!("show {token} --body-file /tmp/frame.bin")),
     ]
 }
 
