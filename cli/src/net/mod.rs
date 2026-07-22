@@ -101,6 +101,17 @@ pub(crate) fn ws_message_next_actions(serial: &crate::ids::Serial, id: &str) -> 
     ]
 }
 
+/// A held (intercepted) WebSocket frame's actions: forward, edit, or drop it
+/// before its hold deadline.
+pub(crate) fn ws_intercept_next_actions(serial: &crate::ids::Serial, id: &str) -> Vec<String> {
+    let token = crate::events::shell_token(id);
+    vec![
+        scoped_action(serial, &format!("resume {token}")),
+        scoped_action(serial, &format!("resume {token} --text '<edited>'")),
+        scoped_action(serial, &format!("drop {token}")),
+    ]
+}
+
 pub(crate) fn tls_error_next_actions(serial: &crate::ids::Serial) -> Vec<String> {
     vec![
         scoped_action(serial, "check --fresh"),
@@ -170,6 +181,12 @@ pub struct RuleSpec {
     pub operation_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response: Option<SyntheticResponseSpec>,
+    /// `ws-*` rules: restrict to a direction (`c2s`/`s2c`); `None` = both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_dir: Option<String>,
+    /// `ws-*` rules: restrict to a frame opcode; `None` = all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_opcode: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
 }

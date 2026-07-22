@@ -241,12 +241,37 @@ pub enum Event {
         compressed: bool,
         #[serde(default, skip_serializing_if = "is_false")]
         truncated: bool,
+        /// Synthesized by `net inject` / a `ws-inject` rule, not observed traffic.
+        #[serde(default, skip_serializing_if = "is_false")]
+        injected: bool,
+        /// A `ws-*` rule or intercept touched this frame.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rule_id: Option<String>,
+        /// `dropped` / `modified` / `refused_deflate` (managed mode).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        disposition: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         close_code: Option<u16>,
         #[serde(skip_serializing_if = "Option::is_none")]
         preview: Option<String>,
         #[serde(default, skip_serializing_if = "is_false")]
         body_redacted: bool,
+        next_actions: Vec<String>,
+    },
+    /// A WebSocket frame paused by `net intercept --dir …`, awaiting the agent's
+    /// `net resume`/`net drop`. Held until acted on or `hold_deadline_ms`.
+    WsIntercept {
+        ts: f64,
+        id: String,
+        session_id: String,
+        capture_session_id: String,
+        host: String,
+        dir: String,
+        opcode: String,
+        len: u64,
+        hold_deadline_ms: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        preview: Option<String>,
         next_actions: Vec<String>,
     },
     /// A WebSocket session closed. Carries the close code/reason (when a close

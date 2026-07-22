@@ -50,6 +50,12 @@ pub const COMPRESSED_ACCUM_CAP: usize = 256 * 1024;
 pub const MAX_DECOMPRESS: usize = 8 * 1024 * 1024;
 /// Chars of payload shown inline in the compact `ws_msg` event / `net ws` row.
 pub const PREVIEW_CAP: usize = 200;
+/// Max per-frame metadata entries retained for one reassembled message (bounds
+/// the `frames` vector for a pathologically fragmented message).
+pub const MAX_RETAINED_FRAMES: usize = 256;
+/// Max concurrently-held WebSocket frames before intercept fails open (forwards
+/// the frame unheld) rather than pausing a direction unboundedly.
+pub const MAX_WS_HELD: usize = 64;
 /// A frame whose declared length exceeds this is a protocol error, not real
 /// traffic — refuse it and mark the direction desynced rather than trusting a
 /// bogus 8-byte length field.
@@ -117,6 +123,78 @@ impl Opcode {
             Opcode::Reserved(_) => "reserved",
         }
     }
+
+    /// The 4-bit wire value (inverse of [Opcode::from_u8]).
+    fn to_u8(self) -> u8 {
+        match self {
+            Opcode::Continuation => 0x0,
+            Opcode::Text => 0x1,
+            Opcode::Binary => 0x2,
+            Opcode::Close => 0x8,
+            Opcode::Ping => 0x9,
+            Opcode::Pong => 0xA,
+            Opcode::Reserved(other) => other & 0x0F,
+        }
+    }
+
+    /// Parse a wire label (`text`/`binary`/`ping`/`pong`/`close`) for injection.
+    pub fn from_label(label: &str) -> Option<Opcode> {
+        match label {
+            "text" => Some(Opcode::Text),
+            "binary" => Some(Opcode::Binary),
+            "ping" => Some(Opcode::Ping),
+            "pong" => Some(Opcode::Pong),
+            "close" => Some(Opcode::Close),
+            _ => None,
+        }
+    }
+}
+
+static INJECT_MASK_SEED: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
+
+/// Encode one final, unfragmented, uncompressed WebSocket frame for injection or
+/// re-emission. `mask` masks the payload — required for client→server (`c2s`)
+/// frames, forbidden for server→client. Injecting uncompressed (RSV1=0) is safe
+/// even under `permessage-deflate` context takeover: an uncompressed message
+/// bypasses the peer's inflate window entirely, so it can't desync later frames.
+pub fn encode_frame(opcode: Opcode, payload: &[u8], mask: bool) -> Vec<u8> {
+    // RFC 6455 §5.5: a control frame's payload is at most 125 bytes. Callers
+    // that accept a user payload (`net inject`) reject oversize up front; this
+    // asserts the invariant for internally-built control frames.
+    debug_assert!(
+        !(opcode.is_control() && payload.len() > 125),
+        "control frame payload must be <=125 bytes, got {}",
+        payload.len()
+    );
+    let mut out = Vec::with_capacity(payload.len() + 14);
+    out.push(0x80 | opcode.to_u8()); // FIN + opcode, RSV=0
+    let mask_bit = if mask { 0x80 } else { 0 };
+    let len = payload.len();
+    if len < 126 {
+        out.push(mask_bit | len as u8);
+    } else if len < 65536 {
+        out.push(mask_bit | 126);
+        out.extend_from_slice(&(len as u16).to_be_bytes());
+    } else {
+        out.push(mask_bit | 127);
+        out.extend_from_slice(&(len as u64).to_be_bytes());
+    }
+    if mask {
+        // The masking key need not be cryptographically random — the receiver
+        // simply XORs with whatever key we send. Vary it per frame from a counter
+        // (Math.random-free) so we don't ship an all-constant key.
+        let key = INJECT_MASK_SEED
+            .fetch_add(0x6d2b_79f5_a1b2_c3d4, Ordering::Relaxed)
+            .to_be_bytes();
+        let key = [key[0], key[1], key[2], key[3]];
+        out.extend_from_slice(&key);
+        for (index, &byte) in payload.iter().enumerate() {
+            out.push(byte ^ key[index & 3]);
+        }
+    } else {
+        out.extend_from_slice(payload);
+    }
+    out
 }
 
 /// One decoded frame with a bounded, unmasked payload prefix.
@@ -179,6 +257,12 @@ impl FrameDecoder {
 
     pub fn desynced(&self) -> bool {
         self.desynced
+    }
+
+    /// `true` when the decoder is between frames (no partial frame buffered), so
+    /// an injected frame can be spliced in without corrupting a fragmented one.
+    pub fn at_boundary(&self) -> bool {
+        self.pending.is_none() && self.buf.is_empty()
     }
 
     /// Feed wire bytes; return frames completed by this chunk (possibly empty).
@@ -348,6 +432,143 @@ fn parse_header(buf: &[u8]) -> HeaderParse {
     }
 }
 
+/// Max frame size buffered whole in managed (intercept/rule) mode. A larger
+/// frame streams through raw and unmanaged.
+const MANAGED_FRAME_CAP: u64 = 8 * 1024 * 1024;
+
+/// A complete frame decoded for managed mode, with its exact on-wire bytes so it
+/// can be forwarded byte-identically (the only window-safe option under
+/// `permessage-deflate` context takeover).
+pub struct ManagedFrame {
+    pub fin: bool,
+    pub rsv1: bool,
+    pub opcode: Opcode,
+    /// Unmasked, whole payload.
+    pub payload: Vec<u8>,
+    /// The exact on-wire bytes (header + masked payload).
+    pub raw: Vec<u8>,
+}
+
+/// Output of [ManagedFramer::push].
+pub enum ManagedItem {
+    /// A fully-decoded frame to manage (rules / intercept).
+    Frame(ManagedFrame),
+    /// Raw bytes to forward verbatim (an oversized/undecodable frame the framer
+    /// won't buffer).
+    Passthrough(Vec<u8>),
+}
+
+/// Full-frame reader for managed mode: buffers each frame whole (up to
+/// [MANAGED_FRAME_CAP]) so it can be dropped, re-encoded, or forwarded exactly.
+/// Oversized/malformed input streams through as [ManagedItem::Passthrough].
+pub struct ManagedFramer {
+    buf: Vec<u8>,
+    /// Remaining bytes of an oversized frame still to stream through raw.
+    oversized_remaining: u64,
+    desynced: bool,
+}
+
+impl ManagedFramer {
+    pub fn new() -> ManagedFramer {
+        ManagedFramer {
+            buf: Vec::new(),
+            oversized_remaining: 0,
+            desynced: false,
+        }
+    }
+
+    /// `true` when between frames — safe to splice an injected frame.
+    pub fn at_boundary(&self) -> bool {
+        self.buf.is_empty() && self.oversized_remaining == 0
+    }
+
+    /// `true` once a malformed header forced the framer to give up decoding and
+    /// stream the rest raw. Frame boundaries are no longer known after this.
+    pub fn desynced(&self) -> bool {
+        self.desynced
+    }
+
+    pub fn push(&mut self, data: &[u8]) -> Vec<ManagedItem> {
+        let mut out = Vec::new();
+        if self.desynced {
+            if !data.is_empty() {
+                out.push(ManagedItem::Passthrough(data.to_vec()));
+            }
+            return out;
+        }
+        self.buf.extend_from_slice(data);
+        loop {
+            if self.oversized_remaining > 0 {
+                let take = self.oversized_remaining.min(self.buf.len() as u64) as usize;
+                if take == 0 {
+                    break;
+                }
+                let chunk: Vec<u8> = self.buf.drain(..take).collect();
+                self.oversized_remaining -= take as u64;
+                out.push(ManagedItem::Passthrough(chunk));
+                continue;
+            }
+            match parse_header(&self.buf) {
+                HeaderParse::Need => break,
+                HeaderParse::Malformed => {
+                    self.desynced = true;
+                    let rest = std::mem::take(&mut self.buf);
+                    if !rest.is_empty() {
+                        out.push(ManagedItem::Passthrough(rest));
+                    }
+                    break;
+                }
+                HeaderParse::Parsed { header, consumed } => {
+                    if header.payload_len > MANAGED_FRAME_CAP {
+                        // Oversized: stream the header now, then the payload raw.
+                        let header_bytes: Vec<u8> = self.buf.drain(..consumed).collect();
+                        out.push(ManagedItem::Passthrough(header_bytes));
+                        self.oversized_remaining = header.payload_len;
+                        continue;
+                    }
+                    let total = consumed + header.payload_len as usize;
+                    if self.buf.len() < total {
+                        break; // wait for the whole frame
+                    }
+                    let raw: Vec<u8> = self.buf.drain(..total).collect();
+                    let mut payload = raw[consumed..].to_vec();
+                    if header.masked {
+                        for (index, byte) in payload.iter_mut().enumerate() {
+                            *byte ^= header.mask[index & 3];
+                        }
+                    }
+                    out.push(ManagedItem::Frame(ManagedFrame {
+                        fin: header.fin,
+                        rsv1: header.rsv1,
+                        opcode: header.opcode,
+                        payload,
+                        raw,
+                    }));
+                }
+            }
+        }
+        out
+    }
+}
+
+impl Default for ManagedFramer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Per-frame breakdown of a reassembled message — retained for
+/// `net show <id> --frames` so fragmentation is debuggable. `len` is the frame's
+/// on-wire payload length.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WsFrameMeta {
+    pub opcode: String,
+    pub len: u64,
+    pub fin: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rsv1: bool,
+}
+
 /// A reassembled application message (or a single control frame). This is the
 /// unit an agent inspects.
 #[derive(Debug, Clone)]
@@ -369,6 +590,8 @@ pub struct Message {
     pub compressed: bool,
     /// The compressed payload was successfully inflated.
     pub decompressed: bool,
+    /// Per-frame breakdown (in order), for fragmentation debugging.
+    pub frames: Vec<WsFrameMeta>,
 }
 
 impl Message {
@@ -549,6 +772,7 @@ struct ActiveMessage {
     truncated: bool,
     frame_count: u32,
     compressed: bool,
+    frames: Vec<WsFrameMeta>,
 }
 
 impl MessageAssembler {
@@ -579,6 +803,13 @@ impl MessageAssembler {
         }
     }
 
+    /// `true` when no fragmented data message is in flight — so a data frame can
+    /// be injected without splitting one (a Continuation is expected next
+    /// otherwise). Control frames may still interleave a fragmented message.
+    pub fn at_message_boundary(&self) -> bool {
+        self.active.is_none()
+    }
+
     /// Feed one decoded frame; return a completed [Message] when one finishes.
     pub fn accept(&mut self, frame: RawFrame) -> Option<Message> {
         if frame.opcode.is_control() {
@@ -592,6 +823,12 @@ impl MessageAssembler {
                 frame_count: 1,
                 compressed: false,
                 decompressed: false,
+                frames: vec![WsFrameMeta {
+                    opcode: frame.opcode.as_str().to_string(),
+                    len: frame.payload_len,
+                    fin: frame.fin,
+                    rsv1: frame.rsv1,
+                }],
                 payload: frame.payload,
             });
         }
@@ -608,6 +845,7 @@ impl MessageAssembler {
                     truncated: false,
                     frame_count: 0,
                     compressed: self.deflate.enabled && frame.rsv1,
+                    frames: Vec::new(),
                 };
                 let fin = frame.fin;
                 self.append_frame(&mut active, frame);
@@ -638,6 +876,16 @@ impl MessageAssembler {
     fn append_frame(&self, active: &mut ActiveMessage, frame: RawFrame) {
         active.frame_count += 1;
         active.wire_len += frame.payload_len;
+        // Cap retained per-frame metadata so a pathologically fragmented message
+        // can't grow this vector without bound.
+        if active.frames.len() < MAX_RETAINED_FRAMES {
+            active.frames.push(WsFrameMeta {
+                opcode: frame.opcode.as_str().to_string(),
+                len: frame.payload_len,
+                fin: frame.fin,
+                rsv1: frame.rsv1,
+            });
+        }
         if frame.truncated {
             active.truncated = true;
         }
@@ -669,6 +917,7 @@ impl MessageAssembler {
             frame_count: active.frame_count,
             compressed: active.compressed,
             decompressed: false,
+            frames: active.frames,
         };
         if !message.compressed {
             return message;
@@ -838,12 +1087,27 @@ pub struct WsMessageRecord {
     pub wire_len: u64,
     pub retained_len: u64,
     pub frame_count: u32,
+    /// Per-frame breakdown, retained only for fragmented messages (`net show
+    /// --frames`); a single-frame message synthesizes this on demand.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frames: Vec<WsFrameMeta>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub truncated: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub compressed: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub decompressed: bool,
+    /// This frame was synthesized by ShadowDroid (`net inject` / a `ws-inject`
+    /// rule), not observed from the app or server.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub injected: bool,
+    /// A `ws-*` rule or intercept touched this frame (rule id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    /// What managed mode did to this frame: `dropped`, `modified`, or
+    /// `refused_deflate` (drop/modify skipped — unsafe under context takeover).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<String>,
     /// Textual payload (text messages + UTF-8 binary/control), capped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
@@ -885,6 +1149,9 @@ impl WsMessageRecord {
             },
             compressed: self.compressed,
             truncated: self.truncated,
+            injected: self.injected,
+            rule_id: self.rule_id.clone(),
+            disposition: self.disposition.clone(),
             close_code: self.close_code,
             preview: self.preview.clone(),
             body_redacted: self.body_redacted,
@@ -913,6 +1180,9 @@ impl WsMessageRecord {
             "truncated": self.truncated,
             "compressed": self.compressed,
             "decompressed": self.decompressed,
+            "injected": self.injected,
+            "rule_id": self.rule_id,
+            "disposition": self.disposition,
             "preview": self.preview,
             "close_code": self.close_code,
             "close_reason": self.close_reason,
@@ -946,6 +1216,20 @@ impl WsMessageRecord {
         }
         self.redaction_policy = Some(policy.label().to_string());
         self.redaction_policy_version = Some(crate::redaction::POLICY_VERSION);
+    }
+
+    /// The per-frame breakdown for `net show --frames`: the stored frames for a
+    /// fragmented message, or a synthesized single frame for an unfragmented one.
+    pub fn frame_breakdown(&self) -> Vec<WsFrameMeta> {
+        if !self.frames.is_empty() {
+            return self.frames.clone();
+        }
+        vec![WsFrameMeta {
+            opcode: self.opcode.clone(),
+            len: self.wire_len,
+            fin: true,
+            rsv1: self.compressed,
+        }]
     }
 
     /// The retained payload bytes, for `net show --body-file` (decodes base64 or
@@ -1212,9 +1496,20 @@ fn build_message_record(
         wire_len: message.wire_len,
         retained_len,
         frame_count: message.frame_count,
+        // Only fragmented messages keep the per-frame breakdown — a single-frame
+        // message is fully described by its own fields, so persisting one frame
+        // entry per `ws_msg` would just bloat the log.
+        frames: if message.frame_count > 1 {
+            message.frames.clone()
+        } else {
+            Vec::new()
+        },
         truncated: message.truncated,
         compressed: message.compressed,
         decompressed: message.decompressed,
+        injected: false,
+        rule_id: None,
+        disposition: None,
         text,
         data_b64,
         preview,
@@ -1288,9 +1583,186 @@ impl WsStats {
     }
 }
 
+/// A frame queued for injection into a live session by `net inject` / a
+/// `ws-inject` rule.
+#[derive(Debug, Clone)]
+pub struct InjectedFrame {
+    pub opcode: Opcode,
+    pub payload: Vec<u8>,
+}
+
+// ── managed mode: frame interception + declarative rules ──────────────────────
+
+/// Armed WebSocket frame interception (`net intercept --dir …`). Matching frames
+/// are paused and surfaced as `ws_intercept` events until the agent acts.
+#[derive(Clone)]
+pub struct WsInterceptCfg {
+    /// Host substring (empty = any).
+    pub host: Option<String>,
+    /// Direction to intercept (None = both).
+    pub dir: Option<Direction>,
+    /// Opcode to intercept (None = all).
+    pub opcode: Option<String>,
+    pub hold_ms: u32,
+    /// On the hold deadline: drop the frame (fail-closed) vs forward it (fail-open).
+    pub on_timeout_drop: bool,
+}
+
+impl WsInterceptCfg {
+    fn matches(&self, host: &str, direction: Direction, opcode: &str) -> bool {
+        self.host
+            .as_deref()
+            .is_none_or(|needle| host.to_lowercase().contains(&needle.to_lowercase()))
+            && self.dir.is_none_or(|dir| dir == direction)
+            && self.opcode.as_deref().is_none_or(|want| want == opcode)
+    }
+}
+
+/// The agent's decision for a held WebSocket frame (`net resume`/`net drop`).
+#[derive(Debug, Clone)]
+pub enum WsHoldDecision {
+    /// Forward the frame unchanged.
+    Forward,
+    /// Forward the frame with a replaced payload.
+    Modify(Vec<u8>),
+    /// Drop the frame.
+    Drop,
+}
+
+/// A paused WebSocket frame awaiting `net resume`/`net drop`. Identity beyond
+/// what `net resume`/`net drop` need already rode out on the `ws_intercept` event.
+pub struct WsHeldFrame {
+    pub tx: Option<tokio::sync::oneshot::Sender<WsHoldDecision>>,
+    pub dir: String,
+    pub opcode: String,
+    pub host: String,
+}
+
+/// Outcome of applying declarative `ws-*` rules to one frame.
+pub enum WsRuleAction {
+    Forward,
+    Drop(String),
+    Modify(String, Vec<u8>),
+}
+
+fn ws_rule_matches(
+    spec: &crate::net::RuleSpec,
+    host: &str,
+    direction: Direction,
+    opcode: &str,
+) -> bool {
+    let host_ok = spec
+        .matcher
+        .host
+        .as_deref()
+        .is_none_or(|needle| host.to_lowercase().contains(&needle.to_lowercase()));
+    let dir_ok = spec
+        .ws_dir
+        .as_deref()
+        .is_none_or(|want| want == direction.as_str());
+    let opcode_ok = spec.ws_opcode.as_deref().is_none_or(|want| want == opcode);
+    host_ok && dir_ok && opcode_ok
+}
+
+/// Apply `ws-drop` / `ws-set-text` rules matching (host, direction, opcode). The
+/// first matching rule wins.
+pub fn apply_ws_rules(
+    rules: &[(String, crate::net::RuleSpec)],
+    host: &str,
+    direction: Direction,
+    opcode: &str,
+) -> WsRuleAction {
+    for (id, spec) in rules {
+        if !matches!(spec.kind.as_str(), "ws-drop" | "ws-set-text") {
+            continue;
+        }
+        if !ws_rule_matches(spec, host, direction, opcode) {
+            continue;
+        }
+        return match spec.kind.as_str() {
+            "ws-drop" => WsRuleAction::Drop(id.clone()),
+            "ws-set-text" => WsRuleAction::Modify(
+                id.clone(),
+                spec.args.first().cloned().unwrap_or_default().into_bytes(),
+            ),
+            _ => WsRuleAction::Forward,
+        };
+    }
+    WsRuleAction::Forward
+}
+
+/// Whether re-encoding a frame in `direction` is window-safe. Under
+/// `permessage-deflate` context takeover, forwarding a re-encoded (uncompressed)
+/// or dropped frame desyncs the peer's inflate window, so drop/modify is refused
+/// there — only byte-exact forwarding (or injection) stays safe.
+fn managed_reencode_safe(deflate: DeflateParams, direction: Direction) -> bool {
+    if !deflate.enabled {
+        return true;
+    }
+    match direction {
+        Direction::ClientToServer => deflate.client_no_context_takeover,
+        Direction::ServerToClient => deflate.server_no_context_takeover,
+    }
+}
+
+/// Build a durable record for a frame ShadowDroid injected (not observed).
+fn injected_record(
+    meta: &WsSessionMeta,
+    direction: Direction,
+    seq: u64,
+    frame: &InjectedFrame,
+    redaction: Option<&crate::redaction::Policy>,
+) -> WsMessageRecord {
+    let message = Message {
+        opcode: frame.opcode,
+        payload: frame.payload.clone(),
+        payload_len: frame.payload.len() as u64,
+        wire_len: frame.payload.len() as u64,
+        truncated: false,
+        frame_count: 1,
+        compressed: false,
+        decompressed: false,
+        frames: Vec::new(),
+    };
+    let mut record = build_message_record(meta, direction, seq, &message, redaction, events_now());
+    record.injected = true;
+    record
+}
+
+/// Live control handles for one WebSocket session, registered in
+/// `SharedState.ws_control` so `net inject` can reach the running tap and splice
+/// a frame into either direction.
+pub struct WsSessionControl {
+    pub host: String,
+    pub permessage_deflate: bool,
+    /// Frames toward the server (masked, written by the `c2s` pump).
+    to_server: mpsc::Sender<InjectedFrame>,
+    /// Frames toward the app (unmasked, written by the `s2c` pump).
+    to_client: mpsc::Sender<InjectedFrame>,
+}
+
+impl WsSessionControl {
+    /// Queue a frame for injection in `direction`. Errors if the session has
+    /// ended or its inject buffer is full.
+    pub fn inject(
+        &self,
+        direction: Direction,
+        frame: InjectedFrame,
+    ) -> std::result::Result<(), &'static str> {
+        let channel = match direction {
+            Direction::ClientToServer => &self.to_server,
+            Direction::ServerToClient => &self.to_client,
+        };
+        channel.try_send(frame).map_err(|error| match error {
+            mpsc::error::TrySendError::Closed(_) => "the WebSocket session has closed",
+            mpsc::error::TrySendError::Full(_) => "the injection buffer is full",
+        })
+    }
+}
+
 /// Splice the two upgraded WebSocket streams, forwarding every byte verbatim
 /// while decoding a copy of each direction into durable records + live events.
-/// Never alters or delays forwarded traffic beyond one buffered read.
+/// Registers a [WsSessionControl] so `net inject` can splice frames in.
 pub async fn tap<Device, Upstream>(
     ctx: Arc<ProxyContext>,
     meta: WsSessionMeta,
@@ -1306,6 +1778,18 @@ pub async fn tap<Device, Upstream>(
     let (device_reader, device_writer) = tokio::io::split(device);
     let (upstream_reader, upstream_writer) = tokio::io::split(upstream);
     let (tx, rx) = mpsc::channel::<WsMessageRecord>(256);
+    // Injection channels: c2s frames go to the server, s2c frames go to the app.
+    let (to_server_tx, to_server_rx) = mpsc::channel::<InjectedFrame>(32);
+    let (to_client_tx, to_client_rx) = mpsc::channel::<InjectedFrame>(32);
+    ctx.shared.ws_control.lock().unwrap().insert(
+        meta.id.clone(),
+        WsSessionControl {
+            host: meta.host.clone(),
+            permessage_deflate: meta.deflate.enabled,
+            to_server: to_server_tx,
+            to_client: to_client_tx,
+        },
+    );
 
     let drain = {
         let ctx_drain = ctx.clone();
@@ -1327,6 +1811,7 @@ pub async fn tap<Device, Upstream>(
         stats.clone(),
         counter.clone(),
         tx.clone(),
+        to_server_rx,
     );
     let server = pump(
         ctx.clone(),
@@ -1338,20 +1823,288 @@ pub async fn tap<Device, Upstream>(
         stats.clone(),
         counter.clone(),
         tx,
+        to_client_rx,
     );
 
     tokio::select! {
         _ = async { tokio::join!(client, server); } => {}
         _ = ctx.shutdown.cancelled() => {}
     }
-    // Both pumps have returned (or been cancelled), dropping every sender; the
-    // drain loop now finalizes the session with a `ws_close` record.
+    // Deregister control before finalizing so no late `net inject` races a dead
+    // session, then let the drain loop write the terminal `ws_close`.
+    ctx.shared.ws_control.lock().unwrap().remove(&meta.id);
     let _ = drain.await;
 }
 
-/// Forward one direction verbatim while decoding a copy into message records.
-/// Bytes are written to `dst` *before* any parsing so decoding can never stall
-/// or corrupt the tunnel.
+/// Is this direction under managed control (intercept armed or a `ws-*` rule)?
+/// Checked per read; the pump switches modes only at a frame boundary.
+fn direction_managed(ctx: &ProxyContext, meta: &WsSessionMeta, direction: Direction) -> bool {
+    let host_match = |host: Option<&str>| {
+        host.is_none_or(|needle| meta.host.to_lowercase().contains(&needle.to_lowercase()))
+    };
+    if let Some(cfg) = ctx.shared.ws_intercept.read().unwrap().as_ref()
+        && host_match(cfg.host.as_deref())
+        && cfg.dir.is_none_or(|dir| dir == direction)
+    {
+        return true;
+    }
+    ctx.shared.rules.read().unwrap().iter().any(|(_, spec)| {
+        matches!(spec.kind.as_str(), "ws-drop" | "ws-set-text")
+            && host_match(spec.matcher.host.as_deref())
+            && spec
+                .ws_dir
+                .as_deref()
+                .is_none_or(|want| want == direction.as_str())
+    })
+}
+
+/// An observation [RawFrame] (payload truncated for storage) from a managed frame.
+fn managed_to_raw(frame: &ManagedFrame) -> RawFrame {
+    let full = frame.payload.len() as u64;
+    let payload = if frame.payload.len() > COMPRESSED_ACCUM_CAP {
+        frame.payload[..COMPRESSED_ACCUM_CAP].to_vec()
+    } else {
+        frame.payload.clone()
+    };
+    let truncated = (payload.len() as u64) < full;
+    RawFrame {
+        fin: frame.fin,
+        rsv1: frame.rsv1,
+        opcode: frame.opcode,
+        payload,
+        payload_len: full,
+        truncated,
+    }
+}
+
+/// Build + queue an observed message record (the observe path, per message).
+fn emit_observed(
+    ctx: &ProxyContext,
+    meta: &WsSessionMeta,
+    direction: Direction,
+    counter: &AtomicU64,
+    stats: &WsStats,
+    tx: &mpsc::Sender<WsMessageRecord>,
+    message: &Message,
+) {
+    stats.record(direction, message);
+    let seq = counter.fetch_add(1, Ordering::Relaxed);
+    let record = build_message_record(
+        meta,
+        direction,
+        seq,
+        message,
+        ctx.shared.redaction.as_ref(),
+        events_now(),
+    );
+    if tx.try_send(record).is_err() {
+        stats.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Pause a matching frame and await the agent's `net resume`/`net drop`. Fails
+/// open (or closed, per `on_timeout_drop`) on the hold deadline.
+async fn ws_hold(
+    ctx: &ProxyContext,
+    meta: &WsSessionMeta,
+    direction: Direction,
+    frame: &ManagedFrame,
+    opcode: &str,
+    cfg: &WsInterceptCfg,
+    id: &str,
+) -> WsHoldDecision {
+    let held_at = events_now();
+    let preview = std::str::from_utf8(&frame.payload)
+        .ok()
+        .map(|text| collapse_ws(text, PREVIEW_CAP))
+        .or_else(|| {
+            (!frame.payload.is_empty()).then(|| format!("<{} bytes>", frame.payload.len()))
+        });
+    let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+    {
+        let mut held = ctx.shared.ws_held.lock().unwrap();
+        if held.len() >= MAX_WS_HELD {
+            // Overloaded: fail open rather than pause the direction unboundedly.
+            return WsHoldDecision::Forward;
+        }
+        held.insert(
+            id.to_string(),
+            WsHeldFrame {
+                tx: Some(decision_tx),
+                dir: direction.as_str().to_string(),
+                opcode: opcode.to_string(),
+                host: meta.host.clone(),
+            },
+        );
+    }
+    let _ = ctx.shared.events.send(Arc::new(Event::WsIntercept {
+        ts: held_at,
+        id: id.to_string(),
+        session_id: meta.id.clone(),
+        capture_session_id: meta.capture_session_id.clone(),
+        host: meta.host.clone(),
+        dir: direction.as_str().to_string(),
+        opcode: opcode.to_string(),
+        len: frame.payload.len() as u64,
+        hold_deadline_ms: cfg.hold_ms,
+        preview,
+        next_actions: crate::net::ws_intercept_next_actions(&ctx.serial, id),
+    }));
+    let decision = match tokio::time::timeout(
+        std::time::Duration::from_millis(u64::from(cfg.hold_ms.max(1))),
+        decision_rx,
+    )
+    .await
+    {
+        Ok(Ok(decision)) => decision,
+        // Deadline or the agent went away: fail per policy.
+        _ => {
+            if cfg.on_timeout_drop {
+                WsHoldDecision::Drop
+            } else {
+                WsHoldDecision::Forward
+            }
+        }
+    };
+    ctx.shared.ws_held.lock().unwrap().remove(id);
+    decision
+}
+
+/// Managed-mode handling for one decoded frame: apply `ws-*` rules and intercept,
+/// then forward (byte-exact), re-encode (modify), or drop — refusing drop/modify
+/// where it would desync a `permessage-deflate` context-takeover window. Returns
+/// `false` if the write side broke.
+#[allow(clippy::too_many_arguments)]
+async fn handle_managed_frame<Writer>(
+    ctx: &ProxyContext,
+    meta: &WsSessionMeta,
+    direction: Direction,
+    assembler: &mut MessageAssembler,
+    writer: &mut Writer,
+    stats: &WsStats,
+    counter: &AtomicU64,
+    tx: &mpsc::Sender<WsMessageRecord>,
+    frame: ManagedFrame,
+) -> bool
+where
+    Writer: AsyncWrite + Unpin,
+{
+    // Only unfragmented single-frame messages are managed; fragmented frames
+    // forward raw and record via the assembler so reassembly isn't corrupted.
+    let single = frame.fin && !matches!(frame.opcode, Opcode::Continuation);
+    if !single {
+        if writer.write_all(&frame.raw).await.is_err() {
+            return false;
+        }
+        if let Some(message) = assembler.accept(managed_to_raw(&frame)) {
+            emit_observed(ctx, meta, direction, counter, stats, tx, &message);
+        }
+        return true;
+    }
+
+    let opcode = frame.opcode.as_str().to_string();
+    let mut action = apply_ws_rules(
+        &ctx.shared.rules.read().unwrap(),
+        &meta.host,
+        direction,
+        &opcode,
+    );
+    // Intercept only if no rule already decided this frame.
+    if matches!(action, WsRuleAction::Forward) {
+        let cfg = ctx
+            .shared
+            .ws_intercept
+            .read()
+            .unwrap()
+            .clone()
+            .filter(|cfg| cfg.matches(&meta.host, direction, &opcode));
+        if let Some(cfg) = cfg {
+            let seq = counter.fetch_add(1, Ordering::Relaxed);
+            let id = format!("{}.{}", meta.id, seq);
+            action = match ws_hold(ctx, meta, direction, &frame, &opcode, &cfg, &id).await {
+                WsHoldDecision::Forward => WsRuleAction::Forward,
+                WsHoldDecision::Modify(payload) => WsRuleAction::Modify(String::new(), payload),
+                WsHoldDecision::Drop => WsRuleAction::Drop(String::new()),
+            };
+        }
+    }
+
+    let safe = managed_reencode_safe(meta.deflate, direction);
+    let mask = direction == Direction::ClientToServer;
+    let mut rule_id = None;
+    let mut disposition = None;
+    let mut modified_payload: Option<Vec<u8>> = None;
+    let bytes: Option<Vec<u8>> = match action {
+        WsRuleAction::Forward => Some(frame.raw.clone()),
+        WsRuleAction::Modify(id, payload) => {
+            rule_id = (!id.is_empty()).then_some(id);
+            if safe {
+                disposition = Some("modified".to_string());
+                let encoded = encode_frame(frame.opcode, &payload, mask);
+                modified_payload = Some(payload);
+                Some(encoded)
+            } else {
+                disposition = Some("refused_deflate".to_string());
+                Some(frame.raw.clone())
+            }
+        }
+        WsRuleAction::Drop(id) => {
+            rule_id = (!id.is_empty()).then_some(id);
+            if safe {
+                disposition = Some("dropped".to_string());
+                None
+            } else {
+                disposition = Some("refused_deflate".to_string());
+                Some(frame.raw.clone())
+            }
+        }
+    };
+    if let Some(bytes) = bytes
+        && writer.write_all(&bytes).await.is_err()
+    {
+        return false;
+    }
+    // Always feed the observation assembler with the ORIGINAL frame — this keeps
+    // the permessage-deflate inflate window in sync (a later observe⇄managed
+    // toggle then decodes correctly) and yields a correctly decompressed record
+    // of what was on the wire. A modified frame instead records its new plaintext
+    // payload so the agent sees the edit; forward/drop/refused record as observed.
+    let observed = assembler.accept(managed_to_raw(&frame));
+    let record_message = match modified_payload {
+        Some(payload) => Some(Message {
+            opcode: frame.opcode,
+            payload_len: payload.len() as u64,
+            wire_len: frame.payload.len() as u64,
+            payload,
+            truncated: false,
+            frame_count: 1,
+            compressed: false,
+            decompressed: false,
+            frames: Vec::new(),
+        }),
+        None => observed,
+    };
+    if let Some(message) = record_message {
+        stats.record(direction, &message);
+        let seq = counter.fetch_add(1, Ordering::Relaxed);
+        let mut record = build_message_record(
+            meta,
+            direction,
+            seq,
+            &message,
+            ctx.shared.redaction.as_ref(),
+            events_now(),
+        );
+        record.rule_id = rule_id;
+        record.disposition = disposition;
+        let _ = tx.try_send(record);
+    }
+    true
+}
+
+/// Forward one direction verbatim while decoding a copy into message records,
+/// and splice queued injections at frame boundaries. Bytes are written to `dst`
+/// *before* any parsing so decoding can never stall or corrupt the tunnel.
 #[allow(clippy::too_many_arguments)]
 async fn pump<Reader, Writer>(
     ctx: Arc<ProxyContext>,
@@ -1363,49 +2116,141 @@ async fn pump<Reader, Writer>(
     stats: Arc<WsStats>,
     counter: Arc<AtomicU64>,
     tx: mpsc::Sender<WsMessageRecord>,
+    mut inject_rx: mpsc::Receiver<InjectedFrame>,
 ) where
     Reader: AsyncRead + Unpin,
     Writer: AsyncWrite + Unpin,
 {
     let mut decoder = FrameDecoder::new();
+    let mut framer = ManagedFramer::new();
+    let mut managed = false;
     let mut buf = vec![0u8; 16 * 1024];
     let mut desync_logged = false;
-    loop {
-        let read = match reader.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(read) => read,
-            Err(_) => break,
-        };
-        if writer.write_all(&buf[..read]).await.is_err() {
-            break;
-        }
-        for frame in decoder.push(&buf[..read]) {
-            if let Some(message) = assembler.accept(frame) {
-                stats.record(direction, &message);
-                let seq = counter.fetch_add(1, Ordering::Relaxed);
-                let record = build_message_record(
-                    &meta,
-                    direction,
-                    seq,
-                    &message,
-                    ctx.shared.redaction.as_ref(),
-                    events_now(),
-                );
-                if tx.try_send(record).is_err() {
-                    stats.dropped.fetch_add(1, Ordering::Relaxed);
+    let mut reached_eof = false;
+    let mut pending_injections: std::collections::VecDeque<InjectedFrame> =
+        std::collections::VecDeque::new();
+    'pump: loop {
+        tokio::select! {
+            biased;
+            injected = inject_rx.recv() => {
+                // `None` means control was deregistered (session ending); keep
+                // forwarding until the read side reaches EOF.
+                if let Some(frame) = injected {
+                    pending_injections.push_back(frame);
+                }
+            }
+            read = reader.read(&mut buf) => {
+                let read = match read {
+                    // Clean EOF: fall through to one last injection flush (the
+                    // decoder is at a boundary on a graceful close) before ending.
+                    Ok(0) => {
+                        reached_eof = true;
+                        while let Ok(frame) = inject_rx.try_recv() {
+                            pending_injections.push_back(frame);
+                        }
+                        0
+                    }
+                    Ok(read) => read,
+                    // A read error leaves framing in an unknown state — don't try
+                    // to splice a final frame; just tear down.
+                    Err(_) => break,
+                };
+                // Switch mode only between frames so a partial frame is never
+                // split across the observe and managed paths.
+                let at_boundary = if managed {
+                    framer.at_boundary()
+                } else {
+                    decoder.at_boundary()
+                };
+                if at_boundary {
+                    managed = direction_managed(&ctx, &meta, direction);
+                }
+                if managed {
+                    for item in framer.push(&buf[..read]) {
+                        match item {
+                            ManagedItem::Passthrough(bytes) => {
+                                if writer.write_all(&bytes).await.is_err() {
+                                    break 'pump;
+                                }
+                            }
+                            ManagedItem::Frame(frame) => {
+                                if !handle_managed_frame(
+                                    &ctx, &meta, direction, &mut assembler, &mut writer,
+                                    &stats, &counter, &tx, frame,
+                                )
+                                .await
+                                {
+                                    break 'pump;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    if writer.write_all(&buf[..read]).await.is_err() {
+                        break;
+                    }
+                    for frame in decoder.push(&buf[..read]) {
+                        if let Some(message) = assembler.accept(frame) {
+                            emit_observed(&ctx, &meta, direction, &counter, &stats, &tx, &message);
+                        }
+                    }
                 }
             }
         }
-        // If framing desyncs, the tunnel keeps flowing (bytes are already
-        // forwarded) but decoding stops; note it once so a debugging agent can
-        // see why frames went quiet.
-        if decoder.desynced() && !desync_logged {
+        // Splice queued injections, but only between frames (RFC 6455 §5.4). A
+        // *data* frame additionally needs a message boundary — injecting one
+        // while a fragmented message is in flight would split it — while a
+        // control frame may legally interleave a fragmented message.
+        // Once framing has desynced we can no longer prove we're between frames,
+        // so splicing would risk cutting one — refuse until (never) resynced.
+        let framing_desynced = if managed {
+            framer.desynced()
+        } else {
+            decoder.desynced()
+        };
+        let at_frame_boundary = !framing_desynced
+            && if managed {
+                framer.at_boundary()
+            } else {
+                decoder.at_boundary()
+            };
+        let at_message_boundary = at_frame_boundary && assembler.at_message_boundary();
+        while let Some(frame) = pending_injections.front() {
+            let ok_here = if frame.opcode.is_control() {
+                at_frame_boundary
+            } else {
+                at_message_boundary
+            };
+            if !ok_here {
+                break; // hold this (and the rest) until the boundary is reached
+            }
+            let frame = pending_injections.pop_front().unwrap();
+            let mask = direction == Direction::ClientToServer;
+            let bytes = encode_frame(frame.opcode, &frame.payload, mask);
+            if writer.write_all(&bytes).await.is_err() {
+                pending_injections.clear();
+                break;
+            }
+            let seq = counter.fetch_add(1, Ordering::Relaxed);
+            let record =
+                injected_record(&meta, direction, seq, &frame, ctx.shared.redaction.as_ref());
+            let _ = tx.try_send(record);
+        }
+        // If framing desyncs (either the observe decoder or the managed framer),
+        // the tunnel keeps flowing (bytes are already forwarded) but decoding —
+        // and any pending injection — stops; note it once.
+        if framing_desynced && !desync_logged {
             desync_logged = true;
             tracing::debug!(
                 session = %meta.id,
                 dir = direction.as_str(),
-                "WebSocket frame decode desynced; forwarding continues untapped"
+                managed,
+                "WebSocket frame decode desynced; forwarding continues untapped, injections halted"
             );
+        }
+        // EOF: the final injection flush above has run; end the pump.
+        if reached_eof {
+            break;
         }
     }
     let _ = writer.shutdown().await;
@@ -1534,6 +2379,171 @@ pub fn b64_decode(input: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+// ── payload rendering (`net show --format`) ──────────────────────────────────
+
+/// Classic `offset  hex…  |ascii|` hexdump for a binary payload.
+pub fn hexdump(data: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for (row, chunk) in data.chunks(16).enumerate() {
+        let _ = write!(out, "{:08x}  ", row * 16);
+        for column in 0..16 {
+            match chunk.get(column) {
+                Some(byte) => {
+                    let _ = write!(out, "{byte:02x} ");
+                }
+                None => out.push_str("   "),
+            }
+            if column == 7 {
+                out.push(' ');
+            }
+        }
+        out.push(' ');
+        for &byte in chunk {
+            out.push(if (0x20..0x7f).contains(&byte) {
+                byte as char
+            } else {
+                '.'
+            });
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// A string is "printable" (so a protobuf length-delimited field reads as a
+/// string rather than a guessed nested message) when it has no control chars
+/// other than whitespace.
+fn is_printable(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|ch| !ch.is_control() || ch.is_whitespace())
+}
+
+fn read_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut result = 0u64;
+    let mut shift = 0u32;
+    loop {
+        if *pos >= buf.len() || shift >= 64 {
+            return None;
+        }
+        let byte = buf[*pos];
+        *pos += 1;
+        result |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(result);
+        }
+        shift += 7;
+    }
+}
+
+/// Best-effort **schemaless** protobuf decode: without a `.proto` we can only
+/// show field numbers + wire values, recursing into length-delimited fields that
+/// parse as a nested message (else UTF-8 string, else base64). Returns `None` if
+/// the bytes don't parse as protobuf — the caller falls back to hex. Repeated
+/// fields collect into arrays. This is a structural aid, not a typed decode.
+pub fn protobuf_decode(data: &[u8]) -> Option<serde_json::Value> {
+    use serde_json::{Map, Value, json};
+    if data.is_empty() {
+        return None;
+    }
+    let mut fields: Map<String, Value> = Map::new();
+    let mut pos = 0usize;
+    while pos < data.len() {
+        let tag = read_varint(data, &mut pos)?;
+        let field = tag >> 3;
+        let wire = tag & 7;
+        if field == 0 {
+            return None;
+        }
+        let value = match wire {
+            0 => json!(read_varint(data, &mut pos)?),
+            1 => {
+                if pos + 8 > data.len() {
+                    return None;
+                }
+                let mut raw = [0u8; 8];
+                raw.copy_from_slice(&data[pos..pos + 8]);
+                pos += 8;
+                json!(u64::from_le_bytes(raw))
+            }
+            5 => {
+                if pos + 4 > data.len() {
+                    return None;
+                }
+                let mut raw = [0u8; 4];
+                raw.copy_from_slice(&data[pos..pos + 4]);
+                pos += 4;
+                json!(u32::from_le_bytes(raw))
+            }
+            2 => {
+                let len = usize::try_from(read_varint(data, &mut pos)?).ok()?;
+                if pos + len > data.len() {
+                    return None;
+                }
+                let sub = &data[pos..pos + len];
+                pos += len;
+                // Length-delimited fields are ambiguous (string vs nested message
+                // vs bytes). Prefer a printable UTF-8 string; else try a nested
+                // message; else keep raw bytes as base64.
+                match std::str::from_utf8(sub) {
+                    Ok(text) if is_printable(text) => json!(text),
+                    _ => match protobuf_decode(sub) {
+                        Some(nested) => nested,
+                        None => match std::str::from_utf8(sub) {
+                            Ok(text) => json!(text),
+                            Err(_) => json!({ "bytes_b64": b64_encode(sub) }),
+                        },
+                    },
+                }
+            }
+            _ => return None, // groups (3/4) are deprecated / unsupported
+        };
+        let key = format!("field_{field}");
+        match fields.get_mut(&key) {
+            None => {
+                fields.insert(key, value);
+            }
+            Some(Value::Array(items)) => items.push(value),
+            Some(prev) => {
+                let first = prev.take();
+                *prev = Value::Array(vec![first, value]);
+            }
+        }
+    }
+    (!fields.is_empty()).then_some(Value::Object(fields))
+}
+
+/// Render a message payload in the requested `format` for `net show --format`.
+/// `hex` → hexdump; `json` → pretty-printed JSON (if it parses); `protobuf` →
+/// schemaless structural decode. Returns `(rendered, note)` — `note` explains a
+/// fallback (e.g. a non-JSON payload under `--format json`).
+pub fn render_payload(payload: &[u8], format: &str) -> (serde_json::Value, Option<String>) {
+    use serde_json::json;
+    match format {
+        "hex" => (json!(hexdump(payload)), None),
+        "json" => match serde_json::from_slice::<serde_json::Value>(payload) {
+            Ok(value) => (value, None),
+            Err(_) => (
+                json!(hexdump(payload)),
+                Some("payload is not valid JSON; showing hex".to_string()),
+            ),
+        },
+        "protobuf" => match protobuf_decode(payload) {
+            Some(value) => (value, None),
+            None => (
+                json!(hexdump(payload)),
+                Some("payload did not parse as protobuf; showing hex".to_string()),
+            ),
+        },
+        other => (
+            json!(hexdump(payload)),
+            Some(format!("unknown format `{other}`; showing hex")),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1629,6 +2639,32 @@ mod tests {
         assert_eq!(message.payload, b"one two three");
         assert_eq!(message.frame_count, 3);
         assert_eq!(message.opcode, Opcode::Text);
+    }
+
+    #[test]
+    fn at_message_boundary_tracks_fragmentation() {
+        // A data injection may only splice at a *message* boundary; this drives
+        // the accessor the pump gates on.
+        let mut assembler =
+            MessageAssembler::new(Direction::ServerToClient, DeflateParams::default());
+        let mut decoder = FrameDecoder::new();
+        assert!(assembler.at_message_boundary(), "idle = at a boundary");
+
+        let mut wire = frame(false, false, 0x1, b"a", None); // text, fin=0
+        wire.extend(frame(true, false, 0x0, b"b", None)); // continuation, fin=1
+        let frames = decoder.push(&wire);
+        assert_eq!(frames.len(), 2);
+
+        assembler.accept(frames[0].clone());
+        assert!(
+            !assembler.at_message_boundary(),
+            "mid-fragment = not a boundary"
+        );
+        assembler.accept(frames[1].clone());
+        assert!(
+            assembler.at_message_boundary(),
+            "FIN continuation restores the boundary"
+        );
     }
 
     #[test]
@@ -2211,9 +3247,13 @@ mod tests {
             wire_len: 10,
             retained_len: 10,
             frame_count: 1,
+            frames: Vec::new(),
             truncated: false,
             compressed: false,
             decompressed: false,
+            injected: false,
+            rule_id: None,
+            disposition: None,
             text: Some("token=Bearer sk-live-abc from bob@example.com".to_string()),
             data_b64: None,
             preview: Some("token=Bearer sk-live-abc from bob@example.com".to_string()),
@@ -2237,6 +3277,210 @@ mod tests {
     }
 
     #[test]
+    fn ws_rules_match_by_host_dir_opcode() {
+        use crate::net::RuleSpec;
+        let rule = |kind: &str, dir: Option<&str>, opcode: Option<&str>, args: &[&str]| {
+            (
+                "r1".to_string(),
+                RuleSpec {
+                    kind: kind.to_string(),
+                    matcher: crate::net::Matcher {
+                        host: Some("chat".to_string()),
+                        ..Default::default()
+                    },
+                    content_type: None,
+                    operation_name: None,
+                    response: None,
+                    ws_dir: dir.map(str::to_string),
+                    ws_opcode: opcode.map(str::to_string),
+                    args: args.iter().map(|s| s.to_string()).collect(),
+                },
+            )
+        };
+        // ws-drop matching s2c text.
+        let rules = vec![rule("ws-drop", Some("s2c"), Some("text"), &[])];
+        assert!(matches!(
+            apply_ws_rules(
+                &rules,
+                "chat.example.com",
+                Direction::ServerToClient,
+                "text"
+            ),
+            WsRuleAction::Drop(_)
+        ));
+        // Direction mismatch → forward.
+        assert!(matches!(
+            apply_ws_rules(
+                &rules,
+                "chat.example.com",
+                Direction::ClientToServer,
+                "text"
+            ),
+            WsRuleAction::Forward
+        ));
+        // Host mismatch → forward.
+        assert!(matches!(
+            apply_ws_rules(
+                &rules,
+                "other.example.com",
+                Direction::ServerToClient,
+                "text"
+            ),
+            WsRuleAction::Forward
+        ));
+        // ws-set-text modifies the payload.
+        let rules = vec![rule("ws-set-text", None, None, &["rewritten"])];
+        match apply_ws_rules(
+            &rules,
+            "chat.example.com",
+            Direction::ClientToServer,
+            "text",
+        ) {
+            WsRuleAction::Modify(_, payload) => assert_eq!(payload, b"rewritten"),
+            _ => panic!("expected modify"),
+        }
+    }
+
+    #[test]
+    fn managed_reencode_safety_tracks_context_takeover() {
+        // No deflate → safe. Context takeover → unsafe. no_context_takeover → safe.
+        assert!(managed_reencode_safe(
+            DeflateParams::default(),
+            Direction::ServerToClient
+        ));
+        let takeover = DeflateParams {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(!managed_reencode_safe(takeover, Direction::ServerToClient));
+        let no_takeover = DeflateParams {
+            enabled: true,
+            client_no_context_takeover: true,
+            server_no_context_takeover: true,
+        };
+        assert!(managed_reencode_safe(
+            no_takeover,
+            Direction::ServerToClient
+        ));
+        assert!(managed_reencode_safe(
+            no_takeover,
+            Direction::ClientToServer
+        ));
+    }
+
+    #[test]
+    fn encode_frame_roundtrips_through_decoder() {
+        for mask in [true, false] {
+            let wire = encode_frame(Opcode::Text, b"injected!", mask);
+            let mut decoder = FrameDecoder::new();
+            let frames = decoder.push(&wire);
+            assert_eq!(frames.len(), 1, "mask={mask}");
+            assert_eq!(frames[0].opcode, Opcode::Text);
+            assert_eq!(frames[0].payload, b"injected!");
+            assert!(frames[0].fin);
+            assert!(!frames[0].truncated);
+        }
+        // A close frame with code + reason decodes back.
+        let mut payload = 1000u16.to_be_bytes().to_vec();
+        payload.extend_from_slice(b"bye");
+        let mut decoder = FrameDecoder::new();
+        let mut assembler =
+            MessageAssembler::new(Direction::ServerToClient, DeflateParams::default());
+        let mut message = None;
+        for frame in decoder.push(&encode_frame(Opcode::Close, &payload, false)) {
+            message = assembler.accept(frame);
+        }
+        assert_eq!(
+            message.unwrap().close_code_reason(),
+            Some((1000, "bye".to_string()))
+        );
+    }
+
+    #[test]
+    fn managed_framer_yields_whole_frames_with_raw_bytes() {
+        // Masked (c2s) + unmasked (s2c) frames both decode to full payload and
+        // preserve the exact on-wire bytes for byte-identical forwarding.
+        let masked = encode_frame(Opcode::Text, b"hello", true);
+        let mut framer = ManagedFramer::new();
+        let items = framer.push(&masked);
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            ManagedItem::Frame(frame) => {
+                assert_eq!(frame.opcode, Opcode::Text);
+                assert_eq!(frame.payload, b"hello");
+                assert_eq!(frame.raw, masked, "raw bytes preserved verbatim");
+            }
+            ManagedItem::Passthrough(_) => panic!("expected a frame"),
+        }
+        // Split across reads still reassembles.
+        let unmasked = encode_frame(Opcode::Binary, b"data", false);
+        let mut framer = ManagedFramer::new();
+        let mut got = Vec::new();
+        for byte in &unmasked {
+            got.extend(framer.push(&[*byte]));
+        }
+        assert_eq!(got.len(), 1);
+    }
+
+    #[test]
+    fn protobuf_decode_reads_fields_schemalessly() {
+        // field 1 (varint) = 150; field 2 (string) = "hi"; nested field 3 = {1:7}.
+        let bytes = [
+            0x08, 0x96, 0x01, // field 1 varint 150
+            0x12, 0x02, b'h', b'i', // field 2 len-delimited "hi"
+            0x1a, 0x02, 0x08, 0x07, // field 3 nested message {field 1: 7}
+        ];
+        let value = protobuf_decode(&bytes).unwrap();
+        assert_eq!(value["field_1"], 150);
+        assert_eq!(value["field_2"], "hi");
+        assert_eq!(value["field_3"]["field_1"], 7);
+        // Garbage / truncated input parses to None (caller falls back to hex).
+        assert!(protobuf_decode(&[0xff, 0xff, 0xff]).is_none());
+        assert!(protobuf_decode(&[]).is_none());
+    }
+
+    #[test]
+    fn render_payload_formats_and_falls_back() {
+        let (json_value, note) = render_payload(br#"{"a":1}"#, "json");
+        assert_eq!(json_value["a"], 1);
+        assert!(note.is_none());
+        // Non-JSON under --format json falls back to hex with a note.
+        let (rendered, note) = render_payload(b"not json", "json");
+        assert!(rendered.as_str().unwrap().contains("6e 6f 74")); // "not"
+        assert!(note.is_some());
+        // Hex format.
+        let (hex, _) = render_payload(&[0xde, 0xad, 0xbe, 0xef], "hex");
+        assert!(hex.as_str().unwrap().contains("de ad be ef"));
+    }
+
+    #[test]
+    fn frame_breakdown_synthesizes_single_frame() {
+        // A fragmented message keeps its stored frames; a single-frame message
+        // synthesizes one entry.
+        let params = DeflateParams::default();
+        let mut wire = frame(false, false, 0x1, b"one ", None);
+        wire.extend(frame(true, false, 0x0, b"two", None));
+        let records = pipeline(Direction::ServerToClient, params, None, &wire);
+        // build_message_record stores frames only for frame_count > 1.
+        assert_eq!(records[0].frame_count, 2);
+        assert_eq!(records[0].frames.len(), 2);
+        assert_eq!(records[0].frame_breakdown().len(), 2);
+
+        let single = pipeline(
+            Direction::ServerToClient,
+            DeflateParams::default(),
+            None,
+            &frame(true, false, 0x1, b"solo", None),
+        );
+        assert!(single[0].frames.is_empty(), "single frame not persisted");
+        assert_eq!(
+            single[0].frame_breakdown().len(),
+            1,
+            "synthesized on demand"
+        );
+    }
+
+    #[test]
     fn encode_payload_prefers_text_for_utf8() {
         let text = Message {
             opcode: Opcode::Text,
@@ -2247,6 +3491,7 @@ mod tests {
             frame_count: 1,
             compressed: false,
             decompressed: false,
+            frames: Vec::new(),
         };
         let (t, b, _, _) = encode_payload(&text);
         assert_eq!(t.as_deref(), Some("{\"a\":1}"));
@@ -2261,6 +3506,7 @@ mod tests {
             frame_count: 1,
             compressed: false,
             decompressed: false,
+            frames: Vec::new(),
         };
         let (t, b, _, _) = encode_payload(&binary);
         assert!(t.is_none());

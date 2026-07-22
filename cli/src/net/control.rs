@@ -58,6 +58,7 @@ fn public_rule(id: &str, spec: &RuleSpec) -> Value {
             "request"
         }
         "set-status" | "set-response-header" | "replace" => "response",
+        "ws-drop" | "ws-set-text" => "websocket",
         _ => "unknown",
     };
     let mut matcher = serde_json::to_value(&spec.matcher).unwrap_or_else(|_| json!({}));
@@ -78,6 +79,12 @@ fn public_rule(id: &str, spec: &RuleSpec) -> Value {
     };
     if let Some(content_type) = &spec.content_type {
         fields.insert("content_type".into(), json!(content_type));
+    }
+    if let Some(ws_dir) = &spec.ws_dir {
+        fields.insert("ws_dir".into(), json!(ws_dir));
+    }
+    if let Some(ws_opcode) = &spec.ws_opcode {
+        fields.insert("ws_opcode".into(), json!(ws_opcode));
     }
     if !spec.args.is_empty() {
         fields.insert("args".into(), json!(spec.args));
@@ -228,6 +235,21 @@ pub async fn serve_client(
                             .cmp(&right.get("id").and_then(Value::as_str))
                     })
             });
+            let ws_intercepting = shared.ws_intercept.read().unwrap().is_some();
+            let ws_held: Vec<Value> = {
+                let held = shared.ws_held.lock().unwrap();
+                held.iter()
+                    .map(|(id, frame)| {
+                        json!({
+                            "id": id,
+                            "host": frame.host,
+                            "dir": frame.dir,
+                            "opcode": frame.opcode,
+                            "state": "held",
+                        })
+                    })
+                    .collect()
+            };
             write_json(
                 &mut wr,
                 &json!({
@@ -249,6 +271,8 @@ pub async fn serve_client(
                     "rejected_holds": shared.rejected_holds.load(Ordering::Relaxed),
                     "held_flows": held_flows,
                     "intercepting": intercepting,
+                    "ws_intercepting": ws_intercepting,
+                    "ws_held": ws_held,
                 }),
             )
             .await?;
@@ -274,8 +298,54 @@ pub async fn serve_client(
             )
             .await?;
         }
+        "ws_intercept" => {
+            if req.get("clear").and_then(Value::as_bool) == Some(true) {
+                *shared.ws_intercept.write().unwrap() = None;
+                write_json(&mut wr, &json!({"ok": true, "intercepting": false})).await?;
+            } else {
+                let cfg = crate::net::ws::WsInterceptCfg {
+                    host: req.get("host").and_then(Value::as_str).map(str::to_string),
+                    dir: match req.get("dir").and_then(Value::as_str) {
+                        Some("c2s") => Some(crate::net::ws::Direction::ClientToServer),
+                        Some("s2c") => Some(crate::net::ws::Direction::ServerToClient),
+                        _ => None,
+                    },
+                    opcode: req
+                        .get("opcode")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    hold_ms: request_u32_field(&req, "hold_ms", 30_000)?,
+                    on_timeout_drop: req.get("on_timeout").and_then(Value::as_str) == Some("drop"),
+                };
+                *shared.ws_intercept.write().unwrap() = Some(cfg);
+                write_json(
+                    &mut wr,
+                    &json!({"ok": true, "intercepting": true, "protocol": "websocket"}),
+                )
+                .await?;
+            }
+        }
         "resume" => {
             let id = req.get("id").and_then(Value::as_str).unwrap_or("");
+            // A WebSocket held frame? Resume with an optional edited payload.
+            if let Some(reply) = ws_release(
+                &shared,
+                id,
+                {
+                    let payload = req
+                        .get("payload_b64")
+                        .and_then(Value::as_str)
+                        .and_then(crate::net::ws::b64_decode);
+                    match payload {
+                        Some(bytes) => crate::net::ws::WsHoldDecision::Modify(bytes),
+                        None => crate::net::ws::WsHoldDecision::Forward,
+                    }
+                },
+                "resume",
+            ) {
+                write_json(&mut wr, &reply).await?;
+                return Ok(());
+            }
             let mutation: Mutation = req
                 .get("mutation")
                 .cloned()
@@ -294,6 +364,12 @@ pub async fn serve_client(
         }
         "drop" => {
             let id = req.get("id").and_then(Value::as_str).unwrap_or("");
+            if let Some(reply) =
+                ws_release(&shared, id, crate::net::ws::WsHoldDecision::Drop, "drop")
+            {
+                write_json(&mut wr, &reply).await?;
+                return Ok(());
+            }
             let status = request_status_field(&req, "status", None)?;
             let decision = HoldDecision::Drop(status);
             match validate_held_decision(&shared, id, &decision) {
@@ -333,6 +409,60 @@ pub async fn serve_client(
                     write_json(&mut wr, &json!({"ok": false, "error": error})).await?;
                 }
             }
+        }
+        "ws_inject" => {
+            let session = req.get("session").and_then(Value::as_str).unwrap_or("");
+            let dir = req.get("dir").and_then(Value::as_str).unwrap_or("s2c");
+            let opcode_label = req.get("opcode").and_then(Value::as_str).unwrap_or("text");
+            let payload = req
+                .get("payload_b64")
+                .and_then(Value::as_str)
+                .and_then(crate::net::ws::b64_decode)
+                .unwrap_or_default();
+            let direction = if dir == "c2s" {
+                crate::net::ws::Direction::ClientToServer
+            } else {
+                crate::net::ws::Direction::ServerToClient
+            };
+            let reply = match crate::net::ws::Opcode::from_label(opcode_label) {
+                None => json!({"ok": false, "error": format!("invalid opcode `{opcode_label}`")}),
+                Some(opcode) => {
+                    let control = shared.ws_control.lock().unwrap();
+                    match control.get(session) {
+                        None => json!({
+                            "ok": false,
+                            "error": format!("no live WebSocket session `{session}` (it may have closed)"),
+                        }),
+                        Some(handle) => {
+                            let host = handle.host.clone();
+                            let permessage_deflate = handle.permessage_deflate;
+                            match handle.inject(
+                                direction,
+                                crate::net::ws::InjectedFrame {
+                                    opcode,
+                                    payload: payload.clone(),
+                                },
+                            ) {
+                                // The frame is enqueued and spliced at the next
+                                // frame boundary (a data frame waits for a message
+                                // boundary) — `queued`, not confirmed on-wire.
+                                Ok(()) => json!({
+                                    "ok": true,
+                                    "queued": true,
+                                    "session": session,
+                                    "host": host,
+                                    "dir": dir,
+                                    "opcode": opcode_label,
+                                    "bytes": payload.len(),
+                                    "permessage_deflate": permessage_deflate,
+                                }),
+                                Err(error) => json!({"ok": false, "error": error}),
+                            }
+                        }
+                    }
+                }
+            };
+            write_json(&mut wr, &reply).await?;
         }
         "show" => {
             let id = req.get("id").and_then(Value::as_str).unwrap_or("");
@@ -596,8 +726,11 @@ fn event_matches(ev: &Event, m: &Matcher) -> bool {
             };
             m.method.is_none() && m.status.is_none() && sub(host, &m.host) && sub(path, &m.path)
         }
-        // Messages/closes carry only host; a path/method/status filter excludes them.
-        Event::WsMsg { host, .. } | Event::WsClose { host, .. } => {
+        // Messages/closes/intercepts carry only host; a path/method/status
+        // filter excludes them.
+        Event::WsMsg { host, .. }
+        | Event::WsClose { host, .. }
+        | Event::WsIntercept { host, .. } => {
             m.method.is_none()
                 && m.status.is_none()
                 && m.path.is_none()
@@ -680,6 +813,51 @@ fn validate_request_rule_filters(spec: &RuleSpec) -> Result<(), String> {
         return Err(format!(
             "request-phase rule `{}` cannot match response status",
             spec.kind
+        ));
+    }
+    Ok(())
+}
+
+/// WebSocket frame rules match only on host + `ws_dir` + `ws_opcode`; the HTTP
+/// matchers (path/method/status/content-type) don't apply and would silently do
+/// nothing, so reject them rather than mislead. Also validate the WS selectors.
+fn validate_ws_rule_filters(spec: &RuleSpec) -> Result<(), String> {
+    if spec.matcher.path.is_some() {
+        return Err(format!(
+            "WebSocket rule `{}` cannot match `--path` (WS rules match on host + --dir + --opcode)",
+            spec.kind
+        ));
+    }
+    if spec.matcher.method.is_some() {
+        return Err(format!(
+            "WebSocket rule `{}` cannot match `--method` (a WebSocket handshake is always GET)",
+            spec.kind
+        ));
+    }
+    if spec.matcher.status.is_some() {
+        return Err(format!(
+            "WebSocket rule `{}` cannot match `--status`",
+            spec.kind
+        ));
+    }
+    if spec.content_type.is_some() {
+        return Err(format!(
+            "WebSocket rule `{}` cannot match `--content-type`",
+            spec.kind
+        ));
+    }
+    if let Some(dir) = spec.ws_dir.as_deref()
+        && !matches!(dir, "c2s" | "s2c")
+    {
+        return Err(format!(
+            "invalid WebSocket direction {dir:?}; expected `c2s` or `s2c`"
+        ));
+    }
+    if let Some(opcode) = spec.ws_opcode.as_deref()
+        && !matches!(opcode, "text" | "binary" | "ping" | "pong" | "close")
+    {
+        return Err(format!(
+            "invalid WebSocket opcode {opcode:?}; expected text|binary|ping|pong|close"
         ));
     }
     Ok(())
@@ -928,8 +1106,19 @@ fn validate_rule(spec: &RuleSpec) -> Result<(), String> {
                 .map(|_| ())
                 .map_err(|error| format!("invalid replacement regex {:?}: {error}", spec.args[0]))
         }
+        // WebSocket frame rules — matched by host + optional dir/opcode, applied
+        // per-frame in the live tap (only for sessions without permessage-deflate
+        // context takeover; see `net inject` for the always-safe path).
+        "ws-drop" => {
+            validate_ws_rule_filters(spec)?;
+            exact(0)
+        }
+        "ws-set-text" => {
+            validate_ws_rule_filters(spec)?;
+            exact(1)
+        }
         other => Err(format!(
-            "unknown rule kind {other:?} (block|delay|map-local|map-remote|respond|set-status|set-request-header|set-response-header|replace)"
+            "unknown rule kind {other:?} (block|delay|map-local|map-remote|respond|set-status|set-request-header|set-response-header|replace|ws-drop|ws-set-text)"
         )),
     }
 }
@@ -943,6 +1132,37 @@ fn release(
     decision: HoldDecision,
 ) -> ReleaseHeldResult {
     crate::net::proxy::release_held(&shared.held, &shared.terminal_holds, id, action, decision)
+}
+
+/// Deliver a decision to a held WebSocket frame. Returns `None` if `id` isn't a
+/// currently-held WS frame (so the caller falls back to the HTTP-flow path).
+fn ws_release(
+    shared: &SharedState,
+    id: &str,
+    decision: crate::net::ws::WsHoldDecision,
+    action: &str,
+) -> Option<Value> {
+    let (tx, host, dir, opcode) = {
+        let mut held = shared.ws_held.lock().unwrap();
+        let entry = held.get_mut(id)?;
+        (
+            entry.tx.take(),
+            entry.host.clone(),
+            entry.dir.clone(),
+            entry.opcode.clone(),
+        )
+    };
+    let delivered = tx.is_some_and(|tx| tx.send(decision).is_ok());
+    Some(json!({
+        "ok": delivered,
+        "id": id,
+        "action": action,
+        "host": host,
+        "dir": dir,
+        "opcode": opcode,
+        "delivered": delivered,
+        "protocol": "websocket",
+    }))
 }
 
 fn failure_terminal_state(terminal: &TerminalHold) -> &'static str {
@@ -1160,6 +1380,8 @@ mod tests {
             content_type: None,
             operation_name: None,
             response: None,
+            ws_dir: None,
+            ws_opcode: None,
             args: args.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -1194,6 +1416,8 @@ mod tests {
                 headers: vec![("content-type".into(), "application/json".into())],
                 body: br#"{"error":"unauthorized"}"#.to_vec(),
             }),
+            ws_dir: None,
+            ws_opcode: None,
             args: vec![],
         };
         assert!(validate_rule(&spec).is_ok());
@@ -1245,6 +1469,51 @@ mod tests {
         assert!(validate_rule(&response_with_status).is_ok());
         response_with_status.matcher.status = Some(99);
         assert!(validate_rule(&response_with_status).is_err());
+    }
+
+    #[test]
+    fn ws_rules_reject_http_matchers_and_bad_selectors() {
+        // A well-formed ws rule with valid selectors is accepted…
+        let mut ok = spec("ws-set-text", &["{\"forced\":true}"]);
+        ok.matcher.host = Some("chat.app".into());
+        ok.ws_dir = Some("s2c".into());
+        ok.ws_opcode = Some("text".into());
+        assert!(validate_rule(&ok).is_ok());
+        assert!(validate_rule(&spec("ws-drop", &[])).is_ok());
+
+        // …and public_rule surfaces the WS selectors, not HTTP fields.
+        let public = public_rule("r1", &ok);
+        assert_eq!(public["phase"], "websocket");
+        assert_eq!(public["ws_dir"], "s2c");
+        assert_eq!(public["ws_opcode"], "text");
+        assert!(public["matcher"].get("path").is_none());
+        assert!(public["matcher"].get("method").is_none());
+
+        // HTTP matchers don't apply to WS frame rules — reject, don't ignore.
+        let mut with_path = spec("ws-drop", &[]);
+        with_path.matcher.path = Some("/ws".into());
+        assert!(validate_rule(&with_path).is_err());
+        let mut with_method = spec("ws-drop", &[]);
+        with_method.matcher.method = Some("GET".into());
+        assert!(validate_rule(&with_method).is_err());
+        let mut with_status = spec("ws-drop", &[]);
+        with_status.matcher.status = Some(101);
+        assert!(validate_rule(&with_status).is_err());
+        let mut with_ct = spec("ws-drop", &[]);
+        with_ct.content_type = Some("application/json".into());
+        assert!(validate_rule(&with_ct).is_err());
+
+        // Bad direction / opcode selectors are rejected.
+        let mut bad_dir = spec("ws-drop", &[]);
+        bad_dir.ws_dir = Some("up".into());
+        assert!(validate_rule(&bad_dir).is_err());
+        let mut bad_opcode = spec("ws-drop", &[]);
+        bad_opcode.ws_opcode = Some("frame".into());
+        assert!(validate_rule(&bad_opcode).is_err());
+
+        // Arg arity still enforced alongside the WS filters.
+        assert!(validate_rule(&spec("ws-set-text", &[])).is_err());
+        assert!(validate_rule(&spec("ws-drop", &["x"])).is_err());
     }
 
     #[test]

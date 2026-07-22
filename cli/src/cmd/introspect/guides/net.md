@@ -66,6 +66,48 @@ close reasons), capture-session scoping, `--since`, and checkpoints apply to
 WebSocket records exactly as to flows. On `watch`, `ws_open`, `ws_msg`,
 and `ws_close` interleave live with `screen`/`http`.
 
+Summarize a chatty socket in one call instead of paging frames, and decode a
+payload without eyeballing base64:
+
+```bash
+shadowdroid net ws w1 --stats             # opcode histogram, per-dir bytes, compression ratio, rate
+shadowdroid net show w1.3 --format json   # pretty JSON (hex | protobuf also; falls back to hex)
+shadowdroid net show w1.3 --frames        # per-frame breakdown of a fragmented message
+shadowdroid net export har --out cap.har  # HAR incl. WS (_webSocketMessages) for browser devtools
+```
+
+### Drive & modify WebSocket traffic
+
+Beyond observing, act on a live session — the agent-in-the-loop model, per frame:
+
+```bash
+# Inject a frame (always safe, even under permessage-deflate):
+shadowdroid net inject w1 --dir s2c --text '{"type":"push","seq":9}'   # simulate a server push to the app
+shadowdroid net inject w1 --dir c2s --binary "$(printf x | base64)"    # send to the server as the app
+shadowdroid net inject w1 --dir s2c --ping                             # ping/pong/close also
+
+# Declarative frame rules (drop or rewrite matching frames):
+shadowdroid net rule add ws-drop --host chat.app --dir c2s --opcode text
+shadowdroid net rule add ws-set-text '{"forced":true}' --host chat.app --dir s2c --opcode text
+
+# Agent-in-the-loop breakpoint on frames:
+shadowdroid net intercept --dir c2s --opcode text --host chat.app --hold-ms 8000
+#   → each match emits a ws_intercept event and appears in `net status` (ws_held);
+shadowdroid net resume w1.7                       # forward unchanged
+shadowdroid net resume w1.7 --text '<edited>'     # forward an edited payload
+shadowdroid net drop   w1.7                        # drop the frame
+shadowdroid net intercept --dir c2s --clear        # disarm
+```
+
+Modified/dropped/injected frames appear in `net ws` marked `injected` /
+`disposition: modified|dropped` / `rule_id`. **Two limits to plan around:**
+(1) drop/modify re-encode a frame, which is unsafe under `permessage-deflate`
+**context takeover** — such frames are forwarded unchanged and marked
+`disposition: refused_deflate`. Start the proxy with `net start --anticomp` to
+negotiate an uncompressed session where drop/modify/intercept fully apply.
+(2) A held frame pauses its whole direction, so act within the app's keepalive
+window (OkHttp defaults to a 5 s ping timeout) or the socket may drop.
+
 Limitations: capture requires the connection to traverse the proxy and be
 decryptable. An engine that ignores the system proxy (some Cronet/QUIC clients)
 or a certificate-pinned WSS handshake produces a `tls_error` (or nothing) rather

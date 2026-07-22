@@ -135,6 +135,14 @@ pub struct SharedState {
     /// Matching flows that failed open because the held count/byte budget was
     /// exhausted. Exposed in status so overload is observable.
     pub rejected_holds: AtomicU64,
+    /// Live WebSocket sessions keyed by session id (`w1`), so `net inject` can
+    /// splice a frame into a running tap. The tap registers on upgrade and
+    /// deregisters on close.
+    pub ws_control: Mutex<HashMap<String, ws::WsSessionControl>>,
+    /// Active WebSocket frame interception (`net intercept --dir …`), or `None`.
+    pub ws_intercept: RwLock<Option<ws::WsInterceptCfg>>,
+    /// Paused WebSocket frames awaiting `net resume`/`net drop`, keyed by frame id.
+    pub ws_held: Mutex<HashMap<String, ws::WsHeldFrame>>,
 }
 
 impl SharedState {
@@ -585,9 +593,17 @@ async fn proxy_websocket(
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
     let port = ws_target_port(req.uri(), &tunnel, &scheme);
-    let req_headers = header_pairs(req.headers());
+    let mut req_headers = header_pairs(req.headers());
     let id = flow::new_id();
     let in_scope = ctx.shared.host_in_scope(&host);
+    // `--anticomp` also disables WebSocket compression: strip the client's
+    // `permessage-deflate` offer so the session negotiates uncompressed. That is
+    // what makes frame modify/drop/intercept window-safe (see
+    // `ws::managed_reencode_safe`). Only for in-scope hosts — out-of-scope
+    // traffic is never altered.
+    if in_scope && ctx.shared.anticomp {
+        req_headers.retain(|(name, _)| !name.eq_ignore_ascii_case("sec-websocket-extensions"));
+    }
 
     let (status, resp_headers, upstream_resp) = match ws_handshake_upstream(
         &scheme,
@@ -3807,6 +3823,8 @@ mod tests {
             content_type: None,
             operation_name: None,
             response: None,
+            ws_dir: None,
+            ws_opcode: None,
             args: vec!["201".into()],
         };
         assert!(super::rule_matches(

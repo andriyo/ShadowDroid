@@ -1714,11 +1714,11 @@ fn show_ws_session(serial: &Serial, id: &str) -> Result<()> {
     Ok(())
 }
 
-fn show_ws_message(serial: &Serial, id: &str, body: bool, body_file: Option<&Path>) -> Result<()> {
+fn show_ws_message(serial: &Serial, id: &str, opts: &ShowOpts) -> Result<()> {
     let Some(record) = store::find_ws_message(serial, id)? else {
         return Err(ws_not_found(id, "message"));
     };
-    if let Some(path) = body_file {
+    if let Some(path) = opts.body_file.as_deref() {
         let Some(bytes) = record.raw_payload() else {
             bail!("WebSocket message `{id}` has no retained payload (empty or control frame)");
         };
@@ -1738,7 +1738,25 @@ fn show_ws_message(serial: &Serial, id: &str, body: bool, body_file: Option<&Pat
         );
         return Ok(());
     }
-    events::emit_result(&record.detail(body));
+    // `--format` implies showing the payload, decoded in the requested view.
+    let mut detail = record.detail(opts.body || opts.format.is_some());
+    if let Some(format) = opts.format.as_deref() {
+        match record.raw_payload() {
+            Some(bytes) => {
+                let (rendered, note) = crate::net::ws::render_payload(&bytes, format);
+                detail["format"] = json!(format);
+                detail["formatted"] = rendered;
+                if let Some(note) = note {
+                    detail["format_note"] = json!(note);
+                }
+            }
+            None => detail["format_note"] = json!("no retained payload to render"),
+        }
+    }
+    if opts.frames {
+        detail["frames"] = json!(record.frame_breakdown());
+    }
+    events::emit_result(&detail);
     Ok(())
 }
 
@@ -1756,17 +1774,21 @@ fn ws_not_found(id: &str, kind: &str) -> anyhow::Error {
     .into()
 }
 
-pub async fn show(
-    serial: &Serial,
-    id: &str,
-    body: bool,
-    har: bool,
-    body_file: Option<&Path>,
-) -> Result<()> {
+pub struct ShowOpts {
+    pub body: bool,
+    pub har: bool,
+    pub body_file: Option<PathBuf>,
+    /// WebSocket message payload rendering: `hex` | `json` | `protobuf`.
+    pub format: Option<String>,
+    /// Per-frame breakdown of a fragmented WebSocket message.
+    pub frames: bool,
+}
+
+pub async fn show(serial: &Serial, id: &str, opts: ShowOpts) -> Result<()> {
     // WebSocket ids (`w…`) resolve to session/message detail, not flows.
     match classify_ws_id(id) {
         Some(WsIdKind::Session) => {
-            if har {
+            if opts.har {
                 bail!(
                     "`--har` applies to HTTP flows; use `net export jsonl` for WebSocket sessions"
                 );
@@ -1774,15 +1796,22 @@ pub async fn show(
             return show_ws_session(serial, id);
         }
         Some(WsIdKind::Message) => {
-            if har {
+            if opts.har {
                 bail!(
                     "`--har` applies to HTTP flows; use `net export jsonl` for WebSocket messages"
                 );
             }
-            return show_ws_message(serial, id, body, body_file);
+            return show_ws_message(serial, id, &opts);
         }
         None => {}
     }
+    let ShowOpts {
+        body,
+        har,
+        body_file,
+        ..
+    } = opts;
+    let body_file = body_file.as_deref();
     // Completed flows live in the session log; a *held* (in-flight) flow lives
     // only in the daemon — try the store first, then ask the daemon.
     if let Some(flow) = store::find_by_id(serial, id)? {
@@ -2061,6 +2090,7 @@ pub struct WsOpts {
     pub grep: Option<String>,
     pub capture_session_id: Option<String>,
     pub since: Option<String>,
+    pub stats: bool,
     pub limit: usize,
 }
 
@@ -2076,6 +2106,9 @@ pub async fn ws(serial: &Serial, opts: WsOpts) -> Result<()> {
         .map(|duration| events::now_ts() - duration.as_secs_f64());
 
     let Some(session_id) = opts.session_id.clone() else {
+        if opts.stats {
+            bail!("`net ws --stats` needs a session id, e.g. `net ws w1 --stats`");
+        }
         let sessions = store::read_ws_sessions(
             serial,
             &store::WsSessionQuery {
@@ -2104,6 +2137,10 @@ pub async fn ws(serial: &Serial, opts: WsOpts) -> Result<()> {
         );
         return Ok(());
     };
+
+    if opts.stats {
+        return ws_stats(serial, &session_id).await;
+    }
 
     let messages = store::read_ws_messages(
         serial,
@@ -2143,6 +2180,152 @@ pub async fn ws(serial: &Serial, opts: WsOpts) -> Result<()> {
     Ok(())
 }
 
+/// `net ws <id> --stats` — one aggregate row so an agent can characterize a
+/// chatty socket without paging every frame.
+async fn ws_stats(serial: &Serial, session_id: &str) -> Result<()> {
+    let messages = store::read_ws_messages(
+        serial,
+        &store::WsMessageQuery {
+            session_id: Some(session_id.to_string()),
+            limit: usize::MAX, // aggregate the whole session (the log is size-bounded)
+            ..Default::default()
+        },
+    )?;
+    if messages.is_empty() && store::find_ws_session(serial, session_id)?.is_none() {
+        return Err(ws_not_found(session_id, "session"));
+    }
+    let mut opcodes: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let (mut c2s_msgs, mut c2s_bytes) = (0u64, 0u64);
+    let (mut s2c_msgs, mut s2c_bytes) = (0u64, 0u64);
+    let (mut compressed, mut wire_bytes, mut payload_bytes) = (0u64, 0u64, 0u64);
+    let mut truncated = 0u64;
+    let (mut first_ts, mut last_ts) = (f64::MAX, f64::MIN);
+    for message in &messages {
+        *opcodes.entry(message.opcode.clone()).or_default() += 1;
+        if message.dir == "c2s" {
+            c2s_msgs += 1;
+            c2s_bytes += message.payload_len;
+        } else {
+            s2c_msgs += 1;
+            s2c_bytes += message.payload_len;
+        }
+        if message.compressed {
+            compressed += 1;
+            wire_bytes += message.wire_len;
+            payload_bytes += message.payload_len;
+        }
+        if message.truncated {
+            truncated += 1;
+        }
+        first_ts = first_ts.min(message.ts);
+        last_ts = last_ts.max(message.ts);
+    }
+    let duration = (last_ts - first_ts).max(0.0);
+    let round1 = |value: f64| (value * 10.0).round() / 10.0;
+    let rate = if duration > 0.0 {
+        messages.len() as f64 / duration
+    } else {
+        0.0
+    };
+    let ratio = if wire_bytes > 0 {
+        payload_bytes as f64 / wire_bytes as f64
+    } else {
+        0.0
+    };
+    emit(
+        "net_ws_stats",
+        json!({
+            "session_id": session_id,
+            "messages": messages.len(),
+            "c2s": {"msgs": c2s_msgs, "bytes": c2s_bytes},
+            "s2c": {"msgs": s2c_msgs, "bytes": s2c_bytes},
+            "opcodes": opcodes,
+            "compressed": {
+                "count": compressed,
+                "wire_bytes": wire_bytes,
+                "payload_bytes": payload_bytes,
+                "ratio": round1(ratio),
+            },
+            "truncated": truncated,
+            "duration_ms": (duration * 1000.0) as u64,
+            "rate_msgs_per_sec": round1(rate),
+            "next_actions": crate::net::ws_session_next_actions(serial, session_id),
+        }),
+    );
+    Ok(())
+}
+
+pub struct InjectOpts {
+    pub session: String,
+    pub dir: String,
+    pub text: Option<String>,
+    pub binary: Option<String>,
+    pub ping: bool,
+    pub pong: bool,
+    pub close: bool,
+    pub code: Option<u16>,
+    pub reason: Option<String>,
+}
+
+/// `net inject` — splice a frame into a live WebSocket session. The daemon writes
+/// it (masked toward the server, unmasked toward the app) uncompressed at the
+/// next frame boundary; it lands in `net ws` marked `injected`.
+pub async fn inject(serial: &Serial, opts: InjectOpts) -> Result<()> {
+    let (opcode, payload): (&str, Vec<u8>) = if let Some(text) = &opts.text {
+        ("text", text.clone().into_bytes())
+    } else if let Some(encoded) = &opts.binary {
+        let bytes = crate::net::ws::b64_decode(encoded).ok_or_else(|| {
+            crate::diagnostic::DiagnosticError::new(
+                "invalid_base64",
+                "input",
+                "`--binary` must be base64".to_string(),
+            )
+            .next_actions(["pass a base64 payload, e.g. `--binary $(printf hi | base64)`"])
+        })?;
+        ("binary", bytes)
+    } else if opts.ping {
+        ("ping", Vec::new())
+    } else if opts.pong {
+        ("pong", Vec::new())
+    } else if opts.close {
+        let mut payload = Vec::new();
+        if let Some(code) = opts.code {
+            payload.extend_from_slice(&code.to_be_bytes());
+            if let Some(reason) = &opts.reason {
+                payload.extend_from_slice(reason.as_bytes());
+            }
+        }
+        ("close", payload)
+    } else {
+        bail!("choose exactly one of --text / --binary / --ping / --pong / --close");
+    };
+    // RFC 6455 §5.5: control frames carry at most 125 bytes.
+    if matches!(opcode, "ping" | "pong" | "close") && payload.len() > 125 {
+        bail!(
+            "a `{opcode}` control frame payload must be ≤125 bytes (got {})",
+            payload.len()
+        );
+    }
+    let reply = checked_control_reply(
+        "ws_inject",
+        control::request(
+            serial,
+            json!({
+                "op": "ws_inject",
+                "session": opts.session,
+                "dir": opts.dir,
+                "opcode": opcode,
+                "payload_b64": crate::net::ws::b64_encode(&payload),
+            }),
+        )
+        .await?,
+    )?;
+    let mut value = reply;
+    value["next_actions"] = json!(crate::net::ws_session_next_actions(serial, &opts.session));
+    emit("net_inject", value);
+    Ok(())
+}
+
 pub async fn export(
     serial: &Serial,
     format: &str,
@@ -2159,6 +2342,9 @@ pub async fn export(
             session,
         )
         .await;
+    }
+    if format == "har" {
+        return export_har(serial, id, out).await;
     }
     let mut flows = match &id {
         Some(id) => store::find_by_id(serial, id)?
@@ -2220,25 +2406,6 @@ pub async fn export(
                 }),
             );
         }
-        "har" => {
-            let out = out.unwrap_or_else(|| PathBuf::from("shadowdroid-network.har"));
-            let bytes =
-                crate::cmd::artifact::write_json(&out, &crate::net::export::to_har(&flows))?;
-            let token = crate::events::shell_token(&out.display().to_string());
-            emit(
-                "net_export",
-                json!({
-                    "format": "har",
-                    "artifact": out.display().to_string(),
-                    "bytes": bytes,
-                    "count": flows.len(),
-                    "next_actions": [
-                        format!("jq '.log.entries | length' {token}"),
-                        "shadowdroid net log"
-                    ],
-                }),
-            );
-        }
         "fixtures" => {
             let out = out.unwrap_or_else(|| PathBuf::from("shadowdroid-fixtures"));
             let summary = crate::net::export::write_fixtures(&flows, &out)?;
@@ -2284,6 +2451,77 @@ fn redact_export_record(
 /// Durable line-per-record export (the machine-readable WebSocket format). Full
 /// flows and WS session/message/close records, filtered by protocol + capture
 /// session, written to `--out` (default `shadowdroid-network.jsonl`).
+/// HAR 1.2 export including WebSocket sessions (Chrome `_webSocketMessages`).
+/// `id` selects one HTTP flow (`f…`) or one WS session (`w…`); omitted exports
+/// everything. Re-redacts under an active policy on the way out.
+async fn export_har(serial: &Serial, id: Option<String>, out: Option<PathBuf>) -> Result<()> {
+    let ws_id = id.as_deref().filter(|id| id.starts_with('w'));
+    let mut flows = match id.as_deref() {
+        Some(id) if ws_id.is_none() => store::find_by_id(serial, id)?
+            .map(|flow| vec![flow])
+            .unwrap_or_default(),
+        Some(_) => Vec::new(), // a WS session id → no HTTP flows
+        None => store::read_all(serial)?,
+    };
+    let mut sessions = if id.is_none() {
+        store::read_ws_har_sessions(serial)?
+    } else if let Some(ws_id) = ws_id {
+        store::read_ws_har_sessions(serial)?
+            .into_iter()
+            .filter(|session| session.open.id == ws_id)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if flows.is_empty() && sessions.is_empty() {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "net_export_empty",
+            "net",
+            match id.as_deref() {
+                Some(id) => format!("no HTTP flow or WebSocket session `{id}` exists to export"),
+                None => "no HTTP flows or WebSocket sessions exist to export".to_string(),
+            },
+        )
+        .detail(json!({"id": id, "format": "har"}))
+        .next_actions([
+            "run `shadowdroid net log --protocol all` to see what was captured",
+            "generate traffic while the proxy is running, then retry the export",
+        ])
+        .into());
+    }
+    if let Some(policy) = crate::redaction::active_policy() {
+        for flow in &mut flows {
+            policy.redact_flow_record(flow);
+        }
+        for session in &mut sessions {
+            session.open.redact_headers(&policy);
+            for message in &mut session.messages {
+                message.redact(&policy);
+            }
+        }
+    }
+    let out = out.unwrap_or_else(|| PathBuf::from("shadowdroid-network.har"));
+    let har = crate::net::export::to_har_with_ws(&flows, &sessions);
+    let bytes = crate::cmd::artifact::write_json(&out, &har)?;
+    let token = crate::events::shell_token(&out.display().to_string());
+    emit(
+        "net_export",
+        json!({
+            "format": "har",
+            "artifact": out.display().to_string(),
+            "bytes": bytes,
+            "count": flows.len() + sessions.len(),
+            "http_flows": flows.len(),
+            "ws_sessions": sessions.len(),
+            "next_actions": [
+                format!("jq '.log.entries | length' {token}"),
+                "shadowdroid net ws"
+            ],
+        }),
+    );
+    Ok(())
+}
+
 async fn export_jsonl(
     serial: &Serial,
     out: Option<PathBuf>,
@@ -2352,16 +2590,47 @@ pub async fn intercept(
     Ok(())
 }
 
-pub async fn resume(serial: &Serial, id: &str, mutation: Mutation) -> Result<()> {
-    let reply = checked_control_reply(
-        "resume",
-        control::request(
-            serial,
-            json!({"op": "resume", "id": id, "mutation": mutation}),
-        )
-        .await?,
-    )?;
+pub async fn resume(
+    serial: &Serial,
+    id: &str,
+    mutation: Mutation,
+    ws_payload: Option<Vec<u8>>,
+) -> Result<()> {
+    let mut request = json!({"op": "resume", "id": id, "mutation": mutation});
+    if let Some(payload) = ws_payload {
+        request["payload_b64"] = json!(crate::net::ws::b64_encode(&payload));
+    }
+    let reply = checked_control_reply("resume", control::request(serial, request).await?)?;
     emit("net_resume", reply);
+    Ok(())
+}
+
+pub struct WsInterceptOpts {
+    pub host: Option<String>,
+    pub dir: Option<String>,
+    pub opcode: Option<String>,
+    pub clear: bool,
+    pub hold_ms: u32,
+    pub on_timeout: String,
+}
+
+/// `net intercept --dir …` — arm (or `--clear` disarm) WebSocket frame
+/// interception. Matching frames pause and surface `ws_intercept` events.
+pub async fn ws_intercept(serial: &Serial, opts: WsInterceptOpts) -> Result<()> {
+    let request = if opts.clear {
+        json!({"op": "ws_intercept", "clear": true})
+    } else {
+        json!({
+            "op": "ws_intercept",
+            "host": opts.host,
+            "dir": opts.dir,
+            "opcode": opts.opcode,
+            "hold_ms": opts.hold_ms,
+            "on_timeout": opts.on_timeout,
+        })
+    };
+    let reply = checked_control_reply("ws_intercept", control::request(serial, request).await?)?;
+    emit("net_ws_intercept", reply);
     Ok(())
 }
 
@@ -2419,6 +2688,8 @@ pub async fn override_local(serial: &Serial, url_glob: &str, file: &Path) -> Res
         content_type: None,
         operation_name: None,
         response: None,
+        ws_dir: None,
+        ws_opcode: None,
         args: vec![file.display().to_string()],
     };
     let reply = checked_control_reply(
@@ -2769,6 +3040,8 @@ mod tests {
             content_type: None,
             operation_name: None,
             response: None,
+            ws_dir: None,
+            ws_opcode: None,
             args: vec![arg.into()],
         }
     }

@@ -143,6 +143,9 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         persistence_errors: AtomicU64::new(0),
         held_bytes: Arc::new(AtomicU64::new(0)),
         rejected_holds: AtomicU64::new(0),
+        ws_control: Mutex::new(HashMap::new()),
+        ws_intercept: RwLock::new(None),
+        ws_held: Mutex::new(HashMap::new()),
     });
 
     let proxy_tasks = TaskTracker::new();

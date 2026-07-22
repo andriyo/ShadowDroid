@@ -1028,10 +1028,16 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "next_actions": ["net checkpoint", "net show <id>", "net ws", "net export har <id>", "watch"]
         })),
         "net ws" => Some(serde_json::json!({
-            "use_when": ["Need to inspect WebSocket (WS/WSS) traffic captured by the proxy.", "Bare `net ws` lists sessions cheaply; `net ws <session-id>` lists that session's messages, filterable by --dir/--opcode/--grep/--since to keep output small."],
-            "output": "line-delimited JSON: ws_session summary rows (bare) or compact ws_msg events (with a session id), then a net_ws summary with the matching ids. Full payloads are fetched on demand via net show <message-id>",
+            "use_when": ["Need to inspect WebSocket (WS/WSS) traffic captured by the proxy.", "Bare `net ws` lists sessions cheaply; `net ws <session-id>` lists that session's messages, filterable by --dir/--opcode/--grep/--since to keep output small.", "Add --stats to a session for one summary row (opcode histogram, per-direction bytes, compression ratio, rate) without paging every frame."],
+            "output": "line-delimited JSON: ws_session summary rows (bare) or compact ws_msg events (with a session id), then a net_ws summary with the matching ids; --stats returns one net_ws_stats object. Full payloads are fetched on demand via net show <message-id> (--body / --format hex|json|protobuf / --frames)",
             "side_effects": ["none"],
-            "next_actions": ["net show <id>", "net ws <session-id>", "net export jsonl --protocol websocket", "watch"]
+            "next_actions": ["net show <id>", "net ws <session-id>", "net inject <session-id>", "net export jsonl --protocol websocket"]
+        })),
+        "net inject" => Some(serde_json::json!({
+            "use_when": ["Need to actively drive a live WebSocket session — simulate a server push to the app (--dir s2c), send a frame to the server as the app (--dir c2s), or a ping/pong/close.", "Testing how the app reacts to an arbitrary or malformed server frame."],
+            "output": "net_inject action JSON with session/host/dir/opcode/bytes; the frame is written on the live socket (uncompressed, so safe under permessage-deflate) and reappears in net ws marked injected:true. Errors typed if the session already closed.",
+            "side_effects": ["sends a real frame on the live WebSocket connection"],
+            "next_actions": ["net ws <session-id>", "net show <message-id> --body", "watch"]
         })),
         "net checkpoint" => Some(serde_json::json!({
             "use_when": ["Need a durable boundary before performing one test action while keeping the proxy and rules active."],

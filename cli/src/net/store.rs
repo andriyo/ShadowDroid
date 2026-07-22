@@ -1266,6 +1266,60 @@ pub fn find_ws_message(serial: &Serial, id: &str) -> Result<Option<WsMessageReco
     find_ws_message_from(&paths::session_log_path(serial)?, id)
 }
 
+/// A full WebSocket session (upgrade + close + ordered messages) for HAR export.
+pub struct WsHarSession {
+    pub open: WsSessionRecord,
+    pub close: Option<WsCloseRecord>,
+    pub messages: Vec<WsMessageRecord>,
+}
+
+fn read_ws_har_sessions_from(path: &Path) -> Result<Vec<WsHarSession>> {
+    let mut opens: Vec<WsSessionRecord> = Vec::new();
+    let mut closes: HashMap<String, WsCloseRecord> = HashMap::new();
+    let mut messages: HashMap<String, Vec<WsMessageRecord>> = HashMap::new();
+    let mut floor = 0_u64;
+    visit_records(path, |record| match record {
+        StoredLine::WsOpen(value) if record_after_floor(&value, floor) => {
+            if let Ok(open) = serde_json::from_value::<WsSessionRecord>(value) {
+                opens.push(open);
+            }
+        }
+        StoredLine::WsClose(value) if record_after_floor(&value, floor) => {
+            if let Ok(close) = serde_json::from_value::<WsCloseRecord>(value) {
+                closes.insert(close.session_id.clone(), close);
+            }
+        }
+        StoredLine::WsMsg(value) if record_after_floor(&value, floor) => {
+            if let Ok(message) = serde_json::from_value::<WsMessageRecord>(value) {
+                messages
+                    .entry(message.session_id.clone())
+                    .or_default()
+                    .push(message);
+            }
+        }
+        StoredLine::Clear(clear) => {
+            floor = clear.after_flow_sequence;
+            opens.clear();
+            closes.clear();
+            messages.clear();
+        }
+        _ => {}
+    })?;
+    Ok(opens
+        .into_iter()
+        .map(|open| WsHarSession {
+            close: closes.remove(&open.id),
+            messages: messages.remove(&open.id).unwrap_or_default(),
+            open,
+        })
+        .collect())
+}
+
+/// Every WebSocket session (with close + messages) for `net export har`.
+pub fn read_ws_har_sessions(serial: &Serial) -> Result<Vec<WsHarSession>> {
+    read_ws_har_sessions_from(&paths::session_log_path(serial)?)
+}
+
 fn export_jsonl_from(
     path: &Path,
     protocol: Protocol,

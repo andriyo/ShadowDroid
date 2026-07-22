@@ -1088,7 +1088,7 @@ pub enum NetCmd {
     },
     /// Mark the current capture boundary without stopping the proxy.
     Checkpoint,
-    /// Full headers + bodies for one flow.
+    /// Full headers + bodies for one flow (or one WebSocket session/message).
     Show {
         id: String,
         /// Include request/response bodies (not just headers).
@@ -1101,6 +1101,13 @@ pub enum NetCmd {
         /// Emit the flow as a single-entry HAR object.
         #[arg(long, conflicts_with = "body_file")]
         har: bool,
+        /// Render a WebSocket message payload decoded: `hex`, `json` (pretty),
+        /// or `protobuf` (schemaless field dump).
+        #[arg(long, value_parser = ["hex", "json", "protobuf"])]
+        format: Option<String>,
+        /// Show the per-frame breakdown of a fragmented WebSocket message.
+        #[arg(long)]
+        frames: bool,
     },
     /// Export flows for interop: `har`, `curl`, or `fixtures` (a replayable
     /// response set + `manifest.json` for deterministic instrumentation tests;
@@ -1149,13 +1156,51 @@ pub enum NetCmd {
         /// Restrict to a recent duration, e.g. 500ms, 2m, 1h.
         #[arg(long, value_name = "DURATION")]
         since: Option<String>,
+        /// Summarize a session (opcode histogram, per-direction bytes,
+        /// compression ratio, rate) instead of listing messages; needs a session id.
+        #[arg(long)]
+        stats: bool,
         /// Max rows to return (most recent first).
         #[arg(short = 'n', long, default_value_t = 50)]
         limit: usize,
     },
-    /// Pause matching flows for agent-in-the-loop editing.
+    /// Inject a WebSocket frame into a live captured session (see `net ws`).
+    /// Uncompressed and safe even under permessage-deflate. Pick exactly one of
+    /// --text/--binary/--ping/--pong/--close.
+    Inject {
+        /// Session id from `net ws` (e.g. `w1`).
+        #[arg(value_name = "SESSION")]
+        session: String,
+        /// Direction: `s2c` (to the app, simulate a server push) or `c2s` (to
+        /// the server, as if from the app).
+        #[arg(long, value_parser = ["c2s", "s2c"])]
+        dir: String,
+        /// Send a text frame with this payload.
+        #[arg(long, conflicts_with_all = ["binary", "ping", "pong", "close"])]
+        text: Option<String>,
+        /// Send a binary frame (base64-encoded payload).
+        #[arg(long, conflicts_with_all = ["text", "ping", "pong", "close"])]
+        binary: Option<String>,
+        /// Send a ping frame.
+        #[arg(long, conflicts_with_all = ["text", "binary", "pong", "close"])]
+        ping: bool,
+        /// Send a pong frame.
+        #[arg(long, conflicts_with_all = ["text", "binary", "ping", "close"])]
+        pong: bool,
+        /// Send a close frame.
+        #[arg(long, conflicts_with_all = ["text", "binary", "ping", "pong"])]
+        close: bool,
+        /// Close code (with --close), e.g. 1000.
+        #[arg(long, requires = "close")]
+        code: Option<u16>,
+        /// Close reason (with --close).
+        #[arg(long, requires = "close")]
+        reason: Option<String>,
+    },
+    /// Pause matching flows (or WebSocket frames, with --dir) for
+    /// agent-in-the-loop editing.
     Intercept {
-        /// Only intercept flows whose host contains this (substring).
+        /// Only intercept flows/frames whose host contains this (substring).
         #[arg(long)]
         host: Option<String>,
         /// Only intercept flows whose URL path contains this (substring).
@@ -1167,7 +1212,17 @@ pub enum NetCmd {
         /// Only intercept flows with this response status (response phase).
         #[arg(long)]
         status: Option<u16>,
-        /// Hold at the request phase, response phase, or both.
+        /// Intercept WebSocket frames in this direction instead of HTTP flows:
+        /// `s2c` (from the server) or `c2s` (from the app).
+        #[arg(long, value_parser = ["c2s", "s2c"])]
+        dir: Option<String>,
+        /// With --dir: only intercept frames of this opcode.
+        #[arg(long, value_parser = ["text", "binary", "ping", "pong", "close"], requires = "dir")]
+        opcode: Option<String>,
+        /// Disarm interception (clears the armed matcher).
+        #[arg(long)]
+        clear: bool,
+        /// Hold at the request phase, response phase, or both (HTTP only).
         #[arg(long, value_parser = ["request", "response", "both"], default_value = "response")]
         at: String,
         /// Auto-act after this long if the agent doesn't (apps time out their own client).
@@ -1177,9 +1232,15 @@ pub enum NetCmd {
         #[arg(long, value_parser = ["resume", "drop"], default_value = "resume")]
         on_timeout: String,
     },
-    /// Release a held flow (optionally mutated).
+    /// Release a held flow (optionally mutated) or a held WebSocket frame.
     Resume {
         id: String,
+        /// Held WebSocket frame: replace its payload with this text before forwarding.
+        #[arg(long, conflicts_with_all = ["set_status", "set_header", "body", "binary"])]
+        text: Option<String>,
+        /// Held WebSocket frame: replace its payload with this base64 binary.
+        #[arg(long, conflicts_with_all = ["set_status", "set_header", "body", "text"])]
+        binary: Option<String>,
         /// Override the response status code.
         #[arg(long)]
         set_status: Option<u16>,
@@ -1327,7 +1388,7 @@ pub enum NetRuleCmd {
 #[derive(clap::Args)]
 pub struct NetRuleAddArgs {
     /// block | delay | map-local | map-remote | respond | set-request-header |
-    /// set-status | set-response-header | replace
+    /// set-status | set-response-header | replace | ws-drop | ws-set-text
     pub kind: String,
     /// Match flows whose host contains this (substring).
     #[arg(long)]
@@ -1338,6 +1399,12 @@ pub struct NetRuleAddArgs {
     /// Match flows with this HTTP method.
     #[arg(long)]
     pub method: Option<String>,
+    /// `ws-*` rules: restrict to a direction, `c2s` or `s2c`.
+    #[arg(long, value_parser = ["c2s", "s2c"])]
+    pub dir: Option<String>,
+    /// `ws-*` rules: restrict to a frame opcode.
+    #[arg(long, value_parser = ["text", "binary", "ping", "pong", "close"])]
+    pub opcode: Option<String>,
     /// Match flows with this response content-type (substring).
     #[arg(long)]
     pub content_type: Option<String>,
@@ -2959,6 +3026,7 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
             grep,
             session,
             since,
+            stats,
             limit,
         } => {
             nc::ws(
@@ -2971,7 +3039,35 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
                     grep: grep.clone(),
                     capture_session_id: session.clone(),
                     since: since.clone(),
+                    stats: *stats,
                     limit: *limit,
+                },
+            )
+            .await
+        }
+        NetCmd::Inject {
+            session,
+            dir,
+            text,
+            binary,
+            ping,
+            pong,
+            close,
+            code,
+            reason,
+        } => {
+            nc::inject(
+                serial,
+                nc::InjectOpts {
+                    session: session.clone(),
+                    dir: dir.clone(),
+                    text: text.clone(),
+                    binary: binary.clone(),
+                    ping: *ping,
+                    pong: *pong,
+                    close: *close,
+                    code: *code,
+                    reason: reason.clone(),
                 },
             )
             .await
@@ -2981,7 +3077,22 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
             body,
             body_file,
             har,
-        } => nc::show(serial, id, *body, *har, body_file.as_deref()).await,
+            format,
+            frames,
+        } => {
+            nc::show(
+                serial,
+                id,
+                nc::ShowOpts {
+                    body: *body,
+                    har: *har,
+                    body_file: body_file.clone(),
+                    format: format.clone(),
+                    frames: *frames,
+                },
+            )
+            .await
+        }
         NetCmd::Export {
             format,
             id,
@@ -3004,21 +3115,41 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
             path,
             method,
             status,
+            dir,
+            opcode,
+            clear,
             at,
             hold_ms,
             on_timeout,
         } => {
-            nc::intercept(
-                serial,
-                matcher(host, path, method, status),
-                at.clone(),
-                *hold_ms,
-                on_timeout.clone(),
-            )
-            .await
+            if dir.is_some() || *clear {
+                nc::ws_intercept(
+                    serial,
+                    nc::WsInterceptOpts {
+                        host: host.clone(),
+                        dir: dir.clone(),
+                        opcode: opcode.clone(),
+                        clear: *clear,
+                        hold_ms: *hold_ms,
+                        on_timeout: on_timeout.clone(),
+                    },
+                )
+                .await
+            } else {
+                nc::intercept(
+                    serial,
+                    matcher(host, path, method, status),
+                    at.clone(),
+                    *hold_ms,
+                    on_timeout.clone(),
+                )
+                .await
+            }
         }
         NetCmd::Resume {
             id,
+            text,
+            binary,
             set_status,
             set_header,
             remove_header,
@@ -3051,7 +3182,22 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
                 delay_ms: *delay_ms,
                 set_url: set_url.clone(),
             };
-            nc::resume(serial, id, mutation).await
+            // A held WebSocket frame edit (--text/--binary); the daemon routes a
+            // `w…` id to the WS held-frame path before the HTTP one.
+            let ws_payload = if let Some(text) = text {
+                Some(text.clone().into_bytes())
+            } else if let Some(encoded) = binary {
+                Some(crate::net::ws::b64_decode(encoded).ok_or_else(|| {
+                    crate::diagnostic::DiagnosticError::new(
+                        "invalid_base64",
+                        "input",
+                        "`--binary` must be base64".to_string(),
+                    )
+                })?)
+            } else {
+                None
+            };
+            nc::resume(serial, id, mutation, ws_payload).await
         }
         NetCmd::Drop { id, set_status } => nc::drop_flow(serial, id, *set_status).await,
         NetCmd::Respond {
@@ -3107,6 +3253,8 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
                     content_type: a.content_type.clone(),
                     operation_name: a.operation_name.clone(),
                     response,
+                    ws_dir: a.dir.clone(),
+                    ws_opcode: a.opcode.clone(),
                     args: a.args.clone(),
                 };
                 nc::rule_add(serial, spec).await

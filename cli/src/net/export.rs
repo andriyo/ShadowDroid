@@ -29,13 +29,87 @@ pub fn curl_command(f: &FlowRecord) -> String {
 
 /// HAR 1.2 archive for a set of flows.
 pub fn to_har(flows: &[FlowRecord]) -> Value {
-    let entries: Vec<Value> = flows.iter().map(har_entry).collect();
+    build_har(flows.iter().map(har_entry).collect())
+}
+
+/// HAR 1.2 archive combining HTTP flows and WebSocket sessions. WebSocket
+/// entries carry Chrome/devtools' `_resourceType:"websocket"` +
+/// `_webSocketMessages` extension so they load in browser devtools, Proxyman,
+/// and Charles.
+pub fn to_har_with_ws(flows: &[FlowRecord], sessions: &[crate::net::store::WsHarSession]) -> Value {
+    let mut entries: Vec<Value> = flows.iter().map(har_entry).collect();
+    entries.extend(sessions.iter().map(ws_har_entry));
+    build_har(entries)
+}
+
+fn build_har(entries: Vec<Value>) -> Value {
     json!({
         "log": {
             "version": "1.2",
             "creator": {"name": "shadowdroid", "version": env!("CARGO_PKG_VERSION")},
             "entries": entries,
         }
+    })
+}
+
+/// One HAR entry for a WebSocket session: the upgrade request/response plus the
+/// devtools `_webSocketMessages` array (`type: send|receive`, opcode, data, time).
+fn ws_har_entry(session: &crate::net::store::WsHarSession) -> Value {
+    let open = &session.open;
+    let duration = session.close.as_ref().map_or(0, |close| close.dur_ms);
+    let messages: Vec<Value> = session
+        .messages
+        .iter()
+        .map(|message| {
+            let opcode = match message.opcode.as_str() {
+                "text" => 1,
+                "binary" => 2,
+                "close" => 8,
+                "ping" => 9,
+                "pong" => 10,
+                _ => 1,
+            };
+            let data = message
+                .text
+                .clone()
+                .or_else(|| message.data_b64.clone())
+                .unwrap_or_default();
+            json!({
+                "type": if message.dir == "c2s" { "send" } else { "receive" },
+                "opcode": opcode,
+                "data": data,
+                "time": message.ts,
+            })
+        })
+        .collect();
+    json!({
+        "startedDateTime": iso8601(open.ts),
+        "time": duration,
+        "_resourceType": "websocket",
+        "request": {
+            "method": "GET",
+            "url": open.url(),
+            "httpVersion": "HTTP/1.1",
+            "headers": har_headers(&open.req_headers),
+            "queryString": [],
+            "cookies": [],
+            "headersSize": -1,
+            "bodySize": 0,
+        },
+        "response": {
+            "status": open.status,
+            "statusText": if open.status == 101 { "Switching Protocols" } else { "" },
+            "httpVersion": "HTTP/1.1",
+            "headers": har_headers(&open.resp_headers),
+            "cookies": [],
+            "content": {"size": 0, "mimeType": "x-unknown"},
+            "redirectURL": "",
+            "headersSize": -1,
+            "bodySize": 0,
+        },
+        "cache": {},
+        "timings": {"send": 0, "wait": duration, "receive": 0},
+        "_webSocketMessages": messages,
     })
 }
 
