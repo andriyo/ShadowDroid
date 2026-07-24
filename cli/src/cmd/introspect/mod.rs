@@ -1154,6 +1154,7 @@ mod tests {
         let commands = catalog["commands"].as_array().unwrap();
 
         assert!(find_command(commands, &["net", "daemon"]).is_none());
+        assert!(find_command(commands, &["video", "daemon"]).is_none());
     }
 
     #[test]

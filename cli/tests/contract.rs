@@ -110,6 +110,45 @@ fn breakpoint_commands_expose_validation_bypass() {
 }
 
 #[test]
+fn video_help_and_catalog_expose_the_agent_recording_contract() {
+    let (help, code) = run(&["video", "record", "--help"]);
+    assert_eq!(code, 0);
+    for option in [
+        "--out",
+        "--duration",
+        "--backend",
+        "--size",
+        "--bit-rate",
+        "--display-id",
+        "--bugreport",
+        "--segment-seconds",
+    ] {
+        assert!(help.contains(option), "missing {option}:\n{help}");
+    }
+
+    let (out, code) = run(&["commands", "--json", "--describe", "video start"]);
+    let value = one_json_line(&out);
+    assert_eq!(code, 0);
+    assert_eq!(value["path"], "video start");
+    assert_eq!(value["command"]["contract"]["output_mode"], "json");
+    assert!(value["command"]["agent"]["use_when"].is_array());
+}
+
+#[test]
+fn video_record_missing_bundle_is_a_structured_usage_error() {
+    let (out, code) = run(&["video", "record", "--duration", "30s"]);
+    let value = one_json_line(&out);
+    assert_eq!(code, 2);
+    assert_eq!(value["code"], "usage");
+    assert_eq!(value["arg"], "--out <DIR>");
+    assert!(
+        value["next_actions"]
+            .as_array()
+            .is_some_and(|actions| !actions.is_empty())
+    );
+}
+
+#[test]
 fn config_schema_describes_stable_device_targets() {
     let (out, code) = run(&["config", "schema", "--json"]);
     let value = one_json_line(&out);

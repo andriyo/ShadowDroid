@@ -55,6 +55,7 @@ mod release;
 mod selector;
 mod transfer;
 mod update;
+mod video;
 mod watch;
 
 fn main() {

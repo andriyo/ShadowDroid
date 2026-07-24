@@ -143,6 +143,9 @@ $ shadowdroid why
   watches, expression eval, native/tombstone readiness, and coroutine insight.
 - **One live event stream** — `watch` emits screen diffs, crashes, toasts,
   popup-watcher actions, and decrypted HTTP(S) on a single timeline.
+- **Crash-safe screen video** — `video record` captures segmented Android
+  screen video into a protected evidence bundle; detached
+  `start` / `mark` / `status` / `stop` verbs cover longer interactive runs.
 - **Built-in HTTP(S) interception** — a host-side MITM proxy built into the
   binary; an optional debug-only in-app agent adds process/coroutine diagnostics
   and explicit above-TLS OkHttp capture, including pinned OkHttp calls.
@@ -164,6 +167,7 @@ $ shadowdroid why
 - [The output contract](#the-output-contract)
 - [When something goes wrong](#when-something-goes-wrong)
 - [What you can drive](#what-you-can-drive)
+- [Screen video evidence](#screen-video-evidence)
 - [Agent debugging](#agent-debugging)
 - [Agent integration](#agent-integration)
 - [FAQ](#faq)
@@ -585,6 +589,13 @@ potentially sensitive. Explicit `--redact-pixels` (PNG only) blacks out matching
 accessibility bounds, but still reports that Android may not expose every
 rendered glyph.
 
+Video is a stricter boundary: global `--redact` does not alter MP4 pixels.
+Every `video` bundle is marked as containing sensitive, unencrypted data; review
+its clips before sharing it. For video bundles, `--redact` filters marker labels;
+device/session identity and recovery paths remain in the protected manifest, so
+the JSON timeline is still marked potentially sensitive. Screen recording is
+video-only — it does not capture device, app, or microphone audio.
+
 Optionally, opt in to a **local usage log**. Schema version 2 records only the
 command path, duration, CLI version, outcome, and typed error code/stage/retry
 posture — never argument values — and never uploads anything:
@@ -733,6 +744,7 @@ selector (then optionally activates it) — the TV analog of `ui tap` /
 | **UI automation** | `ui dump`, `ui audit`, `ui gen`, `ui screenshot`, `ui find`, `ui tap`, `ui set-progress`, `ui double-tap`, `ui long-tap`, `ui swipe`, `ui drag`, `ui swipe-ext`, `ui pinch`, `ui scroll-to`, `ui focus`, `ui text`, `ui pin`, `ui key`, `ui hide-keyboard`, `ui back`, `ui home`, `ui wait`, `ui toast` (action verbs take `--observe`, `--if-screen`, and `--if-interaction`; tap/progress/text also accept `--handle`) |
 | **Triage** | `why` (one-read verdict + evidence), `log` (structured app-scoped logcat + parsed crashes) |
 | **Live timeline** | `watch` (screen changes, crashes, ANRs, toasts, watcher actions, and HTTP events when network capture is active) |
+| **Screen video** | `video record -o DIR [--duration 30s]`; detached `video start -o DIR`, `video status`, `video mark LABEL`, `video stop` |
 | **Layout / Compose** | `layout snapshot`, `layout diff`, `layout source`, `layout recompositions` |
 | **Debugger** | `debug auto`, `snapshot`, `record`, `replay`, `status`, `sessions`, `clients`, `attach`, `break`, `breakpoints`, `pause`, `resume`, `step-in`, `step-over`, `step-out`, `stop`, `stack`, `threads`, `variables`, `eval`, `inspect`, `coroutines`, `continue-until`, `watch`, `step-until-screen-change`, `step-until-log`, `run-until-crash`, `native`, `tombstones` |
 | **App lifecycle/state** | `app start`, `stop`, `install`, `reinstall`, `clear`, `info`, `wait`, `current`; `app state snapshot`, `restore`, `recover`, `cleanup` |
@@ -802,6 +814,54 @@ backups. If interrupted during the commit, subsequent state commands return
 `state_restore_interrupted` instead of pretending the app is safe; run
 `app state recover --app <pkg>` to roll back. Snapshot, restore, and recovery
 leave the app force-stopped.
+
+### Screen video evidence
+
+Use `video record` for a bounded foreground capture:
+
+```bash
+shadowdroid video record -o /tmp/checkout-repro --duration 30s
+```
+
+For an interactive run, start a detached recorder and add human-readable
+timeline boundaries while driving the app:
+
+```bash
+shadowdroid video start -o /tmp/checkout-repro
+shadowdroid video mark "before checkout"
+shadowdroid video status
+shadowdroid video mark "payment failed"
+shadowdroid video stop
+```
+
+Both capture paths write a private-mode bundle on Unix (`0700` directories and
+`0600` files; other platforms are labelled `platform_default`) containing
+`manifest.json`, `events.jsonl`, and numbered MP4 files under `segments/`. When compatible
+segments can be assembled losslessly, the bundle also contains `video.mp4`;
+the segments remain the authoritative capture if assembly is unavailable.
+Recording is segmented before Android's `screenrecord` time limit so a long run
+does not silently end, and `stop` finalizes the active segment before returning.
+
+`record` and `start` accept `--backend auto|screenrecord`, plus `--size`,
+`--bit-rate`, `--display-id`, `--bugreport`, and `--segment-seconds`.
+`auto` selects the available built-in path; explicit `screenrecord` is useful
+when reproducibility matters. Device support for size, display selection, and
+bugreport overlays varies, so unsupported combinations fail rather than being
+silently ignored. The built-in backend captures screen video only, with no app,
+device, or microphone audio.
+
+MP4 pixels are never redacted, including when global `--redact` is enabled.
+The flag does filter marker labels, but structural device/session identifiers
+needed for crash recovery remain in the manifest and timeline. The manifest
+therefore labels every bundle sensitive and unencrypted. Treat the whole
+directory as private evidence and inspect every clip before sharing it.
+
+Per-segment `sample_count` and `media_duration_ms` report encoded coverage.
+Marker offsets and rollover gaps are host-observed approximations, explicitly
+labelled as such in the manifest; use them to navigate evidence, not as
+frame-accurate media timestamps. A static or very short capture can contain only
+one frame: ShadowDroid preserves that segment, reports `playable: false`, marks
+the session `partial`, and does not publish a misleading `video.mp4`.
 
 `watch` is the streaming workhorse — it emits debounced, hash-diffed `screen`
 events plus `crash`, `toast`, `watcher_fired`, and `http` events when a `net`

@@ -207,6 +207,51 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
                 "net log": "for live UI plus network correlation"
             }
         })),
+        "video" => Some(serde_json::json!({
+            "use_when": [
+                "Need durable visual evidence across an Android flow, including actions performed by separate ShadowDroid invocations.",
+                "Need a protected, timestamped recording bundle that survives Android screenrecord duration limits."
+            ],
+            "avoid_when": [
+                "Need one current frame or actionable UI structure; use ui screenshot or ui dump.",
+                "Need runtime/debugger causality without recording pixels; use debug record."
+            ],
+            "output": "compact JSON actions plus a private session bundle containing manifest.json, events.jsonl, crash-safe MP4 segments, and video.mp4 when assembly is possible",
+            "side_effects": ["records every visible screen pixel", "writes sensitive artifacts", "start/record launch a per-device background process"],
+            "prerequisites": ["an attached Android device with screenrecord support; the ShadowDroid on-device server is not required"],
+            "next_actions": ["video record --out shadowdroid-video --duration 30s", "video start --out shadowdroid-video", "video status"]
+        })),
+        "video record" => Some(serde_json::json!({
+            "use_when": ["Need a bounded foreground screen recording that finalizes after a duration or Ctrl-C."],
+            "output": "one video_record action after a finalized private session bundle is ready",
+            "side_effects": ["records all visible pixels", "writes manifest, timeline, and MP4 artifacts"],
+            "prerequisites": ["screenrecord support; audio is not captured by this backend"],
+            "next_actions": ["video status", "collect", "debug record"]
+        })),
+        "video start" => Some(serde_json::json!({
+            "use_when": ["Need background screen recording across multiple independent ShadowDroid commands."],
+            "output": "active session identity and bundle/manifest/timeline paths after the first recorder segment is proven live",
+            "side_effects": ["starts one detached recorder for the selected device", "records all visible pixels"],
+            "next_actions": ["video status", "video mark 'checkpoint'", "video stop"]
+        })),
+        "video status" => Some(serde_json::json!({
+            "use_when": ["Need a passive read of the selected device's persistent recording lifecycle and artifact paths."],
+            "output": "video_status action; running:false and state:null when idle",
+            "side_effects": ["none; does not start a configured emulator"],
+            "next_actions": ["video mark 'checkpoint'", "video stop", "video start --out shadowdroid-video"]
+        })),
+        "video mark" => Some(serde_json::json!({
+            "use_when": ["Need a searchable label aligned to the active video's session and segment clocks."],
+            "output": "video_mark action with session and segment elapsed times",
+            "side_effects": ["appends one redaction-aware marker to events.jsonl and manifest.json"],
+            "next_actions": ["video status", "video stop"]
+        })),
+        "video stop" => Some(serde_json::json!({
+            "use_when": ["Need to gracefully SIGINT screenrecord, verify/pull every segment, and finalize the bundle."],
+            "output": "video_stop action with finalized artifact paths, byte counts, privacy status, and warnings; idle stop is idempotent",
+            "side_effects": ["stops the selected device recorder", "pulls and verifies MP4 segments", "removes only owned device temporary files after verified publication"],
+            "next_actions": ["video record --out shadowdroid-video --duration 30s", "video start --out shadowdroid-video", "collect"]
+        })),
         "ui" => Some(serde_json::json!({
             "use_when": ["Need to read or manipulate the currently visible UI."],
             "output": "one JSON object per read/action",

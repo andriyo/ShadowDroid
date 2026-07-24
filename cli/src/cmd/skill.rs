@@ -562,6 +562,7 @@ fn command_reference() -> String {
         "config",
         "ui",
         "watch",
+        "video",
         "app",
         "perm",
         "device",

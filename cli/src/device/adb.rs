@@ -203,6 +203,54 @@ pub async fn shell_mutating(serial: impl Into<String>, cmd: impl Into<String>) -
     blocking_publication("mutating device shell", move || shell_sync(&serial, &cmd)).await
 }
 
+/// Result of a shell command whose lifetime is controlled by the remote
+/// process. Unlike [`shell`], this operation has no running deadline: callers
+/// must arrange an independently owned remote stop signal. It is intended for
+/// Android's `screenrecord`, whose ADB shell stays open for the whole capture.
+#[derive(Debug)]
+pub struct LongShellOutput {
+    pub status: Option<u8>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+pub async fn shell_long_running(
+    serial: impl Into<String>,
+    cmd: impl Into<String>,
+) -> Result<LongShellOutput> {
+    let serial = serial.into();
+    let cmd = cmd.into();
+    let slots = ADB_BLOCKING_SLOTS
+        .get_or_init(|| Arc::new(Semaphore::new(ADB_BLOCKING_CONCURRENCY)))
+        .clone();
+    let permit = tokio::time::timeout(ADB_TIMEOUT, slots.acquire_owned())
+        .await
+        .map_err(|_| {
+            adb_timeout_error(
+                "long-running device shell",
+                ADB_TIMEOUT,
+                "waiting_for_worker",
+            )
+        })?
+        .map_err(|_| anyhow!("ADB blocking worker pool is closed"))?;
+    spawn_blocking(move || {
+        let _permit = permit;
+        let mut device = get_device_sync(&serial)?;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let status = device
+            .shell_command(&cmd, Some(&mut stdout), Some(&mut stderr))
+            .map_err(|error| anyhow!("adb long-running shell {cmd:?}: {error}"))?;
+        Ok(LongShellOutput {
+            status,
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        })
+    })
+    .await
+    .context("long-running device shell task panicked")?
+}
+
 fn shell_sync(serial: &str, cmd: &str) -> Result<String> {
     let mut device = get_device_sync(serial)?;
     let mut stdout = Vec::new();
@@ -341,11 +389,23 @@ pub async fn pull_to_path(
     remote: impl Into<String>,
     local: impl Into<PathBuf>,
 ) -> Result<u64> {
+    pull_to_path_with_timeout(serial, remote, local, ADB_TRANSFER_TIMEOUT).await
+}
+
+/// Video segments can be hundreds of megabytes. Let the caller scale the ADB
+/// transfer deadline from the remote size while preserving the same staged,
+/// synced, atomic publication used by ordinary file pulls.
+pub async fn pull_to_path_with_timeout(
+    serial: impl Into<String>,
+    remote: impl Into<String>,
+    local: impl Into<PathBuf>,
+    timeout: Duration,
+) -> Result<u64> {
     let serial = serial.into();
     let remote = remote.into();
     let local = local.into();
     let publish_path = local.clone();
-    let staged = bounded_blocking("stage pulled file", ADB_TRANSFER_TIMEOUT, move || {
+    let staged = bounded_blocking("stage pulled file", timeout, move || {
         let (mut temp, existing_permissions) =
             crate::transfer::atomic_temp_for_destination(&local)?;
         let mut device = get_device_sync(&serial)?;

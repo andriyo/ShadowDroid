@@ -134,8 +134,8 @@ pub struct Cli {
     pub quiet: bool,
 
     /// Redact common secrets, PII, identifiers, and configured patterns from
-    /// supported JSON/text output and diagnostic artifacts. For `net start`,
-    /// the same policy is applied to completed captures before persistence.
+    /// supported JSON/text output and diagnostic artifacts. Video applies it to
+    /// marker labels; recovery identifiers and MP4 pixels remain sensitive.
     #[arg(long, global = true)]
     pub redact: bool,
 
@@ -283,6 +283,8 @@ pub enum Cmd {
     Studio(crate::cmd::studio::StudioArgs),
     /// Agent-first debug snapshots, timelines, replays, and Studio-backed debugger control.
     Debug(crate::cmd::debug::DebugArgs),
+    /// Screen-record a device into a timestamped, crash-safe evidence bundle.
+    Video(crate::video::VideoArgs),
     /// Watch the app timeline: UI changes, crashes, toasts, watchers, and network events when available.
     Watch {
         /// Only emit app-scoped events for this package. Permission dialogs are still allowed.
@@ -1788,6 +1790,12 @@ async fn run_inner() -> Result<()> {
     if redact_enabled && let Cmd::Net(NetCmd::Start { redact, .. }) = &mut cmd {
         *redact = true;
     }
+    if let Cmd::Video(args) = &mut cmd {
+        args.redact = redact_enabled;
+        args.redaction = redaction_config
+            .map(crate::config::RedactionConfig::policy_spec)
+            .unwrap_or_default();
+    }
     apply_config_defaults(&mut cmd, &config);
 
     // ── Phase 1: commands that do NOT need the on-device server ──
@@ -1897,6 +1905,19 @@ async fn run_inner() -> Result<()> {
             let serial = selection.resolve(&config).await?;
             return crate::cmd::why::run(&serial, &config, project.as_deref(), args).await;
         }
+        // Video is a host-side ADB daemon and does not need the UiAutomation
+        // server. Detached daemon args carry their own exact serial.
+        Cmd::Video(args) => {
+            if args.is_daemon() {
+                return crate::video::run(args, &Serial::new("")).await;
+            }
+            let serial = if args.allows_target_start() {
+                selection.resolve(&config).await?
+            } else {
+                selection.resolve_existing(&config).await?
+            };
+            return crate::video::run(args, &serial).await;
+        }
         Cmd::Perm(c) => {
             let serial = selection.resolve(&config).await?;
             return dispatch_perm(c, &serial).await;
@@ -2005,6 +2026,7 @@ async fn run_inner() -> Result<()> {
         | Cmd::Config(_)
         | Cmd::Skill(_)
         | Cmd::Studio(_)
+        | Cmd::Video(_)
         | Cmd::Perm(_)
         | Cmd::Appops(_)
         | Cmd::Profile(_)
@@ -5736,6 +5758,80 @@ pub(crate) async fn resolve_serial(explicit: Option<&str>) -> Result<Serial> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn video_surface_parses_foreground_detached_and_capture_options() {
+        let parsed = Cli::try_parse_from([
+            "shadowdroid",
+            "-d",
+            "emulator-5554",
+            "video",
+            "record",
+            "-o",
+            "evidence",
+            "--duration",
+            "30s",
+            "--backend",
+            "screenrecord",
+            "--size",
+            "1280x720",
+            "--bit-rate",
+            "4000000",
+            "--display-id",
+            "42",
+            "--bugreport",
+            "--segment-seconds",
+            "120",
+        ])
+        .unwrap();
+        let Cmd::Video(args) = parsed.cmd else {
+            panic!("expected video command");
+        };
+        let crate::video::VideoCmd::Record(record) = args.command else {
+            panic!("expected video record");
+        };
+        assert_eq!(record.duration.as_deref(), Some("30s"));
+        assert_eq!(record.capture.size.as_deref(), Some("1280x720"));
+        assert_eq!(record.capture.bit_rate, Some(4_000_000));
+        assert_eq!(record.capture.display_id, Some(42));
+        assert!(record.capture.bugreport);
+        assert_eq!(record.capture.segment_seconds, 120);
+        assert_eq!(
+            record.capture.backend,
+            crate::video::VideoBackendArg::Screenrecord
+        );
+
+        assert!(matches!(
+            Cli::try_parse_from(["shadowdroid", "video", "status"])
+                .unwrap()
+                .cmd,
+            Cmd::Video(crate::video::VideoArgs {
+                command: crate::video::VideoCmd::Status,
+                ..
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["shadowdroid", "video", "mark", "before checkout"])
+                .unwrap()
+                .cmd,
+            Cmd::Video(crate::video::VideoArgs {
+                command: crate::video::VideoCmd::Mark { label },
+                ..
+            }) if label == "before checkout"
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "shadowdroid",
+                "video",
+                "start",
+                "-o",
+                "evidence",
+                "--segment-seconds",
+                "4",
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn net_trust_push_is_honest_and_ui_remains_hidden_legacy_alias() {
