@@ -90,6 +90,7 @@ internal object BridgeQuery {
     const val THREAD = "thread"
     const val TIMEOUT_MS = "timeout_ms"
     const val UNCAUGHT = "uncaught"
+    const val VALIDATE = "validate"
 }
 
 internal object BridgeValues {

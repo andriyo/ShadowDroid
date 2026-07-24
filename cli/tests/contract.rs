@@ -100,6 +100,16 @@ fn help_exposes_named_target_and_takeover_controls() {
 }
 
 #[test]
+fn breakpoint_commands_expose_validation_bypass() {
+    let (out, code) = run(&["debug", "break", "line", "--help"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("--force"), "{out}");
+    let (out, code) = run(&["debug", "break", "update", "--help"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("--force"), "{out}");
+}
+
+#[test]
 fn config_schema_describes_stable_device_targets() {
     let (out, code) = run(&["config", "schema", "--json"]);
     let value = one_json_line(&out);

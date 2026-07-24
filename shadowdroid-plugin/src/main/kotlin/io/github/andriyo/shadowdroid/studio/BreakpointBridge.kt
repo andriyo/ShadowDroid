@@ -2,22 +2,25 @@ package io.github.andriyo.shadowdroid.studio
 
 import com.intellij.debugger.ui.breakpoints.JavaExceptionBreakpointType
 import com.intellij.debugger.ui.breakpoints.JavaFieldBreakpointType
-import com.intellij.debugger.ui.breakpoints.JavaLineBreakpointType
 import com.intellij.debugger.ui.breakpoints.JavaWildcardMethodBreakpointType
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.LocalFileSystem
+import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.xdebugger.XDebuggerManager
 import com.intellij.xdebugger.XSourcePosition
 import com.intellij.xdebugger.breakpoints.SuspendPolicy
 import com.intellij.xdebugger.breakpoints.XBreakpoint
+import com.intellij.xdebugger.breakpoints.XBreakpointProperties
 import com.intellij.xdebugger.breakpoints.XBreakpointType
 import com.intellij.xdebugger.breakpoints.XLineBreakpoint
+import com.intellij.xdebugger.breakpoints.XLineBreakpointType
 import org.jetbrains.java.debugger.breakpoints.properties.JavaBreakpointProperties
 import org.jetbrains.java.debugger.breakpoints.properties.JavaExceptionBreakpointProperties
 import org.jetbrains.java.debugger.breakpoints.properties.JavaFieldBreakpointProperties
 import org.jetbrains.java.debugger.breakpoints.properties.JavaLineBreakpointProperties
 import org.jetbrains.java.debugger.breakpoints.properties.JavaMethodBreakpointProperties
 import java.io.File
+import java.net.HttpURLConnection
 import java.nio.charset.StandardCharsets
 import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
@@ -29,6 +32,13 @@ internal object BreakpointBridge {
     // hit_count is documented as observed/approximate, so a burst of real
     // hits inside the window under-counts rather than double-counting.
     private const val HIT_DEDUPE_WINDOW_MS = 250L
+
+    private const val JAVA_LINE_TYPE_ID = "java-line"
+    private const val KOTLIN_LINE_TYPE_ID = "kotlin-line"
+
+    // Plain line breakpoints only; field watchpoints are also XLineBreakpoints
+    // at a file/line and must never be reused as a line breakpoint.
+    private val LINE_TYPE_IDS = setOf(JAVA_LINE_TYPE_ID, KOTLIN_LINE_TYPE_ID)
 
     private val breakpointHits = ConcurrentHashMap<String, Int>()
     private val breakpointLastHit = ConcurrentHashMap<String, Long>()
@@ -44,6 +54,7 @@ internal object BreakpointBridge {
 
     @JvmStatic
     fun forget(project: Project, breakpoint: XBreakpoint<*>) {
+        BreakpointExpressionGuard.forget(breakpoint)
         val id = try {
             breakpointId(project, breakpoint)
         } catch (_: Throwable) {
@@ -52,6 +63,11 @@ internal object BreakpointBridge {
         breakpointHits.remove(id)
         breakpointLastHit.remove(id)
     }
+
+    /** Stable breakpoint id for other bridge components (e.g. error records). */
+    @JvmStatic
+    internal fun breakpointIdFor(project: Project, breakpoint: XBreakpoint<*>): String =
+        breakpointId(project, breakpoint)
 
     @JvmStatic
     fun addLine(query: Map<String, String>, project: Project?): Response {
@@ -63,32 +79,137 @@ internal object BreakpointBridge {
         val temporary = BridgeProtocol.booleanParam(query, BridgeQuery.TEMPORARY, false)
         val condition = query[BridgeQuery.CONDITION]
         val clearCondition = BridgeProtocol.booleanParam(query, BridgeQuery.CLEAR_CONDITION, false)
+        val validate = BridgeProtocol.booleanParam(query, BridgeQuery.VALIDATE, true)
         if (project == null) return BridgeProtocol.bad("no project")
         return try {
-            val breakpoint = StudioThreading.onIdeaThread {
+            // Find-or-create only. A newly created breakpoint is left DISABLED
+            // here so it cannot fire during validation; enabled/temporary and
+            // the condition are all applied in one later hop, after validation
+            // passes — so a rejected expression leaves no partially-configured
+            // breakpoint (atomic, like update()).
+            val prepared = StudioThreading.onIdeaThread {
                 val virtualFile = LocalFileSystem.getInstance().refreshAndFindFileByIoFile(File(file))
                     ?: throw IllegalArgumentException("file not found in IDE VFS: $file")
-                val type = breakpointType(JavaLineBreakpointType::class.java)
-                    ?: throw IllegalStateException("Java line breakpoint type is not available")
-                val props = type.createBreakpointProperties(virtualFile, line - 1)
-                var target = findLineBreakpoint(project, virtualFile.url, line - 1, type.id)
-                if (target == null) {
-                    target = XDebuggerManager.getInstance(project).breakpointManager
-                        .addLineBreakpoint(type, virtualFile.url, line - 1, props, temporary)
+                val chosen = lineBreakpointTypeFor(project, virtualFile, line - 1)
+                val existing = findLineBreakpoint(project, virtualFile.url, line - 1)
+                val target = existing ?: run {
+                    @Suppress("UNCHECKED_CAST")
+                    val lineType = chosen.type as XLineBreakpointType<XBreakpointProperties<*>>
+                    val props = lineType.createBreakpointProperties(virtualFile, line - 1)
+                    XDebuggerManager.getInstance(project).breakpointManager
+                        .addLineBreakpoint(lineType, virtualFile.url, line - 1, props, temporary)
+                        .also { it.setEnabled(false) }
                 }
-                target.setEnabled(enabled)
-                target.setTemporary(temporary)
-                if (clearCondition) {
-                    target.setCondition(null)
-                } else if (condition != null) {
-                    target.setCondition(condition.ifBlank { null })
-                }
-                target
+                PreparedLine(target, chosen.positionSupported, created = existing == null)
             }
-            BridgeProtocol.ok("ok", true, "breakpoint", breakpointInfo(project, breakpoint))
+            val newCondition = if (clearCondition) null else condition?.ifBlank { null }
+            if (validate && newCondition != null) {
+                val problems = ExpressionValidation.validate(
+                    project,
+                    prepared.breakpoint,
+                    newCondition,
+                    expectBoolean = true,
+                )
+                if (problems.isNotEmpty()) {
+                    // Roll back a breakpoint we just created; leave a reused one
+                    // untouched (its prior state, including any old condition).
+                    if (prepared.created) {
+                        StudioThreading.onIdeaThread {
+                            XDebuggerManager.getInstance(project).breakpointManager
+                                .removeBreakpoint(prepared.breakpoint)
+                            null
+                        }
+                    }
+                    return invalidExpression(
+                        project,
+                        prepared.breakpoint,
+                        BreakpointExpressionGuard.KIND_CONDITION,
+                        newCondition,
+                        problems,
+                        removed = prepared.created,
+                    )
+                }
+            }
+            StudioThreading.onIdeaThread {
+                prepared.breakpoint.setEnabled(enabled)
+                prepared.breakpoint.setTemporary(temporary)
+                if (clearCondition || condition != null) {
+                    applyCondition(project, prepared.breakpoint, newCondition)
+                }
+                null
+            }
+            BridgeProtocol.ok(
+                "ok", true,
+                "breakpoint", breakpointInfo(project, prepared.breakpoint),
+                "warning", if (prepared.positionSupported) {
+                    null
+                } else {
+                    "no line breakpoint type accepts this position (blank or comment line?); the breakpoint may never bind"
+                },
+            )
         } catch (t: Throwable) {
             BridgeProtocol.bad(t)
         }
+    }
+
+    private fun applyCondition(project: Project, breakpoint: XBreakpoint<*>, condition: String?) {
+        breakpoint.setCondition(condition)
+        if (condition == null) {
+            BreakpointExpressionGuard.clearManaged(breakpoint, BreakpointExpressionGuard.KIND_CONDITION)
+        } else {
+            BreakpointExpressionGuard.markManaged(breakpoint, BreakpointExpressionGuard.KIND_CONDITION, condition)
+        }
+        BreakpointExpressionGuard.clearErrorsFor(breakpointId(project, breakpoint))
+    }
+
+    private fun applyLogExpression(project: Project, breakpoint: XBreakpoint<*>, expression: String?) {
+        breakpoint.setLogExpression(expression)
+        if (expression == null) {
+            BreakpointExpressionGuard.clearManaged(breakpoint, BreakpointExpressionGuard.KIND_LOG_EXPRESSION)
+        } else {
+            BreakpointExpressionGuard.markManaged(breakpoint, BreakpointExpressionGuard.KIND_LOG_EXPRESSION, expression)
+        }
+        BreakpointExpressionGuard.clearErrorsFor(breakpointId(project, breakpoint))
+    }
+
+    private fun invalidExpression(
+        project: Project,
+        breakpoint: XBreakpoint<*>,
+        kind: String,
+        expression: String,
+        problems: List<ExpressionValidation.Problem>,
+        removed: Boolean = false,
+    ): Response {
+        val typeId = breakpoint.type.id
+        val javaTypeOnKotlinFile = typeId == JAVA_LINE_TYPE_ID &&
+            (breakpoint as? XLineBreakpoint<*>)?.fileUrl?.endsWith(".kt") == true
+        val hint = if (javaTypeOnKotlinFile) {
+            "this existing breakpoint evaluates expressions as Java; remove it and re-add so the " +
+                "Kotlin file gets a Kotlin breakpoint, or write the $kind in Java syntax"
+        } else {
+            "fix the expression, or pass validate=false (CLI --force) to set it anyway; a failing " +
+                "expression no longer blocks Android Studio — the session pauses at the breakpoint " +
+                "and the error is reported on it"
+        }
+        return Response(
+            HttpURLConnection.HTTP_BAD_REQUEST,
+            BridgeProtocol.obj(
+                "ok", false,
+                "error", "invalid_expression: ${problems.first().message}",
+                "error_code", "invalid_expression",
+                "expression", expression,
+                "expression_kind", kind,
+                "breakpoint_type", typeId,
+                "problems", problems.map(ExpressionValidation.Problem::toMap),
+                "applied", false,
+                // A breakpoint we created just to validate is rolled back on
+                // failure, so nothing was left installed; a reused breakpoint is
+                // reported as-is (unchanged).
+                "unconfigured_breakpoint_removed", removed,
+                "hint", hint,
+                "breakpoint", if (removed) null else breakpointInfo(project, breakpoint),
+            ),
+        )
     }
 
     @Suppress("UNCHECKED_CAST")
@@ -218,21 +339,60 @@ internal object BreakpointBridge {
     fun update(query: Map<String, String>, projects: List<Project>, requestedProject: Project?): Response {
         val selected = findBreakpoint(query, projects, requestedProject) ?: return BridgeProtocol.bad("breakpoint not found")
         val breakpoint = selected.breakpoint
+        val validate = BridgeProtocol.booleanParam(query, BridgeQuery.VALIDATE, true)
+        val clearCondition = BridgeProtocol.booleanParam(query, BridgeQuery.CLEAR_CONDITION, false)
+        val newCondition = if (!clearCondition && query.containsKey(BridgeQuery.CONDITION)) {
+            query[BridgeQuery.CONDITION]?.ifBlank { null }
+        } else {
+            null
+        }
+        val clearLogExpression = BridgeProtocol.booleanParam(query, BridgeQuery.CLEAR_LOG_EXPRESSION, false)
+        val newLogExpression = if (!clearLogExpression && query.containsKey(BridgeQuery.LOG_EXPRESSION)) {
+            query[BridgeQuery.LOG_EXPRESSION]?.ifBlank { null }
+        } else {
+            null
+        }
+        // Reject invalid expressions before mutating anything: the whole
+        // update stays unapplied, so the agent retries one atomic call.
+        if (validate && newCondition != null) {
+            val problems = ExpressionValidation.validate(selected.project, breakpoint, newCondition, expectBoolean = true)
+            if (problems.isNotEmpty()) {
+                return invalidExpression(
+                    selected.project,
+                    breakpoint,
+                    BreakpointExpressionGuard.KIND_CONDITION,
+                    newCondition,
+                    problems,
+                )
+            }
+        }
+        if (validate && newLogExpression != null) {
+            val problems = ExpressionValidation.validate(selected.project, breakpoint, newLogExpression, expectBoolean = false)
+            if (problems.isNotEmpty()) {
+                return invalidExpression(
+                    selected.project,
+                    breakpoint,
+                    BreakpointExpressionGuard.KIND_LOG_EXPRESSION,
+                    newLogExpression,
+                    problems,
+                )
+            }
+        }
         return try {
             StudioThreading.onIdeaThread {
                 if (query.containsKey(BridgeQuery.ENABLED)) breakpoint.setEnabled(BridgeProtocol.booleanParam(query, BridgeQuery.ENABLED, breakpoint.isEnabled))
                 if (breakpoint is XLineBreakpoint<*> && query.containsKey(BridgeQuery.TEMPORARY)) {
                     breakpoint.setTemporary(BridgeProtocol.booleanParam(query, BridgeQuery.TEMPORARY, breakpoint.isTemporary))
                 }
-                if (BridgeProtocol.booleanParam(query, BridgeQuery.CLEAR_CONDITION, false)) {
-                    breakpoint.setCondition(null)
+                if (clearCondition) {
+                    applyCondition(selected.project, breakpoint, null)
                 } else if (query.containsKey(BridgeQuery.CONDITION)) {
-                    breakpoint.setCondition(query[BridgeQuery.CONDITION]?.ifBlank { null })
+                    applyCondition(selected.project, breakpoint, newCondition)
                 }
-                if (BridgeProtocol.booleanParam(query, BridgeQuery.CLEAR_LOG_EXPRESSION, false)) {
-                    breakpoint.setLogExpression(null)
+                if (clearLogExpression) {
+                    applyLogExpression(selected.project, breakpoint, null)
                 } else if (query.containsKey(BridgeQuery.LOG_EXPRESSION)) {
-                    breakpoint.setLogExpression(query[BridgeQuery.LOG_EXPRESSION]?.ifBlank { null })
+                    applyLogExpression(selected.project, breakpoint, newLogExpression)
                 }
                 if (query.containsKey(BridgeQuery.LOG_MESSAGE)) breakpoint.setLogMessage(BridgeProtocol.booleanParam(query, BridgeQuery.LOG_MESSAGE, breakpoint.isLogMessage))
                 if (query.containsKey(BridgeQuery.LOG_STACK)) breakpoint.setLogStack(BridgeProtocol.booleanParam(query, BridgeQuery.LOG_STACK, breakpoint.isLogStack))
@@ -285,11 +445,40 @@ internal object BreakpointBridge {
         return null
     }
 
-    private fun findLineBreakpoint(project: Project, fileUrl: String, zeroBasedLine: Int, typeId: String): XLineBreakpoint<*>? =
+    private fun findLineBreakpoint(project: Project, fileUrl: String, zeroBasedLine: Int): XLineBreakpoint<*>? =
         XDebuggerManager.getInstance(project).breakpointManager.allBreakpoints
             .asSequence()
             .filterIsInstance<XLineBreakpoint<*>>()
-            .firstOrNull { it.fileUrl == fileUrl && it.line == zeroBasedLine && it.type.id == typeId }
+            .firstOrNull { it.fileUrl == fileUrl && it.line == zeroBasedLine && it.type.id in LINE_TYPE_IDS }
+
+    // Kotlin files get the Kotlin line breakpoint type so conditions compile
+    // with the Kotlin evaluator. The Java type binds at Kotlin positions too,
+    // but parses expressions as Java — every Kotlin-syntax condition would
+    // fail at hit time.
+    private fun lineBreakpointTypeFor(project: Project, file: VirtualFile, zeroBasedLine: Int): ChosenLineType {
+        // Look types up by id, never by isInstance: KotlinLineBreakpointType
+        // extends JavaLineBreakpointType and is registered order="first", so an
+        // isInstance scan for the Java type would return the Kotlin one — and a
+        // Java file would then evaluate its conditions with the Kotlin evaluator.
+        val javaType = lineBreakpointTypeById(JAVA_LINE_TYPE_ID)
+            ?: throw IllegalStateException("Java line breakpoint type is not available")
+        val extension = file.extension?.lowercase()
+        if (extension == "kt" || extension == "kts") {
+            val kotlinType = lineBreakpointTypeById(KOTLIN_LINE_TYPE_ID)
+            if (kotlinType != null && canPutAt(kotlinType, file, zeroBasedLine, project)) {
+                return ChosenLineType(kotlinType, true)
+            }
+        }
+        return ChosenLineType(javaType, canPutAt(javaType, file, zeroBasedLine, project))
+    }
+
+    private fun lineBreakpointTypeById(id: String): XLineBreakpointType<*>? =
+        XBreakpointType.EXTENSION_POINT_NAME.extensionList
+            .filterIsInstance<XLineBreakpointType<*>>()
+            .firstOrNull { it.id == id }
+
+    private fun canPutAt(type: XLineBreakpointType<*>, file: VirtualFile, zeroBasedLine: Int, project: Project): Boolean =
+        runCatching { type.canPutAt(file, zeroBasedLine, project) }.getOrDefault(false)
 
     private fun findFieldBreakpoint(
         project: Project,
@@ -342,6 +531,7 @@ internal object BreakpointBridge {
             "hit_count", breakpointHits.getOrDefault(id, 0),
             "last_hit_at", breakpointLastHit[id],
             "hit_count_source", "shadowdroid_observed_session_pauses",
+            "last_evaluation_error", BreakpointExpressionGuard.lastErrorFor(id),
             "properties", breakpointPropertiesInfo(breakpoint.properties),
             "file", pos?.file?.path,
             "url", lineBreakpoint?.fileUrl,
@@ -406,6 +596,17 @@ internal object BreakpointBridge {
     private data class ProjectBreakpoint(
         val project: Project,
         val breakpoint: XBreakpoint<*>,
+    )
+
+    private data class PreparedLine(
+        val breakpoint: XLineBreakpoint<*>,
+        val positionSupported: Boolean,
+        val created: Boolean,
+    )
+
+    private data class ChosenLineType(
+        val type: XLineBreakpointType<*>,
+        val positionSupported: Boolean,
     )
 }
 

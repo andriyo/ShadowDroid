@@ -259,6 +259,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                 created.start()
                 server = created
                 serverUrl = "http://127.0.0.1:${created.address.port}"
+                BreakpointExpressionGuard.installModalWatcher()
             }
         }
 
@@ -350,12 +351,21 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
             installAllSessionListeners()
             val sessions = allSessions()
             val sessionPayload = sessions.mapIndexed { index, session -> sessionInfo(index, session) }
+            val blockedDialogs = BreakpointExpressionGuard.blockedDialogs()
             return BridgeProtocol.ok(
                 "ok", true,
                 "api_version", API_VERSION,
                 "url", serverUrl,
                 "projects", projectPayload(),
                 "sessions", sessionPayload,
+                "breakpoint_errors", BreakpointExpressionGuard.recentErrors(),
+                "blocked_dialogs", blockedDialogs,
+                "warning", if (blockedDialogs.isEmpty()) {
+                    null
+                } else {
+                    "Android Studio is showing a blocking dialog (${blockedDialogs.joinToString()}); " +
+                        "debugger requests will time out until it is dismissed in the IDE"
+                },
             )
         }
 

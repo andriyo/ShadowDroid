@@ -146,6 +146,9 @@ pub enum BreakCmd {
         /// Clear any condition on an existing breakpoint at this file/line.
         #[arg(long)]
         clear_condition: bool,
+        /// Set the condition even if Android Studio's validation rejects it.
+        #[arg(long, requires = "condition")]
+        force: bool,
     },
     /// Add a Java exception breakpoint.
     Exception {
@@ -519,6 +522,9 @@ pub struct BreakpointUpdateArgs {
     /// Pass count. Use 0 to disable pass-count filtering.
     #[arg(long)]
     pub pass_count: Option<u32>,
+    /// Set expressions even if Android Studio's validation rejects them.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -602,12 +608,14 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
             temporary,
             condition,
             clear_condition,
+            force,
         }) => {
             let canonical = canonicalize_for_bridge(file)?;
             let line_s = line.to_string();
             let enabled_s = (!*disabled).to_string();
             let temporary_s = temporary.to_string();
             let clear_condition_s = clear_condition.to_string();
+            let validate_s = force.then_some("false");
             let params = [
                 (query::FILE, Some(canonical.as_str())),
                 (query::LINE, Some(line_s.as_str())),
@@ -616,6 +624,7 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
                 (query::TEMPORARY, Some(temporary_s.as_str())),
                 (query::CONDITION, condition.as_deref()),
                 (query::CLEAR_CONDITION, Some(clear_condition_s.as_str())),
+                (query::VALIDATE, validate_s),
             ];
             bridge.get(route::BREAKPOINT_LINE, &params).await?
         }
@@ -698,6 +707,7 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
             let log_stack_s = args.log_stack.map(|v| v.to_string());
             let suspend_s = args.suspend.map(SuspendArg::as_bridge);
             let pass_count_s = args.pass_count.map(|v| v.to_string());
+            let validate_s = args.force.then_some("false");
             let params = [
                 (query::ID, Some(args.id.as_str())),
                 (query::PROJECT, args.project.as_deref()),
@@ -714,6 +724,7 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
                 (query::LOG_STACK, log_stack_s.as_deref()),
                 (query::SUSPEND, suspend_s),
                 (query::PASS_COUNT, pass_count_s.as_deref()),
+                (query::VALIDATE, validate_s),
             ];
             bridge.get(route::BREAKPOINT_UPDATE, &params).await?
         }
@@ -1217,6 +1228,12 @@ fn read_error_json(kind: &str, err: anyhow::Error) -> Value {
     })
 }
 
+/// Machine-readable failure code a bridge error reply may carry alongside the
+/// human `error` string (e.g. `invalid_expression` from breakpoint routes).
+fn bridge_error_code(reply: &Value) -> Option<&str> {
+    reply.get("error_code").and_then(Value::as_str)
+}
+
 fn canonicalize_for_bridge(path: &Path) -> Result<String> {
     let canonical = std::fs::canonicalize(path)
         .with_context(|| format!("source file not found: {}", path.display()))?;
@@ -1305,6 +1322,24 @@ impl BridgeClient {
                 .get("error")
                 .and_then(Value::as_str)
                 .unwrap_or("request failed");
+            if bridge_error_code(&value) == Some("invalid_expression") {
+                return Err(crate::diagnostic::DiagnosticError::new(
+                    "debug_expression_invalid",
+                    "debugger",
+                    format!("Android Studio rejected the breakpoint expression: {message}"),
+                )
+                .detail(serde_json::json!({
+                    "route": path,
+                    "status": status.as_u16(),
+                    "bridge_reply": value,
+                }))
+                .next_actions([
+                    "fix the expression for the breakpoint's language (Kotlin files evaluate Kotlin syntax, Java files Java) — detail.bridge_reply.problems lists what failed",
+                    "check names with `shadowdroid debug variables` on a suspended frame",
+                    "re-run with --force to set it anyway; if it then fails at a hit, the session pauses and the error appears in `shadowdroid debug breakpoints`",
+                ])
+                .into());
+            }
             return Err(crate::diagnostic::DiagnosticError::new(
                 "debugger_bridge_rejected",
                 "debugger",
@@ -1515,6 +1550,14 @@ mod tests {
         ));
         // no index, no device -> first session
         assert!(!selected_session_suspended(&status, None, None));
+    }
+
+    #[test]
+    fn bridge_error_codes_are_extracted_from_replies() {
+        let reply = json!({"ok": false, "error": "invalid_expression: cannot resolve 'foo'", "error_code": "invalid_expression"});
+        assert_eq!(bridge_error_code(&reply), Some("invalid_expression"));
+        assert_eq!(bridge_error_code(&json!({"ok": false, "error": "nope"})), None);
+        assert_eq!(bridge_error_code(&json!({"error_code": 7})), None);
     }
 
     #[tokio::test]

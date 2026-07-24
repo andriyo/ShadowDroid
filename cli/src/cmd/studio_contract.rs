@@ -89,6 +89,7 @@ pub(crate) mod query {
     pub(crate) const THREAD: &str = "thread";
     pub(crate) const TIMEOUT_MS: &str = "timeout_ms";
     pub(crate) const UNCAUGHT: &str = "uncaught";
+    pub(crate) const VALIDATE: &str = "validate";
 }
 
 pub(crate) mod session_action {

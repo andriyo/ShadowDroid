@@ -74,7 +74,16 @@ internal object StudioThreading {
             return future.get(boundedTimeoutMs.toLong(), TimeUnit.MILLISECONDS)
         } catch (e: TimeoutException) {
             future.cancel(true)
-            throw IllegalStateException("debugger manager did not answer within ${boundedTimeoutMs}ms")
+            // A blocking evaluation-error dialog parks the debugger manager
+            // thread; name it so the caller isn't left with a bare timeout.
+            val dialogs = BreakpointExpressionGuard.blockedDialogs()
+            val hint = if (dialogs.isEmpty()) {
+                ""
+            } else {
+                "; Android Studio is showing a blocking dialog (${dialogs.joinToString()}) — " +
+                    "dismiss it in the IDE or clear the offending breakpoint expression"
+            }
+            throw IllegalStateException("debugger manager did not answer within ${boundedTimeoutMs}ms$hint")
         } catch (e: ExecutionException) {
             val cause = e.cause
             when (cause) {

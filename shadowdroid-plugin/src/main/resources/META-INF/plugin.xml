@@ -27,5 +27,9 @@
          Read more: https://plugins.jetbrains.com/docs/intellij/plugin-extension-points.html -->
     <extensions defaultExtensionNs="com.intellij">
         <postStartupActivity implementation="io.github.andriyo.shadowdroid.studio.ShadowDroidDebuggerBridge"/>
+        <!-- Answers "breakpoint expression failed to evaluate" for bridge-set
+             expressions (pause, record) instead of the modal dialog that
+             blocks the debugger until a human clicks it. -->
+        <xdebugger.breakpointBehaviorPolicy implementation="io.github.andriyo.shadowdroid.studio.ShadowDroidBreakpointErrorPolicy"/>
     </extensions>
 </idea-plugin>
