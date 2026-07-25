@@ -1556,7 +1556,10 @@ mod tests {
     fn bridge_error_codes_are_extracted_from_replies() {
         let reply = json!({"ok": false, "error": "invalid_expression: cannot resolve 'foo'", "error_code": "invalid_expression"});
         assert_eq!(bridge_error_code(&reply), Some("invalid_expression"));
-        assert_eq!(bridge_error_code(&json!({"ok": false, "error": "nope"})), None);
+        assert_eq!(
+            bridge_error_code(&json!({"ok": false, "error": "nope"})),
+            None
+        );
         assert_eq!(bridge_error_code(&json!({"error_code": 7})), None);
     }
 
