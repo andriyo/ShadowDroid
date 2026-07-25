@@ -294,6 +294,9 @@ pub async fn recover(serial: &Serial, active: ActiveState) -> Result<ActiveState
     if active.serial != serial.as_str() {
         bail!("video recovery state belongs to another device");
     }
+    if is_terminal_state(&active.state) {
+        return Ok(active);
+    }
     let bundle = Bundle::open(active.bundle.clone());
     let manifest = session::manifest_from_bundle(&active.bundle)?;
     let shared = Arc::new(Mutex::new(Shared {
@@ -1916,4 +1919,34 @@ fn remove_markers_if_owned(pid_path: &Path, ctl_path: &Path, pid: u32, control_p
 
 fn is_terminal_state(state: &str) -> bool {
     matches!(state, "completed" | "partial" | "failed" | "interrupted")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn recovery_is_a_noop_for_terminal_sessions() {
+        let serial = Serial::new("emulator-5554");
+        let active = ActiveState {
+            schema_version: 1,
+            serial: serial.as_str().into(),
+            startup_id: "s1".into(),
+            session_id: "v1".into(),
+            daemon_pid: 42,
+            control_port: None,
+            bundle: "/nonexistent/terminal-video-session".into(),
+            remote_dir: "/data/local/tmp/video/v1".into(),
+            state: "completed".into(),
+            started_at: 0.0,
+            current_segment: None,
+            device_process: None,
+            last_error: None,
+        };
+
+        let recovered = recover(&serial, active).await.unwrap();
+
+        assert_eq!(recovered.state, "completed");
+        assert_eq!(recovered.session_id, "v1");
+    }
 }
