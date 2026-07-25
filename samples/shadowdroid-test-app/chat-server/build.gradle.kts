@@ -21,7 +21,7 @@ dependencies {
     implementation("io.ktor:ktor-server-netty:$ktorVersion")
     implementation("io.ktor:ktor-server-websockets:$ktorVersion")
     implementation("io.ktor:ktor-network-tls-certificates:$ktorVersion")
-    implementation("ch.qos.logback:logback-classic:1.5.18")
+    implementation("ch.qos.logback:logback-classic:1.6.0")
 
     testImplementation(kotlin("test-junit5"))
     testImplementation("io.ktor:ktor-server-test-host:$ktorVersion")

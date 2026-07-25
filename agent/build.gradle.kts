@@ -5,5 +5,5 @@
 // shadowdroid-agent/build.gradle.kts.
 
 plugins {
-    id("com.android.library") version "9.2.1" apply false
+    id("com.android.library") version "9.3.1" apply false
 }

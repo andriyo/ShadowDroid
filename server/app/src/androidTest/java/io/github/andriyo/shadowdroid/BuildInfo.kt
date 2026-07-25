@@ -14,5 +14,5 @@ package io.github.andriyo.shadowdroid
 object BuildInfo {
     const val SERVER_VERSION: String = "0.16.1"
     const val API_VERSION: String = "1"
-    const val UI_AUTOMATOR_VERSION: String = "2.3.0"
+    const val UI_AUTOMATOR_VERSION: String = "2.4.0"
 }

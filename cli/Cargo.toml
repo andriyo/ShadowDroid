@@ -31,12 +31,12 @@ unsafe_code = "forbid"
 clap = { version = "4.6", features = ["derive", "env"] }
 
 # ── Async runtime + HTTP client ─────────────────────────────────────────
-tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "fs", "signal", "sync", "time", "net"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "fs", "signal", "sync", "time", "net"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 
 # ── Serialization ───────────────────────────────────────────────────────
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 
 # ── ADB protocol (no shell-out to adb binary) ───────────────────────────
 # 3.x is a breaking change from 2.x; touch points are in device/adb.rs.
@@ -44,10 +44,10 @@ serde_json = "1.0.149"
 adb_client = { version = "3.2", default-features = false }
 
 # ── Logcat tail + crash parsing ─────────────────────────────────────────
-regex = "1.12"
+regex = "1.13"
 
 # ── Utility ─────────────────────────────────────────────────────────────
-anyhow = "1.0.103"
+anyhow = "1.0.104"
 thiserror = "2.0"         # derives Display + Error for ServerError / AmbiguousMatch
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -67,7 +67,7 @@ image = { version = "0.25", default-features = false, features = ["png"] } # exp
 # ── MITM proxy (`net` namespace) ────────────────────────────────────────
 # All already present transitively (verified in Cargo.lock); promoting to
 # direct deps adds no build cost. aws-lc-rs is the active rustls provider.
-hyper = { version = "1.9", features = ["client", "http1", "http2", "server"] }
+hyper = { version = "1.11", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
 http = "1.4"
 http-body-util = "0.1"

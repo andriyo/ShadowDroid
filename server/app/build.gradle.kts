@@ -82,26 +82,22 @@ kotlin {
 
 dependencies {
     // ── AndroidX UI Automator (the whole point of this APK) ────────────
-    // 2.3.0 = last GA. We tried 2.4.0-beta02 (the absolute latest) but it
-    // races with AndroidJUnitRunner.onStart's UiAutomation init on Android 16:
+    // beta02 raced with AndroidJUnitRunner.onStart's UiAutomation init on Android 16:
     // `UiDevice.getInstance` from @Before triggers a connect that the runner
-    // tries to disconnect, throwing "Cannot call disconnect() while connecting".
-    // openatx uses 2.3.0 successfully on the same emulator. Bump to 2.4.x
-    // when GA + the race is fixed upstream.
-    androidTestImplementation("androidx.test.uiautomator:uiautomator:2.3.0")
+    // tried to disconnect, throwing "Cannot call disconnect() while connecting".
+    // 2.4.0 is now GA; keep real Android 16 startup/connect coverage as the
+    // upgrade guard rather than relying on compile-time validation alone.
+    androidTestImplementation("androidx.test.uiautomator:uiautomator:2.4.0")
     androidTestImplementation("androidx.test:runner:1.7.0")
     androidTestImplementation("androidx.test:rules:1.7.0")
 
     // ── HTTP server: Ktor 3 (JetBrains-maintained, coroutines-native). ─
     // Engine: CIO (pure-Kotlin, no Netty).
     //
-    // VERSION CEILING: every library here must require kotlin-stdlib <= AGP
-    // 9.2.1's built-in Kotlin (2.3.10). Ktor 3.5.x demands stdlib 2.3.21 and
-    // dies at runtime with NoClassDefFoundError: KotlinGenericDeclaration (a
-    // 2.3.21 class absent from 2.3.10) — it compiles but crashes on server
-    // start. 3.4.3 requires only 2.3.0. Bump past 3.4.x only when AGP's
-    // built-in Kotlin reaches the version Ktor demands.
-    val ktor = "3.4.3"
+    // Ktor 3.5.x needs kotlin-stdlib 2.3.21+ at runtime. The build's Kotlin
+    // serialization compiler plugin is kept at 2.4.10 so the APK packages a
+    // compatible stdlib; real server startup below remains the release guard.
+    val ktor = "3.5.1"
     androidTestImplementation("io.ktor:ktor-server-core:$ktor")
     androidTestImplementation("io.ktor:ktor-server-cio:$ktor")
     androidTestImplementation("io.ktor:ktor-server-content-negotiation:$ktor")
@@ -110,11 +106,8 @@ dependencies {
     androidTestImplementation("io.ktor:ktor-server-call-logging:$ktor")
 
     // ── Coroutines + serialization runtime ─────────────────────────────
-    // Same stdlib<=2.3.10 ceiling as Ktor above. coroutines 1.11.0 needs only
-    // 2.2.20 (fine); serialization-json 1.11.0 needs 2.3.20 (too new → would
-    // crash like Ktor 3.5), so it's pinned to 1.10.0 (needs 2.3.0).
     androidTestImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
-    androidTestImplementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.10.0")
+    androidTestImplementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
 
     // ── JUnit 4 + AndroidX test core ───────────────────────────────────
     // We use a @Test method that loops forever to keep the Instrumentation

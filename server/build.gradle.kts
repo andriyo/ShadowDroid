@@ -8,11 +8,12 @@
 // The serialization plugin remains separate and is applied normally.
 
 plugins {
-    id("com.android.application") version "9.2.1" apply false
-    // Must MATCH AGP 9.2.x's built-in Kotlin (KGP 2.3.10) — the serialization
-    // compiler plugin runs inside that compiler, so it tracks AGP's Kotlin, not
-    // standalone Kotlin releases. Bump in lockstep when AGP's bundled KGP moves.
-    id("org.jetbrains.kotlin.plugin.serialization") version "2.3.10" apply false
+    id("com.android.application") version "9.3.1" apply false
+    // The serialization compiler plugin determines the built-in Kotlin
+    // compiler/runtime level used by this build. Keep it aligned with the
+    // current stable Kotlin release so Ktor and kotlinx.serialization can use
+    // their current stable runtimes without missing stdlib classes on-device.
+    id("org.jetbrains.kotlin.plugin.serialization") version "2.4.10" apply false
     id("org.jlleitschuh.gradle.ktlint") version "14.2.0"
 }
 
