@@ -6,7 +6,9 @@ use super::paths;
 use super::session::{self, ActiveState, Bundle};
 use super::{DaemonArgs, RecordArgs, StartArgs};
 use crate::ids::Serial;
-use anyhow::{Context, Result, anyhow};
+#[cfg(not(windows))]
+use anyhow::anyhow;
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::path::Path;
 use std::time::Duration;

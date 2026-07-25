@@ -40,6 +40,8 @@ pub fn log(serial: &Serial) -> Result<PathBuf> {
 }
 
 pub fn protect_dir(path: &Path) -> Result<()> {
+    #[cfg(not(unix))]
+    let _ = path;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -50,6 +52,8 @@ pub fn protect_dir(path: &Path) -> Result<()> {
 }
 
 pub fn protect_file(path: &Path) -> Result<()> {
+    #[cfg(not(unix))]
+    let _ = path;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
