@@ -1,6 +1,7 @@
 package io.github.andriyo.shadowdroid.dump
 
 import android.graphics.Rect
+import android.os.Build
 import android.view.accessibility.AccessibilityNodeInfo
 import io.github.andriyo.shadowdroid.proto.AppRef
 import io.github.andriyo.shadowdroid.proto.Element
@@ -132,7 +133,7 @@ object TreeWalker {
                                 focusable = node.isFocusable,
                                 enabled = node.isEnabled,
                                 selected = node.isSelected,
-                                checked = node.isChecked,
+                                checked = checked(node),
                                 focused = node.isFocused || node.isAccessibilityFocused,
                                 password = node.isPassword,
                                 input = isInput,
@@ -154,6 +155,14 @@ object TreeWalker {
             }
         }
     }
+
+    private fun checked(node: AccessibilityNodeInfo): Boolean =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.BAKLAVA) {
+            node.checked == AccessibilityNodeInfo.CHECKED_STATE_TRUE
+        } else {
+            @Suppress("DEPRECATION")
+            node.isChecked
+        }
 
     /**
      * Stable identity of the actionable screen state.

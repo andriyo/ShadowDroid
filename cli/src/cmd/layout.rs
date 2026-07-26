@@ -4,7 +4,7 @@
 //! Android Studio Layout Inspector enrichment is added when the plugin bridge
 //! and active inspector model are available.
 
-use crate::cmd::debugger::BridgeClient;
+use crate::cmd::debugger::{BridgeClient, DEFAULT_BRIDGE_TIMEOUT_MS};
 use crate::cmd::studio_contract::{query, route, value};
 use crate::device::client::ServerClient;
 use crate::ids::Serial;
@@ -15,9 +15,11 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_LAYOUT_STUDIO_WAIT_MS: u64 = 5_000;
+const MAX_LAYOUT_STUDIO_WAIT_MS: u64 = 30_000;
+const LAYOUT_BRIDGE_RESPONSE_HEADROOM_MS: u64 = 5_000;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct UiFallbackElement {
@@ -200,12 +202,92 @@ async fn snapshot_cmd(
         target_for_sample.as_ref(),
         args.compose || args.semantics || args.source_map,
     );
+    let studio_required = args.compose || args.semantics || args.source_map;
     if let Some(path) = args.out {
+        if invalid_required_snapshot_error(&value, studio_required, None).is_some() {
+            // Keep the requested diagnostic artifact, but do not emit the
+            // normal success envelope for a snapshot whose required Studio
+            // enrichment is invalid.
+            let bytes = crate::cmd::artifact::write_json(&path, &value)?;
+            let artifact = json!({
+                "path": path.display().to_string(),
+                "bytes": bytes,
+                "artifact_type": value.get("type"),
+                "schema_version": value.get("schema_version"),
+            });
+            return Err(
+                invalid_required_snapshot_error(&value, studio_required, Some(artifact))
+                    .expect("invalid snapshot was checked above")
+                    .into(),
+            );
+        }
         crate::cmd::artifact::write_json_and_emit("layout_snapshot", &path, &value)?;
     } else {
+        if let Some(error) = invalid_required_snapshot_error(&value, studio_required, None) {
+            return Err(error.into());
+        }
         crate::events::emit_result(&value);
     }
     Ok(())
+}
+
+fn invalid_required_snapshot_error(
+    value: &Value,
+    studio_required: bool,
+    artifact: Option<Value>,
+) -> Option<crate::diagnostic::DiagnosticError> {
+    let sample_valid = value
+        .get("sample_valid")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !studio_required || sample_valid {
+        return None;
+    }
+
+    let studio = value
+        .get("android_studio_layout")
+        .cloned()
+        .unwrap_or(Value::Null);
+    if studio.get("error_code").and_then(Value::as_str) == Some("layout_debugger_conflict") {
+        return Some(crate::cmd::debugger::layout_debugger_conflict_diagnostic(
+            studio,
+            json!({
+                "sample_valid": sample_valid,
+                "sample": value.get("sample").cloned().unwrap_or(Value::Null),
+                "requested_features": value
+                    .get("features")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "current_app": value
+                    .get("current_app")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "artifact": artifact,
+            }),
+        ));
+    }
+
+    Some(
+        crate::diagnostic::DiagnosticError::new(
+            "layout_snapshot_invalid",
+            "layout",
+            "Android Studio did not produce a valid required layout enrichment",
+        )
+        .retryable(true)
+        .detail(json!({
+            "sample_valid": sample_valid,
+            "sample": value.get("sample").cloned().unwrap_or(Value::Null),
+            "android_studio_layout": studio,
+            "requested_features": value.get("features").cloned().unwrap_or(Value::Null),
+            "current_app": value.get("current_app").cloned().unwrap_or(Value::Null),
+            "artifact": artifact,
+        }))
+        .next_actions([
+            "run `shadowdroid studio status --json` and start/install the Studio plugin if needed",
+            "attach Android Studio Layout Inspector to the target app/process, then rerun the same layout snapshot command",
+            "inspect detail.sample.reasons and the saved artifact before retrying",
+        ]),
+    )
 }
 
 fn layout_snapshot_value(
@@ -299,11 +381,15 @@ async fn recompositions_cmd(
         args.studio_wait_ms,
     );
     let reset_s = args.reset.to_string();
-    let value = match BridgeClient::new(args.studio_url.as_deref()) {
+    let value = match BridgeClient::with_timeout(
+        args.studio_url.as_deref(),
+        layout_bridge_request_timeout(args.studio_wait_ms),
+    ) {
         Ok(bridge) => {
             let params = target.params_with(&[(query::RESET, Some(reset_s.as_str()))]);
             match bridge.get(route::LAYOUT_RECOMPOSITIONS, &params).await {
                 Ok(value) => value,
+                Err(err) if is_layout_debugger_conflict(&err) => return Err(err),
                 Err(err) => studio_layout_unavailable(args.reset, err.to_string()),
             }
         }
@@ -401,7 +487,7 @@ async fn source_cmd(serial: &Serial, client: &ServerClient, args: LayoutSourceAr
         args.studio_wait_ms,
     );
     let studio =
-        studio_layout_source(args.studio_url.as_deref(), element.as_ref(), &args, &target).await;
+        studio_layout_source(args.studio_url.as_deref(), element.as_ref(), &args, &target).await?;
     let source = studio
         .get("source")
         .cloned()
@@ -462,7 +548,10 @@ async fn studio_layout_snapshot(
     studio_url: Option<&str>,
     target: &LayoutStudioTarget,
 ) -> Result<Value> {
-    let bridge = BridgeClient::new(studio_url)?;
+    let bridge = BridgeClient::with_timeout(
+        studio_url,
+        layout_bridge_request_timeout(target.timeout_ms_value),
+    )?;
     let params = target.params();
     bridge.get(route::LAYOUT_SNAPSHOT, &params).await
 }
@@ -653,10 +742,13 @@ async fn studio_layout_source(
     element: Option<&Element>,
     args: &LayoutSourceArgs,
     target: &LayoutStudioTarget,
-) -> Value {
-    let bridge = match BridgeClient::new(studio_url) {
+) -> Result<Value> {
+    let bridge = match BridgeClient::with_timeout(
+        studio_url,
+        layout_bridge_request_timeout(target.timeout_ms_value),
+    ) {
         Ok(bridge) => bridge,
-        Err(err) => return json!({"available": false, "error": err.to_string()}),
+        Err(err) => return Ok(json!({"available": false, "error": err.to_string()})),
     };
     let text = args
         .selector
@@ -685,8 +777,9 @@ async fn studio_layout_source(
     ];
     let params = target.params_with(&params);
     match bridge.get(route::LAYOUT_SOURCE, &params).await {
-        Ok(value) => value,
-        Err(err) => json!({"available": false, "error": err.to_string()}),
+        Ok(value) => Ok(value),
+        Err(err) if is_layout_debugger_conflict(&err) => Err(err),
+        Err(err) => Ok(json!({"available": false, "error": err.to_string()})),
     }
 }
 
@@ -699,12 +792,37 @@ fn merge_studio_layout(value: &mut Value, studio: Result<Value>) {
             value["android_studio_layout"] = studio;
         }
         Err(err) => {
-            value["android_studio_layout"] = json!({
-                "available": false,
-                "error": err.to_string()
-            });
+            if let Some(conflict) = layout_debugger_conflict(&err) {
+                value["android_studio_layout"] = conflict
+                    .detail
+                    .get("bridge_reply")
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        json!({
+                            "available": false,
+                            "error_code": "layout_debugger_conflict",
+                            "error": conflict.message,
+                        })
+                    });
+            } else {
+                value["android_studio_layout"] = json!({
+                    "available": false,
+                    "error": err.to_string()
+                });
+            }
         }
     }
+}
+
+fn layout_debugger_conflict(error: &anyhow::Error) -> Option<&crate::diagnostic::DiagnosticError> {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<crate::diagnostic::DiagnosticError>())
+        .find(|diagnostic| diagnostic.code == "layout_debugger_conflict")
+}
+
+fn is_layout_debugger_conflict(error: &anyhow::Error) -> bool {
+    layout_debugger_conflict(error).is_some()
 }
 
 fn studio_layout_unavailable(reset: bool, reason: String) -> Value {
@@ -794,6 +912,13 @@ fn layout_sample_value(
                     }));
                     next_commands.insert("shadowdroid layout snapshot --compose".into());
                     next_commands.insert("shadowdroid studio status --json".into());
+                } else if let Some(reason) = layout_inspector_tree_mismatch(
+                    studio,
+                    screen,
+                    target.and_then(|target| target.package.as_deref()),
+                ) {
+                    reasons.push(reason);
+                    next_commands.insert("shadowdroid layout snapshot --compose".into());
                 }
             }
             None => {
@@ -856,12 +981,84 @@ fn inspector_node_count(studio: &Value) -> Option<u64> {
     None
 }
 
+fn layout_inspector_tree_mismatch(
+    studio: &Value,
+    screen: &ScreenResponse,
+    target_package: Option<&str>,
+) -> Option<Value> {
+    const MIN_RESOURCE_ANCHORS: usize = 2;
+
+    let package = target_package.or(screen.current_app.package.as_deref())?;
+    let uiautomator_ids = screen
+        .elements
+        .iter()
+        .filter_map(|element| {
+            element
+                .rid
+                .as_deref()
+                .and_then(|rid| uiautomator_resource_name(rid, package))
+                .map(str::to_string)
+        })
+        .collect::<BTreeSet<_>>();
+    let inspector_ids = inspector_resource_names(studio, package);
+
+    // Resource ids are a strong cross-tree identity signal, but many Compose
+    // and custom-rendered screens expose too few of them. Only reject when
+    // both samples have enough target-app anchors and none overlap.
+    if uiautomator_ids.len() < MIN_RESOURCE_ANCHORS
+        || inspector_ids.len() < MIN_RESOURCE_ANCHORS
+        || !uiautomator_ids.is_disjoint(&inspector_ids)
+    {
+        return None;
+    }
+
+    Some(json!({
+        "code": "layout_inspector_tree_mismatch",
+        "detail": "UiAutomation and Android Studio Layout Inspector returned disjoint target-app resource ids; the inspector model is likely stale",
+        "package": package,
+        "uiautomator_anchor_count": uiautomator_ids.len(),
+        "inspector_anchor_count": inspector_ids.len(),
+        "uiautomator_anchor_sample": uiautomator_ids.into_iter().take(5).collect::<Vec<_>>(),
+        "inspector_anchor_sample": inspector_ids.into_iter().take(5).collect::<Vec<_>>(),
+    }))
+}
+
+fn uiautomator_resource_name<'a>(rid: &'a str, package: &str) -> Option<&'a str> {
+    let prefix = format!("{package}:id/");
+    rid.strip_prefix(&prefix).filter(|name| !name.is_empty())
+}
+
+fn inspector_resource_names(studio: &Value, package: &str) -> BTreeSet<String> {
+    let namespace = format!("apk/res/{package}");
+    let qualified_prefix = format!("{package}:");
+    studio
+        .get("windows")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|window| window.get("nodes").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|node| node.get("view_id"))
+        .filter_map(|view_id| {
+            let name = view_id.get("name").and_then(Value::as_str)?;
+            let belongs_to_package = view_id.get("namespace").and_then(Value::as_str)
+                == Some(namespace.as_str())
+                || view_id
+                    .get("qualified_name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|qualified| qualified.starts_with(&qualified_prefix));
+            belongs_to_package.then(|| name.to_string())
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 struct LayoutStudioTarget {
     device: String,
     package: Option<String>,
     pid: Option<String>,
     timeout_ms: String,
+    timeout_ms_value: u64,
 }
 
 impl LayoutStudioTarget {
@@ -879,6 +1076,7 @@ impl LayoutStudioTarget {
                 .or_else(|| app.package.clone()),
             pid: pid_override.or(app.pid).map(|pid| pid.to_string()),
             timeout_ms: timeout_ms.to_string(),
+            timeout_ms_value: timeout_ms,
         }
     }
 
@@ -907,6 +1105,14 @@ impl LayoutStudioTarget {
             "timeout_ms": self.timeout_ms.clone(),
         })
     }
+}
+
+fn layout_bridge_request_timeout(studio_wait_ms: u64) -> Duration {
+    let effective_wait_ms = studio_wait_ms.clamp(100, MAX_LAYOUT_STUDIO_WAIT_MS);
+    Duration::from_millis(
+        DEFAULT_BRIDGE_TIMEOUT_MS
+            .max(effective_wait_ms.saturating_add(LAYOUT_BRIDGE_RESPONSE_HEADROOM_MS)),
+    )
 }
 
 fn element_matches(element: &Element, args: &LayoutSourceArgs) -> bool {
@@ -1052,6 +1258,42 @@ mod tests {
         }
     }
 
+    fn screen_with_resource_ids(package: &str, pid: i32, ids: &[&str]) -> ScreenResponse {
+        let mut screen = screen(package, pid, ids.len() as u32);
+        screen.elements = ids
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let mut element = accessibility_element(name, [0, index as i32, 10, 10]);
+                element.id = index as u32 + 1;
+                element.rid = Some(format!("{package}:id/{name}"));
+                element
+            })
+            .collect();
+        screen
+    }
+
+    fn studio_tree(package: &str, ids: &[&str]) -> Value {
+        let namespace = format!("apk/res/{package}");
+        let nodes = ids
+            .iter()
+            .map(|name| {
+                json!({
+                    "view_id": {
+                        "name": name,
+                        "namespace": namespace,
+                        "qualified_name": format!("{package}:{name}"),
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "available": true,
+            "node_count": nodes.len(),
+            "windows": [{"nodes": nodes}],
+        })
+    }
+
     #[test]
     fn layout_sample_marks_target_and_inspector_failures_invalid() {
         let target = LayoutStudioTarget {
@@ -1059,6 +1301,7 @@ mod tests {
             package: Some("com.expected".into()),
             pid: Some("42".into()),
             timeout_ms: "5000".into(),
+            timeout_ms_value: 5_000,
         };
         let value = json!({
             "available": false,
@@ -1078,10 +1321,196 @@ mod tests {
     }
 
     #[test]
+    fn layout_sample_rejects_disjoint_target_resource_ids_as_stale() {
+        let package = "com.app";
+        let target = LayoutStudioTarget {
+            device: "emulator-5554".into(),
+            package: Some(package.into()),
+            pid: Some("7".into()),
+            timeout_ms: "5000".into(),
+            timeout_ms_value: 5_000,
+        };
+        let screen = screen_with_resource_ids(package, 7, &["main_title", "main_action"]);
+        let studio = studio_tree(package, &["coroutines_status", "coroutines_spawn_button"]);
+
+        let sample = layout_sample_value(&studio, &screen, Some(&target), true);
+
+        assert_eq!(sample["valid"], false);
+        assert_eq!(
+            sample["reasons"][0]["code"],
+            "layout_inspector_tree_mismatch"
+        );
+        assert_eq!(sample["reasons"][0]["uiautomator_anchor_count"], 2);
+        assert_eq!(sample["reasons"][0]["inspector_anchor_count"], 2);
+    }
+
+    #[test]
+    fn layout_sample_accepts_overlapping_or_insufficient_resource_ids() {
+        let package = "com.app";
+        let target = LayoutStudioTarget {
+            device: "emulator-5554".into(),
+            package: Some(package.into()),
+            pid: Some("7".into()),
+            timeout_ms: "5000".into(),
+            timeout_ms_value: 5_000,
+        };
+        let screen = screen_with_resource_ids(package, 7, &["shared_action", "uiautomator_only"]);
+        let overlapping = studio_tree(package, &["shared_action", "inspector_only"]);
+        let single_anchor_screen = screen_with_resource_ids(package, 7, &["uiautomator_only"]);
+        let disjoint = studio_tree(package, &["inspector_one", "inspector_two"]);
+
+        assert_eq!(
+            layout_sample_value(&overlapping, &screen, Some(&target), true)["valid"],
+            true
+        );
+        assert_eq!(
+            layout_sample_value(&disjoint, &single_anchor_screen, Some(&target), true)["valid"],
+            true
+        );
+    }
+
+    #[test]
     fn layout_sample_accepts_valid_uiautomator_only_snapshot() {
         let sample = layout_sample_value(&json!({}), &screen("com.app", 7, 2), None, false);
         assert_eq!(sample["valid"], true);
         assert!(sample["reasons"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn layout_bridge_timeout_outlives_requested_studio_wait() {
+        assert_eq!(
+            layout_bridge_request_timeout(DEFAULT_LAYOUT_STUDIO_WAIT_MS),
+            Duration::from_millis(DEFAULT_BRIDGE_TIMEOUT_MS),
+        );
+        assert_eq!(
+            layout_bridge_request_timeout(20_000),
+            Duration::from_millis(25_000),
+        );
+        assert_eq!(
+            layout_bridge_request_timeout(u64::MAX),
+            Duration::from_millis(MAX_LAYOUT_STUDIO_WAIT_MS + LAYOUT_BRIDGE_RESPONSE_HEADROOM_MS,),
+        );
+    }
+
+    #[test]
+    fn required_invalid_snapshot_becomes_typed_error_with_artifact_evidence() {
+        let value = json!({
+            "type": "layout_snapshot",
+            "schema_version": 1,
+            "sample_valid": false,
+            "sample": {
+                "valid": false,
+                "studio_required": true,
+                "reasons": [{
+                    "code": "layout_inspector_unavailable",
+                    "detail": "bridge request failed"
+                }]
+            },
+            "android_studio_layout": {
+                "available": false,
+                "error": "bridge request failed"
+            }
+        });
+        let artifact = json!({
+            "path": "/tmp/layout.json",
+            "bytes": 123,
+        });
+
+        let error = invalid_required_snapshot_error(&value, true, Some(artifact)).unwrap();
+        assert_eq!(error.code, "layout_snapshot_invalid");
+        assert_eq!(error.stage, "layout");
+        assert!(error.retryable);
+        assert_eq!(error.detail["sample_valid"], false);
+        assert_eq!(
+            error.detail["sample"]["reasons"][0]["code"],
+            "layout_inspector_unavailable"
+        );
+        assert_eq!(error.detail["artifact"]["path"], "/tmp/layout.json");
+        assert!(!error.next_actions.is_empty());
+    }
+
+    #[test]
+    fn snapshot_validation_only_requires_requested_studio_enrichment() {
+        let invalid = json!({"sample_valid": false});
+        let valid = json!({"sample_valid": true});
+
+        assert!(invalid_required_snapshot_error(&invalid, false, None).is_none());
+        assert!(invalid_required_snapshot_error(&valid, true, None).is_none());
+    }
+
+    #[test]
+    fn required_snapshot_preserves_layout_debugger_conflict_and_artifact() {
+        let bridge_reply = json!({
+            "ok": false,
+            "available": false,
+            "type": "layout_snapshot",
+            "error_code": "layout_debugger_conflict",
+            "error": "stop the matching debugger session before retrying",
+            "reason": "stop the matching debugger session before retrying",
+            "session": {
+                "id": "session_3",
+                "package": "com.example.app",
+                "pid": 42
+            }
+        });
+        let value = json!({
+            "sample_valid": false,
+            "sample": {
+                "valid": false,
+                "studio_required": true,
+                "reasons": [{"code": "layout_inspector_unavailable"}]
+            },
+            "android_studio_layout": bridge_reply,
+        });
+
+        let error = invalid_required_snapshot_error(
+            &value,
+            true,
+            Some(json!({"path": "/tmp/layout.json", "bytes": 456})),
+        )
+        .unwrap();
+        assert_eq!(error.code, "layout_debugger_conflict");
+        assert_eq!(error.stage, "layout");
+        assert_eq!(
+            error.detail["bridge_reply"]["error_code"],
+            "layout_debugger_conflict"
+        );
+        assert_eq!(error.detail["artifact"]["path"], "/tmp/layout.json");
+        assert!(
+            error
+                .next_actions
+                .iter()
+                .any(|action| action == "shadowdroid debug stop --session session_3")
+        );
+    }
+
+    #[test]
+    fn snapshot_merge_preserves_conflict_reply_but_degrades_other_bridge_errors() {
+        let bridge_reply = json!({
+            "ok": false,
+            "available": false,
+            "error_code": "layout_debugger_conflict",
+            "error": "stop debugger",
+            "session": {"id": "session_1"}
+        });
+        let conflict = crate::cmd::debugger::layout_debugger_conflict_diagnostic(
+            bridge_reply.clone(),
+            json!({"route": "/v1/layout/snapshot", "status": 409}),
+        );
+        let mut conflict_output = json!({});
+        merge_studio_layout(&mut conflict_output, Err(anyhow::Error::new(conflict)));
+        assert_eq!(conflict_output["android_studio_layout"], bridge_reply);
+
+        let mut generic_output = json!({});
+        merge_studio_layout(
+            &mut generic_output,
+            Err(anyhow::anyhow!("bridge unavailable")),
+        );
+        assert_eq!(generic_output["android_studio_layout"]["available"], false);
+        assert_eq!(
+            generic_output["android_studio_layout"]["error"],
+            "bridge unavailable"
+        );
     }
 
     #[test]

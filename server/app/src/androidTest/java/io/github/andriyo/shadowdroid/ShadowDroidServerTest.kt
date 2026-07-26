@@ -24,31 +24,43 @@ import org.junit.runner.RunWith
  *   just works.
  *
  * Lifecycle:
- *   • `@Before setUp()` — get UiDevice (framework guarantees it's ready),
- *     start Ktor HTTP server.
- *   • `@Test runServerForever()` — block on a sentinel loop. The HTTP server
- *     runs on Ktor's own threads; this method only exists to keep the
- *     Instrumentation process alive (when this method returns, JUnit tears
+ *   • `@Before setUp()` — when the explicit server-mode argument is present,
+ *     get UiDevice (framework guarantees it's ready) and start Ktor.
+ *   • `@Test runServerForever()` — block on a sentinel loop in server mode.
+ *     Without the argument it returns normally, so an unfiltered
+ *     connectedAndroidTest run cannot hang on this infrastructure fixture.
+ *     The HTTP server runs on Ktor's own threads; the loop only exists to keep
+ *     the Instrumentation process alive (when it returns, JUnit tears
  *     everything down).
  *   • `@After tearDown()` — stop Ktor cleanly.
  *
  * Started with:
  *   adb shell am instrument -w -e debug false \
+ *     -e shadowdroid_server true \
  *     -e class io.github.andriyo.shadowdroid.ShadowDroidServerTest \
  *     io.github.andriyo.shadowdroid.test/androidx.test.runner.AndroidJUnitRunner
  */
 @RunWith(AndroidJUnit4::class)
 class ShadowDroidServerTest {
-    private lateinit var server: HttpServer
-    private lateinit var uiDevice: UiDevice
+    private var server: HttpServer? = null
+    private var serverMode = false
 
     @Before
     fun setUp() {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
+        serverMode =
+            serverModeEnabled(
+                InstrumentationRegistry.getArguments().getString(SERVER_MODE_ARGUMENT),
+            )
+        if (!serverMode) {
+            Log.i(TAG, "ShadowDroid server mode not requested; sentinel will return normally")
+            return
+        }
+
         // Standard call — works because AndroidJUnitRunner already initialised
         // UiAutomation. No flag dance, no Configurator setup. Matches openatx
         // exactly.
-        uiDevice = UiDevice.getInstance(instrumentation)
+        val uiDevice = UiDevice.getInstance(instrumentation)
         uiDevice.wakeUp()
         server = HttpServer(instrumentation, uiDevice, port = DEFAULT_PORT).also { it.start() }
         Log.i(TAG, "ShadowDroid server listening on 127.0.0.1:$DEFAULT_PORT")
@@ -63,6 +75,10 @@ class ShadowDroidServerTest {
     @Test
     @LargeTest
     fun runServerForever() {
+        if (!serverMode) {
+            return
+        }
+
         Log.i(TAG, "ShadowDroid server entering main loop")
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val health = UiAutomationHealthTracker(MAX_CONSECUTIVE_HEALTH_FAILURES)
@@ -98,19 +114,23 @@ class ShadowDroidServerTest {
 
     @After
     fun tearDown() {
+        val activeServer = server ?: return
         Log.i(TAG, "ShadowDroid server stopping")
         try {
-            server.stop()
+            activeServer.stop()
         } catch (_: Throwable) {
         }
     }
 
     companion object {
         const val DEFAULT_PORT = 7912
+        internal const val SERVER_MODE_ARGUMENT = "shadowdroid_server"
         private const val MAX_CONSECUTIVE_HEALTH_FAILURES = 20 // 10 seconds
         private const val TAG = "ShadowDroid"
     }
 }
+
+internal fun serverModeEnabled(value: String?): Boolean = value == "true"
 
 internal class UiAutomationHealthTracker(
     private val failureLimit: Int,

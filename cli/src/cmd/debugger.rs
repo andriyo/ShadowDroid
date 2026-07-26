@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::cmd::studio_contract::{self, query, route, session_action};
 use crate::hostenv::shadowdroid_home;
 
-const DEFAULT_BRIDGE_TIMEOUT_MS: u64 = 10_000;
+pub(crate) const DEFAULT_BRIDGE_TIMEOUT_MS: u64 = 10_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum DebugMode {
@@ -1234,6 +1234,71 @@ fn bridge_error_code(reply: &Value) -> Option<&str> {
     reply.get("error_code").and_then(Value::as_str)
 }
 
+fn layout_conflict_session_id(reply: &Value) -> Option<&str> {
+    reply
+        .get("session_id")
+        .or_else(|| reply.get("debug_session_id"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            ["conflicting_session", "debug_session", "session"]
+                .into_iter()
+                .find_map(|field| {
+                    reply
+                        .get(field)
+                        .and_then(|session| session.get("id"))
+                        .and_then(Value::as_str)
+                })
+        })
+        .or_else(|| {
+            reply
+                .get("detail")
+                .and_then(|detail| detail.get("session"))
+                .and_then(|session| session.get("id"))
+                .and_then(Value::as_str)
+        })
+}
+
+pub(crate) fn layout_debugger_conflict_diagnostic(
+    bridge_reply: Value,
+    context: Value,
+) -> crate::diagnostic::DiagnosticError {
+    let message = bridge_reply
+        .get("error")
+        .or_else(|| bridge_reply.get("reason"))
+        .and_then(Value::as_str)
+        .unwrap_or(
+            "Android Studio Layout Inspector cannot inspect a process with a matching active debugger session",
+        )
+        .to_string();
+    let mut detail = context
+        .as_object()
+        .cloned()
+        .unwrap_or_else(|| serde_json::Map::from_iter([("context".to_string(), context)]));
+    let session_id = layout_conflict_session_id(&bridge_reply).map(str::to_string);
+    detail.insert("bridge_reply".into(), bridge_reply);
+
+    let mut next_actions = vec!["shadowdroid debug sessions".to_string()];
+    if let Some(session_id) = session_id {
+        next_actions.push(format!(
+            "shadowdroid debug stop --session {}",
+            crate::events::shell_token(&session_id)
+        ));
+    } else {
+        next_actions.push(
+            "stop the debugger session matching detail.bridge_reply with `shadowdroid debug stop --session <id>`"
+                .to_string(),
+        );
+    }
+    next_actions.push(
+        "retry the layout command after the matching debugger session has stopped".to_string(),
+    );
+
+    crate::diagnostic::DiagnosticError::new("layout_debugger_conflict", "layout", message)
+        .retryable(true)
+        .detail(Value::Object(detail))
+        .next_actions(next_actions)
+}
+
 fn canonicalize_for_bridge(path: &Path) -> Result<String> {
     let canonical = std::fs::canonicalize(path)
         .with_context(|| format!("source file not found: {}", path.display()))?;
@@ -1255,9 +1320,28 @@ impl BridgeClient {
     }
 
     pub(crate) fn with_device(explicit_url: Option<&str>, device: Option<&str>) -> Result<Self> {
+        Self::with_device_and_timeout(
+            explicit_url,
+            device,
+            Duration::from_millis(DEFAULT_BRIDGE_TIMEOUT_MS),
+        )
+    }
+
+    pub(crate) fn with_timeout(
+        explicit_url: Option<&str>,
+        request_timeout: Duration,
+    ) -> Result<Self> {
+        Self::with_device_and_timeout(explicit_url, None, request_timeout)
+    }
+
+    fn with_device_and_timeout(
+        explicit_url: Option<&str>,
+        device: Option<&str>,
+        request_timeout: Duration,
+    ) -> Result<Self> {
         let base_url = resolve_url(explicit_url)?;
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_millis(DEFAULT_BRIDGE_TIMEOUT_MS))
+            .timeout(request_timeout)
             .connect_timeout(Duration::from_millis(2_000))
             .build()
             .context("creating debugger bridge HTTP client")?;
@@ -1317,6 +1401,16 @@ impl BridgeClient {
                 "restart Android Studio after updating the plugin, then retry",
             ])
         })?;
+        if bridge_error_code(&value) == Some("layout_debugger_conflict") {
+            return Err(layout_debugger_conflict_diagnostic(
+                value,
+                serde_json::json!({
+                    "route": path,
+                    "status": status.as_u16(),
+                }),
+            )
+            .into());
+        }
         if !status.is_success() {
             let message = value
                 .get("error")
@@ -1561,6 +1655,83 @@ mod tests {
             None
         );
         assert_eq!(bridge_error_code(&json!({"error_code": 7})), None);
+    }
+
+    #[test]
+    fn layout_debugger_conflict_is_typed_and_names_the_exact_session_stop() {
+        let reply = json!({
+            "ok": false,
+            "error_code": "layout_debugger_conflict",
+            "error": "stop debugger session before attaching Layout Inspector",
+            "conflicting_session": {
+                "id": "session_7",
+                "package": "com.example.app",
+                "pid": 42
+            }
+        });
+
+        let error = layout_debugger_conflict_diagnostic(
+            reply.clone(),
+            json!({"route": "/v1/layout/snapshot", "status": 409}),
+        );
+        assert_eq!(error.code, "layout_debugger_conflict");
+        assert_eq!(error.stage, "layout");
+        assert!(error.retryable);
+        assert_eq!(error.detail["bridge_reply"], reply);
+        assert_eq!(error.detail["status"], 409);
+        assert!(
+            error
+                .next_actions
+                .iter()
+                .any(|action| action == "shadowdroid debug stop --session session_7")
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_http_conflict_reply_bypasses_generic_rejection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let reply = json!({
+            "ok": false,
+            "available": false,
+            "type": "layout_snapshot",
+            "error_code": "layout_debugger_conflict",
+            "error": "stop the matching debugger session before retrying",
+            "session": {"id": "session_9", "package": "com.example.app", "pid": 42}
+        })
+        .to_string();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                reply.len(),
+                reply
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let bridge = BridgeClient::new(Some(&format!("http://{address}"))).unwrap();
+        let error = bridge.get(route::LAYOUT_SNAPSHOT, &[]).await.unwrap_err();
+        assert_eq!(
+            crate::cli::error_code_of(&error),
+            "layout_debugger_conflict"
+        );
+        assert_eq!(crate::cli::error_stage_of(&error), "layout");
+        let diagnostic = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<crate::diagnostic::DiagnosticError>())
+            .unwrap();
+        assert_eq!(diagnostic.detail["status"], 409);
+        assert_eq!(
+            diagnostic.detail["bridge_reply"]["session"]["id"],
+            "session_9"
+        );
     }
 
     #[tokio::test]

@@ -22,6 +22,9 @@ import com.intellij.psi.xml.XmlTag
 import java.awt.Rectangle
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.launch
 import kotlin.math.min
 
 internal object LayoutInspectorBridge {
@@ -39,12 +42,12 @@ internal object LayoutInspectorBridge {
             val activation = activateAndWait(project, query)
             StudioThreading.onIdeaThread {
                 val state = layoutState(project)
-                if (!state.available) {
+                if (activation["model_ready"] != true || !state.available) {
                     return@onIdeaThread BridgeProtocol.ok(
                         "ok", true,
                         "type", BridgeValues.LAYOUT_SNAPSHOT,
                         "available", false,
-                        "reason", state.reason,
+                        "reason", activation["final_reason"] ?: state.reason,
                         "project", projectInfo(project),
                         "activation", activation,
                         "features", layoutFeatures(false, false, false),
@@ -84,13 +87,13 @@ internal object LayoutInspectorBridge {
             val activation = activateAndWait(project, query)
             StudioThreading.onIdeaThread {
                 val state = layoutState(project)
-                if (!state.available) {
+                if (activation["model_ready"] != true || !state.available) {
                     return@onIdeaThread BridgeProtocol.ok(
                         "ok", true,
                         "type", BridgeValues.LAYOUT_RECOMPOSITIONS,
                         "available", false,
                         "reset_requested", reset,
-                        "reason", state.reason,
+                        "reason", activation["final_reason"] ?: state.reason,
                         "project", projectInfo(project),
                         "activation", activation,
                     )
@@ -143,12 +146,12 @@ internal object LayoutInspectorBridge {
             val activation = activateAndWait(project, query)
             StudioThreading.onIdeaThread {
                 val state = layoutState(project)
-                if (!state.available) {
+                if (activation["model_ready"] != true || !state.available) {
                     return@onIdeaThread BridgeProtocol.ok(
                         "ok", true,
                         "type", BridgeValues.LAYOUT_SOURCE,
                         "available", false,
-                        "reason", state.reason,
+                        "reason", activation["final_reason"] ?: state.reason,
                         "project", projectInfo(project),
                         "activation", activation,
                     )
@@ -183,28 +186,92 @@ internal object LayoutInspectorBridge {
     private fun activateAndWait(project: Project, query: Map<String, String>): MutableMap<String, Any?> {
         val timeoutMs = layoutTimeoutMs(query)
         val deadline = BridgeProtocol.nowMs() + timeoutMs
-        var activation = StudioThreading.onIdeaThread { activateLayoutInspector(project, query) }
+        val target = LayoutTarget.from(query)
+        val refresh = StudioThreading.onIdeaThread { LayoutRefreshObserver.install(project) }
+        try {
+            var activation = StudioThreading.onIdeaThread { activateLayoutInspector(project, query, refresh) }
 
-        while (activation["requested"] == true && activation["ok"] != true && BridgeProtocol.nowMs() < deadline) {
-            Thread.sleep(min(LAYOUT_POLL_MS, (deadline - BridgeProtocol.nowMs()).coerceAtLeast(1)))
-            activation = StudioThreading.onIdeaThread { activateLayoutInspector(project, query) }
-        }
+            while (
+                activation["requested"] == true &&
+                activation["ok"] != true &&
+                refresh.fetchError.get() == null &&
+                BridgeProtocol.nowMs() < deadline
+            ) {
+                Thread.sleep(min(LAYOUT_POLL_MS, (deadline - BridgeProtocol.nowMs()).coerceAtLeast(1)))
+                activation = StudioThreading.onIdeaThread { activateLayoutInspector(project, query, refresh) }
+            }
 
-        var state = StudioThreading.onIdeaThread { layoutState(project) }
-        while (!state.available && BridgeProtocol.nowMs() < deadline) {
-            Thread.sleep(min(LAYOUT_POLL_MS, (deadline - BridgeProtocol.nowMs()).coerceAtLeast(1)))
-            state = StudioThreading.onIdeaThread { layoutState(project) }
-        }
+            var state = StudioThreading.onIdeaThread { layoutState(project) }
+            var modelReady = layoutModelReady(target, state, refresh)
+            while (!modelReady && refresh.fetchError.get() == null && BridgeProtocol.nowMs() < deadline) {
+                Thread.sleep(min(LAYOUT_POLL_MS, (deadline - BridgeProtocol.nowMs()).coerceAtLeast(1)))
+                state = StudioThreading.onIdeaThread { layoutState(project) }
+                modelReady = layoutModelReady(target, state, refresh)
+            }
 
-        activation["timeout_ms"] = timeoutMs
-        activation["model_ready"] = state.available
-        if (state.reason != null) {
-            activation["final_reason"] = state.reason
+            val targetMatches = state.client?.process?.let(target::matches) == true
+            val generationAfter = state.model?.lastGeneration
+            activation["timeout_ms"] = timeoutMs
+            activation["model_ready"] = modelReady
+            activation["target_matches_client"] = !target.requested || targetMatches
+            activation["live_fetch_requested"] = refresh.fetchStarted.get()
+            activation["live_fetch_completed"] = refresh.fetchCompleted.get()
+            activation["model_modified"] = refresh.modelModified.get()
+            activation["model_generation_before"] = refresh.baselineGeneration
+            activation["model_generation"] = generationAfter
+            activation["fetch_client_matches"] =
+                refresh.baselineClient != null && refresh.baselineClient === state.client
+            refresh.fetchError.get()?.let { activation["fetch_error"] = it }
+            val finalReason =
+                when {
+                    modelReady -> null
+                    refresh.fetchError.get() != null ->
+                        "Android Studio Layout Inspector live fetch failed: ${refresh.fetchError.get()}"
+                    !state.available -> state.reason
+                    target.requested && !targetMatches ->
+                        "Android Studio Layout Inspector is still attached to a different process"
+                    !refresh.fetchStarted.get() ->
+                        activation["reason"]?.toString()
+                            ?: "Android Studio Layout Inspector did not start a live fetch"
+                    else ->
+                        "Android Studio Layout Inspector did not publish a fresh model after the live fetch request"
+                }
+            if (finalReason != null) {
+                activation["final_reason"] = finalReason
+            }
+            return activation
+        } finally {
+            runCatching {
+                StudioThreading.onIdeaThread { refresh.close() }
+            }
         }
-        return activation
     }
 
-    private fun activateLayoutInspector(project: Project, query: Map<String, String>): MutableMap<String, Any?> {
+    private fun layoutModelReady(
+        target: LayoutTarget,
+        state: LayoutState,
+        refresh: LayoutRefreshObserver,
+    ): Boolean {
+        val targetMatches = state.client?.process?.let(target::matches) == true
+        val generationChanged =
+            state.model?.lastGeneration?.let { it != refresh.baselineGeneration } == true
+        val fetchClientMatches = refresh.baselineClient != null && refresh.baselineClient === state.client
+        return LayoutRefreshPolicy.isReady(
+            targetRequested = target.requested,
+            stateAvailable = state.available,
+            targetMatches = targetMatches,
+            fetchClientMatches = fetchClientMatches,
+            liveFetchRequested = refresh.fetchStarted.get(),
+            modelModified = refresh.modelModified.get(),
+            generationChanged = generationChanged,
+        )
+    }
+
+    private fun activateLayoutInspector(
+        project: Project,
+        query: Map<String, String>,
+        refresh: LayoutRefreshObserver,
+    ): MutableMap<String, Any?> {
         val inspector = LayoutInspectorProjectService.getInstance(project).getLayoutInspector()
         val target = LayoutTarget.from(query)
         val currentClient = inspector.currentClient
@@ -247,10 +314,11 @@ internal object LayoutInspectorBridge {
         inspector.inspectorClientSettings.inLiveMode = true
 
         if (target.matches(currentProcess) && currentClient.isConnected) {
-            currentClient.refresh()
+            refresh.startLiveFetch(inspector, currentClient)
             payload["ok"] = true
             payload["selected"] = processInfo(currentProcess)
             payload["reused_client"] = true
+            payload["fetch_mode"] = "live"
             return payload
         }
 
@@ -275,12 +343,17 @@ internal object LayoutInspectorBridge {
 
         val selected = candidates.first()
         inspector.deviceModel?.setSelectedDevice(selected.device)
-        processModel.setLayoutInspectorSelectedProcess(selected)
-        inspector.currentClient.refresh()
+        val selectedProcessMatches =
+            processModel.selectedProcess?.let(target::matches) == true
+        if (!selectedProcessMatches) {
+            processModel.setLayoutInspectorSelectedProcess(selected)
+        }
 
-        payload["ok"] = true
+        payload["ok"] = false
         payload["selected"] = processInfo(selected)
         payload["candidate_count"] = candidates.size
+        payload["selection_requested"] = !selectedProcessMatches
+        payload["reason"] = "waiting for Android Studio Layout Inspector to connect to the selected process"
         return payload
     }
 
@@ -790,4 +863,80 @@ internal object LayoutInspectorBridge {
         val available: Boolean,
         val reason: String?,
     )
+
+    private class LayoutRefreshObserver private constructor(
+        private val model: InspectorModel,
+    ) {
+        val fetchStarted = AtomicBoolean(false)
+        val fetchCompleted = AtomicBoolean(false)
+        val modelModified = AtomicBoolean(false)
+        val fetchError = AtomicReference<String?>(null)
+
+        @Volatile
+        var baselineGeneration: Int = model.lastGeneration
+            private set
+
+        @Volatile
+        var baselineClient: InspectorClient? = null
+            private set
+
+        private val listener =
+            InspectorModel.ModificationListener { _, _, _ ->
+                modelModified.set(true)
+            }
+
+        fun startLiveFetch(inspector: LayoutInspector, client: InspectorClient) {
+            if (fetchStarted.get()) return
+            modelModified.set(false)
+            baselineGeneration = model.lastGeneration
+            baselineClient = client
+            fetchStarted.set(true)
+            inspector.coroutineScope.launch {
+                try {
+                    client.startFetching()
+                } catch (t: Throwable) {
+                    fetchError.compareAndSet(null, t.message ?: t.javaClass.name)
+                } finally {
+                    fetchCompleted.set(true)
+                }
+            }
+        }
+
+        fun close() {
+            model.removeModificationListener(listener)
+        }
+
+        companion object {
+            fun install(project: Project): LayoutRefreshObserver {
+                val model =
+                    LayoutInspectorProjectService
+                        .getInstance(project)
+                        .getLayoutInspector()
+                        .inspectorModel
+                return LayoutRefreshObserver(model).also {
+                    model.addModificationListener(it.listener)
+                }
+            }
+        }
+    }
+}
+
+internal object LayoutRefreshPolicy {
+    fun isReady(
+        targetRequested: Boolean,
+        stateAvailable: Boolean,
+        targetMatches: Boolean,
+        fetchClientMatches: Boolean,
+        liveFetchRequested: Boolean,
+        modelModified: Boolean,
+        generationChanged: Boolean,
+    ): Boolean {
+        if (!stateAvailable) return false
+        if (!targetRequested) return true
+        return targetMatches &&
+            fetchClientMatches &&
+            liveFetchRequested &&
+            modelModified &&
+            generationChanged
+    }
 }

@@ -826,22 +826,44 @@ pub async fn am_force_stop(serial: impl Into<String>, package: impl AsRef<str>) 
 /// `runner` is `<test_package>/<runner_class_fqn>`, e.g.
 /// `io.github.andriyo.shadowdroid.test/androidx.test.runner.AndroidJUnitRunner`.
 /// `test_class` (optional) restricts execution to a single JUnit class.
+/// `arguments` are passed as AndroidJUnitRunner `-e <key> <value>` extras.
 pub async fn am_instrument(
     serial: impl Into<String>,
     runner: impl AsRef<str>,
     test_class: Option<&str>,
+    arguments: &[(&str, &str)],
     log_path: impl AsRef<str>,
 ) -> Result<()> {
-    let class_arg = test_class
-        .map(|c| format!("-e class {c} "))
-        .unwrap_or_default();
-    let cmd = format!(
-        "nohup am instrument -w -e debug false {class_arg}{runner} > {log_path} 2>&1 &",
-        runner = runner.as_ref(),
-        log_path = log_path.as_ref()
-    );
+    let cmd = am_instrument_command(runner.as_ref(), test_class, arguments, log_path.as_ref());
     shell_mutating(serial, cmd).await?;
     Ok(())
+}
+
+fn am_instrument_command(
+    runner: &str,
+    test_class: Option<&str>,
+    arguments: &[(&str, &str)],
+    log_path: &str,
+) -> String {
+    let mut extras = String::from("-e debug false ");
+    if let Some(test_class) = test_class {
+        extras.push_str(&format!(
+            "-e class {} ",
+            crate::config::quote_device_shell_arg(test_class),
+        ));
+    }
+    for (key, value) in arguments {
+        extras.push_str(&format!(
+            "-e {} {} ",
+            crate::config::quote_device_shell_arg(key),
+            crate::config::quote_device_shell_arg(value),
+        ));
+    }
+    format!(
+        "nohup am instrument -w {extras}{runner} > {log_path} 2>&1 &",
+        runner = crate::config::quote_device_shell_arg(runner),
+        log_path = crate::config::quote_device_shell_arg(log_path),
+    )
 }
 
 /// Kill only lingering `app_process` wrappers owned by ShadowDroid. Other tools
@@ -1087,13 +1109,34 @@ fn parse_getprop_line(line: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReverseMapping, StagedLocalPull, bounded_blocking_with_slots, commit_remote_command,
-        parse_getprop_line, parse_ls_long, parse_reverse_list, remote_temp_path,
+        ReverseMapping, StagedLocalPull, am_instrument_command, bounded_blocking_with_slots,
+        commit_remote_command, parse_getprop_line, parse_ls_long, parse_reverse_list,
+        remote_temp_path,
     };
     use std::io::Write as _;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::Semaphore;
+
+    #[test]
+    fn instrumentation_command_quotes_class_mode_and_paths() {
+        let command = am_instrument_command(
+            "io.example.test/androidx.test.runner.AndroidJUnitRunner",
+            Some("io.example.ServerTest"),
+            &[("shadowdroid_server", "true"), ("future key", "a'b")],
+            "/sdcard/shadowdroid log.txt",
+        );
+
+        assert_eq!(
+            command,
+            "nohup am instrument -w -e debug false \
+             -e class 'io.example.ServerTest' \
+             -e 'shadowdroid_server' 'true' \
+             -e 'future key' 'a'\"'\"'b' \
+             'io.example.test/androidx.test.runner.AndroidJUnitRunner' \
+             > '/sdcard/shadowdroid log.txt' 2>&1 &",
+        );
+    }
 
     #[tokio::test]
     async fn timed_out_blocking_calls_keep_their_worker_slot_until_exit() {

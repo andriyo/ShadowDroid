@@ -1,6 +1,7 @@
 package io.github.andriyo.shadowdroid.studio
 
 import com.android.ddmlib.AndroidDebugBridge
+import com.android.ddmlib.Client
 import com.android.ddmlib.IDevice
 import com.intellij.debugger.engine.JavaDebugProcess
 import com.intellij.debugger.engine.JavaStackFrame
@@ -184,7 +185,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
             // Runs on whichever thread fired the pause — often the debugger
             // manager thread, which must never block on the EDT. Breakpoint
             // state only needs read access, so take it on this thread.
-            ReadAction.compute<Unit, RuntimeException> {
+            ReadAction.computeBlocking<Unit, RuntimeException> {
                 for (breakpoint in XDebuggerManager.getInstance(project).breakpointManager.allBreakpoints) {
                     if (breakpoint is XLineBreakpoint<*> &&
                         fileUrl == breakpoint.fileUrl &&
@@ -335,9 +336,21 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                         selectProject(query, null, requireUnambiguous = true),
                         query,
                     )
-                    BridgeRoutes.LAYOUT_SNAPSHOT -> LayoutInspectorBridge.snapshot(selectProject(query, null), query)
-                    BridgeRoutes.LAYOUT_RECOMPOSITIONS -> LayoutInspectorBridge.recompositions(selectProject(query, null), query)
-                    BridgeRoutes.LAYOUT_SOURCE -> LayoutInspectorBridge.source(selectProject(query, null), query)
+                    BridgeRoutes.LAYOUT_SNAPSHOT -> layoutRequest(
+                        BridgeValues.LAYOUT_SNAPSHOT,
+                        query,
+                        LayoutInspectorBridge::snapshot,
+                    )
+                    BridgeRoutes.LAYOUT_RECOMPOSITIONS -> layoutRequest(
+                        BridgeValues.LAYOUT_RECOMPOSITIONS,
+                        query,
+                        LayoutInspectorBridge::recompositions,
+                    )
+                    BridgeRoutes.LAYOUT_SOURCE -> layoutRequest(
+                        BridgeValues.LAYOUT_SOURCE,
+                        query,
+                        LayoutInspectorBridge::source,
+                    )
                     else -> Response(
                         HttpURLConnection.HTTP_NOT_FOUND,
                         BridgeProtocol.obj("ok", false, "error", "not_found", "path", path),
@@ -373,6 +386,87 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
             installAllSessionListeners()
             val payload = allSessions().mapIndexed { index, session -> sessionInfo(index, session) }
             return BridgeProtocol.ok("ok", true, "sessions", payload)
+        }
+
+        private fun layoutRequest(
+            type: String,
+            query: Map<String, String>,
+            request: (Project?, Map<String, String>) -> Response,
+        ): Response {
+            val project = selectProject(query, null)
+            if (project == null) return request(null, query)
+
+            val requestedTarget = LayoutDebuggerRequestTarget(
+                projectKey = projectKey(project),
+                device = query[BridgeQuery.DEVICE],
+                packageName = query[BridgeQuery.PACKAGE],
+                pid = optionalPid(query[BridgeQuery.PID]),
+            )
+            val activeSessions = allSessions()
+                .filter { it.project === project }
+                .mapNotNull { session ->
+                    layoutDebuggerTarget(session)?.let { target -> session to target }
+                }
+            val matchedTarget = LayoutDebuggerGuard.matchingSession(
+                requestedTarget,
+                activeSessions.map { it.second },
+            )
+            val matchedSession = matchedTarget?.let { target ->
+                activeSessions.firstOrNull { it.second.sessionId == target.sessionId }?.first
+            }
+            if (matchedTarget != null && matchedSession != null) {
+                return layoutDebuggerConflict(type, project, requestedTarget, matchedSession, matchedTarget)
+            }
+            return request(project, query)
+        }
+
+        private fun optionalPid(value: String?): Int? {
+            if (value.isNullOrBlank()) return null
+            return value.toIntOrNull() ?: throw IllegalArgumentException("invalid integer: $value")
+        }
+
+        private fun layoutDebuggerConflict(
+            type: String,
+            project: Project,
+            request: LayoutDebuggerRequestTarget,
+            session: XDebugSession,
+            target: LayoutDebuggerSessionTarget,
+        ): Response {
+            val reason = "Android Studio debugger session ${target.sessionId} matches the requested " +
+                "app process; stop it before using Layout Inspector"
+            val nextAction = "shadowdroid debug stop --session ${target.sessionId}"
+            return Response(
+                HttpURLConnection.HTTP_CONFLICT,
+                BridgeProtocol.obj(
+                    "ok", false,
+                    "available", false,
+                    "error_code", "layout_debugger_conflict",
+                    "error", reason,
+                    "reason", reason,
+                    "type", type,
+                    "project", projectInfo(project),
+                    "target", BridgeProtocol.map(
+                        "device", request.device,
+                        "package", request.packageName,
+                        "pid", request.pid,
+                    ),
+                    "session", BridgeProtocol.map(
+                        "id", target.sessionId,
+                        "name", session.sessionName,
+                        "project", projectInfo(session.project),
+                        "device", BridgeProtocol.map(
+                            "serial", target.deviceSerial,
+                            "avd", target.deviceAvd,
+                        ),
+                        "package", target.packageName,
+                        "process_name", target.processName,
+                        "pid", target.pid,
+                        "suspended", session.isSuspended,
+                    ),
+                    "next_action", nextAction,
+                    "next_actions", listOf(nextAction),
+                ),
+            )
         }
 
         private fun controlSession(query: Map<String, String>): Response {
@@ -1084,20 +1178,58 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
             )
         }
 
-        // The device a debug session is attached to, resolved by matching the
-        // session's JDWP connection port to a ddmlib client's debugger port.
+        private fun layoutDebuggerTarget(session: XDebugSession): LayoutDebuggerSessionTarget? {
+            // A resolved ddmlib client is the evidence that this is an Android
+            // app debugger session. Do not block Layout Inspector merely
+            // because an unrelated debugger is active in the same project.
+            val client = sessionClient(session) ?: return null
+            val device = try {
+                client.device
+            } catch (_: Throwable) {
+                null
+            }
+            val clientData = try {
+                client.clientData
+            } catch (_: Throwable) {
+                null
+            }
+            return LayoutDebuggerSessionTarget(
+                sessionId = sessionId(session),
+                projectKey = projectKey(session.project),
+                deviceSerial = device?.serialNumber,
+                deviceAvd = device?.let(::deviceAvdName),
+                packageName = try {
+                    clientData?.packageName
+                } catch (_: Throwable) {
+                    null
+                },
+                processName = try {
+                    clientData?.processName
+                } catch (_: Throwable) {
+                    null
+                },
+                pid = try {
+                    clientData?.pid?.takeIf { it > 0 }
+                } catch (_: Throwable) {
+                    null
+                },
+            )
+        }
+
+        // The ddmlib client a debug session is attached to, resolved by
+        // matching the session's JDWP connection port to the client's debugger
+        // port.
         // Uses the static AndroidDebugBridge.getBridge() accessor: it is safe
         // from any thread, unlike AndroidSdkUtils.getDebugBridge which asserts
         // the EDT — and this runs inside onDebuggerThread suppliers, where
         // waiting on the EDT is a deadlock vector. Best-effort: null for
         // non-Java sessions or before ADB is initialized, so the rest of the
         // session payload still renders.
-        private fun sessionDevice(session: XDebugSession): IDevice? {
+        private fun sessionClient(session: XDebugSession): Client? {
             val java = session.debugProcess as? JavaDebugProcess ?: return null
             val ports = try {
                 val connection = java.debuggerSession.process.connection
                 listOfNotNull(
-                    connection.address,
                     connection.debuggerAddress,
                     connection.applicationAddress,
                 ).mapNotNull { portOf(it) }.toSet()
@@ -1106,13 +1238,20 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
             }
             if (ports.isEmpty()) return null
             return try {
-                AndroidDebugBridge.getBridge()?.devices?.firstOrNull { device ->
-                    device.clients.any { it.isValid && it.debuggerListenPort in ports }
-                }
+                AndroidDebugBridge.getBridge()?.devices
+                    ?.flatMap { device -> device.clients.toList() }
+                    ?.firstOrNull { client -> client.isValid && client.debuggerListenPort in ports }
             } catch (t: Throwable) {
                 null
             }
         }
+
+        private fun sessionDevice(session: XDebugSession): IDevice? =
+            try {
+                sessionClient(session)?.device
+            } catch (_: Throwable) {
+                null
+            }
 
         // A RemoteConnection address may be "host:port" (e.g. "localhost:64879")
         // or a bare "port"; take the trailing numeric component either way.

@@ -39,8 +39,11 @@ use crate::ids::Serial;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::error::{ContextKind, ContextValue};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
-use serde_json::json;
+use serde_json::{Value, json};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::process::{ExitStatus, Stdio};
+use std::time::Duration;
 
 use crate::cmd::app_install::AppInstallArgs;
 use crate::cmd::debug::{DebugArgs, DebugCmd};
@@ -3367,6 +3370,20 @@ async fn dispatch_app(
     let events = crate::crashscan::finish_probe(probe).await;
     match result {
         Ok(outcome) => {
+            // A since-last-command event can predate this launch. Only promote
+            // a candidate fatal event after a fresh, post-probe foreground read
+            // proves the requested launch postcondition is no longer true.
+            let foreground = if app_start_has_fatal_event(&outcome, &events) {
+                adb::foreground_activity(serial).await
+            } else {
+                None
+            };
+            if let Some(error) = app_start_crash_error(&outcome, &events, foreground.as_deref()) {
+                // Preserve the same in-band evidence on the typed error that
+                // would otherwise have ridden the successful action envelope.
+                crate::events::stash_events(events);
+                return Err(error.into());
+            }
             outcome.emit(events);
             Ok(())
         }
@@ -3375,6 +3392,91 @@ async fn dispatch_app(
             Err(err)
         }
     }
+}
+
+/// Promote a fatal crash observed while `app start` was completing into a
+/// command failure only when a fresh foreground read also disproves the launch
+/// postcondition. The concurrent probe can surface a crash from before a
+/// successful relaunch; that event remains attached evidence, not a false
+/// failure. ANRs, unrelated crashes, and future non-fatal event kinds likewise
+/// remain attached without changing the outcome.
+fn app_start_crash_error(
+    outcome: &Outcome,
+    events: &[Value],
+    foreground_component: Option<&str>,
+) -> Option<crate::diagnostic::DiagnosticError> {
+    let Outcome::Action("app_start", launch) = outcome else {
+        return None;
+    };
+    let package = launch.get("package").and_then(Value::as_str)?;
+    let fatal_events = app_start_fatal_events(events, package);
+    if fatal_events.is_empty() {
+        return None;
+    }
+    let foreground_component = foreground_component?;
+    let requested_activity = launch.get("requested_activity").and_then(Value::as_str);
+    if matching_started_activity(foreground_component, package, requested_activity).is_some() {
+        return None;
+    }
+
+    let package_token = crate::events::shell_token(package);
+    Some(
+        crate::diagnostic::DiagnosticError::new(
+            "app_start_crashed",
+            "app",
+            format!(
+                "a fatal {package} crash was observed and the requested app is no longer foreground"
+            ),
+        )
+        .retryable(true)
+        .detail(json!({
+            "package": package,
+            "launch": launch,
+            "fatal_events": fatal_events,
+            "postcondition": {
+                "expected_package": package,
+                "expected_activity": requested_activity,
+                "foreground_component": foreground_component,
+                "satisfied": false,
+                "observed_after_events": true,
+            },
+        }))
+        .next_actions([
+            format!("shadowdroid why --app {package_token}"),
+            format!("shadowdroid log --app {package_token} --last 2m --level e"),
+            format!("shadowdroid debug snapshot --app {package_token}"),
+        ]),
+    )
+}
+
+fn app_start_fatal_events(events: &[Value], package: &str) -> Vec<Value> {
+    events
+        .iter()
+        .filter(|event| {
+            event.get("type").and_then(Value::as_str) == Some("crash")
+                && matches!(
+                    event.get("kind").and_then(Value::as_str),
+                    Some("java" | "native")
+                )
+                && event
+                    .get("package")
+                    .and_then(Value::as_str)
+                    .is_some_and(|crashed| {
+                        crate::watch::logcat::package_matches_filter(crashed, package)
+                    })
+        })
+        .cloned()
+        .collect()
+}
+
+fn app_start_has_fatal_event(outcome: &Outcome, events: &[Value]) -> bool {
+    let Outcome::Action("app_start", launch) = outcome else {
+        return false;
+    };
+    launch
+        .get("package")
+        .and_then(Value::as_str)
+        .is_some_and(|package| !app_start_fatal_events(events, package).is_empty())
 }
 
 async fn dispatch_app_inner(
@@ -3394,6 +3496,7 @@ async fn dispatch_app_inner(
                     .await?;
             let mut body = json!({
                 "package": package,
+                "requested_activity": activity,
                 "activity": r.activity,
                 "launcher_activities": r.launcher_activities,
                 "ok": r.ok,
@@ -3511,14 +3614,18 @@ fn matching_started_activity(
         return None;
     }
     let normalize = |activity: &str| {
+        let activity = activity.trim();
         if activity.starts_with('.') {
             format!("{package}{activity}")
+        } else if !activity.contains('.') {
+            format!("{package}.{activity}")
         } else {
             activity.to_string()
         }
     };
     let foreground_activity = normalize(foreground_activity);
     if let Some(requested) = requested_activity {
+        let requested = requested.trim();
         let requested = requested
             .split_once('/')
             .map(|(component_package, activity)| (component_package == package).then_some(activity))
@@ -5634,15 +5741,21 @@ async fn cmd_test(
             .context("freeing the UiAutomation slot before the test run")?;
     }
 
-    // Inherit stdio so the test runner's output streams live to the user.
-    let program = command
-        .first()
-        .ok_or_else(|| anyhow!("no command given; use `shadowdroid test -- <command>`"))?;
-    let status = std::process::Command::new(program)
-        .args(&command[1..])
-        .status()
-        .with_context(|| format!("failed to launch `{}`", command.join(" ")))?;
-    let exit_code = status.code();
+    let command_result =
+        run_test_command_until(&command, tokio::signal::ctrl_c(), Duration::from_secs(3)).await;
+
+    // A cancelled Gradle/device runner can leave our test package or its
+    // instrumentation wrapper alive even after the host child exits. Always
+    // restore the requested disconnected baseline before optionally starting
+    // the persistent ShadowDroid server again.
+    let post_test_cleanup_error = {
+        let cleanup = async {
+            let _guard = installer::acquire_lifecycle_lock(serial)?;
+            free_ui_automation_slot(serial).await
+        }
+        .await;
+        cleanup.err().map(|error: anyhow::Error| error.to_string())
+    };
 
     let reconnect_result = if reconnect {
         Some(installer::ensure_ready(serial, apk, any_apk_version).await)
@@ -5655,27 +5768,73 @@ async fn cmd_test(
         .map(ToString::to_string);
     let reconnected = reconnect_result.as_ref().map(Result::is_ok);
 
-    if !status.success() {
-        let mut next_actions =
-            vec!["inspect the test command output above, fix the failing test, and rerun"];
-        if reconnect_error.is_some() {
+    let outcome = match command_result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let mut next_actions =
+                vec!["check that the test command exists and can be launched directly"];
+            if post_test_cleanup_error.is_some() || reconnect_error.is_some() {
+                next_actions.push("run `shadowdroid doctor --fix` to repair the device lifecycle");
+            }
+            return Err(crate::diagnostic::DiagnosticError::new(
+                "test_command_runner_failed",
+                "test",
+                format!("could not run the test command: {error}"),
+            )
+            .detail(json!({
+                "device": serial,
+                "command": command,
+                "reconnect_requested": reconnect,
+                "reconnected": reconnected,
+                "post_test_cleanup_error": post_test_cleanup_error,
+                "reconnect_error": reconnect_error,
+            }))
+            .next_actions(next_actions)
+            .process_exit_code(1)
+            .into());
+        }
+    };
+    let exit_code = outcome.status.code();
+
+    if outcome.interrupted || !outcome.status.success() {
+        let mut next_actions = if outcome.interrupted {
+            vec!["inspect any partial test output above before rerunning the interrupted command"]
+        } else {
+            vec!["inspect the test command output above, fix the failing test, and rerun"]
+        };
+        if post_test_cleanup_error.is_some() || reconnect_error.is_some() {
             next_actions.push("run `shadowdroid doctor` to repair the failed post-test reconnect");
         }
+        let process_exit_code = if outcome.interrupted {
+            130
+        } else {
+            exit_code.filter(|code| *code > 0).unwrap_or(1)
+        };
         return Err(crate::diagnostic::DiagnosticError::new(
-            "test_command_failed",
+            if outcome.interrupted {
+                "test_command_interrupted"
+            } else {
+                "test_command_failed"
+            },
             "test",
-            format!("test command exited with status {}", exit_code.unwrap_or(1)),
+            if outcome.interrupted {
+                "test command was interrupted".to_string()
+            } else {
+                format!("test command exited with status {}", exit_code.unwrap_or(1))
+            },
         )
         .detail(json!({
             "device": serial,
             "command": command,
             "exit_code": exit_code,
+            "interrupted": outcome.interrupted,
             "reconnect_requested": reconnect,
             "reconnected": reconnected,
+            "post_test_cleanup_error": post_test_cleanup_error,
             "reconnect_error": reconnect_error,
         }))
         .next_actions(next_actions)
-        .process_exit_code(exit_code.filter(|code| *code > 0).unwrap_or(1))
+        .process_exit_code(process_exit_code)
         .into());
     }
 
@@ -5693,6 +5852,7 @@ async fn cmd_test(
             "device": serial,
             "command": command,
             "test_exit_code": exit_code,
+            "post_test_cleanup_error": post_test_cleanup_error,
         }))
         .next_actions([
             "run `shadowdroid doctor` to inspect the failed reconnect",
@@ -5701,15 +5861,97 @@ async fn cmd_test(
         .into());
     }
 
+    if reconnect {
+        if let Some(error) = &post_test_cleanup_error {
+            tracing::warn!("post-test cleanup reported `{error}`, but reconnect recovered");
+        }
+    } else if let Some(error) = post_test_cleanup_error {
+        return Err(
+            crate::diagnostic::DiagnosticError::new(
+                "test_cleanup_failed",
+                "lifecycle",
+                format!(
+                    "test command passed, but ShadowDroid could not restore a clean device state: {error}"
+                ),
+            )
+            .retryable(true)
+            .detail(json!({
+                "device": serial,
+                "command": command,
+                "test_exit_code": exit_code,
+                "reconnect_requested": reconnect,
+            }))
+            .next_actions([
+                "run `shadowdroid doctor --fix` to repair the device lifecycle",
+                "run `shadowdroid disconnect` after resolving the reported cleanup issue",
+            ])
+            .into(),
+        );
+    }
+
     let out = json!({
         "device": serial,
         "command": command,
         "exit_code": exit_code,
+        "interrupted": false,
         "reconnect_requested": reconnect,
         "reconnected": reconnected,
     });
     emit_action("test", &out);
     Ok(())
+}
+
+#[derive(Debug)]
+struct TestCommandOutcome {
+    status: ExitStatus,
+    interrupted: bool,
+}
+
+async fn run_test_command_until<F>(
+    command: &[String],
+    interrupt: F,
+    interrupt_grace: Duration,
+) -> Result<TestCommandOutcome>
+where
+    F: Future<Output = std::io::Result<()>>,
+{
+    let program = command
+        .first()
+        .ok_or_else(|| anyhow!("no command given; use `shadowdroid test -- <command>`"))?;
+    let mut child = tokio::process::Command::new(program)
+        .args(&command[1..])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("failed to launch `{}`", command.join(" ")))?;
+    tokio::pin!(interrupt);
+
+    tokio::select! {
+        biased;
+        signal = &mut interrupt => {
+            signal.context("waiting for test-command interrupt")?;
+            let status = match tokio::time::timeout(interrupt_grace, child.wait()).await {
+                Ok(wait) => wait.context("waiting for interrupted test command")?,
+                Err(_) => {
+                    // The terminal's SIGINT normally reaches the whole foreground
+                    // process group. This is the bounded fallback for wrappers
+                    // that swallow it; waiting after kill also reaps the child.
+                    child.kill().await.context("stopping interrupted test command")?;
+                    child.wait().await.context("reaping interrupted test command")?
+                }
+            };
+            Ok(TestCommandOutcome {
+                status,
+                interrupted: true,
+            })
+        }
+        status = child.wait() => Ok(TestCommandOutcome {
+            status: status.context("waiting for test command")?,
+            interrupted: false,
+        }),
+    }
 }
 
 pub(crate) async fn resolve_serial(explicit: Option<&str>) -> Result<Serial> {
@@ -5758,6 +6000,38 @@ pub(crate) async fn resolve_serial(explicit: Option<&str>) -> Result<Serial> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    fn current_test_binary_command(arguments: &[&str]) -> Vec<String> {
+        let executable = std::env::current_exe().expect("resolve current test executable");
+        std::iter::once(executable.to_string_lossy().into_owned())
+            .chain(arguments.iter().map(|argument| (*argument).to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_command_runner_distinguishes_normal_completion() {
+        let command = current_test_binary_command(&["--exact", "__shadowdroid_no_such_test__"]);
+        let outcome = run_test_command_until(
+            &command,
+            std::future::pending::<std::io::Result<()>>(),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.status.success());
+        assert!(!outcome.interrupted);
+    }
+
+    #[tokio::test]
+    async fn test_command_runner_reaps_child_on_interrupt() {
+        let command = current_test_binary_command(&["--exact", "__shadowdroid_no_such_test__"]);
+        let outcome = run_test_command_until(&command, std::future::ready(Ok(())), Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert!(outcome.interrupted);
+    }
 
     #[test]
     fn video_surface_parses_foreground_detached_and_capture_options() {
@@ -6208,6 +6482,24 @@ mod tests {
             .as_deref(),
             Some("io.github.andriyo.shadowdroid.sample.MainActivity")
         );
+        assert_eq!(
+            matching_started_activity(
+                "io.github.andriyo.shadowdroid.sample/.MainActivity",
+                package,
+                Some("MainActivity")
+            )
+            .as_deref(),
+            Some("io.github.andriyo.shadowdroid.sample.MainActivity")
+        );
+        assert_eq!(
+            matching_started_activity(
+                "io.github.andriyo.shadowdroid.sample/.MainActivity",
+                package,
+                Some("  io.github.andriyo.shadowdroid.sample/MainActivity  ")
+            )
+            .as_deref(),
+            Some("io.github.andriyo.shadowdroid.sample.MainActivity")
+        );
         assert!(
             matching_started_activity(
                 "io.github.andriyo.shadowdroid.sample/.AltLauncherActivity",
@@ -6224,6 +6516,134 @@ mod tests {
                 "io.github.andriyo.shadowdroid.sample/.MainActivity",
                 package,
                 Some("other.package/.MainActivity")
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn app_start_promotes_fatal_event_only_when_postcondition_fails() {
+        let outcome = Outcome::Action(
+            "app_start",
+            json!({
+                "package": "com.example.app",
+                "requested_activity": ".MainActivity",
+                "activity": "com.example.app.MainActivity",
+                "ok": true,
+            }),
+        );
+        let events = vec![
+            json!({
+                "type": "crash",
+                "kind": "java",
+                "package": "com.example.app:worker",
+                "exception": "java.lang.IllegalArgumentException",
+                "message": "boom",
+            }),
+            json!({"type": "warning", "code": "unrelated"}),
+        ];
+
+        let error =
+            app_start_crash_error(&outcome, &events, Some("com.android.launcher/.Launcher"))
+                .unwrap();
+        assert_eq!(error.code, "app_start_crashed");
+        assert_eq!(error.stage, "app");
+        assert!(error.retryable);
+        assert_eq!(error.detail["package"], "com.example.app");
+        assert_eq!(error.detail["launch"]["ok"], true);
+        assert_eq!(error.detail["fatal_events"].as_array().unwrap().len(), 1);
+        assert_eq!(error.detail["postcondition"]["satisfied"], false);
+        assert_eq!(
+            error.detail["postcondition"]["foreground_component"],
+            "com.android.launcher/.Launcher"
+        );
+        assert!(
+            error
+                .next_actions
+                .iter()
+                .any(|action| action == "shadowdroid why --app com.example.app")
+        );
+    }
+
+    #[test]
+    fn app_start_successful_relaunch_keeps_prior_crash_event_nonfatal() {
+        let outcome = Outcome::Action(
+            "app_start",
+            json!({
+                "package": "com.example.app",
+                "requested_activity": ".MainActivity",
+                "activity": "com.example.app.MainActivity",
+                "ok": true,
+            }),
+        );
+        let prior_crash = json!({
+            "type": "crash",
+            "kind": "java",
+            "package": "com.example.app",
+            "exception": "java.lang.RuntimeException",
+            "message": "crashed before relaunch",
+        });
+
+        assert!(app_start_has_fatal_event(
+            &outcome,
+            std::slice::from_ref(&prior_crash)
+        ));
+        assert!(
+            app_start_crash_error(
+                &outcome,
+                &[prior_crash],
+                Some("com.example.app/.MainActivity"),
+            )
+            .is_none(),
+            "the prior crash remains attached evidence, but the fresh foreground proves relaunch"
+        );
+    }
+
+    #[test]
+    fn app_start_does_not_infer_failure_without_a_foreground_postcondition() {
+        let outcome = Outcome::Action(
+            "app_start",
+            json!({"package": "com.example.app", "requested_activity": null, "ok": true}),
+        );
+        let events = [json!({"type": "crash", "kind": "native", "package": "com.example.app"})];
+
+        assert!(app_start_crash_error(&outcome, &events, None).is_none());
+        assert!(
+            app_start_crash_error(
+                &outcome,
+                &events,
+                Some("com.example.app/.RedirectedActivity"),
+            )
+            .is_none(),
+            "without an explicit activity, any foreground activity in the package satisfies launch"
+        );
+    }
+
+    #[test]
+    fn app_start_keeps_nonfatal_and_unrelated_events_on_success() {
+        let outcome = Outcome::Action(
+            "app_start",
+            json!({"package": "com.example.app", "ok": true}),
+        );
+        let events = vec![
+            json!({"type": "crash", "kind": "anr", "package": "com.example.app"}),
+            json!({"type": "crash", "kind": "native", "package": "com.other.app"}),
+            json!({"type": "warning", "code": "layout_slow"}),
+        ];
+
+        assert!(
+            app_start_crash_error(&outcome, &events, Some("com.android.launcher/.Launcher"),)
+                .is_none()
+        );
+        assert!(
+            app_start_crash_error(
+                &Outcome::Action("app_current", json!({"package": "com.example.app"})),
+                &[json!({
+                    "type": "crash",
+                    "kind": "java",
+                    "package": "com.example.app"
+                })],
+                None,
             )
             .is_none()
         );

@@ -3,16 +3,21 @@ package io.github.andriyo.shadowdroid.sample
 import android.app.Activity
 import android.view.View
 import android.widget.FrameLayout
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Button
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.ExperimentalComposeUiApi
@@ -70,14 +75,14 @@ fun composeSliderFixtures(
 }
 
 @Composable
-@OptIn(ExperimentalComposeUiApi::class)
+@OptIn(ExperimentalComposeUiApi::class, ExperimentalMaterial3Api::class)
 private fun SliderFixtures(
     onStatus: (String) -> Unit,
     onDelayedNavigation: () -> Unit,
 ) {
-    var continuous by remember { mutableStateOf(0.38f) }
-    var discrete by remember { mutableStateOf(50f) }
-    var rtl by remember { mutableStateOf(25f) }
+    var continuous by remember { mutableFloatStateOf(0.38f) }
+    var discrete by remember { mutableFloatStateOf(50f) }
+    var rtl by remember { mutableFloatStateOf(25f) }
 
     Column(
         Modifier
@@ -90,6 +95,7 @@ private fun SliderFixtures(
             onValueChange = { continuous = it },
             onValueChangeFinished = { onStatus("Compose continuous slider changed to $continuous") },
             valueRange = 0.22f..0.50f,
+            thumb = { InspectorSafeSliderThumb(enabled = true) },
             modifier =
                 Modifier
                     .testTag("compose_continuous_slider")
@@ -103,6 +109,7 @@ private fun SliderFixtures(
             onValueChangeFinished = { onStatus("Compose discrete slider changed to $discrete") },
             valueRange = 0f..100f,
             steps = 3,
+            thumb = { InspectorSafeSliderThumb(enabled = true) },
             modifier =
                 Modifier
                     .testTag("compose_discrete_slider")
@@ -115,6 +122,7 @@ private fun SliderFixtures(
             onValueChange = {},
             enabled = false,
             valueRange = 0f..100f,
+            thumb = { InspectorSafeSliderThumb(enabled = false) },
             modifier =
                 Modifier
                     .testTag("compose_disabled_slider")
@@ -128,6 +136,7 @@ private fun SliderFixtures(
                 onValueChange = { rtl = it },
                 onValueChangeFinished = { onStatus("Compose RTL slider changed to $rtl") },
                 valueRange = 0f..100f,
+                thumb = { InspectorSafeSliderThumb(enabled = true) },
                 modifier =
                     Modifier
                         .testTag("compose_rtl_slider")
@@ -145,6 +154,23 @@ private fun SliderFixtures(
             Text("Open delayed Compose destination")
         }
     }
+}
+
+@Composable
+private fun InspectorSafeSliderThumb(enabled: Boolean) {
+    // Compose UI Inspector 1.11.x can mis-map SliderDefaults.Thumb's
+    // Boolean and inline DpSize parameters and crash the inspected process.
+    val color =
+        if (enabled) {
+            MaterialTheme.colorScheme.primary
+        } else {
+            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+        }
+    Box(
+        Modifier
+            .size(width = 4.dp, height = 44.dp)
+            .background(color, CircleShape),
+    )
 }
 
 @Composable

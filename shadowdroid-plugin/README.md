@@ -6,7 +6,7 @@
 ## Plugin Structure
 
 This project is configured as an Android Studio plugin. The Gradle build targets Android Studio
-Quail 1 (`2026.1.1.8`) and declares a dependency on the bundled Android plugin
+Quail 2 (`2026.1.2.10`) and declares a dependency on the bundled Android plugin
 (`org.jetbrains.android`).
 
 ## Project Structure

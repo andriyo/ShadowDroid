@@ -243,8 +243,14 @@ pub async fn run(
         (Some(pkg), Some(fg)) => !fg.contains(pkg.as_str()),
         _ => false,
     };
+    let crash_origin = last_crash.map(|_| {
+        evidence
+            .get("crash")
+            .map(classify_crash_origin)
+            .unwrap_or(CrashOrigin::Unresolved)
+    });
     let verdicts = rank_verdicts(VerdictInputs {
-        crashed: last_crash.is_some(),
+        crash_origin,
         anr: last_anr.is_some(),
         net_failed: &net_failed,
         tls_errors: &tls_errors,
@@ -321,12 +327,19 @@ pub async fn run(
 
 #[derive(Clone, Copy)]
 struct VerdictInputs<'a> {
-    crashed: bool,
+    crash_origin: Option<CrashOrigin>,
     anr: bool,
     net_failed: &'a [Value],
     tls_errors: &'a [Value],
     app_left_foreground: bool,
     has_log_errors: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CrashOrigin {
+    Project,
+    InspectorTooling,
+    Unresolved,
 }
 
 #[derive(Clone, Copy)]
@@ -349,13 +362,19 @@ fn rank_verdicts(inputs: VerdictInputs<'_>) -> Vec<RankedVerdict<'_>> {
         flow,
     };
     let mut verdicts = Vec::new();
-    if inputs.crashed {
-        verdicts.push(finding(
-            "app_crashed",
-            "the app process crashed — see evidence.crash (project_frames point into your code)",
-            0.99,
-            None,
-        ));
+    if let Some(origin) = inputs.crash_origin {
+        let explanation = match origin {
+            CrashOrigin::Project => {
+                "the app process crashed — see evidence.crash; project_frames point into your code"
+            }
+            CrashOrigin::InspectorTooling => {
+                "the app process crashed in injected inspector/tooling code — see evidence.crash; no project frames were resolved"
+            }
+            CrashOrigin::Unresolved => {
+                "the app process crashed — see evidence.crash; no project frames were resolved, so inspect the reported app/library/system stack"
+            }
+        };
+        verdicts.push(finding("app_crashed", explanation, 0.99, None));
     }
     if inputs.anr {
         verdicts.push(finding(
@@ -440,6 +459,42 @@ fn rank_verdicts(inputs: VerdictInputs<'_>) -> Vec<RankedVerdict<'_>> {
     verdicts
 }
 
+fn classify_crash_origin(crash: &Value) -> CrashOrigin {
+    if crash
+        .get("project_frames")
+        .and_then(Value::as_array)
+        .is_some_and(|frames| !frames.is_empty())
+    {
+        return CrashOrigin::Project;
+    }
+
+    const INSPECTOR_TOOLING_MARKERS: &[&str] = &[
+        "androidx.compose.ui.inspection.",
+        "androidx.inspection.",
+        "deps.ui.inspection.",
+        "com.android.tools.idea.layoutinspector.",
+        "com.android.tools.layoutinspector.",
+    ];
+    if value_contains_any(crash, INSPECTOR_TOOLING_MARKERS) {
+        CrashOrigin::InspectorTooling
+    } else {
+        CrashOrigin::Unresolved
+    }
+}
+
+fn value_contains_any(value: &Value, markers: &[&str]) -> bool {
+    match value {
+        Value::String(text) => markers.iter().any(|marker| text.contains(marker)),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| value_contains_any(value, markers)),
+        Value::Object(fields) => fields
+            .values()
+            .any(|value| value_contains_any(value, markers)),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,7 +509,7 @@ mod tests {
         })];
         let tls = vec![json!({"host": "background.example"})];
         let ranked = rank_verdicts(VerdictInputs {
-            crashed: false,
+            crash_origin: None,
             anr: false,
             net_failed: &failures,
             tls_errors: &tls,
@@ -478,7 +533,7 @@ mod tests {
     fn crashes_and_anrs_keep_precedence() {
         let failures = vec![json!({"status": 500, "matched": "rule", "modified": true})];
         let ranked = rank_verdicts(VerdictInputs {
-            crashed: true,
+            crash_origin: Some(CrashOrigin::Unresolved),
             anr: true,
             net_failed: &failures,
             tls_errors: &[],
@@ -495,7 +550,7 @@ mod tests {
         let failures = vec![json!({"id": "f1", "status": 503, "modified": false})];
         let tls = vec![json!({"host": "api.example"})];
         let ranked = rank_verdicts(VerdictInputs {
-            crashed: false,
+            crash_origin: None,
             anr: false,
             net_failed: &failures,
             tls_errors: &tls,
@@ -504,5 +559,83 @@ mod tests {
         });
         assert_eq!(ranked[0].code, "tls_rejected");
         assert_eq!(ranked[1].code, "backend_errors");
+    }
+
+    #[test]
+    fn crash_explanation_mentions_project_frames_only_when_present() {
+        let crash = json!({
+            "stack": ["com.example.app.MainActivity.onCreate(MainActivity.kt:42)"],
+            "project_frames": [{
+                "frame": "com.example.app.MainActivity.onCreate(MainActivity.kt:42)",
+                "file": "app/src/main/kotlin/com/example/app/MainActivity.kt",
+                "line": 42
+            }]
+        });
+        let ranked = rank_verdicts(VerdictInputs {
+            crash_origin: Some(classify_crash_origin(&crash)),
+            anr: false,
+            net_failed: &[],
+            tls_errors: &[],
+            app_left_foreground: false,
+            has_log_errors: false,
+        });
+
+        assert_eq!(classify_crash_origin(&crash), CrashOrigin::Project);
+        assert!(
+            ranked[0]
+                .explanation
+                .contains("project_frames point into your code")
+        );
+    }
+
+    #[test]
+    fn crash_explanation_identifies_inspector_only_stack() {
+        let crash = json!({
+            "exception": "java.lang.IllegalArgumentException",
+            "stack": [
+                "androidx.compose.ui.inspection.inspector.InlineClassConverter.castParameterValue(InlineClassConverter.kt:42)",
+                "androidx.compose.ui.inspection.ComposeLayoutInspector$getComposableNodes$data$1.invoke(ComposeLayoutInspector.kt:482)",
+                "android.os.Looper.loop(Looper.java:338)"
+            ]
+        });
+        let ranked = rank_verdicts(VerdictInputs {
+            crash_origin: Some(classify_crash_origin(&crash)),
+            anr: false,
+            net_failed: &[],
+            tls_errors: &[],
+            app_left_foreground: false,
+            has_log_errors: false,
+        });
+
+        assert_eq!(classify_crash_origin(&crash), CrashOrigin::InspectorTooling);
+        assert!(
+            ranked[0]
+                .explanation
+                .contains("injected inspector/tooling code")
+        );
+        assert!(!ranked[0].explanation.contains("point into your code"));
+    }
+
+    #[test]
+    fn crash_explanation_does_not_blame_project_for_unresolved_stack() {
+        let crash = json!({
+            "exception": "java.lang.IllegalStateException",
+            "stack": [
+                "android.os.Handler.dispatchMessage(Handler.java:103)",
+                "android.os.Looper.loop(Looper.java:338)"
+            ]
+        });
+        let ranked = rank_verdicts(VerdictInputs {
+            crash_origin: Some(classify_crash_origin(&crash)),
+            anr: false,
+            net_failed: &[],
+            tls_errors: &[],
+            app_left_foreground: false,
+            has_log_errors: false,
+        });
+
+        assert_eq!(classify_crash_origin(&crash), CrashOrigin::Unresolved);
+        assert!(ranked[0].explanation.contains("app/library/system stack"));
+        assert!(!ranked[0].explanation.contains("point into your code"));
     }
 }

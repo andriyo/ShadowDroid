@@ -110,8 +110,9 @@ dependencies {
     androidTestImplementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
 
     // ── JUnit 4 + AndroidX test core ───────────────────────────────────
-    // We use a @Test method that loops forever to keep the Instrumentation
-    // process alive. Standard AndroidJUnitRunner handles UiAutomation init.
+    // We use a @Test method that loops forever only when the CLI supplies its
+    // explicit server-mode argument. Standard AndroidJUnitRunner handles
+    // UiAutomation init; unfiltered connected tests return from the sentinel.
     androidTestImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.3.0")
 }

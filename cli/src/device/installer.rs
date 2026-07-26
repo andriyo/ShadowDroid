@@ -41,6 +41,7 @@ pub const UI_CHANNEL: &str = "ui";
 /// for why this is the proven pattern over a custom runner subclass.
 pub const RUNNER_CLASS: &str = "androidx.test.runner.AndroidJUnitRunner";
 pub const SERVER_TEST_CLASS: &str = "io.github.andriyo.shadowdroid.ShadowDroidServerTest";
+pub const SERVER_MODE_ARGUMENT: &str = "shadowdroid_server";
 pub const DEFAULT_PORT: u16 = 7912;
 const RELEASE_MAIN_APK_ASSET: &str = "shadowdroid-server-main.apk";
 const RELEASE_TEST_APK_ASSET: &str = "shadowdroid-server-test.apk";
@@ -845,7 +846,14 @@ async fn start_instrumentation(serial: &Serial) -> Result<()> {
     adb::am_force_stop(serial, TEST_PACKAGE).await?;
     adb::am_force_stop(serial, APP_PACKAGE).await?;
     let runner = format!("{TEST_PACKAGE}/{RUNNER_CLASS}");
-    adb::am_instrument(serial, runner, Some(SERVER_TEST_CLASS), INSTRUMENT_LOG_PATH).await?;
+    adb::am_instrument(
+        serial,
+        runner,
+        Some(SERVER_TEST_CLASS),
+        &[(SERVER_MODE_ARGUMENT, "true")],
+        INSTRUMENT_LOG_PATH,
+    )
+    .await?;
     Ok(())
 }
 

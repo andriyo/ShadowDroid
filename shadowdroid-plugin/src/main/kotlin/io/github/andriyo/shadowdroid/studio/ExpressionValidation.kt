@@ -45,7 +45,7 @@ internal object ExpressionValidation {
         expectBoolean: Boolean,
     ): List<Problem> =
         try {
-            ReadAction.compute<List<Problem>, RuntimeException> {
+            ReadAction.computeBlocking<List<Problem>, RuntimeException> {
                 validateInReadAction(project, breakpoint, expression, expectBoolean)
             }
         } catch (t: Throwable) {
