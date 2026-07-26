@@ -1,37 +1,50 @@
 package io.github.andriyo.shadowdroid.sample
 
-import android.app.Activity
+import android.graphics.Color
 import android.os.Bundle
-import android.widget.Button
-import android.widget.LinearLayout
-import android.widget.TextView
-import kotlin.math.roundToInt
+import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 
-class DetailActivity : Activity() {
+class DetailActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
+        )
         super.onCreate(savedInstanceState)
-        val root = LinearLayout(this).apply {
-            id = R.id.detail_root
-            orientation = LinearLayout.VERTICAL
-            setPadding(18.dp, 18.dp, 18.dp, 18.dp)
+        val source = intent.getStringExtra("source") ?: "unknown"
+        setContent {
+            ShadowLabTheme {
+                LabDestinationScreen(
+                    rootTag = "detail_root",
+                    eyebrow = "INCIDENT DETAIL",
+                    title = "Dispatch received.",
+                    summary =
+                        "A separate Activity verifies explicit lifecycle transitions and a deterministic return path.",
+                    accent = LabViolet,
+                ) {
+                    DestinationValue(
+                        label = "NAVIGATION SOURCE",
+                        value = "Detail activity opened from $source",
+                        tag = "detail_message",
+                        description = "Detail activity message",
+                        accent = LabVioletBright,
+                    )
+                    DestinationValue(
+                        label = "TASK STATE",
+                        value = "Foreground · return will finish this Activity",
+                        accent = LabMint,
+                    )
+                    DestinationButton(
+                        label = "Finish detail",
+                        tag = "detail_finish_button",
+                        description = "Finish detail activity button",
+                        onClick = ::finish,
+                    )
+                }
+            }
         }
-        root.addView(TextView(this).apply {
-            id = R.id.detail_message
-            text = "Detail activity opened from ${intent.getStringExtra("source") ?: "unknown"}"
-            textSize = 20f
-            contentDescription = "Detail activity message"
-        })
-        root.addView(Button(this).apply {
-            id = R.id.detail_finish_button
-            text = "Finish detail"
-            isAllCaps = false
-            contentDescription = "Finish detail activity button"
-            setOnClickListener { finish() }
-        })
-        setContentView(root)
     }
-
-    private val Int.dp: Int
-        get() = (this * resources.displayMetrics.density).roundToInt()
 }
-

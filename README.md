@@ -163,6 +163,7 @@ $ shadowdroid why
 - [How it works](#how-it-works)
 - [Install](#install)
 - [Connect](#connect)
+- [Field Lab sample](#field-lab-sample)
 - [The agent loop](#the-agent-loop)
 - [The output contract](#the-output-contract)
 - [When something goes wrong](#when-something-goes-wrong)
@@ -425,6 +426,56 @@ then skip the adb install and trust-store readback and report the basis as
 `asserted`. Even without it, a successful `net trust`/`net check` is cached per
 device (keyed by CA fingerprint), so repeat runs skip the probe; pass `--fresh`
 to force a real check.
+
+## Field Lab sample
+
+[`samples/shadowdroid-test-app`](samples/shadowdroid-test-app) is a polished,
+stateful Android showcase for driving ShadowDroid against a real package. Its
+four destinations turn the fixture surface into an operator workflow:
+
+| Destination | Experience |
+| --- | --- |
+| **Overview** | Mission progress, live posture, workspace shortcuts, and a recent-event trail |
+| **Mission** | A three-gate “Night Shift: Signal Recovery” run with validation, semantic range control, gated state, relay selection, and a long press |
+| **Signals** | An HTTP request composer, live WS/WSS field channel, and platform WebView |
+| **Lab** | Searchable deterministic fixtures for selectors, native/Compose ranges, windows, permissions, lifecycle, storage, coroutines, logs, crash, and ANR paths |
+
+Build and install it from the repository root:
+
+```bash
+./server/gradlew -p samples/shadowdroid-test-app :app:assembleDebug
+shadowdroid app reinstall \
+  samples/shadowdroid-test-app/app/build/outputs/apk/debug/app-debug.apk \
+  --grant-all --wait-front
+shadowdroid app start io.github.andriyo.shadowdroid.sample \
+  --activity .MainActivity
+```
+
+Three concise showcase journeys:
+
+- **Night Shift mission:** open **Mission**, enter any non-empty callsign and
+  run code `NIGHT-42`, set `mission_signal_slider` to `71`, enable
+  `mission_telemetry_switch`, arm the relay, select `mission_relay_east`, then
+  resolve `mission_hold_acknowledge` with `ui find` and long-press its
+  `element.tap` coordinates. The terminal postcondition is the **Signal
+  recovered** dialog.
+- **Selector gauntlet:** open **Lab** and use the initially expanded
+  **Interaction gauntlet**. An exact text tap on `Duplicate action` should be
+  ambiguous; the stable IDs disambiguate both buttons. The same section keeps
+  nested clickable ancestors, disabled targets, a true no-op, and controlled
+  unstable accessibility updates.
+- **Network channel:** run the sample Ktor server, trust the ShadowDroid CA on
+  the target as appropriate, then start
+  `shadowdroid net start --host shadowdroid.localhost`. Open **Signals → Open
+  live channel**, establish WSS, transmit text, then exercise the binary and
+  4KB frame actions before a normal close. Inspect the result with
+  `shadowdroid net ws`.
+
+The visual shell adds realistic navigation and state without hiding the test
+contract: the raw deterministic fixtures and their stable resource IDs,
+Compose test tags, and content descriptions remain directly available in
+**Lab**. See [`samples/README.md`](samples/README.md) for command-oriented
+walkthroughs.
 
 ## The agent loop
 

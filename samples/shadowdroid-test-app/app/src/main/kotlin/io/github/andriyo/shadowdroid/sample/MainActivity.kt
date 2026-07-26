@@ -1,8 +1,6 @@
 package io.github.andriyo.shadowdroid.sample
 
 import android.Manifest
-import android.annotation.SuppressLint
-import android.app.AlertDialog
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -10,10 +8,11 @@ import android.app.PendingIntent
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ContentValues
-import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -22,21 +21,20 @@ import android.os.Looper
 import android.util.Log
 import android.view.Gravity
 import android.view.View
-import android.webkit.WebResourceError
-import android.webkit.WebResourceRequest
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import android.widget.Button
-import android.widget.EditText
-import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.PopupWindow
-import android.widget.ProgressBar
-import android.widget.ScrollView
-import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
@@ -44,21 +42,56 @@ import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
-    private lateinit var statusText: TextView
-    private lateinit var counterValue: TextView
-    private lateinit var nameInput: EditText
-    private lateinit var urlInput: EditText
-    private lateinit var bodyInput: EditText
-    private lateinit var progress: ProgressBar
-    private lateinit var webViewContainer: FrameLayout
-    private var counter = 0
+    private val events = mutableStateListOf<String>()
+    private var statusMessage by mutableStateOf("Booting the Field Lab…")
+    private var networkBusy by mutableStateOf(false)
+
+    // Intentionally simple and breakpoint-friendly. This exact mutation is a
+    // long-lived debugger fixture used for conditional breakpoint validation.
+    private var counter by mutableIntStateOf(0)
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
+        )
         super.onCreate(savedInstanceState)
         createNotificationChannel()
         startService(Intent(this, RemoteEchoService::class.java))
-        render()
-        setStatus("Ready: ${intentSummary(intent)}")
+        setStatus("Field Lab ready · ${intentSummary(intent)}")
+
+        setContent {
+            ShadowLabTheme {
+                ShadowLabApp(
+                    status = statusMessage,
+                    events = events,
+                    networkBusy = networkBusy,
+                    counter = counter,
+                    onIncrementCounter = ::incrementCounter,
+                    actions =
+                        LabActions(
+                            setStatus = ::setStatus,
+                            startUnstableUpdates = ::startUnstableUpdates,
+                            showPopup = ::showPopup,
+                            showToast = ::showToast,
+                            requestCameraPermission = ::requestCameraPermission,
+                            postNotification = ::postNotification,
+                            openDetail = ::openDetail,
+                            openDelayedDetail = ::openDelayedDetail,
+                            openDeepLink = ::openDeepLink,
+                            copyClipboard = ::copyClipboard,
+                            writeSampleFiles = ::writeSampleFiles,
+                            openCoroutines = ::openCoroutines,
+                            emitLogs = ::emitLogs,
+                            crashNow = ::crashNow,
+                            blockMainThread = ::blockMainThread,
+                            openWebSocketChat = ::openWebSocketChat,
+                            runRequest = ::runRequest,
+                        ),
+                )
+            }
+        }
+
         Log.i(TAG, "MainActivity created")
         runShadowDroidProbe(intent)
     }
@@ -66,7 +99,7 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        setStatus("New intent: ${intentSummary(intent)}")
+        setStatus("New intent · ${intentSummary(intent)}")
         runShadowDroidProbe(intent)
     }
 
@@ -78,469 +111,190 @@ class MainActivity : ComponentActivity() {
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         val granted = grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED
-        setStatus("Permission request $requestCode result: granted=$granted")
+        setStatus("Permission request $requestCode result · granted=$granted")
     }
 
-    private fun render() {
-        val scroll = ScrollView(this).apply {
-            isFillViewport = false
-            contentDescription = "ShadowDroid sample scroll container"
-        }
-        val root = LinearLayout(this).apply {
-            id = R.id.sample_root
-            orientation = LinearLayout.VERTICAL
-            setPadding(18.dp, 18.dp, 18.dp, 28.dp)
-        }
-        scroll.addView(root)
+    private fun incrementCounter() {
+        counter += 1
+        setStatus("Counter incremented to $counter")
+    }
 
-        root.addView(title("ShadowDroid Test App"))
-        statusText = TextView(this).apply {
-            id = R.id.status_text
-            textSize = 15f
-            contentDescription = "Current sample status"
-            setPadding(0, 8.dp, 0, 8.dp)
-        }
-        root.addView(statusText, fullWidth())
-
-        addRangeFixtures(root)
-
-        addSection(root, "Inputs")
-        nameInput = editText(R.id.name_input, "agent name", "Name input")
-        root.addView(nameInput, fullWidth())
-        urlInput = editText(R.id.url_input, DEFAULT_HTTPS_URL, "Network URL input")
-        root.addView(urlInput, fullWidth())
-        bodyInput = editText(R.id.body_input, DEFAULT_GRAPHQL_BODY, "Request body input").apply {
-            minLines = 3
-            gravity = Gravity.TOP
-        }
-        root.addView(bodyInput, fullWidth())
-
-        addSection(root, "Selectors")
-        counterValue = TextView(this).apply {
-            id = R.id.counter_value
-            text = "Counter: 0"
-            contentDescription = "Counter value"
-        }
-        root.addView(counterValue, fullWidth())
-        root.addView(button(R.id.counter_button, "Increment counter", "Increment counter button") {
-            counter += 1
-            counterValue.text = "Counter: $counter"
-            setStatus("Counter incremented to $counter")
-        })
-        root.addView(button(R.id.duplicate_one_button, "Duplicate action", "Duplicate action first") {
-            setStatus("First duplicate action tapped")
-        })
-        root.addView(button(R.id.duplicate_two_button, "Duplicate action", "Duplicate action second") {
-            setStatus("Second duplicate action tapped")
-        })
-        root.addView(button(R.id.disabled_button, "Disabled target", "Disabled target button") {
-            setStatus("This should not run")
-        }.apply {
-            isEnabled = false
-        })
-        root.addView(
-            LinearLayout(this).apply {
-                id = R.id.nested_card
-                orientation = LinearLayout.VERTICAL
-                isClickable = true
-                isFocusable = true
-                contentDescription = "Nested clickable card"
-                setPadding(12.dp, 12.dp, 12.dp, 12.dp)
-                setOnClickListener { setStatus("Nested clickable ancestor activated") }
-                addView(
-                    TextView(context).apply {
-                        id = R.id.nested_card_label
-                        text = "Nested child action"
-                        contentDescription = "Nested non-clickable child"
-                    },
-                    fullWidth(),
-                )
-            },
-            fullWidth(),
-        )
-        root.addView(
-            LinearLayout(this).apply {
-                id = R.id.nested_outer_card
-                orientation = LinearLayout.VERTICAL
-                isClickable = true
-                isFocusable = true
-                contentDescription = "Outer clickable ancestor"
-                setPadding(12.dp, 12.dp, 12.dp, 12.dp)
-                setOnClickListener { setStatus("Outer clickable ancestor activated") }
-                addView(
-                    LinearLayout(context).apply {
-                        id = R.id.nested_inner_card
-                        orientation = LinearLayout.VERTICAL
-                        isClickable = true
-                        isFocusable = true
-                        contentDescription = "Inner clickable ancestor"
-                        setPadding(12.dp, 12.dp, 12.dp, 12.dp)
-                        setOnClickListener { setStatus("Nearest clickable ancestor activated") }
-                        addView(
-                            TextView(context).apply {
-                                id = R.id.nested_inner_label
-                                text = "Nearest ancestor action"
-                                contentDescription = "Child with multiple clickable ancestors"
-                            },
-                            fullWidth(),
-                        )
-                    },
-                    fullWidth(),
-                )
-            },
-            fullWidth(),
-        )
-        root.addView(
-            LinearLayout(this).apply {
-                id = R.id.disabled_card
-                orientation = LinearLayout.VERTICAL
-                isClickable = true
-                isFocusable = true
-                isEnabled = false
-                contentDescription = "Disabled clickable card"
-                setPadding(12.dp, 12.dp, 12.dp, 12.dp)
-                setOnClickListener { setStatus("Disabled card should not run") }
-                addView(
-                    TextView(context).apply {
-                        id = R.id.disabled_card_label
-                        text = "Disabled child action"
-                        contentDescription = "Child inside disabled card"
-                    },
-                    fullWidth(),
-                )
-            },
-            fullWidth(),
-        )
-        root.addView(
-            button(R.id.noop_button, "No-op action", "Valid action without screen change") {
-                // Deliberately no visible mutation: delivery and outcome must
-                // remain distinct in `ui tap --observe`.
-            },
-        )
-        root.addView(
-            button(
-                R.id.unstable_updates_button,
-                "Start unstable updates",
-                "Start unstable accessibility updates",
-            ) {
-                var update = 0
-                val updater =
-                    object : Runnable {
-                        override fun run() {
-                            update += 1
-                            setStatus("Unstable accessibility update $update")
-                            if (update < UNSTABLE_UPDATE_COUNT) {
-                                mainHandler.postDelayed(this, UNSTABLE_UPDATE_INTERVAL_MS)
-                            }
-                        }
+    private fun startUnstableUpdates() {
+        var update = 0
+        val updater =
+            object : Runnable {
+                override fun run() {
+                    update += 1
+                    setStatus("Unstable accessibility update $update")
+                    if (update < UNSTABLE_UPDATE_COUNT) {
+                        mainHandler.postDelayed(this, UNSTABLE_UPDATE_INTERVAL_MS)
                     }
-                mainHandler.post(updater)
-            },
-        )
-
-        addSection(root, "Popups And Permissions")
-        root.addView(button(R.id.dialog_button, "Show dialog", "Show alert dialog button") { showDialog() })
-        root.addView(button(R.id.popup_button, "Show popup", "Show popup window button") { showPopup(root) })
-        root.addView(button(R.id.toast_button, "Show toast", "Show toast button") {
-            Toast.makeText(this, "ShadowDroid sample toast", Toast.LENGTH_LONG).show()
-            setStatus("Toast shown")
-        })
-        root.addView(button(R.id.camera_permission_button, "Request camera permission", "Camera permission button") {
-            requestPermissions(arrayOf(Manifest.permission.CAMERA), REQ_CAMERA)
-        })
-        root.addView(button(R.id.notification_button, "Post notification", "Post notification button") {
-            postNotification()
-        })
-
-        addSection(root, "Lifecycle And Device")
-        root.addView(button(R.id.detail_button, "Open detail activity", "Open detail activity button") {
-            startActivity(Intent(this, DetailActivity::class.java).putExtra("source", "main-button"))
-        })
-        root.addView(
-            button(
-                R.id.delayed_detail_button,
-                "Open delayed detail activity",
-                "Open delayed detail activity button",
-            ) {
-                setStatus("Delayed detail navigation scheduled")
-                mainHandler.postDelayed(
-                    {
-                        startActivity(
-                            Intent(this, DetailActivity::class.java)
-                                .putExtra("source", "delayed-button"),
-                        )
-                    },
-                    DELAYED_NAVIGATION_MS,
-                )
-            },
-        )
-        root.addView(button(R.id.deep_link_button, "Open deep link", "Open deep link button") {
-            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("shadowdroid://sample/deeplink/from-main?value=42")))
-        })
-        root.addView(button(R.id.clipboard_button, "Copy clipboard value", "Copy clipboard button") { copyClipboard() })
-        root.addView(button(R.id.file_button, "Write sample files", "Write sample files button") { writeSampleFiles() })
-        root.addView(button(R.id.coroutines_button, "Open coroutine workload", "Open coroutine workload button") {
-            startActivity(Intent(this, CoroutinesActivity::class.java))
-        })
-
-        addSection(root, "Logs And Failure Modes")
-        root.addView(button(R.id.log_button, "Emit log messages", "Emit log messages button") { emitLogs() })
-        root.addView(button(R.id.crash_button, "Crash now", "Crash now button") {
-            throw RuntimeException("Deliberate ShadowDroid sample crash")
-        })
-        root.addView(button(R.id.anr_button, "Block main thread 12s", "Block main thread button") {
-            setStatus("Blocking main thread for 12 seconds")
-            Thread.sleep(12_000)
-            setStatus("Main thread block finished")
-        })
-
-        addSection(root, "Network")
-        progress = ProgressBar(this).apply {
-            id = R.id.network_progress
-            visibility = View.GONE
-            isIndeterminate = true
-            contentDescription = "Network request progress"
-        }
-        root.addView(progress, fullWidth())
-        root.addView(button(R.id.websocket_chat_button, "Open WebSocket chat", "Open WebSocket chat button") {
-            startActivity(Intent(this, WebSocketChatActivity::class.java))
-        })
-        root.addView(button(R.id.https_get_button, "HTTPS GET", "HTTPS GET button") {
-            runRequest("https-get", "GET", primaryUrl())
-        })
-        root.addView(button(R.id.http_get_button, "HTTP GET", "HTTP GET button") {
-            runRequest("http-get", "GET", DEFAULT_HTTP_URL)
-        })
-        root.addView(button(R.id.json_post_button, "JSON POST", "JSON POST button") {
-            runRequest("json-post", "POST", primaryUrl(), bodyInput.text.toString())
-        })
-        root.addView(button(R.id.graphql_post_button, "GraphQL POST", "GraphQL POST button") {
-            runRequest(
-                "graphql-post",
-                "POST",
-                urlWithPath("/anything/graphql"),
-                bodyInput.text.toString(),
-                mapOf("X-GraphQL-Operation" to "ShadowDroidSampleQuery"),
-            )
-        })
-        root.addView(button(R.id.status_418_button, "HTTP 418 status", "HTTP 418 status button") {
-            runRequest("status-418", "GET", urlWithPath("/status/418"))
-        })
-        root.addView(button(R.id.slow_request_button, "Slow request", "Slow request button") {
-            runRequest("slow-request", "GET", urlWithPath("/delay/2"))
-        })
-        root.addView(button(R.id.large_body_button, "Large response", "Large response button") {
-            runRequest("large-response", "GET", urlWithPath("/bytes/4096"))
-        })
-
-        webViewContainer = FrameLayout(this).apply {
-            id = R.id.webview_container
-            contentDescription = "WebView container"
-        }
-        root.addView(button(R.id.webview_button, "Load WebView", "Load WebView button") { loadWebView() })
-        root.addView(webViewContainer, fullWidth().apply { height = 320.dp })
-
-        setContentView(scroll)
+                }
+            }
+        mainHandler.post(updater)
     }
 
-    private fun addSection(root: LinearLayout, label: String) {
-        root.addView(TextView(this).apply {
-            text = label
-            textSize = 18f
-            typeface = Typeface.DEFAULT_BOLD
-            setPadding(0, 18.dp, 0, 4.dp)
-        }, fullWidth())
+    private fun showToast() {
+        Toast.makeText(this, "ShadowDroid Field Lab signal received", Toast.LENGTH_LONG).show()
+        setStatus("Toast shown")
     }
 
-    private fun addRangeFixtures(root: LinearLayout) {
-        addSection(root, "Range Controls")
-        root.addView(
-            seekBar(
-                idValue = R.id.platform_continuous_slider,
-                description = "Platform continuous slider",
-                maxValue = 1_000,
-                initialValue = 380,
-            ),
-            fullWidth(),
-        )
-        root.addView(
-            seekBar(
-                idValue = R.id.platform_discrete_slider,
-                description = "Platform discrete slider",
-                maxValue = 4,
-                initialValue = 2,
-            ).apply { keyProgressIncrement = 1 },
-            fullWidth(),
-        )
-        root.addView(
-            seekBar(
-                idValue = R.id.platform_disabled_slider,
-                description = "Platform disabled slider",
-                maxValue = 100,
-                initialValue = 50,
-            ).apply { isEnabled = false },
-            fullWidth(),
-        )
-        root.addView(
-            seekBar(
-                idValue = R.id.platform_rtl_slider,
-                description = "Platform RTL slider",
-                maxValue = 100,
-                initialValue = 25,
-            ).apply { layoutDirection = View.LAYOUT_DIRECTION_RTL },
-            fullWidth(),
-        )
-        root.addView(
-            TextView(this).apply {
-                id = R.id.coordinate_only_range
-                text = "Coordinate-only range surrogate"
-                contentDescription = "Coordinate-only range surrogate"
-                gravity = Gravity.CENTER
-                setPadding(12.dp, 18.dp, 12.dp, 18.dp)
-            },
-            fullWidth(),
-        )
-        root.addView(
-            composeSliderFixtures(this) { message -> setStatus(message) },
-            fullWidth().apply { height = 720.dp },
-        )
-    }
-
-    private fun seekBar(
-        idValue: Int,
-        description: String,
-        maxValue: Int,
-        initialValue: Int,
-    ): SeekBar =
-        SeekBar(this).apply {
-            id = idValue
-            contentDescription = description
-            max = maxValue
-            progress = initialValue
-            setOnSeekBarChangeListener(
-                object : SeekBar.OnSeekBarChangeListener {
-                    override fun onProgressChanged(
-                        seekBar: SeekBar?,
-                        progress: Int,
-                        fromUser: Boolean,
-                    ) {
-                        if (fromUser) setStatus("$description changed to $progress")
-                    }
-
-                    override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
-
-                    override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
-                },
-            )
-        }
-
-    private fun title(text: String): TextView =
-        TextView(this).apply {
-            this.text = text
-            textSize = 24f
-            typeface = Typeface.DEFAULT_BOLD
-        }
-
-    private fun editText(idValue: Int, value: String, description: String): EditText =
-        EditText(this).apply {
-            id = idValue
-            setText(value)
-            hint = description
-            contentDescription = description
-            setSingleLine(false)
-            setPadding(12.dp, 8.dp, 12.dp, 8.dp)
-        }
-
-    private fun button(idValue: Int, text: String, description: String, onClick: () -> Unit): Button =
-        Button(this).apply {
-            id = idValue
-            this.text = text
-            contentDescription = description
-            isAllCaps = false
-            setOnClickListener { onClick() }
-            layoutParams = fullWidth()
-        }
-
-    private fun fullWidth(): LinearLayout.LayoutParams =
-        LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-        ).apply {
-            topMargin = 6.dp
-        }
-
-    private fun showDialog() {
-        AlertDialog.Builder(this)
-            .setTitle("ShadowDroid dialog")
-            .setMessage("Dialog body for watcher and selector tests.")
-            .setPositiveButton("Accept") { _, _ -> setStatus("Dialog accepted") }
-            .setNegativeButton("Cancel") { _, _ -> setStatus("Dialog cancelled") }
-            .setNeutralButton("Later") { _, _ -> setStatus("Dialog deferred") }
-            .show()
+    private fun requestCameraPermission() {
+        requestPermissions(arrayOf(Manifest.permission.CAMERA), REQ_CAMERA)
     }
 
     private fun showPopup(parent: View) {
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(18.dp, 18.dp, 18.dp, 18.dp)
-            setBackgroundColor(0xFFFFFFFF.toInt())
-            addView(TextView(context).apply {
-                text = "Popup window"
-                textSize = 18f
-                typeface = Typeface.DEFAULT_BOLD
-            })
-        }
-        val popup = PopupWindow(content, 280.dp, LinearLayout.LayoutParams.WRAP_CONTENT, true)
-        content.addView(Button(this).apply {
-            text = "Dismiss popup"
-            isAllCaps = false
-            setOnClickListener {
-                popup.dismiss()
-                setStatus("Popup dismissed")
+        val content =
+            LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(22.dp, 20.dp, 22.dp, 18.dp)
+                background =
+                    GradientDrawable().apply {
+                        setColor(0xFF1A2032.toInt())
+                        cornerRadius = 22.dp.toFloat()
+                        setStroke(1.dp, 0xFF55D6E8.toInt())
+                    }
+                addView(
+                    TextView(context).apply {
+                        text = "Relay overlay"
+                        textSize = 20f
+                        typeface = Typeface.DEFAULT_BOLD
+                        setTextColor(0xFFF3F4FF.toInt())
+                    },
+                )
+                addView(
+                    TextView(context).apply {
+                        text = "A native PopupWindow above a Compose destination."
+                        textSize = 14f
+                        setTextColor(0xFFA9AFC3.toInt())
+                        setPadding(0, 8.dp, 0, 12.dp)
+                    },
+                )
             }
-        })
+        val popup =
+            PopupWindow(
+                content,
+                320.dp,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                true,
+            ).apply {
+                elevation = 18.dp.toFloat()
+                isOutsideTouchable = true
+            }
+        content.addView(
+            Button(this).apply {
+                text = "Dismiss overlay"
+                isAllCaps = false
+                contentDescription = "Dismiss popup"
+                setOnClickListener {
+                    popup.dismiss()
+                    setStatus("Popup dismissed")
+                }
+            },
+        )
+        popup.setOnDismissListener {
+            if (statusMessage == "Popup shown") setStatus("Popup dismissed")
+        }
         popup.showAtLocation(parent, Gravity.CENTER, 0, 0)
         setStatus("Popup shown")
     }
 
+    private fun openDetail() {
+        startActivity(
+            Intent(this, DetailActivity::class.java)
+                .putExtra("source", "main-button"),
+        )
+    }
+
+    private fun openDelayedDetail() {
+        setStatus("Delayed detail navigation scheduled")
+        mainHandler.postDelayed(
+            {
+                startActivity(
+                    Intent(this, DetailActivity::class.java)
+                        .putExtra("source", "delayed-button"),
+                )
+            },
+            DELAYED_NAVIGATION_MS,
+        )
+    }
+
+    private fun openDeepLink() {
+        startActivity(
+            Intent(
+                Intent.ACTION_VIEW,
+                Uri.parse("shadowdroid://sample/deeplink/from-main?value=42"),
+            ),
+        )
+    }
+
+    private fun openCoroutines() {
+        startActivity(Intent(this, CoroutinesActivity::class.java))
+    }
+
+    private fun openWebSocketChat() {
+        startActivity(Intent(this, WebSocketChatActivity::class.java))
+    }
+
+    private fun crashNow() {
+        throw RuntimeException("Deliberate ShadowDroid sample crash")
+    }
+
+    private fun blockMainThread() {
+        setStatus("Blocking main thread for 12 seconds")
+        Thread.sleep(12_000)
+        setStatus("Main thread block finished")
+    }
+
     private fun postNotification() {
-        if (Build.VERSION.SDK_INT >= 33 &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        if (
+            Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
         ) {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIFICATIONS)
+            requestPermissions(
+                arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                REQ_NOTIFICATIONS,
+            )
             return
         }
         val intent = Intent(this, MainActivity::class.java).putExtra("source", "notification")
-        val pendingIntent = PendingIntent.getActivity(
-            this,
-            100,
-            intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-        val notification = if (Build.VERSION.SDK_INT >= 26) {
-            Notification.Builder(this, CHANNEL_ID)
-        } else {
-            @Suppress("DEPRECATION")
-            Notification.Builder(this)
-        }
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setContentTitle("ShadowDroid sample")
-            .setContentText("Notification posted from the sample app")
-            .setContentIntent(pendingIntent)
-            .setAutoCancel(true)
-            .build()
+        val pendingIntent =
+            PendingIntent.getActivity(
+                this,
+                100,
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+        val notification =
+            (
+                if (Build.VERSION.SDK_INT >= 26) {
+                    Notification.Builder(this, CHANNEL_ID)
+                } else {
+                    @Suppress("DEPRECATION")
+                    Notification.Builder(this)
+                }
+            )
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setContentTitle("Field Lab recovery")
+                .setContentText("The ShadowDroid relay is ready for inspection")
+                .setContentIntent(pendingIntent)
+                .setAutoCancel(true)
+                .build()
         (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).notify(1001, notification)
         setStatus("Notification posted")
     }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT < 26) return
-        val channel = NotificationChannel(
-            CHANNEL_ID,
-            getString(R.string.notification_channel_name),
-            NotificationManager.IMPORTANCE_DEFAULT,
-        )
-        (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(channel)
+        val channel =
+            NotificationChannel(
+                CHANNEL_ID,
+                getString(R.string.notification_channel_name),
+                NotificationManager.IMPORTANCE_DEFAULT,
+            )
+        (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
+            .createNotificationChannel(channel)
     }
 
     private fun copyClipboard() {
@@ -550,21 +304,24 @@ class MainActivity : ComponentActivity() {
         setStatus("Copied clipboard value: $value")
     }
 
-    private fun writeSampleFiles() {
+    private fun writeSampleFiles(
+        operatorName: String,
+        currentCounter: Int,
+    ) {
         val dir = File(filesDir, "shadowdroid-sample").apply { mkdirs() }
         val file = File(dir, "state.json")
         val cacheFile = File(cacheDir, "shadowdroid-sample-cache.txt")
         val timestamp = System.currentTimeMillis()
         file.writeText(
             """
-            {"counter":$counter,"name":"${nameInput.text}","timestamp":$timestamp}
+            {"counter":$currentCounter,"name":"$operatorName","timestamp":$timestamp}
             """.trimIndent(),
         )
         cacheFile.writeText("cache sample $timestamp\n")
         getSharedPreferences("shadowdroid-state", MODE_PRIVATE)
             .edit()
             .putString("session", "sample-session-$timestamp")
-            .putInt("counter", counter)
+            .putInt("counter", currentCounter)
             .commit()
         val database = openOrCreateDatabase("shadowdroid-state.db", MODE_PRIVATE, null)
         database.enableWriteAheadLogging()
@@ -597,19 +354,20 @@ class MainActivity : ComponentActivity() {
         label: String,
         method: String,
         url: String,
-        body: String? = null,
-        headers: Map<String, String> = emptyMap(),
+        body: String?,
+        headers: Map<String, String>,
     ) {
-        progress.visibility = View.VISIBLE
+        networkBusy = true
         setStatus("$label running: $url")
         Thread {
-            val result = try {
-                performRequest(label, method, url, body, headers)
-            } catch (t: Throwable) {
-                "$label failed: ${t.javaClass.simpleName}: ${t.message}"
-            }
+            val result =
+                try {
+                    performRequest(label, method, url, body, headers)
+                } catch (t: Throwable) {
+                    "$label failed: ${t.javaClass.simpleName}: ${t.message}"
+                }
             mainHandler.post {
-                progress.visibility = View.GONE
+                networkBusy = false
                 setStatus(result)
             }
         }.start()
@@ -623,7 +381,13 @@ class MainActivity : ComponentActivity() {
             uri.host == "example.com" &&
             uri.path?.startsWith("/.well-known/shadowdroid-canary/") == true
         ) {
-            runRequest("ShadowDroid canary", "GET", uri.toString())
+            runRequest(
+                "ShadowDroid canary",
+                "GET",
+                uri.toString(),
+                null,
+                emptyMap(),
+            )
         }
     }
 
@@ -635,14 +399,15 @@ class MainActivity : ComponentActivity() {
         headers: Map<String, String>,
     ): String {
         val started = System.currentTimeMillis()
-        val connection = (URL(url).openConnection() as HttpURLConnection).apply {
-            requestMethod = method
-            connectTimeout = 8_000
-            readTimeout = 8_000
-            setRequestProperty("User-Agent", "ShadowDroidTestApp/0.1")
-            setRequestProperty("X-ShadowDroid-Sample", label)
-            headers.forEach { (name, value) -> setRequestProperty(name, value) }
-        }
+        val connection =
+            (URL(url).openConnection() as HttpURLConnection).apply {
+                requestMethod = method
+                connectTimeout = 8_000
+                readTimeout = 8_000
+                setRequestProperty("User-Agent", "ShadowDroidTestApp/0.1")
+                setRequestProperty("X-ShadowDroid-Sample", label)
+                headers.forEach { (name, value) -> setRequestProperty(name, value) }
+            }
         if (body != null) {
             connection.doOutput = true
             connection.setRequestProperty("Content-Type", "application/json")
@@ -658,54 +423,12 @@ class MainActivity : ComponentActivity() {
         return "$label completed status=$code bytes=${preview.length} elapsed=${elapsed}ms preview=${preview.squash()}"
     }
 
-    @SuppressLint("SetJavaScriptEnabled")
-    private fun loadWebView() {
-        val url = primaryUrl()
-        val webView = WebView(this).apply {
-            id = R.id.web_view
-            contentDescription = "Sample WebView"
-            settings.javaScriptEnabled = true
-            webViewClient = object : WebViewClient() {
-                override fun onPageFinished(view: WebView?, url: String?) {
-                    setStatus("WebView loaded: $url")
-                }
-
-                override fun onReceivedError(
-                    view: WebView?,
-                    request: WebResourceRequest?,
-                    error: WebResourceError?,
-                ) {
-                    if (request?.isForMainFrame != false) {
-                        setStatus("WebView error: ${error?.description}")
-                    }
-                }
-            }
-        }
-        webViewContainer.removeAllViews()
-        webViewContainer.addView(
-            webView,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT,
-            ),
-        )
-        webView.loadUrl(url)
-        setStatus("WebView loading: $url")
-    }
-
-    private fun primaryUrl(): String =
-        urlInput.text.toString().trim().ifEmpty { DEFAULT_HTTPS_URL }
-
-    private fun urlWithPath(path: String): String =
-        try {
-            val base = URL(primaryUrl())
-            URL(base.protocol, base.host, base.port, path).toString()
-        } catch (_: Throwable) {
-            "https://httpbin.org$path"
-        }
-
     private fun setStatus(message: String) {
-        statusText.text = message
+        statusMessage = message
+        if (events.firstOrNull() != message) {
+            events.add(0, message)
+            while (events.size > MAX_EVENTS) events.removeAt(events.lastIndex)
+        }
         Log.i(TAG, message)
     }
 
@@ -729,9 +452,6 @@ class MainActivity : ComponentActivity() {
         private const val DELAYED_NAVIGATION_MS = 350L
         private const val UNSTABLE_UPDATE_COUNT = 40
         private const val UNSTABLE_UPDATE_INTERVAL_MS = 50L
-        private const val DEFAULT_HTTPS_URL = "https://httpbin.org/anything/shadowdroid"
-        private const val DEFAULT_HTTP_URL = "http://httpbin.org/anything/shadowdroid-cleartext"
-        private const val DEFAULT_GRAPHQL_BODY =
-            """{"operationName":"ShadowDroidSampleQuery","query":"query ShadowDroidSampleQuery { sample: __typename }","variables":{"source":"shadowdroid-test-app"}}"""
+        private const val MAX_EVENTS = 20
     }
 }

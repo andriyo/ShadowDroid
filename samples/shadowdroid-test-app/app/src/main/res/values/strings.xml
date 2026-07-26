@@ -1,10 +1,9 @@
 <resources>
-    <string name="app_name">ShadowDroid Test App</string>
-    <string name="main_activity_name">ShadowDroid Test</string>
-    <string name="alt_launcher_activity_name">ShadowDroid Alt Launcher</string>
-    <string name="detail_activity_name">ShadowDroid Detail</string>
-    <string name="deep_link_activity_name">ShadowDroid Deep Link</string>
-    <string name="coroutines_activity_name">ShadowDroid Coroutines</string>
-    <string name="notification_channel_name">Sample events</string>
+    <string name="app_name">ShadowDroid Field Lab</string>
+    <string name="main_activity_name">Field Lab</string>
+    <string name="alt_launcher_activity_name">Quick Diagnostic</string>
+    <string name="detail_activity_name">Incident Detail</string>
+    <string name="deep_link_activity_name">External Handoff</string>
+    <string name="coroutines_activity_name">Telemetry Workers</string>
+    <string name="notification_channel_name">Field Lab events</string>
 </resources>
-

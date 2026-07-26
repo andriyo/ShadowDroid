@@ -1,51 +1,61 @@
 package io.github.andriyo.shadowdroid.sample
 
-import android.app.Activity
+import android.graphics.Color
 import android.os.Bundle
-import android.widget.Button
-import android.widget.LinearLayout
-import android.widget.TextView
-import kotlin.math.roundToInt
+import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 
 /**
  * Launches the [CoroutineWorkload] zoo on open, so simply starting this activity
- * (via a tap or `am start .../CoroutinesActivity`) makes the app's coroutine
- * state worth dumping with `shadowdroid aar coroutines`.
+ * makes the app's coroutine state worth dumping with `shadowdroid aar coroutines`.
  */
-class CoroutinesActivity : Activity() {
-    private lateinit var status: TextView
+class CoroutinesActivity : ComponentActivity() {
+    private var status by mutableStateOf("")
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
+        )
         super.onCreate(savedInstanceState)
-        val root = LinearLayout(this).apply {
-            id = R.id.coroutines_root
-            orientation = LinearLayout.VERTICAL
-            setPadding(18.dp, 18.dp, 18.dp, 18.dp)
+        status = CoroutineWorkload.startOnce()
+        setContent {
+            ShadowLabTheme {
+                LabDestinationScreen(
+                    rootTag = "coroutines_root",
+                    eyebrow = "RUNTIME OBSERVATORY",
+                    title = "Telemetry workers.",
+                    summary =
+                        "A deliberately unhealthy coroutine topology is now live behind this calm status surface.",
+                    accent = LabMint,
+                ) {
+                    DestinationValue(
+                        label = "WORKLOAD STATUS",
+                        value = status,
+                        tag = "coroutines_status",
+                        description = "Coroutine workload status",
+                        accent = LabMint,
+                    )
+                    DestinationValue(
+                        label = "EXPECTED TOPOLOGY",
+                        value = "leaked heartbeat · idle workers · slow collector · blocked emitter",
+                        description = "Coroutine workload title",
+                        accent = LabAmber,
+                    )
+                    DestinationButton(
+                        label = "Spawn another worker",
+                        tag = "coroutines_spawn_button",
+                        description = "Spawn coroutine worker button",
+                    ) {
+                        status = CoroutineWorkload.spawnWorker()
+                    }
+                }
+            }
         }
-        root.addView(TextView(this).apply {
-            text = "Coroutine workload"
-            textSize = 22f
-            contentDescription = "Coroutine workload title"
-        })
-        status = TextView(this).apply {
-            id = R.id.coroutines_status
-            textSize = 15f
-            contentDescription = "Coroutine workload status"
-            setPadding(0, 12.dp, 0, 12.dp)
-        }
-        root.addView(status)
-        root.addView(Button(this).apply {
-            id = R.id.coroutines_spawn_button
-            text = "Spawn another worker"
-            isAllCaps = false
-            contentDescription = "Spawn coroutine worker button"
-            setOnClickListener { status.text = CoroutineWorkload.spawnWorker() }
-        })
-
-        status.text = CoroutineWorkload.startOnce()
-        setContentView(root)
     }
-
-    private val Int.dp: Int
-        get() = (this * resources.displayMetrics.density).roundToInt()
 }

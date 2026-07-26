@@ -1,37 +1,50 @@
 package io.github.andriyo.shadowdroid.sample
 
-import android.app.Activity
+import android.graphics.Color
 import android.os.Bundle
-import android.widget.Button
-import android.widget.LinearLayout
-import android.widget.TextView
-import kotlin.math.roundToInt
+import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 
-class DeepLinkActivity : Activity() {
+class DeepLinkActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
+        )
         super.onCreate(savedInstanceState)
-        val root = LinearLayout(this).apply {
-            id = R.id.deep_link_root
-            orientation = LinearLayout.VERTICAL
-            setPadding(18.dp, 18.dp, 18.dp, 18.dp)
+        val uri = intent.data?.toString() ?: "none"
+        setContent {
+            ShadowLabTheme {
+                LabDestinationScreen(
+                    rootTag = "deep_link_root",
+                    eyebrow = "EXTERNAL HANDOFF",
+                    title = "Link resolved.",
+                    summary =
+                        "A browsable custom scheme landed in an exported Activity with its payload intact.",
+                    accent = LabCyan,
+                ) {
+                    DestinationValue(
+                        label = "RESOLVED URI",
+                        value = "Deep link: $uri",
+                        tag = "deep_link_message",
+                        description = "Deep link activity message",
+                        accent = LabCyan,
+                    )
+                    DestinationValue(
+                        label = "ROUTE CONTRACT",
+                        value = "shadowdroid://sample/deeplink/…",
+                        accent = LabMint,
+                    )
+                    DestinationButton(
+                        label = "Finish deep link",
+                        tag = "deep_link_finish_button",
+                        description = "Finish deep link activity button",
+                        onClick = ::finish,
+                    )
+                }
+            }
         }
-        root.addView(TextView(this).apply {
-            id = R.id.deep_link_message
-            text = "Deep link: ${intent.data ?: "none"}"
-            textSize = 20f
-            contentDescription = "Deep link activity message"
-        })
-        root.addView(Button(this).apply {
-            id = R.id.deep_link_finish_button
-            text = "Finish deep link"
-            isAllCaps = false
-            contentDescription = "Finish deep link activity button"
-            setOnClickListener { finish() }
-        })
-        setContentView(root)
     }
-
-    private val Int.dp: Int
-        get() = (this * resources.displayMetrics.density).roundToInt()
 }
-
