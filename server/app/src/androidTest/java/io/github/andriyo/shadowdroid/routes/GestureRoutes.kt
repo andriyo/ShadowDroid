@@ -1,10 +1,12 @@
 package io.github.andriyo.shadowdroid.routes
 
+import android.app.Instrumentation
 import androidx.test.uiautomator.By
 import androidx.test.uiautomator.UiDevice
 import io.github.andriyo.shadowdroid.BadRequest
 import io.github.andriyo.shadowdroid.NotFound
 import io.github.andriyo.shadowdroid.proto.OkResponse
+import io.ktor.server.application.ApplicationCall
 import io.ktor.server.request.receive
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
@@ -16,84 +18,170 @@ object GestureRoutes {
     fun register(
         route: Route,
         uiDevice: UiDevice,
+        instr: Instrumentation,
     ) {
         route.post("/tap") {
-            val r: XyReq = call.receive()
-            if (!uiDevice.click(r.x, r.y)) throw BadRequest("tap_failed", "UiDevice.click returned false")
-            call.respond(OkResponse())
+            handleTap(call, uiDevice, instr, guarded = false)
+        }
+        route.post("/guarded/tap") {
+            handleTap(call, uiDevice, instr, guarded = true)
         }
         route.post("/double_tap") {
-            val r: XyReq = call.receive()
-            uiDevice.click(r.x, r.y)
-            Thread.sleep(50)
-            uiDevice.click(r.x, r.y)
-            call.respond(OkResponse())
+            handleDoubleTap(call, uiDevice, instr, guarded = false)
+        }
+        route.post("/guarded/double_tap") {
+            handleDoubleTap(call, uiDevice, instr, guarded = true)
         }
         route.post("/long_tap") {
-            val r: LongTapReq = call.receive()
-            // Implemented as a zero-distance swipe — UiDevice has no
-            // long_click(x,y) primitive, but a "swipe" that doesn't move
-            // for N ms is a long-press.
-            val steps = (r.duration_ms / 5).coerceAtLeast(10) // ~5ms per step
-            uiDevice.swipe(r.x, r.y, r.x, r.y, steps)
-            call.respond(OkResponse())
+            handleLongTap(call, uiDevice, instr, guarded = false)
+        }
+        route.post("/guarded/long_tap") {
+            handleLongTap(call, uiDevice, instr, guarded = true)
         }
         route.post("/swipe") {
-            val r: SwipeReq = call.receive()
-            // UiDevice.swipe takes a `steps` count (1 step ≈ 5ms).
-            val steps = (r.duration_ms / 5).coerceAtLeast(1)
-            if (!uiDevice.swipe(r.from[0], r.from[1], r.to[0], r.to[1], steps)) {
-                throw BadRequest("swipe_failed", "UiDevice.swipe returned false")
-            }
-            call.respond(OkResponse())
+            handleSwipe(call, uiDevice, instr, guarded = false)
+        }
+        route.post("/guarded/swipe") {
+            handleSwipe(call, uiDevice, instr, guarded = true)
         }
         route.post("/drag") {
-            val r: SwipeReq = call.receive()
-            // UiDevice.drag has a separate "long-press then move" semantics
-            // distinct from swipe; we synthesize via a long initial dwell
-            // then the swipe. UI Automator 2.x doesn't expose drag(x,y,x,y).
-            val initialDwell = 200 // ms
-            uiDevice.swipe(r.from[0], r.from[1], r.from[0], r.from[1], initialDwell / 5)
-            val moveSteps = (r.duration_ms / 5).coerceAtLeast(1)
-            uiDevice.swipe(r.from[0], r.from[1], r.to[0], r.to[1], moveSteps)
-            call.respond(OkResponse())
+            handleDrag(call, uiDevice, instr, guarded = false)
+        }
+        route.post("/guarded/drag") {
+            handleDrag(call, uiDevice, instr, guarded = true)
         }
         route.post("/swipe_ext") {
-            val r: SwipeExtReq = call.receive()
-            val (x1, y1, x2, y2) =
-                swipeExtCoords(
-                    uiDevice.displayWidth,
-                    uiDevice.displayHeight,
-                    r.direction,
-                    r.scale,
-                )
-            val steps = (r.duration_ms / 5).coerceAtLeast(1)
-            uiDevice.swipe(x1, y1, x2, y2, steps)
-            call.respond(OkResponse())
+            handleSwipeExt(call, uiDevice, instr, guarded = false)
+        }
+        route.post("/guarded/swipe_ext") {
+            handleSwipeExt(call, uiDevice, instr, guarded = true)
         }
         route.post("/pinch") {
-            val r: PinchReq = call.receive()
-            // UiObject2.pinchIn/Out needs a real object handle, so pinch targets
-            // a selector (rid/text/desc) rather than a dump element id.
-            val by =
-                when {
-                    r.rid != null -> By.res(r.rid)
-                    r.text != null -> By.textContains(r.text)
-                    r.desc != null -> By.descContains(r.desc)
-                    else -> throw BadRequest("empty_selector", "pinch needs one of rid|text|desc")
-                }
-            val obj =
-                uiDevice.findObject(by)
-                    ?: throw NotFound("element_not_found", "no element matched the pinch selector")
-            val pct = (r.percent.coerceIn(1, 100)) / 100f
-            when (r.direction.lowercase()) {
-                "in", "close" -> obj.pinchClose(pct)
-                "out", "open" -> obj.pinchOpen(pct)
-                else -> throw BadRequest("bad_direction", "direction must be in|out, got '${r.direction}'")
-            }
-            call.respond(OkResponse())
+            handlePinch(call, uiDevice, instr, guarded = false)
+        }
+        route.post("/guarded/pinch") {
+            handlePinch(call, uiDevice, instr, guarded = true)
         }
     }
+}
+
+private suspend fun handleTap(
+    call: ApplicationCall,
+    uiDevice: UiDevice,
+    instr: Instrumentation,
+    guarded: Boolean,
+) {
+    val r: XyReq = call.receive()
+    withUiActionGuard(call, uiDevice, instr, guarded) {
+        if (!uiDevice.click(r.x, r.y)) throw BadRequest("tap_failed", "UiDevice.click returned false")
+    }
+    call.respond(OkResponse())
+}
+
+private suspend fun handleDoubleTap(
+    call: ApplicationCall,
+    uiDevice: UiDevice,
+    instr: Instrumentation,
+    guarded: Boolean,
+) {
+    val r: XyReq = call.receive()
+    withUiActionGuard(call, uiDevice, instr, guarded) {
+        uiDevice.click(r.x, r.y)
+        Thread.sleep(50)
+        uiDevice.click(r.x, r.y)
+    }
+    call.respond(OkResponse())
+}
+
+private suspend fun handleLongTap(
+    call: ApplicationCall,
+    uiDevice: UiDevice,
+    instr: Instrumentation,
+    guarded: Boolean,
+) {
+    val r: LongTapReq = call.receive()
+    withUiActionGuard(call, uiDevice, instr, guarded) {
+        // A zero-distance swipe provides long-press semantics.
+        val steps = (r.duration_ms / 5).coerceAtLeast(10)
+        uiDevice.swipe(r.x, r.y, r.x, r.y, steps)
+    }
+    call.respond(OkResponse())
+}
+
+private suspend fun handleSwipe(
+    call: ApplicationCall,
+    uiDevice: UiDevice,
+    instr: Instrumentation,
+    guarded: Boolean,
+) {
+    val r: SwipeReq = call.receive()
+    withUiActionGuard(call, uiDevice, instr, guarded) {
+        val steps = (r.duration_ms / 5).coerceAtLeast(1)
+        if (!uiDevice.swipe(r.from[0], r.from[1], r.to[0], r.to[1], steps)) {
+            throw BadRequest("swipe_failed", "UiDevice.swipe returned false")
+        }
+    }
+    call.respond(OkResponse())
+}
+
+private suspend fun handleDrag(
+    call: ApplicationCall,
+    uiDevice: UiDevice,
+    instr: Instrumentation,
+    guarded: Boolean,
+) {
+    val r: SwipeReq = call.receive()
+    withUiActionGuard(call, uiDevice, instr, guarded) {
+        val initialDwell = 200
+        uiDevice.swipe(r.from[0], r.from[1], r.from[0], r.from[1], initialDwell / 5)
+        val moveSteps = (r.duration_ms / 5).coerceAtLeast(1)
+        uiDevice.swipe(r.from[0], r.from[1], r.to[0], r.to[1], moveSteps)
+    }
+    call.respond(OkResponse())
+}
+
+private suspend fun handleSwipeExt(
+    call: ApplicationCall,
+    uiDevice: UiDevice,
+    instr: Instrumentation,
+    guarded: Boolean,
+) {
+    val r: SwipeExtReq = call.receive()
+    withUiActionGuard(call, uiDevice, instr, guarded) {
+        val (x1, y1, x2, y2) =
+            swipeExtCoords(uiDevice.displayWidth, uiDevice.displayHeight, r.direction, r.scale)
+        val steps = (r.duration_ms / 5).coerceAtLeast(1)
+        uiDevice.swipe(x1, y1, x2, y2, steps)
+    }
+    call.respond(OkResponse())
+}
+
+private suspend fun handlePinch(
+    call: ApplicationCall,
+    uiDevice: UiDevice,
+    instr: Instrumentation,
+    guarded: Boolean,
+) {
+    val r: PinchReq = call.receive()
+    withUiActionGuard(call, uiDevice, instr, guarded) {
+        val by =
+            when {
+                r.rid != null -> By.res(r.rid)
+                r.text != null -> By.textContains(r.text)
+                r.desc != null -> By.descContains(r.desc)
+                else -> throw BadRequest("empty_selector", "pinch needs one of rid|text|desc")
+            }
+        val obj =
+            uiDevice.findObject(by)
+                ?: throw NotFound("element_not_found", "no element matched the pinch selector")
+        val pct = (r.percent.coerceIn(1, 100)) / 100f
+        when (r.direction.lowercase()) {
+            "in", "close" -> obj.pinchClose(pct)
+            "out", "open" -> obj.pinchOpen(pct)
+            else -> throw BadRequest("bad_direction", "direction must be in|out, got '${r.direction}'")
+        }
+    }
+    call.respond(OkResponse())
 }
 
 /**

@@ -797,7 +797,7 @@ mod tests {
             content_hash: None,
             interaction_hash: None,
             interaction_hash_version: 1,
-            snapshot_state: "consistent".into(),
+            snapshot_state: crate::proto::SnapshotState::Consistent,
             captured_at_ms: None,
             viewport: crate::proto::Viewport { w: 20, h: 20 },
             current_app: crate::proto::AppRef {

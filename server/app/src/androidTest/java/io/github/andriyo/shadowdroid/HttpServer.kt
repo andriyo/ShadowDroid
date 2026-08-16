@@ -54,7 +54,7 @@ class HttpServer(
                     route("/v1") {
                         StateRoutes.register(this, uiDevice, instrumentation)
                         ScreenRoutes.register(this, uiDevice, instrumentation)
-                        GestureRoutes.register(this, uiDevice)
+                        GestureRoutes.register(this, uiDevice, instrumentation)
                         KeyTextRoutes.register(this, uiDevice, instrumentation)
                         AppRoutes.register(this, uiDevice, instrumentation)
                         SystemRoutes.register(this, uiDevice, instrumentation)
@@ -97,6 +97,12 @@ private fun Application.installPlugins() {
         exception<BadRequest> { call, e ->
             call.respond(HttpStatusCode.BadRequest, ErrorEnvelope(ErrorBody(e.code, e.message ?: "bad request", e.detail)))
         }
+        exception<PreconditionFailed> { call, e ->
+            call.respond(
+                HttpStatusCode.PreconditionFailed,
+                ErrorEnvelope(ErrorBody(e.code, e.message ?: "precondition failed", e.detail)),
+            )
+        }
         exception<NotFound> { call, e ->
             call.respond(HttpStatusCode.NotFound, ErrorEnvelope(ErrorBody(e.code, e.message ?: "not found", e.detail)))
         }
@@ -128,6 +134,12 @@ class BadRequest(
 ) : RuntimeException(message)
 
 class NotFound(
+    val code: String,
+    message: String,
+    val detail: Map<String, Any?>? = null,
+) : RuntimeException(message)
+
+class PreconditionFailed(
     val code: String,
     message: String,
     val detail: Map<String, Any?>? = null,

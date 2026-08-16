@@ -1215,7 +1215,7 @@ mod tests {
             content_hash: Some("c:abc123".into()),
             interaction_hash: Some("i:1111111111111111".into()),
             interaction_hash_version: 1,
-            snapshot_state: "consistent".into(),
+            snapshot_state: crate::proto::SnapshotState::Consistent,
             captured_at_ms: Some(1),
             viewport: Viewport { w: 1, h: 2 },
             current_app: AppRef {

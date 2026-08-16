@@ -767,13 +767,18 @@ loop-fusion actions, `ui pin` intentionally exposes only the pre-action
 `--if-screen` / `--if-interaction` guards—not `--observe` or postconditions,
 whose returned screen could reveal an unmasked keypad value. The PIN is still
 present in the local process invocation, so use the host's normal shell-history
-and process-visibility protections.
+and process-visibility protections. When either guard is present, every digit
+and the optional Enter revalidate the original interaction identity inside the
+on-device action request; partial-entry failures remain PIN-redacted.
 
 Loop-fusion action verbs (`ui tap`, `ui set-progress`, coordinate gestures, `ui pinch`, `ui text`,
 `ui key`, `ui back`, and `ui home`) accept `--observe` (wait for a 500 ms
 accessibility-event quiet period, then return the stable compact screen) and
 `--if-screen <hash>` (strict optimistic concurrency) and `--if-interaction
 <hash>` (ignore display-only volatility while guarding actionable structure).
+The device server re-captures and validates that state in the same guarded
+request that resolves the target and injects input. A server too old to support
+this contract fails the distinct guarded route before injecting anything.
 Both refuse changed state and return the fresh screen. A single `--expect-text`, `--expect-desc`,
 `--expect-rid`, `--expect-package`, or `--expect-activity` postcondition implies
 observation; `--expect-exact`, `--observe-delay-ms`, and `--timeout-ms` refine

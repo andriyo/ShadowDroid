@@ -22,9 +22,9 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
-use crate::device::client::{ServerClient, ServerError};
+use crate::device::client::{ActionGuard, ServerClient, ServerError};
 use crate::events::{CompactElement, emit_action, emit_result};
-use crate::proto::{Element, ScreenResponse};
+use crate::proto::{Element, ScreenResponse, SnapshotState};
 
 /// What a dispatch arm produced. Emission happens centrally so cross-cutting
 /// keys (`events`, `screen`) attach in one place.
@@ -313,22 +313,28 @@ pub async fn run_fused<F, Fut>(
     act: F,
 ) -> Result<Outcome>
 where
-    F: FnOnce(Option<u32>) -> Fut,
+    F: FnOnce(ServerClient, Option<u32>) -> Fut,
     Fut: std::future::Future<Output = Result<(&'static str, Value)>>,
 {
     let postcondition = requested_postcondition(fusion)?;
     validate_observation_args(fusion, postcondition.is_some())?;
     let observe = fusion.observe || postcondition.is_some();
     validate_interaction_guard(fusion)?;
-    let pre_screen = if fusion.if_screen.is_some()
+    let guarded = fusion.if_screen.is_some()
         || fusion.if_interaction.is_some()
-        || fusion.element_handle.is_some()
-        || observe
-    {
+        || fusion.element_handle.is_some();
+    let pre_screen = if guarded || observe {
         Some(client.screen().await?)
     } else {
         None
     };
+    if guarded {
+        require_consistent_action_snapshot(
+            pre_screen
+                .as_ref()
+                .expect("guarded pre-screen requested above"),
+        )?;
+    }
     if let Some(expected) = &fusion.if_screen {
         let screen = pre_screen.as_ref().expect("pre-screen requested above");
         if &screen.screen_hash != expected {
@@ -386,7 +392,16 @@ where
         }
     }
 
-    let (cmd, mut body) = match act(resolved_handle_id).await {
+    let action_client = if guarded {
+        client.with_action_guard(ActionGuard {
+            if_screen: fusion.if_screen.clone(),
+            if_interaction: fusion.if_interaction.clone(),
+            element_handle: fusion.element_handle.clone(),
+        })
+    } else {
+        client.clone()
+    };
+    let (cmd, mut body) = match act(action_client, resolved_handle_id).await {
         Ok(result) => result,
         Err(err) => return Err(enrich_not_found(client, hint, err).await),
     };
@@ -448,6 +463,24 @@ where
         }
     }
     Ok(Outcome::Action(cmd, body))
+}
+
+pub(crate) fn require_consistent_action_snapshot(screen: &ScreenResponse) -> Result<()> {
+    if screen.snapshot_state == SnapshotState::Consistent {
+        return Ok(());
+    }
+    Err(crate::diagnostic::DiagnosticError::new(
+        "snapshot_not_consistent",
+        "ui",
+        "the current UI snapshot is not consistent; no input was injected",
+    )
+    .retryable(true)
+    .detail(json!({"screen": compact_screen_value(screen)}))
+    .next_actions([
+        "wait for the current transition to settle, then re-plan from detail.screen",
+        "update and reconnect the ShadowDroid server if snapshot_state is unknown",
+    ])
+    .into())
 }
 
 struct StableObservation {
@@ -891,7 +924,7 @@ mod tests {
             content_hash: Some("c:screen-1".into()),
             interaction_hash: Some("i:1111111111111111".into()),
             interaction_hash_version: 1,
-            snapshot_state: "transitioning".into(),
+            snapshot_state: SnapshotState::Transitioning,
             captured_at_ms: Some(123),
             viewport: crate::proto::Viewport { w: 1080, h: 1920 },
             current_app: crate::proto::AppRef {
@@ -918,6 +951,16 @@ mod tests {
         assert_eq!(compact["current_app"]["sampled_at_ms"], 120);
         assert_eq!(compact["ui_tree"]["window_id"], 7);
         assert_eq!(compact["warning"], "still converging");
+
+        let error = require_consistent_action_snapshot(&screen).unwrap_err();
+        assert_eq!(crate::cli::error_code_of(&error), "snapshot_not_consistent");
+        assert!(crate::cli::error_retryable_of(&error));
+        assert!(!crate::cli::error_uses_fallback(&error));
+
+        let mut legacy = screen;
+        legacy.snapshot_state = SnapshotState::Unknown;
+        let error = require_consistent_action_snapshot(&legacy).unwrap_err();
+        assert_eq!(crate::cli::error_code_of(&error), "snapshot_not_consistent");
     }
 
     #[test]
@@ -1028,7 +1071,7 @@ mod tests {
             content_hash: Some("c:destination".into()),
             interaction_hash: Some("i:2222222222222222".into()),
             interaction_hash_version: 1,
-            snapshot_state: "consistent".into(),
+            snapshot_state: SnapshotState::Consistent,
             captured_at_ms: Some(500),
             viewport: crate::proto::Viewport { w: 1080, h: 1920 },
             current_app: crate::proto::AppRef {

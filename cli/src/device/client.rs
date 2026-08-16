@@ -10,7 +10,7 @@
 
 use crate::proto::*;
 use anyhow::{Context, Result, anyhow};
-use reqwest::{Client, Response};
+use reqwest::{Client, RequestBuilder, Response};
 use serde::Serialize;
 use std::path::Path;
 use std::time::Duration;
@@ -21,6 +21,17 @@ pub struct ServerClient {
     base: String, // e.g. "http://127.0.0.1:7912/v1"
     http: Client,
     transfer_http: Client,
+    action_guard: Option<ActionGuard>,
+}
+
+/// Preconditions carried by an action request and re-validated on-device
+/// immediately before input injection. Guarded requests use distinct routes so
+/// an older server cannot silently ignore the contract and still act.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ActionGuard {
+    pub if_screen: Option<String>,
+    pub if_interaction: Option<String>,
+    pub element_handle: Option<String>,
 }
 
 impl ServerClient {
@@ -40,7 +51,38 @@ impl ServerClient {
             base: format!("http://127.0.0.1:{port}/v1"),
             http,
             transfer_http,
+            action_guard: None,
         })
+    }
+
+    pub fn with_action_guard(&self, guard: ActionGuard) -> Self {
+        let mut guarded = self.clone();
+        guarded.action_guard = Some(guard);
+        guarded
+    }
+
+    fn action_path(&self, path: &str) -> String {
+        if self.action_guard.is_some() {
+            format!("/guarded{path}")
+        } else {
+            path.to_string()
+        }
+    }
+
+    fn apply_action_guard(&self, mut request: RequestBuilder) -> RequestBuilder {
+        let Some(guard) = &self.action_guard else {
+            return request;
+        };
+        if let Some(value) = &guard.if_screen {
+            request = request.header("X-ShadowDroid-If-Screen", value);
+        }
+        if let Some(value) = &guard.if_interaction {
+            request = request.header("X-ShadowDroid-If-Interaction", value);
+        }
+        if let Some(value) = &guard.element_handle {
+            request = request.header("X-ShadowDroid-Element-Handle", value);
+        }
+        request
     }
 
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
@@ -78,12 +120,9 @@ impl ServerClient {
         path: &str,
         body: &B,
     ) -> Result<T> {
-        let resp = self
-            .http
-            .post(format!("{}{}", self.base, path))
-            .json(body)
-            .send()
-            .await?;
+        let path = self.action_path(path);
+        let request = self.http.post(format!("{}{}", self.base, path)).json(body);
+        let resp = self.apply_action_guard(request).send().await?;
         check_then_json(resp).await
     }
 
@@ -108,11 +147,9 @@ impl ServerClient {
     }
 
     async fn post_empty<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let resp = self
-            .http
-            .post(format!("{}{}", self.base, path))
-            .send()
-            .await?;
+        let path = self.action_path(path);
+        let request = self.http.post(format!("{}{}", self.base, path));
+        let resp = self.apply_action_guard(request).send().await?;
         check_then_json(resp).await
     }
 
@@ -283,17 +320,15 @@ impl ServerClient {
     }
 
     pub async fn xpath_tap(&self, query: &str, coordinate_fallback: bool) -> Result<FindTapResp> {
-        let resp = self
-            .http
-            .post(format!("{}/xpath", self.base))
-            .json(&XpathReq {
+        self.post(
+            "/xpath",
+            &XpathReq {
                 query: query.to_string(),
                 tap: true,
                 coordinate_fallback,
-            })
-            .send()
-            .await?;
-        check_then_json(resp).await
+            },
+        )
+        .await
     }
 
     // ── gestures ────────────────────────────────────────────────
@@ -624,6 +659,7 @@ async fn check_response(resp: Response) -> Result<Response> {
     if status.is_success() {
         return Ok(resp);
     }
+    let guarded_endpoint = resp.url().path().contains("/v1/guarded/");
     // Try to decode the structured error
     let text = resp.text().await?;
     if let Ok(env) = serde_json::from_str::<ErrorEnvelope>(&text) {
@@ -632,6 +668,16 @@ async fn check_response(resp: Response) -> Result<Response> {
             code: env.error.code,
             message: env.error.message,
             detail: env.error.detail,
+        }
+        .into());
+    }
+    if guarded_endpoint && status == reqwest::StatusCode::NOT_FOUND {
+        return Err(ServerError {
+            status,
+            code: "server_guard_unsupported".to_string(),
+            message: "the connected server does not support authoritative UI action guards"
+                .to_string(),
+            detail: None,
         }
         .into());
     }
@@ -664,5 +710,65 @@ mod tests {
 
         let server = anyhow!("server error 500 Internal Server Error: boom");
         assert!(!is_transient_transport_error(&server));
+    }
+
+    #[test]
+    fn action_guard_uses_distinct_route_and_wire_headers() {
+        let client = ServerClient::new(17912)
+            .unwrap()
+            .with_action_guard(ActionGuard {
+                if_screen: Some("screen-1".into()),
+                if_interaction: Some("i:0123456789abcdef".into()),
+                element_handle: Some("i:0123456789abcdef/e:4".into()),
+            });
+        assert_eq!(client.action_path("/find_tap"), "/guarded/find_tap");
+
+        let request = client
+            .apply_action_guard(client.http.post("http://127.0.0.1/action"))
+            .build()
+            .unwrap();
+        assert_eq!(request.headers()["X-ShadowDroid-If-Screen"], "screen-1");
+        assert_eq!(
+            request.headers()["X-ShadowDroid-If-Interaction"],
+            "i:0123456789abcdef"
+        );
+        assert_eq!(
+            request.headers()["X-ShadowDroid-Element-Handle"],
+            "i:0123456789abcdef/e:4"
+        );
+    }
+
+    #[test]
+    fn unguarded_client_keeps_legacy_route() {
+        let client = ServerClient::new(17912).unwrap();
+        assert_eq!(client.action_path("/find_tap"), "/find_tap");
+    }
+
+    #[tokio::test]
+    async fn unstructured_guarded_404_is_typed_as_unsupported() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let read = socket.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..read]).contains("POST /v1/guarded/tap "));
+            socket
+                .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let response = Client::new()
+            .post(format!("http://{address}/v1/guarded/tap"))
+            .send()
+            .await
+            .unwrap();
+        let error = check_response(response).await.unwrap_err();
+        let server_error = error.downcast_ref::<ServerError>().unwrap();
+        assert_eq!(server_error.code, "server_guard_unsupported");
+        server.await.unwrap();
     }
 }

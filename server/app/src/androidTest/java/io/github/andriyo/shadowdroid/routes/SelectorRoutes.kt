@@ -12,6 +12,9 @@ import io.github.andriyo.shadowdroid.NotFound
 import io.github.andriyo.shadowdroid.dump.TreeWalker
 import io.github.andriyo.shadowdroid.proto.Element
 import io.github.andriyo.shadowdroid.proto.RangeSemantics
+import io.github.andriyo.shadowdroid.proto.ScreenResponse
+import io.github.andriyo.shadowdroid.proto.SnapshotState
+import io.ktor.server.application.ApplicationCall
 import io.ktor.server.request.receive
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
@@ -43,10 +46,136 @@ object SelectorRoutes {
         }
 
         route.post("/find_tap") {
-            val request: SelectorReq = call.receive()
-            val match = chooseUnique(findElementMatches(request.copy(all = true), uiDevice, instr), request)
+            handleFindTap(call, uiDevice, instr, guarded = false)
+        }
+        route.post("/guarded/find_tap") {
+            handleFindTap(call, uiDevice, instr, guarded = true)
+        }
+
+        route.post("/xpath") {
+            handleXpath(call, uiDevice, instr, guarded = false)
+        }
+        route.post("/guarded/xpath") {
+            handleXpath(call, uiDevice, instr, guarded = true)
+        }
+
+        route.post("/set_progress") {
+            handleSetProgress(call, uiDevice, instr, guarded = false)
+        }
+        route.post("/guarded/set_progress") {
+            handleSetProgress(call, uiDevice, instr, guarded = true)
+        }
+
+        // Fast on-device scroll-to: drive a scrollable UiObject2 directly rather
+        // than the host loop's dump→swipe→dump per step. The CLI falls back to
+        // the host loop if this route is absent (404) or there's no scrollable.
+        route.post("/scroll") {
+            val r: ScrollReq = call.receive()
+            val response =
+                withUiActionGuard(call, uiDevice, instr, guarded = false) {
+                    if (r.text == null && r.rid == null && r.desc == null) {
+                        throw BadRequest("empty_selector", "scroll needs one of text|rid|desc")
+                    }
+                    val scrollable =
+                        (
+                            if (r.container_rid != null) {
+                                uiDevice.findObject(By.res(r.container_rid))
+                            } else {
+                                uiDevice.findObject(By.scrollable(true))
+                            }
+                        )
+                            ?: throw NotFound("no_scrollable", "no scrollable container found")
+                    val dir =
+                        when (r.direction.lowercase()) {
+                            "up" -> Direction.UP
+                            "left" -> Direction.LEFT
+                            "right" -> Direction.RIGHT
+                            else -> Direction.DOWN
+                        }
+                    // Detect the target with the canonical normalized matcher (the same
+                    // one `/find` uses) — not `By.textContains`, which is case-sensitive
+                    // and unnormalized. A match with a usable tap point is on-screen.
+                    val selector =
+                        SelectorReq(
+                            text = r.text,
+                            rid = r.rid,
+                            desc = r.desc,
+                            exact = r.exact,
+                            all = true,
+                        )
+
+                    fun visibleHit(): ElementMatch? = chooseVisibleScrollTarget(findElementMatches(selector, uiDevice, instr), selector)
+
+                    var found = visibleHit()
+                    var swipes = 0
+                    while (found == null && swipes < r.max_swipes) {
+                        val more = scrollable.scroll(dir, 0.8f)
+                        swipes++
+                        found = visibleHit()
+                        if (!more) break
+                    }
+                    val hit = found
+                    val tap = hit?.element?.tap
+                    if (tap == null) {
+                        ScrollResp(matched = false, x = -1, y = -1, swipes = swipes)
+                    } else {
+                        if (r.tap) tapMatch(hit, uiDevice, coordinateFallback = false)
+                        ScrollResp(matched = true, x = tap[0], y = tap[1], swipes = swipes)
+                    }
+                }
+            call.respond(response)
+        }
+    }
+}
+
+private suspend fun handleFindTap(
+    call: ApplicationCall,
+    uiDevice: UiDevice,
+    instr: Instrumentation,
+    guarded: Boolean,
+) {
+    val request: SelectorReq = call.receive()
+    val response =
+        withUiActionGuard(call, uiDevice, instr, guarded) { guard ->
+            val match =
+                guard?.resolved
+                    ?: chooseUnique(
+                        guard?.let { findElementMatches(request.copy(all = true), it.captured.walked) }
+                            ?: findElementMatches(request.copy(all = true), uiDevice, instr),
+                        request,
+                    )
             val tap = tapMatch(match, uiDevice, request.coordinate_fallback)
-            call.respond(
+            FindTapResp(
+                matched = match.element,
+                activated_element = tap.activatedElement,
+                actionable_resolved = tap.actionableResolved,
+                input_delivered = tap.inputDelivered,
+                x = tap.x,
+                y = tap.y,
+                action = tap.action,
+            )
+        }
+    call.respond(response)
+}
+
+private suspend fun handleXpath(
+    call: ApplicationCall,
+    uiDevice: UiDevice,
+    instr: Instrumentation,
+    guarded: Boolean,
+) {
+    val request: XpathReq = call.receive()
+    // Keep the response branches statically typed so Ktor selects the concrete
+    // serializer instead of trying to encode their common Any supertype.
+    if (request.tap) {
+        val response =
+            withUiActionGuard(call, uiDevice, instr, guarded) { guard ->
+                val selector = SelectorReq(xpath = request.query, all = true)
+                val matches =
+                    guard?.let { findElementMatches(selector, it.captured.walked) }
+                        ?: findElementMatches(selector, uiDevice, instr)
+                val match = guard?.resolved ?: chooseUnique(matches, selector)
+                val tap = tapMatch(match, uiDevice, request.coordinate_fallback)
                 FindTapResp(
                     matched = match.element,
                     activated_element = tap.activatedElement,
@@ -55,101 +184,44 @@ object SelectorRoutes {
                     x = tap.x,
                     y = tap.y,
                     action = tap.action,
-                ),
-            )
-        }
-
-        route.post("/xpath") {
-            val request: XpathReq = call.receive()
-            // Always collect the complete match set. Taking the first match on
-            // a tap silently bypassed ShadowDroid's strict ambiguity contract
-            // and made identical screens behave differently depending on tree
-            // order.
-            val selector = SelectorReq(xpath = request.query, all = true)
-            val matches = findElementMatches(selector, uiDevice, instr)
-            if (request.tap) {
-                val match = chooseUnique(matches, selector)
-                val tap = tapMatch(match, uiDevice, request.coordinate_fallback)
-                call.respond(
-                    FindTapResp(
-                        matched = match.element,
-                        activated_element = tap.activatedElement,
-                        actionable_resolved = tap.actionableResolved,
-                        input_delivered = tap.inputDelivered,
-                        x = tap.x,
-                        y = tap.y,
-                        action = tap.action,
-                    ),
                 )
-            } else {
+            }
+        call.respond(response)
+    } else {
+        val response =
+            withUiActionGuard(call, uiDevice, instr, guarded) { guard ->
+                val selector = SelectorReq(xpath = request.query, all = true)
+                val matches =
+                    guard?.let { findElementMatches(selector, it.captured.walked) }
+                        ?: findElementMatches(selector, uiDevice, instr)
                 val elements = matches.map { it.element }
-                call.respond(FindResp(matched = elements.firstOrNull(), elements = elements))
+                FindResp(matched = elements.firstOrNull(), elements = elements)
             }
-        }
-
-        route.post("/set_progress") {
-            val request: SetProgressReq = call.receive()
-            val selector = request.selector()
-            val match = chooseUnique(findElementMatches(selector, uiDevice, instr), selector)
-            call.respond(setProgress(match, request, uiDevice, instr))
-        }
-
-        // Fast on-device scroll-to: drive a scrollable UiObject2 directly rather
-        // than the host loop's dump→swipe→dump per step. The CLI falls back to
-        // the host loop if this route is absent (404) or there's no scrollable.
-        route.post("/scroll") {
-            val r: ScrollReq = call.receive()
-            if (r.text == null && r.rid == null && r.desc == null) {
-                throw BadRequest("empty_selector", "scroll needs one of text|rid|desc")
-            }
-            val scrollable =
-                (
-                    if (r.container_rid != null) {
-                        uiDevice.findObject(By.res(r.container_rid))
-                    } else {
-                        uiDevice.findObject(By.scrollable(true))
-                    }
-                )
-                    ?: throw NotFound("no_scrollable", "no scrollable container found")
-            val dir =
-                when (r.direction.lowercase()) {
-                    "up" -> Direction.UP
-                    "left" -> Direction.LEFT
-                    "right" -> Direction.RIGHT
-                    else -> Direction.DOWN
-                }
-            // Detect the target with the canonical normalized matcher (the same
-            // one `/find` uses) — not `By.textContains`, which is case-sensitive
-            // and unnormalized. A match with a usable tap point is on-screen.
-            val selector =
-                SelectorReq(
-                    text = r.text,
-                    rid = r.rid,
-                    desc = r.desc,
-                    exact = r.exact,
-                    all = true,
-                )
-
-            fun visibleHit(): ElementMatch? = chooseVisibleScrollTarget(findElementMatches(selector, uiDevice, instr), selector)
-
-            var found = visibleHit()
-            var swipes = 0
-            while (found == null && swipes < r.max_swipes) {
-                val more = scrollable.scroll(dir, 0.8f)
-                swipes++
-                found = visibleHit()
-                if (!more) break
-            }
-            val hit = found
-            val tap = hit?.element?.tap
-            if (tap == null) {
-                call.respond(ScrollResp(matched = false, x = -1, y = -1, swipes = swipes))
-            } else {
-                if (r.tap) tapMatch(hit, uiDevice, coordinateFallback = false)
-                call.respond(ScrollResp(matched = true, x = tap[0], y = tap[1], swipes = swipes))
-            }
-        }
+        call.respond(response)
     }
+}
+
+private suspend fun handleSetProgress(
+    call: ApplicationCall,
+    uiDevice: UiDevice,
+    instr: Instrumentation,
+    guarded: Boolean,
+) {
+    val request: SetProgressReq = call.receive()
+    val response =
+        withUiActionGuard(call, uiDevice, instr, guarded) { guard ->
+            val resolved = guard?.resolved
+            val selector = if (resolved == null) request.selector() else progressReadbackSelector(resolved)
+            val match =
+                resolved
+                    ?: chooseUnique(
+                        guard?.let { findElementMatches(selector, it.captured.walked) }
+                            ?: findElementMatches(selector, uiDevice, instr),
+                        selector,
+                    )
+            setProgress(match, request, selector, resolved?.element?.handle, uiDevice, instr)
+        }
+    call.respond(response)
 }
 
 /**
@@ -222,9 +294,18 @@ internal fun findElementMatches(
     uiDevice: UiDevice,
     instr: Instrumentation,
 ): List<ElementMatch> {
-    request.validate()
     val root = instr.uiAutomation.rootInActiveWindow
-    val elements = TreeWalker.walkWithNodes(root, uiDevice.displayWidth, uiDevice.displayHeight)
+    return findElementMatches(
+        request,
+        TreeWalker.walkWithNodes(root, uiDevice.displayWidth, uiDevice.displayHeight),
+    )
+}
+
+internal fun findElementMatches(
+    request: SelectorReq,
+    elements: List<TreeWalker.WalkedElement>,
+): List<ElementMatch> {
+    request.validate()
     val matches =
         elements
             .filter { request.matches(it.element) }
@@ -366,6 +447,8 @@ private data class SetProgressResp(
 private suspend fun setProgress(
     match: ElementMatch,
     request: SetProgressReq,
+    readbackSelector: SelectorReq,
+    readbackHandle: String?,
     uiDevice: UiDevice,
     instr: Instrumentation,
 ): SetProgressResp {
@@ -394,7 +477,7 @@ private suspend fun setProgress(
             }
         if (match.node.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SET_PROGRESS.id, arguments)) {
             val readback =
-                readBackRange(request.selector(), uiDevice, instr, semanticTarget, before)
+                readBackRange(readbackSelector, readbackHandle, uiDevice, instr, semanticTarget, before)
                     ?: throw BadRequest(
                         "set_progress_unverified",
                         "ACTION_SET_PROGRESS was delivered but range-value readback became unavailable",
@@ -482,7 +565,7 @@ private suspend fun setProgress(
     val y = (bounds[1] + bounds[3]) / 2
     if (!uiDevice.click(x, y)) throw BadRequest("set_progress_failed", "UiDevice.click returned false")
 
-    val readback = target?.let { readBackRange(request.selector(), uiDevice, instr, it, before) }
+    val readback = target?.let { readBackRange(readbackSelector, readbackHandle, uiDevice, instr, it, before) }
     val after = readback?.range
     val mutationVerified =
         if (readback == null) {
@@ -513,6 +596,17 @@ private suspend fun setProgress(
         x = x,
         y = y,
     )
+}
+
+private fun progressReadbackSelector(match: ElementMatch): SelectorReq {
+    val element = match.element
+    return when {
+        element.rid != null ->
+            SelectorReq(rid = element.rid, klass = element.klass, all = true, exact = true)
+        element.desc != null ->
+            SelectorReq(desc = element.desc, klass = element.klass, all = true, exact = true)
+        else -> SelectorReq(id = element.id, klass = element.klass, all = true, exact = true)
+    }
 }
 
 private fun validateProgressRequest(request: SetProgressReq) {
@@ -587,6 +681,7 @@ private data class ProgressReadback(
 
 private suspend fun readBackRange(
     selector: SelectorReq,
+    handle: String?,
     uiDevice: UiDevice,
     instr: Instrumentation,
     expected: Float,
@@ -600,12 +695,22 @@ private suspend fun readBackRange(
         // semantics tree so a successful action cannot be "verified" against
         // pre-action values.
         runCatching { instr.uiAutomation.clearCache() }
-        val matches = findElementMatches(selector.copy(all = true), uiDevice, instr)
         val after =
-            try {
-                chooseUnique(matches, selector).element.range
-            } catch (_: RuntimeException) {
-                null
+            if (handle != null) {
+                val captured =
+                    captureScreen(
+                        uiDevice,
+                        instr,
+                        ScreenEnrichmentCache.shared(uiDevice, instr),
+                    )
+                rangeForHandleOrSelector(captured.toResponse(), handle, selector)
+            } else {
+                val matches = findElementMatches(selector.copy(all = true), uiDevice, instr)
+                try {
+                    chooseUnique(matches, selector).element.range
+                } catch (_: RuntimeException) {
+                    null
+                }
             }
         if (after != null) {
             latest = after
@@ -617,6 +722,20 @@ private suspend fun readBackRange(
         delay(PROGRESS_READBACK_POLL_MS)
     } while (SystemClock.elapsedRealtime() < deadline)
     return latest?.let { ProgressReadback(it, targetReached = false) }
+}
+
+internal fun rangeForHandleOrSelector(
+    screen: ScreenResponse,
+    handle: String,
+    selector: SelectorReq,
+): RangeSemantics? {
+    if (screen.snapshot_state != SnapshotState.CONSISTENT) return null
+    screen.elements
+        .firstOrNull { it.handle == handle }
+        ?.range
+        ?.let { return it }
+    val selectorMatches = screen.elements.filter(selector::matches)
+    return selectorMatches.singleOrNull()?.range
 }
 
 internal fun progressChanged(

@@ -9,6 +9,7 @@ import io.github.andriyo.shadowdroid.proto.AppRef
 import io.github.andriyo.shadowdroid.proto.Element
 import io.github.andriyo.shadowdroid.proto.ImeState
 import io.github.andriyo.shadowdroid.proto.RangeSemantics
+import io.github.andriyo.shadowdroid.proto.SnapshotState
 import io.github.andriyo.shadowdroid.proto.Viewport
 import kotlinx.serialization.json.JsonPrimitive
 import org.junit.Assert.assertEquals
@@ -251,11 +252,11 @@ class ScreenIdentityTest {
                 refreshedAtElapsedMs = 0,
             )
         assertEquals(
-            "transitioning",
+            SnapshotState.TRANSITIONING,
             assessSnapshot("com.example", 7, true, 3, "com.example", pending).state,
         )
         assertEquals(
-            "transitioning",
+            SnapshotState.TRANSITIONING,
             assessSnapshot("com.previous", 7, true, 3, "com.example", pending).state,
         )
 
@@ -268,11 +269,11 @@ class ScreenIdentityTest {
                 refreshedAtElapsedMs = 1,
             )
         assertEquals(
-            "consistent",
+            SnapshotState.CONSISTENT,
             assessSnapshot("com.example", 7, true, 3, "com.example", complete).state,
         )
         assertEquals(
-            "transitioning",
+            SnapshotState.TRANSITIONING,
             assessSnapshot("com.example", 8, true, 3, "com.example", complete).state,
         )
     }
@@ -300,7 +301,7 @@ class ScreenIdentityTest {
                 foregroundPackage = "com.example",
                 enrichment = enrichment,
             )
-        assertEquals("transitioning", assessment.state)
+        assertEquals(SnapshotState.TRANSITIONING, assessment.state)
         assertTrue(assessment.warning?.contains("accessible content") == true)
     }
 

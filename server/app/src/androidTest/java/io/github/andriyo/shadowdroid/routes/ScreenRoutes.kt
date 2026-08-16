@@ -12,6 +12,7 @@ import io.github.andriyo.shadowdroid.proto.AppRef
 import io.github.andriyo.shadowdroid.proto.Element
 import io.github.andriyo.shadowdroid.proto.ImeState
 import io.github.andriyo.shadowdroid.proto.ScreenResponse
+import io.github.andriyo.shadowdroid.proto.SnapshotState
 import io.github.andriyo.shadowdroid.proto.StableScreenResponse
 import io.github.andriyo.shadowdroid.proto.UiTreeSnapshot
 import io.github.andriyo.shadowdroid.proto.Viewport
@@ -80,7 +81,7 @@ object ScreenRoutes {
             val snapshot = captureScreen(uiDevice, instr, enrichmentCache)
             call.respond(
                 StableScreenResponse(
-                    stable = idle && snapshot.assessment.state == "consistent",
+                    stable = idle && snapshot.assessment.state == SnapshotState.CONSISTENT,
                     settle_ms = (SystemClock.elapsedRealtime() - started).coerceAtLeast(0L),
                     quiet_period_ms = quietMs,
                     screen = snapshot.toResponse(),
@@ -137,7 +138,7 @@ object ScreenRoutes {
     }
 }
 
-private fun CapturedScreen.toResponse(): ScreenResponse {
+internal fun CapturedScreen.toResponse(): ScreenResponse {
     val ime = detectImeState(elements, enrichment)
     val currentApp =
         AppRef(
@@ -171,9 +172,9 @@ private fun CapturedScreen.toResponse(): ScreenResponse {
     )
 }
 
-private data class CapturedScreen(
+internal data class CapturedScreen(
     val viewport: Viewport,
-    val elements: List<Element>,
+    val walked: List<TreeWalker.WalkedElement>,
     val treePackage: String?,
     val treeWindowId: Int?,
     val treeSampledAtMs: Long,
@@ -181,10 +182,13 @@ private data class CapturedScreen(
     val enrichment: ScreenEnrichment,
     val assessment: SnapshotAssessment,
     val capturedAtMs: Long,
-)
+) {
+    val elements: List<Element>
+        get() = walked.map { it.element }
+}
 
 internal data class SnapshotAssessment(
-    val state: String,
+    val state: SnapshotState,
     val warning: String? = null,
 )
 
@@ -195,7 +199,7 @@ internal data class SnapshotAssessment(
  * the transition explicit instead of returning a contradictory authoritative
  * snapshot.
  */
-private suspend fun captureScreen(
+internal suspend fun captureScreen(
     uiDevice: UiDevice,
     instr: Instrumentation,
     enrichmentCache: ScreenEnrichmentCache,
@@ -205,7 +209,8 @@ private suspend fun captureScreen(
     do {
         val viewport = Viewport(uiDevice.displayWidth, uiDevice.displayHeight)
         val root = instr.uiAutomation.rootInActiveWindow
-        val elements = TreeWalker.walk(root, viewport.w, viewport.h)
+        val walked = TreeWalker.walkWithNodes(root, viewport.w, viewport.h)
+        val elements = walked.map { it.element }
         val treePackage = root?.packageName?.toString()?.takeIf { it.isNotBlank() }
         val treeWindowId = root?.windowId
         val treeReady = elements.isNotEmpty() || (root?.childCount ?: 0) > 0
@@ -231,7 +236,7 @@ private suspend fun captureScreen(
         latest =
             CapturedScreen(
                 viewport = viewport,
-                elements = elements,
+                walked = walked,
                 treePackage = treePackage,
                 treeWindowId = treeWindowId,
                 treeSampledAtMs = treeSampledAtMs,
@@ -240,7 +245,7 @@ private suspend fun captureScreen(
                 assessment = assessment,
                 capturedAtMs = System.currentTimeMillis(),
             )
-        if (assessment.state == "consistent" || SystemClock.elapsedRealtime() >= deadline) {
+        if (assessment.state == SnapshotState.CONSISTENT || SystemClock.elapsedRealtime() >= deadline) {
             return latest
         }
         delay(SNAPSHOT_RETRY_MS)
@@ -258,31 +263,31 @@ internal fun assessSnapshot(
 ): SnapshotAssessment {
     if (elementCount > 0 && treePackage == null) {
         return SnapshotAssessment(
-            "transitioning",
+            SnapshotState.TRANSITIONING,
             "UI tree package was unavailable while visible elements were present",
         )
     }
     if (treePackage != null && treePackage != foregroundPackage) {
         return SnapshotAssessment(
-            "transitioning",
+            SnapshotState.TRANSITIONING,
             "UI tree package '$treePackage' did not match foreground package '$foregroundPackage'",
         )
     }
     if (!treeReady && foregroundPackage != null) {
         return SnapshotAssessment(
-            "transitioning",
+            SnapshotState.TRANSITIONING,
             "foreground UI tree had not produced accessible content after the bounded consistency check",
         )
     }
     if (elementCount > 0 && enrichment.windowId != treeWindowId) {
         return SnapshotAssessment(
-            "transitioning",
+            SnapshotState.TRANSITIONING,
             "UI tree window '$treeWindowId' did not match foreground metadata window '${enrichment.windowId}'",
         )
     }
     if (foregroundPackage != enrichment.`package`) {
         return SnapshotAssessment(
-            "transitioning",
+            SnapshotState.TRANSITIONING,
             "foreground metadata had not converged for package '$foregroundPackage'",
         )
     }
@@ -291,11 +296,11 @@ internal fun assessSnapshot(
         (enrichment.activity == null || enrichment.pid == null)
     ) {
         return SnapshotAssessment(
-            "transitioning",
+            SnapshotState.TRANSITIONING,
             "foreground activity/PID remained incomplete after the bounded consistency check",
         )
     }
-    return SnapshotAssessment("consistent")
+    return SnapshotAssessment(SnapshotState.CONSISTENT)
 }
 
 private const val SNAPSHOT_CONVERGENCE_MS = 800L

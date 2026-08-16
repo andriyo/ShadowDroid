@@ -2245,26 +2245,33 @@ async fn dispatch_ui_inner(
                 rid: rid.clone(),
                 desc: desc.clone(),
             };
-            crate::fusion::run_fused(client, &fusion, Some(hint), |handle_id| {
-                cmd_tap(
-                    client,
-                    serial,
-                    handle_id.or(id),
-                    fallback_id,
-                    a,
-                    b,
-                    text,
-                    rid,
-                    desc,
-                    xpath,
-                    exact,
-                    clickable,
-                    coordinate_fallback,
-                    studio_url.as_deref(),
-                    studio_wait_ms,
-                    fusion.if_screen.is_some(),
-                )
-            })
+            let has_screen_guard = fusion.if_screen.is_some();
+            crate::fusion::run_fused(
+                client,
+                &fusion,
+                Some(hint),
+                move |action_client, handle_id| async move {
+                    cmd_tap(
+                        &action_client,
+                        serial,
+                        handle_id.or(id),
+                        fallback_id,
+                        a,
+                        b,
+                        text,
+                        rid,
+                        desc,
+                        xpath,
+                        exact,
+                        clickable,
+                        coordinate_fallback,
+                        studio_url.as_deref(),
+                        studio_wait_ms,
+                        has_screen_guard,
+                    )
+                    .await
+                },
+            )
             .await
         }
         UiCmd::SetProgress {
@@ -2296,26 +2303,31 @@ async fn dispatch_ui_inner(
                 rid: rid.clone(),
                 desc: desc.clone(),
             };
-            crate::fusion::run_fused(client, &fusion, Some(hint), |handle_id| async move {
-                let query = SelectorQuery {
-                    id: handle_id.or(id),
-                    text,
-                    rid,
-                    desc,
-                    xpath,
-                    exact,
-                    ..Default::default()
-                };
-                let response = client
-                    .set_progress(&query, value, percent, clamp, coordinate_fallback)
-                    .await?;
-                Ok(("set_progress", serde_json::to_value(response)?))
-            })
+            crate::fusion::run_fused(
+                client,
+                &fusion,
+                Some(hint),
+                |action_client, handle_id| async move {
+                    let query = SelectorQuery {
+                        id: handle_id.or(id),
+                        text,
+                        rid,
+                        desc,
+                        xpath,
+                        exact,
+                        ..Default::default()
+                    };
+                    let response = action_client
+                        .set_progress(&query, value, percent, clamp, coordinate_fallback)
+                        .await?;
+                    Ok(("set_progress", serde_json::to_value(response)?))
+                },
+            )
             .await
         }
         UiCmd::DoubleTap { x, y, fusion } => {
-            crate::fusion::run_fused(client, &fusion, None, |_| async {
-                client.double_tap(x, y).await?;
+            crate::fusion::run_fused(client, &fusion, None, |action_client, _| async move {
+                action_client.double_tap(x, y).await?;
                 Ok(("double_tap", json!({"x":x,"y":y})))
             })
             .await
@@ -2326,8 +2338,8 @@ async fn dispatch_ui_inner(
             duration_ms,
             fusion,
         } => {
-            crate::fusion::run_fused(client, &fusion, None, |_| async {
-                client.long_tap(x, y, duration_ms).await?;
+            crate::fusion::run_fused(client, &fusion, None, |action_client, _| async move {
+                action_client.long_tap(x, y, duration_ms).await?;
                 Ok(("long_tap", json!({"x":x,"y":y,"duration_ms":duration_ms})))
             })
             .await
@@ -2340,8 +2352,8 @@ async fn dispatch_ui_inner(
             duration_ms,
             fusion,
         } => {
-            crate::fusion::run_fused(client, &fusion, None, |_| async {
-                client.swipe(x1, y1, x2, y2, duration_ms).await?;
+            crate::fusion::run_fused(client, &fusion, None, |action_client, _| async move {
+                action_client.swipe(x1, y1, x2, y2, duration_ms).await?;
                 Ok((
                     "swipe",
                     json!({"from":[x1,y1],"to":[x2,y2],"duration_ms":duration_ms}),
@@ -2357,8 +2369,8 @@ async fn dispatch_ui_inner(
             duration_ms,
             fusion,
         } => {
-            crate::fusion::run_fused(client, &fusion, None, |_| async {
-                client.drag(x1, y1, x2, y2, duration_ms).await?;
+            crate::fusion::run_fused(client, &fusion, None, |action_client, _| async move {
+                action_client.drag(x1, y1, x2, y2, duration_ms).await?;
                 Ok((
                     "drag",
                     json!({"from":[x1,y1],"to":[x2,y2],"duration_ms":duration_ms}),
@@ -2372,8 +2384,10 @@ async fn dispatch_ui_inner(
             duration_ms,
             fusion,
         } => {
-            crate::fusion::run_fused(client, &fusion, None, |_| async {
-                client.swipe_ext(&direction, scale, duration_ms).await?;
+            crate::fusion::run_fused(client, &fusion, None, |action_client, _| async move {
+                action_client
+                    .swipe_ext(&direction, scale, duration_ms)
+                    .await?;
                 Ok((
                     "swipe_ext",
                     json!({"direction":direction,"scale":scale,"duration_ms":duration_ms}),
@@ -2394,8 +2408,12 @@ async fn dispatch_ui_inner(
                 rid: rid.clone(),
                 desc: desc.clone(),
             };
-            crate::fusion::run_fused(client, &fusion, Some(hint), |_| async {
-                client
+            crate::fusion::run_fused(
+                client,
+                &fusion,
+                Some(hint),
+                |action_client, _| async move {
+                action_client
                     .pinch(
                         rid.as_deref(),
                         text.as_deref(),
@@ -2408,7 +2426,8 @@ async fn dispatch_ui_inner(
                     "pinch",
                     json!({"direction":direction,"rid":rid,"text":text,"desc":desc,"percent":percent}),
                 ))
-            })
+                },
+            )
             .await
         }
         UiCmd::ScrollTo(args) => crate::cmd::scroll::run(client, &args).await,
@@ -2439,13 +2458,18 @@ async fn dispatch_ui_inner(
                 rid: rid.clone(),
                 desc: desc.clone(),
             };
-            crate::fusion::run_fused(client, &fusion, Some(hint), |handle_id| async move {
-                let target = text_target_query(handle_id.or(id), text, rid, desc, xpath, exact);
-                client
-                    .text_with_target(&value, clear, target.as_ref())
-                    .await?;
-                Ok(("text", json!({"value":value,"clear":clear,"target":target})))
-            })
+            crate::fusion::run_fused(
+                client,
+                &fusion,
+                Some(hint),
+                |action_client, handle_id| async move {
+                    let target = text_target_query(handle_id.or(id), text, rid, desc, xpath, exact);
+                    action_client
+                        .text_with_target(&value, clear, target.as_ref())
+                        .await?;
+                    Ok(("text", json!({"value":value,"clear":clear,"target":target})))
+                },
+            )
             .await
         }
         UiCmd::Pin {
@@ -2469,8 +2493,8 @@ async fn dispatch_ui_inner(
             Ok(Outcome::Action(cmd, body))
         }
         UiCmd::Key { name, fusion } => {
-            crate::fusion::run_fused(client, &fusion, None, |_| async {
-                let injected = client.key(&name).await?;
+            crate::fusion::run_fused(client, &fusion, None, |action_client, _| async move {
+                let injected = action_client.key(&name).await?;
                 Ok(("key", json!({"name":name,"injected":injected})))
             })
             .await
@@ -2492,15 +2516,15 @@ async fn dispatch_ui_inner(
             ))
         }
         UiCmd::Back { fusion } => {
-            crate::fusion::run_fused(client, &fusion, None, |_| async {
-                let injected = client.key("back").await?;
+            crate::fusion::run_fused(client, &fusion, None, |action_client, _| async move {
+                let injected = action_client.key("back").await?;
                 Ok(("key", json!({"name":"back","injected":injected})))
             })
             .await
         }
         UiCmd::Home { fusion } => {
-            crate::fusion::run_fused(client, &fusion, None, |_| async {
-                let injected = client.key("home").await?;
+            crate::fusion::run_fused(client, &fusion, None, |action_client, _| async move {
+                let injected = action_client.key("home").await?;
                 Ok(("key", json!({"name":"home","injected":injected})))
             })
             .await
@@ -4293,6 +4317,11 @@ fn server_error_retryable(code: &str, status: reqwest::StatusCode) -> bool {
                 | "no_focused_field"
                 | "no_scrollable"
                 | "screenshot_failed"
+                | "screen_changed"
+                | "interaction_changed"
+                | "stale_element"
+                | "snapshot_not_consistent"
+                | "server_guard_unsupported"
                 | "shell_timeout"
                 | "swipe_failed"
                 | "tap_failed"
@@ -4309,6 +4338,19 @@ fn command_contract_action(command_path: Option<&str>, fallback: &str) -> String
 fn server_error_next_actions(code: &str, command_path: Option<&str>) -> Option<Vec<String>> {
     let current_contract = |fallback: &str| command_contract_action(command_path, fallback);
     match code {
+        "screen_changed" | "interaction_changed" | "stale_element" | "snapshot_not_consistent" => {
+            Some(vec![
+                "re-plan from detail.screen; do not reuse stale numeric element ids or handles"
+                    .to_string(),
+                "shadowdroid ui dump".to_string(),
+                current_contract("ui tap"),
+            ])
+        }
+        "server_guard_unsupported" | "missing_action_guard" => Some(vec![
+            "shadowdroid connect".to_string(),
+            "shadowdroid doctor --fix --json".to_string(),
+            current_contract("ui tap"),
+        ]),
         "element_not_found" => Some(vec![
             "inspect detail.top_texts and detail.closest when present".to_string(),
             "shadowdroid ui dump".to_string(),
@@ -5086,6 +5128,74 @@ fn validate_pin_interaction_guard(hash: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+fn require_consistent_pin_snapshot(
+    screen: &crate::proto::ScreenResponse,
+    digits_entered: usize,
+) -> Result<()> {
+    if screen.snapshot_state == crate::proto::SnapshotState::Consistent {
+        return Ok(());
+    }
+    Err(crate::diagnostic::DiagnosticError::new(
+        "snapshot_not_consistent",
+        "ui",
+        "the PIN-pad snapshot is not consistent; PIN entry stopped before the next input",
+    )
+    .retryable(true)
+    .detail(json!({
+        "pin_redacted": true,
+        "digits_entered": digits_entered,
+        "submitted": false,
+    }))
+    .next_actions([
+        "clear or dismiss any partial PIN before retrying",
+        "wait for the intended PIN pad to settle, then read its interaction hash again",
+    ])
+    .into())
+}
+
+fn pin_action_failure(
+    error: anyhow::Error,
+    digits_entered: usize,
+    submitting: bool,
+) -> anyhow::Error {
+    let guard_code = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::device::client::ServerError>())
+        .map(|server| server.code.as_str())
+        .filter(|code| {
+            matches!(
+                *code,
+                "screen_changed"
+                    | "interaction_changed"
+                    | "snapshot_not_consistent"
+                    | "server_guard_unsupported"
+                    | "missing_action_guard"
+            )
+        });
+    let code = guard_code.unwrap_or(if submitting {
+        "pin_submit_failed"
+    } else {
+        "pin_digit_failed"
+    });
+    let message = if submitting {
+        "PIN digits were entered, but guarded submission could not be completed"
+    } else {
+        "PIN entry stopped because a digit button could not be activated"
+    };
+    crate::diagnostic::DiagnosticError::new(code, "ui", message)
+        .retryable(guard_code.is_some())
+        .detail(json!({
+            "pin_redacted": true,
+            "digits_entered": digits_entered,
+            "submitted": false,
+        }))
+        .next_actions([
+            "clear or dismiss any partial PIN before retrying",
+            "read the intended PIN pad again and guard the retry with its interaction hash",
+        ])
+        .into()
+}
+
 async fn cmd_pin(
     client: &ServerClient,
     digits: &str,
@@ -5098,6 +5208,10 @@ async fn cmd_pin(
     // anything. This avoids leaving a partial PIN when a required digit is not
     // represented by an unambiguous accessibility node.
     let screen = client.screen().await?;
+    let guarded = if_screen.is_some() || if_interaction.is_some();
+    if guarded {
+        require_consistent_pin_snapshot(&screen, 0)?;
+    }
     if let Some(expected) = if_screen
         && screen.screen_hash != expected
     {
@@ -5135,11 +5249,25 @@ async fn cmd_pin(
             .into());
         }
     }
+    let pin_interaction_guard = if guarded {
+        Some(screen.interaction_hash.clone().ok_or_else(|| {
+            crate::diagnostic::DiagnosticError::new(
+                "interaction_guard_unsupported",
+                "ui",
+                "the PIN pad did not provide an interaction identity; no PIN digits were entered",
+            )
+            .detail(json!({"pin_redacted": true, "digits_entered": 0, "submitted": false}))
+            .next_actions(["update and reconnect the ShadowDroid server before guarded PIN entry"])
+        })?)
+    } else {
+        None
+    };
     let mut required = [false; 10];
     for byte in digits.bytes() {
         required[usize::from(byte - b'0')] = true;
     }
     let mut targets: [Option<SelectorQuery>; 10] = std::array::from_fn(|_| None);
+    let mut target_handles: [Option<String>; 10] = std::array::from_fn(|_| None);
     let mut unavailable = 0usize;
     for (digit, needed) in required.into_iter().enumerate() {
         if !needed {
@@ -5177,6 +5305,7 @@ async fn cmd_pin(
             coordinate_fallback,
             ..Default::default()
         });
+        target_handles[digit] = element.handle.clone();
     }
     if unavailable > 0 {
         return Err(crate::diagnostic::DiagnosticError::new(
@@ -5202,25 +5331,26 @@ async fn cmd_pin(
         let target = targets[usize::from(byte - b'0')]
             .as_ref()
             .expect("all required PIN targets were preflighted");
-        let response = match client.find_tap(target).await {
+        let target_handle = target_handles[usize::from(byte - b'0')].clone();
+        let action_client = if guarded {
+            let expected_screen = if completed == 0 {
+                screen.screen_hash.clone()
+            } else {
+                let current = client.screen().await?;
+                require_consistent_pin_snapshot(&current, completed)?;
+                current.screen_hash
+            };
+            client.with_action_guard(crate::device::client::ActionGuard {
+                if_screen: Some(expected_screen),
+                if_interaction: pin_interaction_guard.clone(),
+                element_handle: target_handle,
+            })
+        } else {
+            client.clone()
+        };
+        let response = match action_client.find_tap(target).await {
             Ok(response) => response,
-            Err(_) => {
-                return Err(crate::diagnostic::DiagnosticError::new(
-                    "pin_digit_failed",
-                    "ui",
-                    "PIN entry stopped because a digit button could not be activated",
-                )
-                .detail(json!({
-                    "pin_redacted": true,
-                    "digits_entered": completed,
-                    "submitted": false,
-                }))
-                .next_actions([
-                    "clear or dismiss the partial PIN before retrying",
-                    "inspect `ui dump` and guard the retry with --if-interaction",
-                ])
-                .into());
-            }
+            Err(error) => return Err(pin_action_failure(error, completed, false)),
         };
         let delivered = response.input_delivered.unwrap_or(true);
         if !delivered {
@@ -5248,7 +5378,23 @@ async fn cmd_pin(
     }
 
     let submit_injection_reported = if submit {
-        Some(client.key("enter").await?)
+        let action_client = if guarded {
+            let current = client.screen().await?;
+            require_consistent_pin_snapshot(&current, completed)?;
+            client.with_action_guard(crate::device::client::ActionGuard {
+                if_screen: Some(current.screen_hash),
+                if_interaction: pin_interaction_guard,
+                element_handle: None,
+            })
+        } else {
+            client.clone()
+        };
+        Some(
+            action_client
+                .key("enter")
+                .await
+                .map_err(|error| pin_action_failure(error, completed, true))?,
+        )
     } else {
         None
     };
@@ -6754,6 +6900,12 @@ mod tests {
             "progress_value_out_of_range",
             "range_semantics_unavailable",
             "screenshot_failed",
+            "screen_changed",
+            "interaction_changed",
+            "stale_element",
+            "snapshot_not_consistent",
+            "server_guard_unsupported",
+            "missing_action_guard",
             "shell_failed",
             "shell_timeout",
             "swipe_failed",
@@ -7033,6 +7185,31 @@ mod tests {
                 "validation error exposed the PIN value"
             );
         }
+    }
+
+    #[test]
+    fn pin_guard_failures_strip_screen_details_after_partial_entry() {
+        let server = anyhow::Error::new(crate::device::client::ServerError {
+            status: reqwest::StatusCode::PRECONDITION_FAILED,
+            code: "screen_changed".to_string(),
+            message: "stale PIN pad".to_string(),
+            detail: Some(json!({"screen": {"text": "partially-visible-secret"}})),
+        });
+        let error = pin_action_failure(server, 2, false);
+        let diagnostic = error
+            .downcast_ref::<crate::diagnostic::DiagnosticError>()
+            .expect("PIN guard errors should cross the boundary as redacted diagnostics");
+
+        assert_eq!(diagnostic.code, "screen_changed");
+        assert_eq!(diagnostic.detail["pin_redacted"], true);
+        assert_eq!(diagnostic.detail["digits_entered"], 2);
+        assert!(diagnostic.detail.get("screen").is_none());
+        assert!(
+            !diagnostic
+                .detail
+                .to_string()
+                .contains("partially-visible-secret")
+        );
     }
 
     #[test]

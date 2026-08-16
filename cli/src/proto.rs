@@ -56,8 +56,8 @@ pub struct ScreenResponse {
     pub interaction_hash: Option<String>,
     #[serde(default = "default_interaction_hash_version")]
     pub interaction_hash_version: u32,
-    #[serde(default = "default_snapshot_state")]
-    pub snapshot_state: String,
+    #[serde(default)]
+    pub snapshot_state: SnapshotState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub captured_at_ms: Option<u64>,
     pub viewport: Viewport,
@@ -80,8 +80,14 @@ const fn default_interaction_hash_version() -> u32 {
     1
 }
 
-fn default_snapshot_state() -> String {
-    "unknown".to_string()
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotState {
+    Consistent,
+    Transitioning,
+    #[default]
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -462,12 +468,32 @@ mod tests {
         assert!(screen.content_hash.is_none());
         assert!(screen.interaction_hash.is_none());
         assert_eq!(screen.interaction_hash_version, 1);
-        assert_eq!(screen.snapshot_state, "unknown");
+        assert_eq!(screen.snapshot_state, SnapshotState::Unknown);
         assert!(screen.captured_at_ms.is_none());
         assert!(screen.ui_tree.is_none());
 
         let json = serde_json::to_string(&screen).unwrap();
         assert!(!json.contains("\"ime\""), "{json}");
+    }
+
+    #[test]
+    fn snapshot_state_is_typed_and_future_safe() {
+        assert_eq!(
+            serde_json::from_str::<SnapshotState>("\"consistent\"").unwrap(),
+            SnapshotState::Consistent
+        );
+        assert_eq!(
+            serde_json::from_str::<SnapshotState>("\"transitioning\"").unwrap(),
+            SnapshotState::Transitioning
+        );
+        assert_eq!(
+            serde_json::from_str::<SnapshotState>("\"future_state\"").unwrap(),
+            SnapshotState::Unknown
+        );
+        assert_eq!(
+            serde_json::to_string(&SnapshotState::Consistent).unwrap(),
+            "\"consistent\""
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@ import androidx.test.uiautomator.UiDevice
 import io.github.andriyo.shadowdroid.BadRequest
 import io.github.andriyo.shadowdroid.NotFound
 import io.github.andriyo.shadowdroid.proto.OkResponse
+import io.ktor.server.application.ApplicationCall
 import io.ktor.server.request.receive
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
@@ -22,49 +23,76 @@ object KeyTextRoutes {
         instr: Instrumentation,
     ) {
         route.post("/key") {
-            val r: KeyReq = call.receive()
-            val injected =
-                when {
-                    r.code != null -> uiDevice.pressKeyCode(r.code)
-                    r.name != null -> pressNamed(uiDevice, r.name)
-                    else -> throw BadRequest("missing_key", "either 'name' or 'code' required")
-                }
-            // UiDevice.pressBack/pressHome/pressKeyCode return false on Android
-            // 14+ even when the key event is delivered and handled — the boolean
-            // reflects an injection-reporting quirk, not whether the action
-            // happened (verified: `back` navigates correctly while still
-            // returning false). Re-pressing would double-navigate, so we report
-            // the raw result via `ok` rather than treating false as a hard
-            // failure. Genuinely bad input (unknown name, or neither name nor
-            // code) still errors above with unknown_key / missing_key.
-            call.respond(OkResponse(ok = injected))
+            handleKey(call, uiDevice, instr, guarded = false)
+        }
+        route.post("/guarded/key") {
+            handleKey(call, uiDevice, instr, guarded = true)
         }
         route.post("/text") {
-            val r: TextReq = call.receive()
-            val selector = r.selector()
-            if (selector != null) {
-                // Strict ambiguity, like `find_tap`: a unique (or uniquely-exact)
-                // match, else `ambiguous_match` — never type into the wrong field.
-                val match = chooseUnique(findElementMatches(selector.copy(all = true), uiDevice, instr), selector)
-                if (!setAccessibilityText(match.node, r.value)) {
-                    throw BadRequest(
-                        "text_failed",
-                        "matched element rejected ACTION_SET_TEXT",
-                    )
-                }
-            } else if (!setFocusedAccessibilityText(instr, r.value)) {
-                val focused =
-                    uiDevice.findObject(By.focused(true))
-                        ?: throw NotFound(
-                            "no_focused_field",
-                            "no element has input focus. Tap a text field first, or pass --id/--text/--rid/--desc/--xpath.",
-                        )
-                if (r.clear) focused.clear()
-                focused.text = r.value
-            }
-            call.respond(OkResponse())
+            handleText(call, uiDevice, instr, guarded = false)
+        }
+        route.post("/guarded/text") {
+            handleText(call, uiDevice, instr, guarded = true)
         }
     }
+}
+
+private suspend fun handleKey(
+    call: ApplicationCall,
+    uiDevice: UiDevice,
+    instr: Instrumentation,
+    guarded: Boolean,
+) {
+    val request: KeyReq = call.receive()
+    val injected =
+        withUiActionGuard(call, uiDevice, instr, guarded) {
+            when {
+                request.code != null -> uiDevice.pressKeyCode(request.code)
+                request.name != null -> pressNamed(uiDevice, request.name)
+                else -> throw BadRequest("missing_key", "either 'name' or 'code' required")
+            }
+        }
+    // UiDevice.pressBack/pressHome/pressKeyCode return false on Android 14+
+    // even when the key event was delivered. Report the raw result rather than
+    // re-pressing and potentially navigating twice.
+    call.respond(OkResponse(ok = injected))
+}
+
+private suspend fun handleText(
+    call: ApplicationCall,
+    uiDevice: UiDevice,
+    instr: Instrumentation,
+    guarded: Boolean,
+) {
+    val request: TextReq = call.receive()
+    withUiActionGuard(call, uiDevice, instr, guarded) { guard ->
+        val selector = request.selector()
+        val match =
+            guard?.resolved
+                ?: selector?.let {
+                    chooseUnique(
+                        guard?.let { snapshot ->
+                            findElementMatches(it.copy(all = true), snapshot.captured.walked)
+                        } ?: findElementMatches(it.copy(all = true), uiDevice, instr),
+                        it,
+                    )
+                }
+        if (match != null) {
+            if (!setAccessibilityText(match.node, request.value)) {
+                throw BadRequest("text_failed", "matched element rejected ACTION_SET_TEXT")
+            }
+        } else if (!setFocusedAccessibilityText(instr, request.value)) {
+            val focused =
+                uiDevice.findObject(By.focused(true))
+                    ?: throw NotFound(
+                        "no_focused_field",
+                        "no element has input focus. Tap a text field first, or pass --id/--text/--rid/--desc/--xpath.",
+                    )
+            if (request.clear) focused.clear()
+            focused.text = request.value
+        }
+    }
+    call.respond(OkResponse())
 }
 
 private fun pressNamed(

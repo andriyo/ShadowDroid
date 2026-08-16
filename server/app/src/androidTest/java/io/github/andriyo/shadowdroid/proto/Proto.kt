@@ -1,5 +1,6 @@
 package io.github.andriyo.shadowdroid.proto
 
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.Transient
 import kotlinx.serialization.json.JsonElement
@@ -52,7 +53,7 @@ data class ScreenResponse(
     val content_hash: String,
     val interaction_hash: String,
     val interaction_hash_version: Int = 1,
-    val snapshot_state: String = "consistent",
+    val snapshot_state: SnapshotState,
     val captured_at_ms: Long? = null,
     val viewport: Viewport,
     val current_app: AppRef,
@@ -62,6 +63,15 @@ data class ScreenResponse(
     val ime: ImeState = ImeState(),
     val elements: List<Element>,
 )
+
+@Serializable
+enum class SnapshotState {
+    @SerialName("consistent")
+    CONSISTENT,
+
+    @SerialName("transitioning")
+    TRANSITIONING,
+}
 
 @Serializable
 data class StableScreenResponse(
