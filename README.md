@@ -872,12 +872,16 @@ included SQLite `-wal`/`-shm`/`-journal` sidecars, and
 cannot guarantee physical erasure.
 
 Restore refuses a package/signature mismatch unless `--allow-incompatible` is
-explicit. It stages all data privately, records a recovery marker, atomically
-swaps each selected root, verifies every hash/mode, and only then deletes the
-backups. If interrupted during the commit, subsequent state commands return
-`state_restore_interrupted` instead of pretending the app is safe; run
-`app state recover --app <pkg>` to roll back. Snapshot, restore, and recovery
-leave the app force-stopped.
+explicit. It stages all data privately, atomically claims a recovery marker,
+swaps each selected root, and records `verified` only after every hash/mode
+check passes. The pending-marker rename is the commit point; rollback data is
+garbage-collected only afterward. If a restore is interrupted while
+`prepared`, `app state recover --app <pkg>` rolls it back. If it is interrupted
+after `verified`, recovery finishes the commit instead. Recovery is idempotent,
+and a no-pending recovery does not stop a running app. Snapshot and restore
+leave the app force-stopped; recovery does so only for an active transaction.
+This protects against fail-stop CLI/ADB interruptions, not sudden device
+storage loss without filesystem durability guarantees.
 
 ### Screen video evidence
 

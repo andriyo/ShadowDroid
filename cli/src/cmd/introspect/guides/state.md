@@ -47,6 +47,8 @@ State snapshots are unencrypted sensitive directories protected as
 `0700`/`0600`; the manifest records package/version/signing identity, SHA-256,
 size, and mode. Restore force-stops the app, refuses incompatible
 package/signature state unless explicitly overridden, stages and verifies
-before deleting rollback data, and leaves a marker on interruption. Use
-`app state recover --app <pkg>` when that marker is reported and
+before deleting rollback data, and leaves a phase-marked transaction on
+interruption. Use `app state recover --app <pkg>` when that marker is reported;
+it rolls back `prepared` state and finalizes `verified` state. A no-pending
+recovery leaves a running app unchanged. Use
 `app state cleanup --from <snapshot>` for best-effort overwrite/delete.

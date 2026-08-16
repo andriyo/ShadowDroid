@@ -859,7 +859,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         "app state" => Some(serde_json::json!({
             "use_when": ["Need deterministic private app state across compatible APK versions without raw run-as shell redirection."],
             "output": "metadata-only snapshot/restore/recovery/cleanup JSON; private contents are never printed",
-            "side_effects": ["snapshot/restore/recover force-stop the app", "snapshot writes protected host files", "restore mutates selected private roots transactionally", "cleanup overwrites and deletes a host snapshot"],
+            "side_effects": ["snapshot/restore force-stop the app; recover force-stops only when a pending transaction exists", "snapshot writes protected host files", "restore mutates selected private roots transactionally", "cleanup overwrites and deletes a host snapshot"],
             "prerequisites": ["installed debuggable package with working run-as"],
             "next_actions": ["app state snapshot --app <pkg> --out <dir> --include shared_prefs", "app state restore --from <dir>", "app state recover --app <pkg>", "app state cleanup --from <dir>", "commands --guide state --json"]
         })),
@@ -877,8 +877,8 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "app state recover" => Some(serde_json::json!({
             "use_when": ["A restore reported an interruption/pending marker and selected roots may be partial."],
-            "output": "rollback result without private contents",
-            "side_effects": ["force-stops the app", "restores private backups or removes newly created partial roots"],
+            "output": "phase-aware rollback/finalize result without private contents",
+            "side_effects": ["force-stops the app only when a pending transaction exists", "rolls back prepared roots or finalizes verified roots", "cleans self-proving terminal transaction metadata"],
             "next_actions": ["app state restore --from <dir>", "app start <pkg>"]
         })),
         "app state cleanup" => Some(serde_json::json!({
