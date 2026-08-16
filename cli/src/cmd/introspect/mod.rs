@@ -1174,6 +1174,32 @@ mod tests {
     }
 
     #[test]
+    fn collect_catalog_explicitly_advertises_passive_lifecycle_behavior() {
+        let catalog = catalog(&Cli::command());
+        let collect = find_command(catalog["commands"].as_array().unwrap(), &["collect"])
+            .expect("collect command");
+        let side_effects = collect["agent"]["side_effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(side_effects.contains("does not start an AVD"));
+        assert!(side_effects.contains("create adb forwards"));
+
+        let prerequisites = collect["agent"]["prerequisites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(prerequisites.contains("must already be online"));
+        assert!(prerequisites.contains("already-established session"));
+    }
+
+    #[test]
     fn every_public_command_advertises_parseable_next_action_templates() {
         let catalog = catalog(&Cli::command());
         assert_eq!(catalog["schema_version"], 3);

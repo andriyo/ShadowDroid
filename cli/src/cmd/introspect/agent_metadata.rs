@@ -188,8 +188,8 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         "collect" => Some(serde_json::json!({
             "use_when": ["Need a shareable evidence bundle after a failure or before handing off an investigation."],
             "output": "directory with doctor report, device info, logcat/crash context, best-effort screen/screenshot/app state, and per-artifact privacy status",
-            "side_effects": ["writes files under --out or a generated collection directory"],
-            "prerequisites": ["use global --redact for text/JSON artifacts", "--redact-screenshots explicitly applies accessibility-bounds pixel masking and requires global redaction"],
+            "side_effects": ["writes files under --out or a generated collection directory", "does not start an AVD, install/start/repair the ShadowDroid server, create adb forwards, or clean up device processes"],
+            "prerequisites": ["the selected device or named AVD must already be online", "server-backed artifacts are captured only when an already-established session is reachable", "use global --redact for text/JSON artifacts", "--redact-screenshots explicitly applies accessibility-bounds pixel masking and requires global redaction"],
             "next_actions": ["doctor", "debug snapshot", "layout snapshot"]
         })),
         "watch" => Some(serde_json::json!({

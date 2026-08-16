@@ -1,8 +1,6 @@
-`shadowdroid` is the agent-facing control and debugging layer for a running
-Android app: deploy, control app/device state, inspect and act on UI, triage
-logs/crashes, read debugger/layout state, observe network traffic. Gradle or
-the `android` CLI builds; ShadowDroid verifies the result on a device or
-emulator.
+`shadowdroid` controls and debugs a running Android app: deployment, app/device
+state, UI, logs/crashes, debugger/layout, and network. Gradle or `android`
+builds; ShadowDroid verifies on a device or emulator.
 
 ## Discover before constructing a command
 
@@ -117,8 +115,9 @@ TV/leanback prefer `ui focus` and `ui key dpad_*`.
   different screen); never installs or starts the server.
 - `log --last 5m --level e` — bounded app-scoped logcat with crash/ANR blocks
   parsed into events.
-- `collect --app <pkg>` — handoff bundle; degrades to adb evidence without the
-  server.
+- `collect --app <pkg>` — passive bundle; the device/AVD must be online. It
+  reads an existing server session or degrades to adb evidence; never starts an
+  AVD/server or forward.
 
 UI and app results may carry an `events` array for a crash/ANR detected since
 the previous invocation; inspect it before probing further.

@@ -6,7 +6,8 @@
 //! and the existing on-device routes, so they ship without an APK change. Most
 //! deliberately do *not* go through [crate::device::installer::ensure_ready] —
 //! `doctor` diagnoses the very server `ensure_ready` would start, and `collect`
-//! must still produce a bundle when the server can't come up.
+//! only probes an already-established session so evidence capture cannot start
+//! or repair the server.
 
 pub mod aar;
 pub mod agent;

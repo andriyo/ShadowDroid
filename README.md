@@ -216,6 +216,9 @@ HTTP. The host CLI owns orchestration: the watch diff loop, logcat parsing for
 the `log`/`why`/crash-event paths, watcher policy, act+observe fusion, source
 mapping, and recovery. This split means host/adb evidence in `log`, `why`,
 `doctor`, and `collect` remains useful when the on-device server is down.
+`collect` is passive with respect to device lifecycle: the selected device/AVD
+must already be online, and it only reads server-backed evidence through an
+already-established session. It never starts an AVD, server, or adb forward.
 
 Optional integrations extend the same command surface:
 
@@ -609,7 +612,9 @@ object per line, then an action summary.
 **`collect`** is the "I give up, here's everything" bundle: `doctor` output,
 device info, logcat + crash buffer, screenshot, screen dump, and app state, all
 in one directory. It degrades gracefully — the host-side diagnostics are
-captured even if the on-device server can't start. With global `--redact` (or
+captured even if no already-established on-device server session is reachable,
+without installing, starting, repairing, or forwarding one. With global
+`--redact` (or
 `redaction.enabled` in config), every JSON/text artifact is filtered and the
 manifest records privacy status per file. Screenshot pixels are never silently
 treated as safe: they remain marked potentially sensitive; add

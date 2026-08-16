@@ -11,6 +11,22 @@ fn run(home: &std::path::Path, cwd: &std::path::Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
+fn run_with_emulator(
+    home: &std::path::Path,
+    cwd: &std::path::Path,
+    emulator: &std::path::Path,
+    args: &[&str],
+) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_shadowdroid"))
+        .args(args)
+        .current_dir(cwd)
+        .env("HOME", home)
+        .env("SHADOWDROID_QUIET", "1")
+        .env("SHADOWDROID_EMULATOR", emulator)
+        .output()
+        .unwrap()
+}
+
 fn json(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
         panic!(
@@ -175,5 +191,132 @@ fn missing_named_avd_is_not_misreported_as_an_adb_serial() {
             .unwrap()
             .iter()
             .all(|action| !action.as_str().unwrap_or("").contains("-d mobile"))
+    );
+}
+
+#[test]
+fn collect_rejects_a_stopped_if_needed_avd_without_starting_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let init = run(
+        &home,
+        &project,
+        &[
+            "config",
+            "init",
+            "--project",
+            "--default-target",
+            "mobile",
+            "--target-name",
+            "mobile",
+            "--target-avd",
+            "Definitely_Not_A_Running_Collect_AVD",
+            "--target-start",
+            "if-needed",
+            "--json",
+        ],
+    );
+    assert!(init.status.success(), "{}", json(&init));
+
+    // If collect accidentally routes through target::resolve, the if-needed
+    // policy makes it inspect this impossible emulator path. resolve_existing
+    // must reject the stopped target before emulator discovery/start instead.
+    let impossible_emulator = temp.path().join("must-not-be-invoked-emulator");
+    let bundle = temp.path().join("collect-bundle");
+    let collect = run_with_emulator(
+        &home,
+        &project,
+        &impossible_emulator,
+        &["collect", "--out", bundle.to_str().unwrap()],
+    );
+    let error = json(&collect);
+    assert!(!collect.status.success(), "{error}");
+    assert_eq!(error["code"], "target_avd_not_running");
+    assert_eq!(error["detail"]["target_name"], "mobile");
+    assert_eq!(
+        error["detail"]["avd"],
+        "Definitely_Not_A_Running_Collect_AVD"
+    );
+    assert_eq!(error["detail"]["configured_start"], "if-needed");
+    assert_eq!(error["detail"]["start_allowed_for_command"], false);
+    assert!(
+        !bundle.exists(),
+        "target rejection must happen before the collection directory is created"
+    );
+}
+
+#[test]
+fn collect_rejects_an_explicit_offline_serial_before_creating_a_bundle() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let bundle = temp.path().join("collect-bundle");
+    let collect = run(
+        &home,
+        &project,
+        &[
+            "--device",
+            "definitely-not-an-online-shadowdroid-device",
+            "collect",
+            "--no-screenshot",
+            "--out",
+            bundle.to_str().unwrap(),
+        ],
+    );
+    let error = json(&collect);
+    assert!(!collect.status.success(), "{error}");
+    assert_eq!(error["code"], "device_unavailable");
+    assert_eq!(
+        error["detail"]["serial"],
+        "definitely-not-an-online-shadowdroid-device"
+    );
+    assert!(error["detail"]["online_devices"].is_array());
+    assert!(
+        !bundle.exists(),
+        "offline serial rejection must happen before the collection directory is created"
+    );
+}
+
+#[test]
+fn collect_rejects_a_configured_offline_serial_before_creating_a_bundle() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(home.join(".shadowdroid")).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        home.join(".shadowdroid/config.json"),
+        r#"{"device":"definitely-not-an-online-configured-device"}"#,
+    )
+    .unwrap();
+
+    let bundle = temp.path().join("collect-bundle");
+    let collect = run(
+        &home,
+        &project,
+        &[
+            "collect",
+            "--no-screenshot",
+            "--out",
+            bundle.to_str().unwrap(),
+        ],
+    );
+    let error = json(&collect);
+    assert!(!collect.status.success(), "{error}");
+    assert_eq!(error["code"], "device_unavailable");
+    assert_eq!(
+        error["detail"]["serial"],
+        "definitely-not-an-online-configured-device"
+    );
+    assert!(
+        !bundle.exists(),
+        "offline configured serial rejection must happen before collection creates a bundle"
     );
 }

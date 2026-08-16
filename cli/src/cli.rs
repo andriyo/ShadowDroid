@@ -201,8 +201,8 @@ pub enum Cmd {
         json: bool,
     },
     /// Gather a self-contained diagnostic bundle (doctor report, device info,
-    /// recent logcat + crash buffer, and — if the server is up — screen dump,
-    /// screenshot, current activity, app info) into a directory.
+    /// recent logcat + crash buffer, and — if an existing server is reachable —
+    /// screen dump, screenshot, current activity, app info) into a directory.
     Collect {
         /// App package to scope the bundle to (defaults to the configured app).
         #[arg(long)]
@@ -1676,6 +1676,26 @@ impl DeviceSelection {
         resolve_serial(config.device.as_deref()).await
     }
 
+    /// Resolve an already-online device without starting any configured AVD.
+    /// Unlike cleanup-oriented callers of `resolve_existing`, passive
+    /// collection must reject an explicit/configured serial that is not in
+    /// adb's usable-device inventory before it creates an evidence bundle.
+    async fn resolve_online(&self, config: &ShadowDroidConfig) -> Result<Serial> {
+        if let Some(device) = self.explicit_device.as_deref() {
+            return resolve_online_serial(device).await;
+        }
+        if let Some(target) = self.target_name(config) {
+            let serial =
+                crate::device::target::resolve_existing(config, target, self.takeover).await?;
+            crate::events::set_current_device(serial.to_string());
+            return Ok(serial);
+        }
+        if let Some(device) = config.device.as_deref() {
+            return resolve_online_serial(device).await;
+        }
+        resolve_serial(None).await
+    }
+
     /// Preserve doctor's inventory-first behavior for direct/legacy serials;
     /// only named targets need lifecycle resolution and optional startup.
     async fn doctor_device(&self, config: &ShadowDroidConfig) -> Result<Option<String>> {
@@ -1809,9 +1829,10 @@ async fn run_inner() -> Result<()> {
     apply_config_defaults(&mut cmd, &config);
 
     // ── Phase 1: commands that do NOT need the on-device server ──
-    // doctor diagnoses the very server `ensure_ready` would start; collect does
-    // its own best-effort bring-up so it can degrade; perm/appops/profile and
-    // `app install`/`reinstall` are pure host-side `adb`.
+    // doctor diagnoses the very server `ensure_ready` would start; collect only
+    // probes an already-established session so it can degrade without changing
+    // device lifecycle state; perm/appops/profile and `app install`/`reinstall`
+    // are pure host-side `adb`.
     match &cmd {
         Cmd::Devices => return cmd_devices(&config).await,
         Cmd::Init(args) => return crate::cmd::studio::run_init(args).await,
@@ -1893,7 +1914,7 @@ async fn run_inner() -> Result<()> {
             no_screenshot,
             redact_screenshots,
         } => {
-            let serial = selection.resolve(&config).await?;
+            let serial = selection.resolve_online(&config).await?;
             let app = resolve_app_package(&config, Some(&serial), app.clone()).await?;
             return crate::cmd::collect::run(
                 &serial,
@@ -6182,6 +6203,30 @@ pub(crate) async fn resolve_serial(explicit: Option<&str>) -> Result<Serial> {
             }
         }
     };
+    crate::events::set_current_device(serial.to_string());
+    Ok(serial)
+}
+
+async fn resolve_online_serial(requested: &str) -> Result<Serial> {
+    let devices = adb::list_devices().await.context("listing devices")?;
+    if !devices.iter().any(|candidate| candidate == requested) {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "device_unavailable",
+            "device",
+            format!("adb device `{requested}` is not online"),
+        )
+        .retryable(true)
+        .detail(json!({
+            "serial": requested,
+            "online_devices": devices,
+        }))
+        .next_actions([
+            "connect and authorize the selected device, then retry",
+            "run `shadowdroid devices` to inspect current device states",
+        ])
+        .into());
+    }
+    let serial = Serial::from(requested);
     crate::events::set_current_device(serial.to_string());
     Ok(serial)
 }

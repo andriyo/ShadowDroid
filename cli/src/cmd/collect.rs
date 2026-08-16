@@ -2,12 +2,14 @@
 //! self-contained diagnostic bundle: the agent's "I give up" artifact.
 //!
 //! Fans out over reads that already exist — `doctor` diagnostics, `getprop`
-//! device info, recent logcat (+ the crash buffer), and (if the server is up)
-//! a screen dump, screenshot, current activity, and app info — into a directory
+//! device info, recent logcat (+ the crash buffer), and (if an existing server
+//! session is reachable) a screen dump, screenshot, current activity, and app
+//! info — into a directory
 //! plus a `collect.json` manifest. More useful day-to-day than a full
-//! `adb bugreport`, and it **degrades gracefully**: if the on-device server
-//! can't start, the host-side diagnostics (logs, device info, doctor report)
-//! are still captured.
+//! `adb bugreport`, and it **degrades gracefully**: it never starts, installs,
+//! repairs, or forwards the on-device server; when no existing session is
+//! reachable, host-side diagnostics (logs, device info, doctor report) are
+//! still captured.
 //!
 //! Privacy: the bundle is written locally and never uploaded. Screenshots and
 //! logs may contain PII — treat the directory accordingly before sharing it.
@@ -38,6 +40,24 @@ struct Bundle {
     errors: Vec<String>,
     artifacts: Vec<ArtifactPrivacy>,
     policy: Option<crate::redaction::Policy>,
+}
+
+/// Convert the non-mutating existing-session probe into collect's best-effort
+/// capture shape. Keeping all three outcomes explicit prevents a future
+/// refactor from treating "not already running" as permission to repair or
+/// start the server.
+fn passive_server_probe<T>(probe: Result<Option<T>>) -> (Option<T>, Option<String>) {
+    match probe {
+        Ok(Some(client)) => (Some(client), None),
+        Ok(None) => (
+            None,
+            Some(
+                "no already-established ShadowDroid server session is reachable; collect did not start one"
+                    .to_string(),
+            ),
+        ),
+        Err(error) => (None, Some(format!("existing server probe failed: {error}"))),
+    }
 }
 
 impl Bundle {
@@ -170,18 +190,17 @@ pub async fn run(
         bundle.write_text("ui_automation_owners.txt", body);
     }
 
-    // ── server-backed captures (best-effort; degrade if unavailable) ─────────
-    // any_apk_version=true: collect wants whatever server is already up (the v1
-    // API is stable across versions) — it should never force a reinstall just to
-    // grab a screen dump. `doctor --fix` is the verb that enforces the version.
-    let client = match installer::ensure_ready(serial, None, true).await {
-        Ok(c) => Some(c),
-        Err(e) => {
-            bundle.errors.push(format!("server unavailable: {e}"));
-            eprintln!("collect: server unavailable ({e}); capturing host-side diagnostics only");
-            None
-        }
-    };
+    // ── server-backed captures (best-effort; existing session only) ──────────
+    // any_apk_version=true: collect accepts whatever compatible server is
+    // already reachable. `probe_existing` does not allocate/reassert a forward,
+    // install APKs, start instrumentation, or clean up processes. `connect` and
+    // `doctor --fix` are the explicit lifecycle-repair verbs.
+    let (client, server_error) =
+        passive_server_probe(installer::probe_existing(serial, true).await);
+    if let Some(error) = server_error {
+        bundle.errors.push(format!("server unavailable: {error}"));
+        eprintln!("collect: server unavailable ({error}); capturing host-side diagnostics only");
+    }
     let server_ok = client.is_some();
     let mut captured_screen = None;
     if let Some(client) = &client {
@@ -278,4 +297,32 @@ pub async fn run(
         }),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::passive_server_probe;
+
+    #[test]
+    fn passive_server_probe_preserves_all_three_best_effort_outcomes() {
+        let (client, error) = passive_server_probe::<u8>(Ok(Some(7)));
+        assert_eq!(client, Some(7));
+        assert_eq!(error, None);
+
+        let (client, error) = passive_server_probe::<u8>(Ok(None));
+        assert_eq!(client, None);
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|message| message.contains("collect did not start one"))
+        );
+
+        let (client, error) =
+            passive_server_probe::<u8>(Err(anyhow::anyhow!("probe transport failed")));
+        assert_eq!(client, None);
+        assert_eq!(
+            error.as_deref(),
+            Some("existing server probe failed: probe transport failed")
+        );
+    }
 }
