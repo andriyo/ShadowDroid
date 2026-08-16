@@ -969,8 +969,15 @@ map-remote / set-status / set-request-header / set-response-header / replace /
 block / delay). A `respond` rule atomically returns a synthetic status, headers,
 and literal or file-backed body without contacting upstream; it can match a
 GraphQL `operationName` from either the URL query or JSON POST body. Captured
-flows name the rule and report `upstream_bypassed:true`; saved sessions can be
-served offline with `net replay`. `net check <app>` labels its
+flows name the rule and report `upstream_bypassed:true`. `net export fixtures`
+writes the versioned, content-addressed bundle consumed directly by `net
+replay --from`: the loader validates its schema, paths, sizes, hashes, statuses,
+and headers before atomically replacing the active set. Replay keys include
+method, scheme, canonical host, effective port, case-sensitive path, normalized
+query pairs, GraphQL operation, and canonical JSON (or raw body) hash, so
+same-route requests cannot silently collide. Redacted, truncated, streamed,
+errored, or otherwise incomplete captures are refused rather than producing
+misleading fixtures. `net check <app>` labels its
 debuggable/targetSdk result as a static heuristic and leaves the app-specific
 verdict unverified. With the proxy running, `net check --probe <app>` launches a
 package-scoped HTTPS canary; it reports verified/interceptable only when the app
@@ -979,7 +986,9 @@ captured. `net export har|curl|fixtures` hands flows to other tools by writing a
 durable artifact and returning an actionable summary;
 HAR defaults to `shadowdroid-network.har`, curl to
 `shadowdroid-network.curl.sh`, and fixtures to `shadowdroid-fixtures` unless
-`--out` selects another path.
+`--out` selects another path. A corrupt or incompatible replay candidate leaves
+the prior active generation untouched; an older running daemon is detected by
+capability preflight and must be restarted before loading the bundle.
 
 Header rules deliberately name their phase: use `set-request-header` before
 upstream or `set-response-header` before returning to the app. The ambiguous

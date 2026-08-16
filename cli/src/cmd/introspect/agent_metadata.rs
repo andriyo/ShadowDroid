@@ -1178,8 +1178,9 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "net replay" => Some(serde_json::json!({
             "use_when": ["Need to serve saved responses without the real backend for deterministic app testing."],
-            "output": "replay setup/action JSON",
-            "side_effects": ["starts or configures replay behavior for matching traffic"],
+            "prerequisites": ["an already-running current net daemon", "a complete unredacted fixtures bundle from net export fixtures"],
+            "output": "atomic replay replacement JSON with generation, selected count, and active-set fingerprint",
+            "side_effects": ["atomically replaces replay behavior for exact matching traffic; invalid candidates leave the prior set active"],
             "next_actions": ["net start", "watch", "ui dump"]
         })),
         "net rule" => Some(serde_json::json!({

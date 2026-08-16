@@ -2,7 +2,9 @@ package io.github.andriyo.shadowdroid.agent.okhttp
 
 import io.github.andriyo.shadowdroid.agent.Capture
 import io.github.andriyo.shadowdroid.agent.CapturedFlow
+import io.github.andriyo.shadowdroid.agent.CapturedHeader
 import io.github.andriyo.shadowdroid.agent.Intercept
+import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.Interceptor
 import okhttp3.Response
@@ -44,6 +46,7 @@ class ShadowDroidCaptureInterceptor : Interceptor {
 
         val reqType = runCatching { request.body?.contentType()?.toString() }.getOrNull()
         val reqBody = captureRequestBody(request)
+        val reqHeaders = captureHeaders(request.headers)
         val operationName = operationName(reqBody.text)
 
         val response = chain.proceed(request)
@@ -54,6 +57,7 @@ class ShadowDroidCaptureInterceptor : Interceptor {
         val path = capturedRequestTarget(url)
         val respType = runCatching { response.body?.contentType()?.toString() }.getOrNull()
         val respBody = readResponseBody(response, respType)
+        val responseHeaders = captureHeaders(response.headers)
 
         // Decide (and possibly block) only when something is armed, keeping the
         // hold machinery out of the normal capture path.
@@ -62,6 +66,7 @@ class ShadowDroidCaptureInterceptor : Interceptor {
         var finalStatus: Int? = response.code
         var finalBody = respBody
         var finalRespType = respType
+        var finalRespHeaders = responseHeaders
         if (Intercept.isArmed()) {
             val summary = JSONObject().apply {
                 put("id", id)
@@ -82,6 +87,8 @@ class ShadowDroidCaptureInterceptor : Interceptor {
                         durMs,
                         reqType,
                         respType,
+                        reqHeaders,
+                        responseHeaders,
                         reqBody,
                         respBody.copy(streamed = false),
                         response.code,
@@ -98,13 +105,28 @@ class ShadowDroidCaptureInterceptor : Interceptor {
                     finalStatus = mutation.response.code
                     finalBody = mutation.capturedBody
                     finalRespType = mutation.responseType
+                    finalRespHeaders = captureHeaders(mutation.response.headers)
                 }
 
                 Intercept.Action.PassThrough -> Unit
             }
         }
 
-        recordFlow(id, request, url, durMs, reqType, finalRespType, reqBody, finalBody, finalStatus, modified, null)
+        recordFlow(
+            id,
+            request,
+            url,
+            durMs,
+            reqType,
+            finalRespType,
+            reqHeaders,
+            finalRespHeaders,
+            reqBody,
+            finalBody,
+            finalStatus,
+            modified,
+            null,
+        )
         return out
     }
 
@@ -115,6 +137,8 @@ class ShadowDroidCaptureInterceptor : Interceptor {
         durMs: Long,
         reqType: String?,
         respType: String?,
+        reqHeaders: List<CapturedHeader>,
+        respHeaders: List<CapturedHeader>,
         reqBody: BodyCapture,
         respBody: BodyCapture,
         status: Int?,
@@ -129,11 +153,14 @@ class ShadowDroidCaptureInterceptor : Interceptor {
                     method = request.method,
                     scheme = url.scheme,
                     host = url.host,
+                    port = url.port,
                     path = capturedRequestTarget(url),
                     status = status,
                     durMs = durMs,
                     reqType = reqType,
                     respType = respType,
+                    reqHeaders = reqHeaders,
+                    respHeaders = respHeaders,
                     reqLen = reqBody.originalLength,
                     respLen = respBody.originalLength,
                     reqBody = reqBody.text,
@@ -155,7 +182,7 @@ class ShadowDroidCaptureInterceptor : Interceptor {
         // Peeking a long-lived response would delay delivery until the cap is
         // filled (or indefinitely for a quiet stream). Preserve it untouched.
         if (isStreamingContentType(responseType)) return metadataOnly(declaredLength, streamed = true)
-        if (!isTextualContentType(responseType)) return metadataOnly(declaredLength)
+        if (!isTextualContentType(responseType)) return captureNonTextualResponse(declaredLength)
         return runCatching {
             // One extra byte distinguishes an exactly-at-cap body from a body
             // whose total size is unknown and exceeds the capture cap.
@@ -187,4 +214,10 @@ internal fun capturedRequestTarget(url: HttpUrl): String =
             append('?')
             append(it)
         }
+    }
+
+/** OkHttp's indexed header view retains repeated fields and their order. */
+internal fun captureHeaders(headers: Headers): List<CapturedHeader> =
+    List(headers.size) { index ->
+        CapturedHeader(headers.name(index), headers.value(index))
     }

@@ -33,6 +33,10 @@ pub struct FlowRecord {
     pub method: String,
     pub scheme: String,
     pub host: String,
+    /// Effective destination port. Older records omit it and replay migration
+    /// falls back to the scheme default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
     pub path: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub host_redacted: bool,
@@ -78,6 +82,12 @@ pub struct FlowRecord {
     pub rule_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub modified: bool,
+    /// A request-phase interception changed the buffered request body. The
+    /// stored body then describes what was forwarded, while replay lookup runs
+    /// against the app's pre-interception body, so such a flow is deliberately
+    /// ineligible for exact fixture export.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub request_body_modified: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub upstream_bypassed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -164,6 +174,7 @@ impl FlowRecord {
             "method": self.method,
             "scheme": self.scheme,
             "host": self.host,
+            "port": self.port,
             "path": self.path,
             "url": format!("{}://{}{}", self.scheme, self.host, self.path),
             "host_redacted": self.host_redacted,
@@ -185,6 +196,7 @@ impl FlowRecord {
             "rule_id": self.rule_id,
             "rule_ids": self.rule_ids,
             "modified": self.modified,
+            "request_body_modified": self.request_body_modified,
             "upstream_bypassed": self.upstream_bypassed,
             "error": self.error,
             "error_redacted": self.error_redacted,
@@ -381,6 +393,7 @@ mod tests {
             method: "POST".into(),
             scheme: "https".into(),
             host: "api.livd.app".into(),
+            port: Some(443),
             path: "/v1/login".into(),
             host_redacted: false,
             path_redacted: false,
@@ -407,6 +420,7 @@ mod tests {
             rule_id: None,
             rule_ids: vec![],
             modified: false,
+            request_body_modified: false,
             upstream_bypassed: false,
             error: None,
             error_redacted: false,

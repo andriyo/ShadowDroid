@@ -118,8 +118,8 @@ pub struct SharedState {
     pub events: broadcast::Sender<Arc<Event>>,
     /// Declarative rules (`net rule`), applied in order: `(id, spec)`.
     pub rules: RwLock<Vec<(String, RuleSpec)>>,
-    /// Saved flows served as canned responses (`net replay`), or `None`.
-    pub replay: RwLock<Option<Vec<FlowRecord>>>,
+    /// Fully validated immutable response set (`net replay`), or `None`.
+    pub replay: RwLock<Option<Arc<ActiveReplay>>>,
     /// Hosts we've already reported a `tls_error` for, so a client that keeps
     /// retrying a rejected handshake produces one signal, not a flood.
     pub tls_errors_seen: Mutex<HashSet<String>>,
@@ -143,6 +143,16 @@ pub struct SharedState {
     pub ws_intercept: RwLock<Option<ws::WsInterceptCfg>>,
     /// Paused WebSocket frames awaiting `net resume`/`net drop`, keyed by frame id.
     pub ws_held: Mutex<HashMap<String, ws::WsHeldFrame>>,
+}
+
+/// One atomically published replay generation. Its metadata and exact entries
+/// travel together so status can never report a fingerprint from one set with
+/// the count from another.
+#[derive(Debug)]
+pub struct ActiveReplay {
+    pub set: crate::net::replay::ReplaySet,
+    pub generation: u64,
+    pub loaded_at: f64,
 }
 
 impl SharedState {
@@ -636,7 +646,7 @@ async fn proxy_websocket(
         Ok(t) => t,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
-    let port = ws_target_port(req.uri(), &tunnel, &scheme);
+    let port = effective_target_port(req.uri(), &tunnel, &scheme);
     let mut req_headers = header_pairs(req.headers());
     let id = flow::new_id();
     let in_scope = ctx.shared.host_in_scope(&host);
@@ -671,6 +681,7 @@ async fn proxy_websocket(
                         req.method(),
                         &scheme,
                         &host,
+                        port,
                         &path,
                         &req_headers,
                         &[],
@@ -680,6 +691,7 @@ async fn proxy_websocket(
                         0,
                         e.to_string(),
                         Some("websocket".into()),
+                        false,
                         false,
                         &[],
                     ),
@@ -702,6 +714,7 @@ async fn proxy_websocket(
                     method: req.method().as_str(),
                     scheme: &scheme,
                     host: &host,
+                    port,
                     path: &path,
                     req_headers: &req_headers,
                     req_bytes: &[],
@@ -713,6 +726,7 @@ async fn proxy_websocket(
                     error: None,
                     matched: Some("websocket".into()),
                     modified: false,
+                    request_body_modified: false,
                     rule_ids: &[],
                 },
             );
@@ -822,7 +836,7 @@ async fn proxy_websocket(
     ws_switching_response(&resp_headers)
 }
 
-fn ws_target_port(uri: &Uri, tunnel: &Option<(Scheme, Authority)>, scheme: &str) -> u16 {
+fn effective_target_port(uri: &Uri, tunnel: &Option<(Scheme, Authority)>, scheme: &str) -> u16 {
     if let Some((_, authority)) = tunnel {
         if let Some(p) = authority.port_u16() {
             return p;
@@ -1049,6 +1063,7 @@ async fn proxy_request(
     let (parts, body) = req.into_parts();
     let method = parts.method.clone();
     let (scheme, host, path, mut url) = resolve_target(&parts.uri, &tunnel)?;
+    let port = effective_target_port(&parts.uri, &tunnel, &scheme);
     let mut req_headers = header_pairs(&parts.headers);
 
     // Read the request body, buffering up to the cap then streaming it upstream —
@@ -1085,13 +1100,71 @@ async fn proxy_request(
     let mut matched: Option<String> = None;
     let mut rule_ids = Vec::<String>::new();
     let mut modified = false;
+    let mut request_body_modified = false;
 
     // ── replay (P3): serve a saved response, never hitting upstream ──
-    if in_scope
-        && let Some((status, mut headers, body)) =
-            replay_lookup(&ctx.shared, method.as_str(), &host, &path)
-    {
-        replace_content_length(&mut headers, synthetic_response_length(status, body.len()));
+    let replay = if in_scope && !req_streaming {
+        replay_lookup(
+            &ctx.shared,
+            method.as_str(),
+            &scheme,
+            &host,
+            port,
+            &path,
+            &req_bytes,
+        )
+    } else {
+        Ok(None)
+    };
+    let replay = match replay {
+        Ok(replay) => replay,
+        Err(error) => {
+            let message = format!("replay lookup failed: {error:#}");
+            let status = StatusCode::BAD_GATEWAY.as_u16();
+            let headers = vec![(
+                "content-type".to_string(),
+                "text/plain; charset=utf-8".to_string(),
+            )];
+            let body = Bytes::from(format!("shadowdroid proxy: {message}"));
+            capture_bypassed(
+                &ctx,
+                FlowParts {
+                    id: &id,
+                    method: method.as_str(),
+                    scheme: &scheme,
+                    host: &host,
+                    port,
+                    path: &path,
+                    req_headers: &req_headers,
+                    req_bytes: &req_bytes,
+                    req_streamed: false,
+                    status: Some(status),
+                    resp_headers: &headers,
+                    resp_bytes: &body,
+                    dur_ms: 0,
+                    error: Some(message),
+                    matched: Some("replay:error".into()),
+                    modified: false,
+                    request_body_modified: false,
+                    rule_ids: &[],
+                },
+            );
+            return Ok(build_client_response_for(&method, status, &headers, body));
+        }
+    };
+    if let Some(replay) = replay {
+        let ReplaySyntheticResponse {
+            status,
+            mut headers,
+            body,
+            representation_content_length,
+        } = replay;
+        let response_length = if method == Method::HEAD {
+            representation_content_length
+        } else {
+            synthetic_response_length(status, body.len())
+        };
+        replace_content_length(&mut headers, response_length);
         let wire_body = if response_allows_body(&method, status) {
             body.clone()
         } else {
@@ -1104,6 +1177,7 @@ async fn proxy_request(
                 method: method.as_str(),
                 scheme: &scheme,
                 host: &host,
+                port,
                 path: &path,
                 req_headers: &req_headers,
                 req_bytes: &req_bytes,
@@ -1115,10 +1189,17 @@ async fn proxy_request(
                 error: None,
                 matched: Some("replay".into()),
                 modified: true,
+                request_body_modified: false,
                 rule_ids: &[],
             },
         );
-        return Ok(build_client_response_for(&method, status, &headers, body));
+        return Ok(build_replay_client_response(
+            &method,
+            status,
+            &headers,
+            body,
+            representation_content_length,
+        ));
     }
 
     // ── request-phase rules (P3): block / map-local short-circuit; map-remote
@@ -1158,6 +1239,7 @@ async fn proxy_request(
                     method: method.as_str(),
                     scheme: &scheme,
                     host: &host,
+                    port,
                     path: &path,
                     req_headers: &req_headers,
                     req_bytes: &req_bytes,
@@ -1169,6 +1251,7 @@ async fn proxy_request(
                     error: None,
                     matched: Some("rule".into()),
                     modified: true,
+                    request_body_modified: false,
                     rule_ids: &rule_ids,
                 },
             );
@@ -1184,6 +1267,7 @@ async fn proxy_request(
             method: method.as_str(),
             scheme: &scheme,
             host: &host,
+            port,
             path: &path,
             req_headers: &req_headers,
             req_bytes: &req_bytes,
@@ -1195,6 +1279,7 @@ async fn proxy_request(
             error: None,
             matched: None,
             modified: false,
+            request_body_modified: false,
             rule_ids: &rule_ids,
         });
         stamp_capture_context(&ctx, &mut snap);
@@ -1223,6 +1308,7 @@ async fn proxy_request(
                             method: method.as_str(),
                             scheme: &scheme,
                             host: &host,
+                            port,
                             path: &path,
                             req_headers: &req_headers,
                             req_bytes: &req_bytes,
@@ -1234,6 +1320,7 @@ async fn proxy_request(
                             error: None,
                             matched: Some("intercept:respond".into()),
                             modified: true,
+                            request_body_modified: false,
                             rule_ids: &rule_ids,
                         },
                     );
@@ -1245,7 +1332,8 @@ async fn proxy_request(
                     if !m.is_noop() {
                         modified = true;
                         matched = Some("intercept".into());
-                        apply_request_mutation(&mut url, &mut req_headers, &mut req_bytes, &m);
+                        request_body_modified |=
+                            apply_request_mutation(&mut url, &mut req_headers, &mut req_bytes, &m);
                     }
                     if let Some(d) = m.delay_ms {
                         tokio::time::sleep(Duration::from_millis(d as u64)).await;
@@ -1298,6 +1386,7 @@ async fn proxy_request(
                         &method,
                         &scheme,
                         &host,
+                        port,
                         &path,
                         &req_headers,
                         &req_bytes,
@@ -1308,6 +1397,7 @@ async fn proxy_request(
                         e.to_string(),
                         matched.clone(),
                         modified,
+                        request_body_modified,
                         &rule_ids,
                     ),
                 );
@@ -1365,6 +1455,7 @@ async fn proxy_request(
                     method: method.as_str(),
                     scheme: &scheme,
                     host: &host,
+                    port,
                     path: &path,
                     req_headers: &req_headers,
                     req_bytes: &req_bytes,
@@ -1376,6 +1467,7 @@ async fn proxy_request(
                     error: None,
                     matched: matched.clone(),
                     modified,
+                    request_body_modified,
                     rule_ids: &rule_ids,
                 };
                 capture_streamed(&ctx, parts, len_hint);
@@ -1412,6 +1504,7 @@ async fn proxy_request(
                         &method,
                         &scheme,
                         &host,
+                        port,
                         &path,
                         &req_headers,
                         &req_bytes,
@@ -1422,6 +1515,7 @@ async fn proxy_request(
                         e.clone(),
                         matched.clone(),
                         modified,
+                        request_body_modified,
                         &rule_ids,
                     ),
                 );
@@ -1488,6 +1582,7 @@ async fn proxy_request(
             method: method.as_str(),
             scheme: &scheme,
             host: &host,
+            port,
             path: &path,
             req_headers: &req_headers,
             req_bytes: &req_bytes,
@@ -1499,6 +1594,7 @@ async fn proxy_request(
             error: None,
             matched: None,
             modified: false,
+            request_body_modified,
             rule_ids: &rule_ids,
         });
         stamp_capture_context(&ctx, &mut snap);
@@ -1574,6 +1670,7 @@ async fn proxy_request(
                 method: method.as_str(),
                 scheme: &scheme,
                 host: &host,
+                port,
                 path: &path,
                 req_headers: &req_headers,
                 req_bytes: &req_bytes,
@@ -1585,6 +1682,7 @@ async fn proxy_request(
                 error: error.clone(),
                 matched,
                 modified,
+                request_body_modified,
                 rule_ids: &rule_ids,
             },
         );
@@ -1597,6 +1695,7 @@ async fn proxy_request(
                 method: method.as_str(),
                 scheme: &scheme,
                 host: &host,
+                port,
                 path: &path,
                 req_headers: &req_headers,
                 req_bytes: &req_bytes,
@@ -1608,6 +1707,7 @@ async fn proxy_request(
                 error: error.clone(),
                 matched,
                 modified,
+                request_body_modified,
                 rule_ids: &rule_ids,
             },
             Some(wire_len),
@@ -1923,6 +2023,25 @@ fn build_client_response_for(
     }
 }
 
+fn build_replay_client_response(
+    method: &Method,
+    status: u16,
+    headers: &[(String, String)],
+    body: Bytes,
+    representation_content_length: Option<u64>,
+) -> Response<ProxyBody> {
+    if *method == Method::HEAD {
+        response_with_body(
+            status,
+            headers,
+            full_body(Bytes::new()),
+            representation_content_length,
+        )
+    } else {
+        build_client_response_for(method, status, headers, body)
+    }
+}
+
 fn error_response(status: StatusCode, msg: &str) -> Response<ProxyBody> {
     error_response_for(&Method::GET, status, msg)
 }
@@ -1941,6 +2060,7 @@ struct FlowParts<'a> {
     method: &'a str,
     scheme: &'a str,
     host: &'a str,
+    port: u16,
     path: &'a str,
     req_headers: &'a [(String, String)],
     req_bytes: &'a [u8],
@@ -1955,6 +2075,7 @@ struct FlowParts<'a> {
     error: Option<String>,
     matched: Option<String>,
     modified: bool,
+    request_body_modified: bool,
     rule_ids: &'a [String],
 }
 
@@ -1981,6 +2102,7 @@ fn make_flow(p: FlowParts<'_>) -> FlowRecord {
         method: p.method.to_string(),
         scheme: p.scheme.to_string(),
         host: p.host.to_string(),
+        port: Some(p.port),
         path: p.path.to_string(),
         host_redacted: false,
         path_redacted: false,
@@ -2004,6 +2126,7 @@ fn make_flow(p: FlowParts<'_>) -> FlowRecord {
         rule_id: p.rule_ids.last().cloned(),
         rule_ids: p.rule_ids.to_vec(),
         modified: p.modified,
+        request_body_modified: p.request_body_modified,
         upstream_bypassed: false,
         error: p.error,
         error_redacted: false,
@@ -2020,6 +2143,7 @@ fn error_flow<'a>(
     method: &'a Method,
     scheme: &'a str,
     host: &'a str,
+    port: u16,
     path: &'a str,
     req_headers: &'a [(String, String)],
     req_bytes: &'a [u8],
@@ -2030,6 +2154,7 @@ fn error_flow<'a>(
     error: String,
     matched: Option<String>,
     modified: bool,
+    request_body_modified: bool,
     rule_ids: &'a [String],
 ) -> FlowParts<'a> {
     FlowParts {
@@ -2037,6 +2162,7 @@ fn error_flow<'a>(
         method: method.as_str(),
         scheme,
         host,
+        port,
         path,
         req_headers,
         req_bytes,
@@ -2048,6 +2174,7 @@ fn error_flow<'a>(
         error: Some(error),
         matched,
         modified,
+        request_body_modified,
         rule_ids,
     }
 }
@@ -2353,12 +2480,14 @@ fn apply_request_mutation(
     headers: &mut Vec<(String, String)>,
     body: &mut Bytes,
     m: &Mutation,
-) {
+) -> bool {
+    let original_body = body.clone();
     if let Some(u) = &m.set_url {
         *url = u.clone();
     }
     apply_header_mutations(headers, m);
     apply_body_mutation(body, m);
+    *body != original_body
 }
 
 fn apply_response_mutation(
@@ -2699,25 +2828,49 @@ fn apply_response_rules(
     rule_ids
 }
 
-/// If replay is loaded and a saved flow matches (method+host+path), return its
-/// response triple.
+/// If replay is loaded and the complete canonical request key matches, return
+/// its response. A malformed or ambiguous live key fails closed rather than
+/// selecting the first fixture or accidentally reaching the real backend.
 fn replay_lookup(
     shared: &SharedState,
     method: &str,
+    scheme: &str,
     host: &str,
+    port: u16,
     path: &str,
-) -> Option<SyntheticResponse> {
-    let guard = shared.replay.read().unwrap();
-    let flows = guard.as_ref()?;
-    let f = flows
-        .iter()
-        .find(|f| f.method.eq_ignore_ascii_case(method) && f.host == host && f.path == path)?;
-    let body = f
-        .resp_body
-        .clone()
-        .map(|s| Bytes::from(s.into_bytes()))
-        .unwrap_or_default();
-    Some((f.status.unwrap_or(200), f.resp_headers.clone(), body))
+    body: &[u8],
+) -> Result<Option<ReplaySyntheticResponse>> {
+    let active = shared.replay.read().unwrap().clone();
+    let Some(active) = active else {
+        return Ok(None);
+    };
+    let request = crate::net::replay::ReplayRequest {
+        method,
+        scheme,
+        host,
+        effective_port: port,
+        path_and_query: path,
+        body,
+    };
+    match active.set.lookup(&request)? {
+        crate::net::replay::ReplayLookup::Hit(response) => Ok(Some(ReplaySyntheticResponse {
+            status: response.status,
+            headers: response.headers,
+            body: Bytes::from(response.body.into_bytes()),
+            representation_content_length: response.representation_content_length,
+        })),
+        crate::net::replay::ReplayLookup::Miss => Ok(None),
+        crate::net::replay::ReplayLookup::Ambiguous { matches } => {
+            anyhow::bail!("validated replay set returned {matches} matches")
+        }
+    }
+}
+
+struct ReplaySyntheticResponse {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Bytes,
+    representation_content_length: Option<u64>,
 }
 
 /// Rewrite the scheme+authority of a URL (keeping the *original* request path),
@@ -3032,10 +3185,10 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Rewind<T> {
 mod tests {
     use super::{
         ContentEncoding, DecodeFailure, DecodeOutcome, EncodingDisposition, HeldFlow, HoldDecision,
-        ReleaseHeldResult, TerminalHoldHistory, decode_capped, decompress_bounded_with_cap,
-        encoding_disposition, frame_stream_body, graphql_operation_matches, host_glob_match,
-        persisted_tls_error_fields, release_held, resolve_held, tls_failure_reason,
-        upstream_headers, ws_tls_connector,
+        ReleaseHeldResult, TerminalHoldHistory, apply_request_mutation, decode_capped,
+        decompress_bounded_with_cap, encoding_disposition, frame_stream_body,
+        graphql_operation_matches, host_glob_match, persisted_tls_error_fields, release_held,
+        resolve_held, tls_failure_reason, upstream_headers, ws_tls_connector,
     };
     use crate::net::Mutation;
     use crate::net::flow::FlowRecord;
@@ -3380,6 +3533,7 @@ mod tests {
             method: "POST",
             scheme: "https",
             host: "h",
+            port: 443,
             path: "/upload",
             req_headers: &headers,
             req_bytes: &[], // streamed: no buffered body
@@ -3391,12 +3545,45 @@ mod tests {
             error: None,
             matched: None,
             modified: false,
+            request_body_modified: false,
             rule_ids: &[],
         });
         assert!(rec.req_streamed);
         assert!(rec.req_body.is_none());
         // req_len comes from content-length, not the (empty) buffer.
         assert_eq!(rec.req_len, 1_048_576);
+    }
+
+    #[test]
+    fn request_mutation_reports_only_body_identity_changes() {
+        let mut url = "https://example.test/original".to_string();
+        let mut headers = vec![("x-before".to_string(), "one".to_string())];
+        let mut body = Bytes::from_static(b"before");
+        let metadata_only = Mutation {
+            set_url: Some("https://example.test/redirected".into()),
+            set_headers: vec![("x-after".into(), "two".into())],
+            ..Default::default()
+        };
+
+        assert!(!apply_request_mutation(
+            &mut url,
+            &mut headers,
+            &mut body,
+            &metadata_only,
+        ));
+        assert_eq!(body, Bytes::from_static(b"before"));
+
+        let replace_body = Mutation {
+            body: Some(b"after".to_vec()),
+            ..Default::default()
+        };
+        assert!(apply_request_mutation(
+            &mut url,
+            &mut headers,
+            &mut body,
+            &replace_body,
+        ));
+        assert_eq!(body, Bytes::from_static(b"after"));
     }
 
     #[test]
@@ -3568,6 +3755,28 @@ mod tests {
             Some(42),
         );
         assert_eq!(response.headers()[http::header::CONTENT_LENGTH], "42");
+    }
+
+    #[test]
+    fn replayed_head_preserves_captured_representation_length() {
+        let response = super::build_replay_client_response(
+            &hyper::Method::HEAD,
+            200,
+            &[("x-fixture".into(), "head".into())],
+            bytes::Bytes::new(),
+            Some(1_234),
+        );
+        assert_eq!(response.headers()[http::header::CONTENT_LENGTH], "1234");
+        assert_eq!(response.headers()["x-fixture"], "head");
+
+        let absent = super::build_replay_client_response(
+            &hyper::Method::HEAD,
+            200,
+            &[],
+            bytes::Bytes::new(),
+            None,
+        );
+        assert!(!absent.headers().contains_key(http::header::CONTENT_LENGTH));
     }
 
     #[test]

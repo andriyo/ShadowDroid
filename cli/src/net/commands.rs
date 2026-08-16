@@ -54,6 +54,48 @@ fn checked_control_reply(op: &str, reply: serde_json::Value) -> Result<serde_jso
     }
 }
 
+fn require_replay_bundle_capability(
+    status: &serde_json::Value,
+    expected_format: u64,
+    serial: &Serial,
+) -> Result<()> {
+    let supported = status
+        .pointer("/capabilities/replay_bundle_format")
+        .and_then(serde_json::Value::as_u64);
+    let atomic_replace = status
+        .pointer("/capabilities/replay_atomic_replace")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    if supported == Some(expected_format) && atomic_replace {
+        return Ok(());
+    }
+
+    Err(crate::diagnostic::DiagnosticError::new(
+        "net_daemon_upgrade_required",
+        "net",
+        "the running net daemon does not support atomic replay bundles",
+    )
+    .retryable(true)
+    .detail(json!({
+        "device": serial.as_str(),
+        "required_replay_bundle_format": expected_format,
+        "daemon_replay_bundle_format": supported,
+        "daemon_atomic_replace": atomic_replace,
+    }))
+    .next_actions([
+        format!(
+            "shadowdroid -d {} net stop",
+            crate::events::shell_token(serial.as_str())
+        ),
+        format!(
+            "shadowdroid -d {} net start",
+            crate::events::shell_token(serial.as_str())
+        ),
+        "retry the replay command".to_string(),
+    ])
+    .into())
+}
+
 fn daemon_port_field(status: &serde_json::Value, field: &str) -> Result<Option<u16>> {
     let Some(value) = status.get(field) else {
         return Ok(None);
@@ -2988,28 +3030,113 @@ pub async fn rules_apply(serial: &Serial, file: &Path) -> Result<()> {
 }
 
 pub async fn replay(serial: &Serial, from: &Path, host: Option<String>) -> Result<()> {
-    let text = std::fs::read_to_string(from).with_context(|| format!("read {}", from.display()))?;
-    let mut flows: Vec<serde_json::Value> = text
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
-    if let Some(h) = &host {
-        flows.retain(|f| {
-            f.get("host")
-                .and_then(|v| v.as_str())
-                .map(|x| x.contains(h.as_str()))
-                .unwrap_or(false)
-        });
-    }
-    let count = flows.len();
-    let reply = checked_control_reply(
-        "replay",
-        control::request(serial, json!({"op": "replay", "flows": flows})).await?,
+    let metadata = std::fs::symlink_metadata(from)
+        .with_context(|| format!("inspect replay input {}", from.display()))?;
+    let bundle_input = metadata.is_dir()
+        || from.file_name().and_then(|name| name.to_str()) == Some("manifest.json");
+    let set = (if bundle_input {
+        crate::net::replay::load_bundle(from, host.as_deref())
+    } else {
+        crate::net::replay::load_legacy_jsonl_strict(from, host.as_deref())
+    })
+    .map_err(|error| {
+        crate::diagnostic::DiagnosticError::new(
+            "net_replay_input_invalid",
+            "net",
+            format!("replay input is invalid: {error:#}"),
+        )
+        .detail(json!({
+            "from": from.display().to_string(),
+            "host": host.as_deref(),
+            "input_kind": if bundle_input { "bundle" } else { "legacy_jsonl" },
+        }))
+        .next_actions([
+            "inspect manifest.json and its content-addressed response files",
+            "re-export a completed, unredacted, untruncated flow with `net export fixtures`",
+            "retry without `--host` if the exact canonical host was filtered out",
+        ])
+    })?;
+    let count = set.len();
+    let source_count = set.source_count();
+    let source_bundle_sha256 = set.source_bundle_sha256().map(str::to_string);
+    let active_set_sha256 = set.active_set_sha256().to_string();
+    let payload = set.to_payload();
+
+    // Validate the local artifact completely before touching the daemon. The
+    // capability preflight keeps an old daemon's legacy clear-on-invalid op
+    // out of the path; the versioned op is still safe if the daemon races.
+    let status = checked_control_reply(
+        "status",
+        control::request(serial, json!({"op": "status"})).await?,
     )?;
+    require_replay_bundle_capability(
+        &status,
+        crate::net::replay::REPLAY_FORMAT_VERSION.into(),
+        serial,
+    )?;
+    let startup_id = status
+        .get("startup_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            crate::diagnostic::DiagnosticError::new(
+                "net_daemon_protocol",
+                "net",
+                "net daemon status omitted startup_id before replay replacement",
+            )
+            .retryable(true)
+            .detail(json!({"daemon_status": status}))
+            .next_actions([
+                "run `shadowdroid net stop`, then `shadowdroid net start`",
+                "retry the replay command",
+            ])
+        })?
+        .to_string();
+    let reply = checked_control_reply(
+        "replay_replace_v1",
+        control::request(
+            serial,
+            json!({
+                "op": "replay_replace_v1",
+                "expected_startup_id": startup_id,
+                "payload": payload,
+            }),
+        )
+        .await?,
+    )?;
+    if reply
+        .get("active_set_sha256")
+        .and_then(serde_json::Value::as_str)
+        != Some(active_set_sha256.as_str())
+        || reply.get("count").and_then(serde_json::Value::as_u64) != Some(count as u64)
+    {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "net_daemon_protocol",
+            "net",
+            "net daemon replay acknowledgement did not match the validated candidate",
+        )
+        .retryable(true)
+        .detail(json!({
+            "expected_count": count,
+            "expected_active_set_sha256": active_set_sha256,
+            "daemon_reply": reply,
+        }))
+        .next_actions([
+            "run `shadowdroid net status` and inspect replay generation/fingerprint",
+            "run `shadowdroid net stop`, then `shadowdroid net start` before retrying",
+        ])
+        .into());
+    }
     emit(
         "net_replay",
-        json!({"loaded": count, "from": from.display().to_string(), "daemon": reply}),
+        json!({
+            "loaded": count,
+            "source_count": source_count,
+            "from": from.display().to_string(),
+            "host": host,
+            "source_bundle_sha256": source_bundle_sha256,
+            "active_set_sha256": active_set_sha256,
+            "daemon": reply,
+        }),
     );
     Ok(())
 }
@@ -3102,6 +3229,33 @@ mod tests {
         )
         .unwrap();
         assert!(!serialized.contains("SENTINEL-SECRET-PATTERN"));
+    }
+
+    #[test]
+    fn replay_requires_an_atomic_bundle_capability_before_mutation() {
+        let serial = Serial::new("emulator-5554");
+        let current = json!({
+            "capabilities": {
+                "replay_bundle_format": 1,
+                "replay_atomic_replace": true,
+            }
+        });
+        assert!(require_replay_bundle_capability(&current, 1, &serial).is_ok());
+
+        for status in [
+            json!({"running": true}),
+            json!({"capabilities": {"replay_bundle_format": 1}}),
+            json!({"capabilities": {
+                "replay_bundle_format": 2,
+                "replay_atomic_replace": true,
+            }}),
+        ] {
+            let error = require_replay_bundle_capability(&status, 1, &serial).unwrap_err();
+            assert_eq!(
+                crate::cli::error_code_of(&error),
+                "net_daemon_upgrade_required"
+            );
+        }
     }
 
     #[test]

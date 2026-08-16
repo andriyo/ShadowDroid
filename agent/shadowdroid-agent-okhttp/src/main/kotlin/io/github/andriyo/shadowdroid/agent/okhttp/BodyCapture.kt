@@ -68,6 +68,14 @@ internal fun metadataOnly(length: Long, streamed: Boolean = false): BodyCapture 
         streamed = streamed,
     )
 
+/**
+ * A non-text response is deliberately not buffered. Only a declared zero byte
+ * response can therefore be represented as an exact empty body; every other
+ * length, including OkHttp's unknown -1 sentinel, is incomplete for replay.
+ */
+internal fun captureNonTextualResponse(declaredLength: Long): BodyCapture =
+    metadataOnly(declaredLength, streamed = declaredLength != 0L)
+
 internal fun isStreamingContentType(contentType: String?): Boolean {
     val type = contentType?.substringBefore(';')?.trim()?.lowercase() ?: return false
     return type == "text/event-stream" ||

@@ -12,7 +12,7 @@
 //! (`watch`) until the client disconnects.
 
 use crate::ids::Serial;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,7 +23,9 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::events::Event;
 use crate::net::flow::FlowRecord;
-use crate::net::proxy::{HoldDecision, InterceptCfg, ReleaseHeldResult, SharedState, TerminalHold};
+use crate::net::proxy::{
+    ActiveReplay, HoldDecision, InterceptCfg, ReleaseHeldResult, SharedState, TerminalHold,
+};
 use crate::net::{Matcher, Mutation, RuleSpec, flow, paths, store};
 
 /// In-daemon state the control handlers read/mutate.
@@ -121,6 +123,56 @@ fn capture_redaction_status(policy: Option<&crate::redaction::Policy>) -> Value 
         }),
         None => json!({"enabled": false}),
     }
+}
+
+fn replay_status(slot: &std::sync::RwLock<Option<Arc<ActiveReplay>>>) -> Value {
+    match slot.read().unwrap().clone() {
+        Some(active) => json!({
+            "active": true,
+            "generation": active.generation,
+            "count": active.set.len(),
+            "active_set_sha256": active.set.active_set_sha256(),
+            "loaded_at": active.loaded_at,
+        }),
+        None => json!({"active": false}),
+    }
+}
+
+fn publish_replay_set(
+    slot: &std::sync::RwLock<Option<Arc<ActiveReplay>>>,
+    set: crate::net::replay::ReplaySet,
+) -> Result<Value> {
+    let count = set.len();
+    let active_set_sha256 = set.active_set_sha256().to_string();
+    let loaded_at = crate::events::now_ts();
+    let mut guard = slot.write().unwrap();
+    let generation = guard
+        .as_ref()
+        .map(|active| active.generation)
+        .unwrap_or_default()
+        .checked_add(1)
+        .context("replay generation overflow")?;
+    *guard = Some(Arc::new(ActiveReplay {
+        set,
+        generation,
+        loaded_at,
+    }));
+    Ok(json!({
+        "count": count,
+        "generation": generation,
+        "active_set_sha256": active_set_sha256,
+        "loaded_at": loaded_at,
+    }))
+}
+
+fn replace_replay_from_wire(
+    slot: &std::sync::RwLock<Option<Arc<ActiveReplay>>>,
+    payload: Value,
+) -> Result<Value> {
+    // Decode, validate response bytes/headers, and bind the fingerprint before
+    // acquiring the write lock. Publication is one pointer replacement.
+    let set = crate::net::replay::ReplaySet::from_wire_value(payload)?;
+    publish_replay_set(slot, set)
 }
 
 fn request_u32_field(req: &Value, field: &str, default: u32) -> Result<u32> {
@@ -283,7 +335,12 @@ pub async fn serve_client(
                     "started": state.started,
                     "capture_session_id": state.capture_session_id,
                     "ca_fingerprint": state.ca_fingerprint,
+                    "capabilities": {
+                        "replay_bundle_format": crate::net::replay::REPLAY_FORMAT_VERSION,
+                        "replay_atomic_replace": true,
+                    },
                     "capture_redaction": capture_redaction_status(shared.redaction.as_ref()),
+                    "replay": replay_status(&shared.replay),
                     "flows": state.flow_count.load(Ordering::Relaxed),
                     "dropped_flows": shared.dropped_flows.load(Ordering::Relaxed),
                     "persistence_errors": shared.persistence_errors.load(Ordering::Relaxed),
@@ -645,15 +702,77 @@ pub async fn serve_client(
             };
             write_json(&mut wr, &json!({"ok": true, "cleared": n})).await?;
         }
+        "replay_replace_v1" => {
+            let expected_startup_id = req
+                .get("expected_startup_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if expected_startup_id != state.startup_id {
+                write_json(
+                    &mut wr,
+                    &json!({
+                        "ok": false,
+                        "code": "replay_daemon_identity_changed",
+                        "error": "net daemon identity changed after replay capability preflight",
+                        "expected_startup_id": expected_startup_id,
+                        "actual_startup_id": state.startup_id,
+                    }),
+                )
+                .await?;
+            } else {
+                let payload = req.get("payload").cloned().unwrap_or(Value::Null);
+                match replace_replay_from_wire(&shared.replay, payload) {
+                    Ok(summary) => {
+                        let mut reply = summary;
+                        reply["ok"] = Value::Bool(true);
+                        write_json(&mut wr, &reply).await?;
+                    }
+                    Err(error) => {
+                        write_json(
+                            &mut wr,
+                            &json!({
+                                "ok": false,
+                                "code": "replay_payload_invalid",
+                                "error": format!("invalid replay payload: {error:#}"),
+                            }),
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
+        // Compatibility for pre-bundle CLIs. It is strict and atomic: invalid
+        // or empty legacy input never clears an already active replay set.
         "replay" => {
-            let flows: Vec<FlowRecord> = req
-                .get("flows")
-                .cloned()
-                .and_then(|v| serde_json::from_value(v).ok())
-                .unwrap_or_default();
-            let count = flows.len();
-            *shared.replay.write().unwrap() = if flows.is_empty() { None } else { Some(flows) };
-            write_json(&mut wr, &json!({"ok": true, "count": count})).await?;
+            let candidate = (|| -> Result<crate::net::replay::ReplaySet> {
+                let value = req.get("flows").cloned().context("missing legacy flows")?;
+                let flows: Vec<FlowRecord> =
+                    serde_json::from_value(value).context("decode legacy replay flows")?;
+                let sources = flows
+                    .iter()
+                    .map(crate::net::replay::ReplaySource::from_flow_or_default_port)
+                    .collect::<Result<Vec<_>>>()?;
+                crate::net::replay::build_bundle(&sources)?.into_replay_set(None)
+            })();
+            match candidate.and_then(|set| publish_replay_set(&shared.replay, set)) {
+                Ok(summary) => {
+                    let mut reply = summary;
+                    reply["ok"] = Value::Bool(true);
+                    reply["legacy"] = Value::Bool(true);
+                    write_json(&mut wr, &reply).await?;
+                }
+                Err(error) => {
+                    write_json(
+                        &mut wr,
+                        &json!({
+                            "ok": false,
+                            "code": "legacy_replay_invalid",
+                            "error": format!("invalid legacy replay input: {error:#}"),
+                        }),
+                    )
+                    .await?;
+                }
+            }
         }
         "watch" => {
             let matcher: Matcher = req
@@ -1437,6 +1556,59 @@ mod tests {
         assert_eq!(status["custom_patterns"], 1);
         assert_eq!(status["fingerprint"], policy.fingerprint());
         assert!(!status.to_string().contains("SENTINEL-PRIVATE-PATTERN"));
+    }
+
+    fn replay_set(path: &str, response: &str) -> crate::net::replay::ReplaySet {
+        let flow = FlowRecord {
+            id: format!("fixture-{path}"),
+            method: "GET".into(),
+            scheme: "https".into(),
+            host: "api.example.com".into(),
+            port: Some(443),
+            path: path.into(),
+            status: Some(200),
+            resp_headers: vec![("content-type".into(), "text/plain".into())],
+            resp_type: Some("text/plain".into()),
+            resp_len: response.len() as u64,
+            resp_body: Some(response.into()),
+            ..Default::default()
+        };
+        crate::net::replay::build_bundle(&[
+            crate::net::replay::ReplaySource::from_flow(&flow).unwrap()
+        ])
+        .unwrap()
+        .into_replay_set(None)
+        .unwrap()
+    }
+
+    #[test]
+    fn replay_replacement_validates_before_one_atomic_generation_swap() {
+        let slot = std::sync::RwLock::new(None);
+        let first = replay_set("/a", "first");
+        let first_fingerprint = first.active_set_sha256().to_string();
+        let first_summary = publish_replay_set(&slot, first).unwrap();
+        assert_eq!(first_summary["generation"], 1);
+        let first_arc = slot.read().unwrap().clone().unwrap();
+
+        let second = replay_set("/b", "second");
+        let mut corrupt = serde_json::to_value(second.to_payload()).unwrap();
+        corrupt["entries"][0]["response"]["body"] = json!("tampered");
+        assert!(replace_replay_from_wire(&slot, corrupt).is_err());
+        let after_rejection = slot.read().unwrap().clone().unwrap();
+        assert!(Arc::ptr_eq(&first_arc, &after_rejection));
+        assert_eq!(after_rejection.generation, 1);
+        assert_eq!(after_rejection.set.active_set_sha256(), first_fingerprint);
+
+        let second_fingerprint = second.active_set_sha256().to_string();
+        let second_summary =
+            replace_replay_from_wire(&slot, serde_json::to_value(second.to_payload()).unwrap())
+                .unwrap();
+        assert_eq!(second_summary["generation"], 2);
+        assert_eq!(second_summary["active_set_sha256"], second_fingerprint);
+        let status = replay_status(&slot);
+        assert_eq!(status["generation"], 2);
+        assert_eq!(status["count"], 1);
+        assert_eq!(status["active_set_sha256"], second_fingerprint);
     }
 
     #[test]

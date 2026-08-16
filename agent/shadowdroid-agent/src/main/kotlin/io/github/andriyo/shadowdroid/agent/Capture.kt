@@ -4,6 +4,12 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.atomic.AtomicLong
 
+/** One HTTP header field, retaining its position among repeated fields. */
+data class CapturedHeader(
+    val name: String,
+    val value: String,
+)
+
 /**
  * A captured HTTP(S) flow. Serialized in the **same JSON shape as the host
  * `FlowRecord`** (`cli/src/net/flow.rs`) so the CLI's `net log` /
@@ -32,6 +38,9 @@ class CapturedFlow(
     val streamed: Boolean,
     val modified: Boolean,
     val error: String?,
+    val port: Int? = null,
+    val reqHeaders: List<CapturedHeader> = emptyList(),
+    val respHeaders: List<CapturedHeader> = emptyList(),
 ) {
     fun toJson(): JSONObject =
         JSONObject().apply {
@@ -40,11 +49,12 @@ class CapturedFlow(
             put("method", method)
             put("scheme", scheme)
             put("host", host)
+            put("port", port ?: JSONObject.NULL)
             put("path", path)
             put("status", status ?: JSONObject.NULL)
             put("dur_ms", durMs ?: JSONObject.NULL)
-            put("req_headers", JSONArray())
-            put("resp_headers", JSONArray())
+            put("req_headers", reqHeaders.toTupleArray())
+            put("resp_headers", respHeaders.toTupleArray())
             put("req_type", reqType ?: JSONObject.NULL)
             put("resp_type", respType ?: JSONObject.NULL)
             put("req_len", reqLen)
@@ -60,6 +70,17 @@ class CapturedFlow(
             put("error", error ?: JSONObject.NULL)
         }
 }
+
+private fun List<CapturedHeader>.toTupleArray(): JSONArray =
+    JSONArray().apply {
+        forEach { header ->
+            put(
+                JSONArray()
+                    .put(header.name)
+                    .put(header.value),
+            )
+        }
+    }
 
 /**
  * In-memory ring buffer of captured flows, drained over the control channel by

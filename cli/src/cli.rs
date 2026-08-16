@@ -1121,10 +1121,9 @@ pub enum NetCmd {
         #[arg(long)]
         frames: bool,
     },
-    /// Export flows for interop: `har`, `curl`, or `fixtures` (a replayable
-    /// response set + `manifest.json` for deterministic instrumentation tests;
-    /// GraphQL POSTs are keyed by operationName). Framework-specific setups are
-    /// generated from the neutral fixtures manifest by your own tooling.
+    /// Export flows for interop: `har`, `curl`, or `fixtures` (a versioned,
+    /// content-addressed replay bundle with exact request keys). Fixture export
+    /// rejects redacted, truncated, streamed, errored, or body-incomplete flows.
     Export {
         /// Export format: har, curl, fixtures, or jsonl (durable line-per-record
         /// stream; the machine-readable format for WebSocket messages).
@@ -1315,12 +1314,13 @@ pub enum NetCmd {
     },
     /// Apply a bulk rules file (JSON array of rules).
     Rules { file: PathBuf },
-    /// Serve saved responses without a backend.
+    /// Atomically serve a validated fixtures bundle without a backend.
     Replay {
-        /// Directory of saved responses to serve (a `fixtures` export).
+        /// Directory (or manifest.json) produced by `net export fixtures`.
+        /// Historical raw FlowRecord JSONL remains supported with strict parsing.
         #[arg(long)]
         from: PathBuf,
-        /// Only replay for this host; let other hosts pass through.
+        /// Select this exact canonical host from a multi-host bundle.
         #[arg(long)]
         host: Option<String>,
     },
@@ -1333,7 +1333,7 @@ impl NetCmd {
     fn allows_target_start(&self) -> bool {
         matches!(
             self,
-            Self::Check { .. } | Self::Trust { .. } | Self::Start { .. } | Self::Replay { .. }
+            Self::Check { .. } | Self::Trust { .. } | Self::Start { .. }
         )
     }
 }

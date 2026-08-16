@@ -28,6 +28,7 @@ pub mod export;
 pub mod flow;
 pub mod paths;
 pub mod proxy;
+pub mod replay;
 pub mod store;
 pub mod trust;
 pub mod ws;
