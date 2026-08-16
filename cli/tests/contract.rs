@@ -110,6 +110,150 @@ fn breakpoint_commands_expose_validation_bypass() {
 }
 
 #[test]
+fn logpoint_add_requires_explicit_output_and_hides_suspend_policy() {
+    let (out, code) = run(&[
+        "debug",
+        "logpoint",
+        "add",
+        "--file",
+        "/tmp/Foo.kt",
+        "--line",
+        "42",
+    ]);
+    let value = one_json_line(&out);
+    assert_eq!(code, 2);
+    assert_eq!(value["code"], "usage");
+    let arg = value["arg"].as_str().unwrap_or_default();
+    assert!(arg.contains("--expression"), "{value}");
+    assert!(arg.contains("--log-message"), "{value}");
+    assert!(arg.contains("--log-stack"), "{value}");
+
+    let (help, code) = run(&["debug", "logpoint", "add", "--help"]);
+    assert_eq!(code, 0);
+    for option in [
+        "--expression",
+        "--log-message",
+        "--log-stack",
+        "--condition",
+        "--pass-count",
+        "--owner",
+        "--max-events-per-second",
+        "--max-message-chars",
+    ] {
+        assert!(help.contains(option), "missing {option}:\n{help}");
+    }
+    assert!(
+        !help.contains("--suspend"),
+        "logpoint suspension must stay fixed and hidden:\n{help}"
+    );
+
+    let (out, code) = run(&[
+        "debug",
+        "logpoint",
+        "add",
+        "--file",
+        "/tmp/Foo.kt",
+        "--line",
+        "42",
+        "--expression",
+        "   ",
+    ]);
+    let value = one_json_line(&out);
+    assert_eq!(code, 2);
+    assert_eq!(value["code"], "usage");
+    assert_eq!(value["arg"], "--expression <EXPRESSION>");
+}
+
+#[test]
+fn logpoint_numeric_limits_match_the_studio_bridge() {
+    for (option, value) in [
+        ("--line", "2147483648"),
+        ("--pass-count", "2147483648"),
+        ("--max-message-chars", "65537"),
+    ] {
+        let line = if option == "--line" { value } else { "42" };
+        let mut args = vec![
+            "debug",
+            "logpoint",
+            "add",
+            "--file",
+            "/tmp/Foo.kt",
+            "--line",
+            line,
+            "--expression",
+            "counter",
+        ];
+        if option != "--line" {
+            args.extend([option, value]);
+        }
+        let (out, code) = run(&args);
+        let error = one_json_line(&out);
+        assert_eq!(code, 2, "{option} unexpectedly accepted {value}: {error}");
+        assert_eq!(error["code"], "usage", "{option}: {error}");
+    }
+}
+
+#[test]
+fn logpoint_resume_cursor_requires_its_stream_id() {
+    for args in [
+        vec!["debug", "logpoint", "events", "--after", "7"],
+        vec!["debug", "logpoint", "events", "--stream-id", "stream-a"],
+        vec!["debug", "logpoint", "follow", "--after", "7"],
+        vec!["debug", "logpoint", "follow", "--stream-id", "stream-a"],
+    ] {
+        let (out, code) = run(&args);
+        let error = one_json_line(&out);
+        assert_eq!(code, 2, "unexpectedly accepted {args:?}: {error}");
+        assert_eq!(error["code"], "usage", "{args:?}: {error}");
+    }
+
+    for command in ["events", "follow"] {
+        let (help, code) = run(&["debug", "logpoint", command, "--help"]);
+        assert_eq!(code, 0, "{help}");
+        assert!(help.contains("--stream-id <STREAM_ID>"), "{help}");
+
+        let path = format!("debug logpoint {command}");
+        let (catalog, code) = run(&["commands", "--json", "--describe", &path]);
+        let catalog = one_json_line(&catalog);
+        assert_eq!(code, 0, "{catalog}");
+        let args = catalog["command"]["args"].as_array().unwrap();
+        let after = args.iter().find(|arg| arg["name"] == "after").unwrap();
+        let stream_id = args.iter().find(|arg| arg["name"] == "stream_id").unwrap();
+        assert_eq!(after["requires"], serde_json::json!(["stream_id"]));
+        assert_eq!(stream_id["requires"], serde_json::json!(["after"]));
+    }
+}
+
+#[test]
+fn logpoint_catalog_describes_transactional_add_and_jsonl_follow() {
+    let (out, code) = run(&["commands", "--json", "--describe", "debug logpoint add"]);
+    let add = one_json_line(&out);
+    assert_eq!(code, 0, "{add}");
+    assert_eq!(add["path"], "debug logpoint add");
+    assert_eq!(add["command"]["contract"]["output_mode"], "json");
+    assert_eq!(
+        add["command"]["agent"]["output"],
+        "logpoint creation JSON with stable id, ownership, limits, and fixed suspend_policy=NONE"
+    );
+    let groups = add["command"]["argument_groups"].as_array().unwrap();
+    assert!(groups.iter().any(|group| {
+        group["name"] == "logpoint_output"
+            && group["required"] == true
+            && group["args"] == serde_json::json!(["expression", "log_message", "log_stack"])
+    }));
+
+    let (out, code) = run(&["commands", "--json", "--describe", "debug logpoint follow"]);
+    let follow = one_json_line(&out);
+    assert_eq!(code, 0, "{follow}");
+    assert_eq!(follow["path"], "debug logpoint follow");
+    assert_eq!(follow["command"]["contract"]["output_mode"], "jsonl");
+    assert_eq!(
+        follow["command"]["agent"]["output"],
+        "JSONL logpoint events and cursor-gap/stream-reset warnings followed by a terminal action summary"
+    );
+}
+
+#[test]
 fn video_help_and_catalog_expose_the_agent_recording_contract() {
     let (help, code) = run(&["video", "record", "--help"]);
     assert_eq!(code, 0);

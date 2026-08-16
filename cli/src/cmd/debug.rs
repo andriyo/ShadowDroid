@@ -706,6 +706,16 @@ async fn debugger_snapshot(device: Option<&str>, studio_url: Option<&str>, depth
         )
         .await
         .unwrap_or_else(|err| json!({"ok": false, "error": err.to_string()}));
+    let logpoint_events = bridge
+        .read_logpoint_events(None, 50, 0, &debugger::LogpointEventFilters::default())
+        .await
+        .unwrap_or_else(|err| {
+            json!({
+                "ok": false,
+                "available": false,
+                "error": err.to_string(),
+            })
+        });
     let coroutine_depth_s = depth.to_string();
     let coroutines = bridge
         .get(
@@ -725,6 +735,7 @@ async fn debugger_snapshot(device: Option<&str>, studio_url: Option<&str>, depth
         "stack": stack,
         "variables": variables,
         "watches": watches,
+        "logpoint_events": logpoint_events,
         "coroutines": coroutines,
     })
 }
@@ -748,6 +759,27 @@ async fn record_cmd(
     args: RecordArgs,
     studio_url: Option<&str>,
 ) -> Result<()> {
+    let logpoint_app_filter = if args.app.is_some() {
+        let config = ShadowDroidConfig::load()?;
+        let (resolved, _) = resolve_auto_app(serial, client, &config, args.app.as_deref()).await?;
+        Some(resolved.package.ok_or_else(|| {
+            crate::diagnostic::DiagnosticError::new(
+                "debug_record_app_unresolved",
+                "debugger",
+                "the debug record app filter did not resolve to one installed package",
+            )
+            .detail(json!({
+                "app": args.app,
+                "resolution_source": resolved.source,
+            }))
+            .next_actions([
+                "pass an exact package to `shadowdroid debug record --app <package>`",
+                "add an app alias with `shadowdroid config init --project --app <name> --package <package>`",
+            ])
+        })?)
+    } else {
+        None
+    };
     if let Some(parent) = args.out.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -781,6 +813,13 @@ async fn record_cmd(
 
     let (log_tx, mut log_rx) = mpsc::channel(256);
     spawn_logcat(serial.clone(), log_tx);
+    let (logpoint_tx, mut logpoint_rx) = mpsc::channel(256);
+    spawn_record_logpoints(
+        serial.clone(),
+        studio_url.map(str::to_owned),
+        logpoint_app_filter,
+        logpoint_tx,
+    );
 
     let mut last_screen_hash: Option<String> = None;
     let mut last_app: Option<Value> = None;
@@ -800,6 +839,7 @@ async fn record_cmd(
         tokio::select! {
             _ = &mut stop => break,
             Some(event) = log_rx.recv() => write_event(&mut out, &event)?,
+            Some(event) = logpoint_rx.recv() => write_event(&mut out, &event)?,
             _ = ticker.tick() => {
                 let screen = client.screen().await.context("record screen")?;
                 let app_value = serde_json::to_value(&screen.current_app).unwrap_or(Value::Null);
@@ -839,7 +879,14 @@ async fn record_cmd(
                     logs: 0,
                     depth: args.depth,
                 };
-                let debugger = debugger_snapshot(Some(serial.as_str()), studio_url, snap_args.depth).await;
+                let mut debugger = debugger_snapshot(Some(serial.as_str()), studio_url, snap_args.depth).await;
+                // Logpoint hits are written as their own ordered timeline
+                // records by `spawn_record_logpoints`. Exclude the snapshot's
+                // recent-history copy so one hit does not also churn and
+                // duplicate the generic debugger snapshot event.
+                if let Some(debugger_map) = debugger.as_object_mut() {
+                    debugger_map.remove("logpoint_events");
+                }
                 let suspended = debugger_suspended(&debugger);
                 if suspended == Some(true) && last_debugger_suspended != Some(true) {
                     write_event(&mut out, &json!({
@@ -953,6 +1000,148 @@ fn spawn_logcat(serial: Serial, out: mpsc::Sender<Value>) {
             let _ = out
                 .send(json!({"type":"logcat","ts":now_ms(),"format":"threadtime","line":line}))
                 .await;
+        }
+    });
+}
+
+fn spawn_record_logpoints(
+    serial: Serial,
+    studio_url: Option<String>,
+    app_filter: Option<String>,
+    out: mpsc::Sender<Value>,
+) {
+    tokio::spawn(async move {
+        let bridge = match BridgeClient::with_device(studio_url.as_deref(), Some(serial.as_str())) {
+            Ok(bridge) => bridge,
+            Err(err) => {
+                let _ = out
+                    .send(json!({
+                        "type": "warning",
+                        "stage": "logpoint_record",
+                        "code": "logpoint_events_unavailable",
+                        "ts": now_ms(),
+                        "msg": err.to_string(),
+                        "detail": {"debug_record_continues": true},
+                        "next_actions": ["shadowdroid studio status --json"],
+                    }))
+                    .await;
+                return;
+            }
+        };
+        let filters = debugger::LogpointEventFilters::default();
+        let initial = match bridge.read_logpoint_events(None, 1, 0, &filters).await {
+            Ok(value) => value,
+            Err(err) => {
+                let _ = out
+                    .send(json!({
+                        "type": "warning",
+                        "stage": "logpoint_record",
+                        "code": "logpoint_events_unavailable",
+                        "ts": now_ms(),
+                        "msg": err.to_string(),
+                        "detail": {"debug_record_continues": true},
+                        "next_actions": ["shadowdroid studio status --json"],
+                    }))
+                    .await;
+                return;
+            }
+        };
+        let mut stream_id = initial
+            .get("stream_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let mut cursor = initial
+            .get("latest_cursor")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        loop {
+            let response = match bridge
+                .read_logpoint_events(Some(cursor), 100, 1_000, &filters)
+                .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    let _ = out
+                        .send(json!({
+                            "type": "warning",
+                            "stage": "logpoint_record",
+                            "code": "logpoint_stream_interrupted",
+                            "ts": now_ms(),
+                            "msg": err.to_string(),
+                            "detail": {"last_cursor": cursor},
+                            "next_actions": ["shadowdroid studio status --json"],
+                        }))
+                        .await;
+                    return;
+                }
+            };
+            let response_stream = response
+                .get("stream_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if stream_id
+                .as_deref()
+                .is_some_and(|known| Some(known) != response_stream.as_deref())
+            {
+                let previous_stream_id = stream_id.clone();
+                cursor = debugger::logpoint_page_high_water(&response, 0);
+                stream_id = response_stream;
+                let _ = out
+                    .send(json!({
+                        "type": "warning",
+                        "stage": "logpoint_record",
+                        "code": "logpoint_stream_reset",
+                        "ts": now_ms(),
+                        "msg": "Android Studio restarted its logpoint event stream; debug record resumed at the new live tail",
+                        "detail": {
+                            "previous_stream_id": previous_stream_id,
+                            "stream_id": stream_id,
+                            "cursor": cursor,
+                        },
+                        "next_actions": ["shadowdroid debug logpoint events"],
+                    }))
+                    .await;
+                continue;
+            }
+            stream_id = response_stream;
+            if response
+                .get("latest_cursor")
+                .and_then(Value::as_u64)
+                .is_some_and(|latest| latest < cursor)
+            {
+                cursor = debugger::logpoint_page_high_water(&response, 0);
+                continue;
+            }
+            if response.get("overflowed").and_then(Value::as_bool) == Some(true) {
+                let _ = out
+                    .send(json!({
+                        "type": "warning",
+                        "stage": "logpoint_record",
+                        "code": "logpoint_cursor_gap",
+                        "ts": now_ms(),
+                        "msg": "logpoint events were evicted before debug record consumed them",
+                        "detail": debugger::logpoint_page_metadata(&response),
+                        "next_actions": [
+                            "reduce logpoint frequency or raise its capture rate limit",
+                            "use a narrower logpoint condition or pass count"
+                        ],
+                    }))
+                    .await;
+            }
+            if let Some(events) = response.get("events").and_then(Value::as_array) {
+                for event in events {
+                    if !debugger::logpoint_event_matches_package(event, app_filter.as_deref()) {
+                        continue;
+                    }
+                    if out.send(event.clone()).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            cursor = response
+                .get("next_cursor")
+                .and_then(Value::as_u64)
+                .unwrap_or(cursor);
         }
     });
 }
@@ -2214,7 +2403,8 @@ async fn write_screenshot(
 }
 
 fn write_event(out: &mut File, value: &Value) -> Result<()> {
-    writeln!(out, "{}", serde_json::to_string(value)?)?;
+    let value = crate::redaction::redact_output_if_active(value.clone());
+    writeln!(out, "{}", serde_json::to_string(&value)?)?;
     out.flush()?;
     Ok(())
 }

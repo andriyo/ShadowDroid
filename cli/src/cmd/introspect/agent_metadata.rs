@@ -451,10 +451,10 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             }
         })),
         "debug" => Some(serde_json::json!({
-            "use_when": ["Need runtime causality, stack/variable state, breakpoints, replay, or Android Studio debugger control."],
+            "use_when": ["Need runtime causality, stack/variable state, breakpoints, non-suspending logpoints, replay, or Android Studio debugger control."],
             "output": "bounded JSON debug state or JSONL timelines depending on subcommand",
             "side_effects": ["attach/break/resume/step commands affect debugger/app execution"],
-            "next_actions": ["debug auto", "debug snapshot", "debug record", "debug run-until-crash", "commands --guide debugger --json"]
+            "next_actions": ["debug auto", "debug snapshot", "debug logpoint add", "debug record", "commands --guide debugger --json"]
         })),
         "debug auto" => Some(serde_json::json!({
             "use_when": ["Need the fastest agent entrypoint for launching/configuring the app, attaching the debugger when available, and returning a useful snapshot."],
@@ -556,6 +556,56 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "output": "breakpoint list JSON",
             "side_effects": ["none"],
             "next_actions": ["debug break line", "debug break remove", "debug resume"]
+        })),
+        "debug logpoint" => Some(serde_json::json!({
+            "use_when": ["Need to observe source-line runtime values repeatedly without leaving the app suspended."],
+            "output": "configured logpoint JSON or structured logpoint-hit JSON/JSONL",
+            "side_effects": ["add/remove/clear mutate Android Studio breakpoint state", "log expressions are real debugger evaluation and may have side effects"],
+            "next_actions": ["debug logpoint add", "debug logpoint follow", "debug logpoint list", "commands --guide debugger --json"]
+        })),
+        "debug logpoint add" => Some(serde_json::json!({
+            "use_when": ["Need a transactionally configured non-suspending source-line observation without editing or rebuilding the app."],
+            "output": "logpoint creation JSON with stable id, ownership, limits, and fixed suspend_policy=NONE",
+            "side_effects": ["adds or updates an Android Studio line logpoint", "evaluates the condition/log expression whenever the source location is hit"],
+            "prerequisites": ["supply at least one of --expression, --log-message, or --log-stack", "Android Studio bridge must be running with the source project open"],
+            "next_actions": ["debug logpoint follow", "debug logpoint events", "debug logpoint list"],
+            "prefer_over": {
+                "debug break line": "when execution must continue and repeated evidence matters more than an interactive suspended frame",
+                "log": "when locals, fields, or expressions at an exact source line are needed without adding app logging"
+            }
+        })),
+        "debug logpoint list" => Some(serde_json::json!({
+            "use_when": ["Need to inspect configured semantic logpoints, their owners, limits, and hit state."],
+            "output": "bounded logpoint list JSON",
+            "side_effects": ["none"],
+            "next_actions": ["debug logpoint add", "debug logpoint follow", "debug logpoint remove --id <id>"]
+        })),
+        "debug logpoint events" => Some(serde_json::json!({
+            "use_when": ["Need one bounded cursor page of recent structured logpoint hits without opening a stream."],
+            "output": "logpoint event page JSON with stream_id, cursor/overflow counters, and events[]",
+            "side_effects": ["none"],
+            "prerequisites": ["when --after is used, also pass --stream-id from the page that issued that cursor"],
+            "next_actions": ["debug logpoint follow", "debug logpoint events --after <next_cursor> --stream-id <stream_id>", "debug logpoint list"]
+        })),
+        "debug logpoint follow" => Some(serde_json::json!({
+            "use_when": ["Need to stream structured logpoint hits while the app continues running."],
+            "output": "JSONL logpoint events and cursor-gap/stream-reset warnings followed by a terminal action summary",
+            "side_effects": ["keeps a bounded long-poll open until Ctrl-C, --duration-ms, or --max-events"],
+            "prerequisites": ["create or enable at least one logpoint", "use --replay-existing only when buffered pre-follow hits are wanted", "when --after is used, also pass --stream-id from the page that issued that cursor"],
+            "next_actions": ["debug logpoint events", "debug logpoint list", "debug snapshot"]
+        })),
+        "debug logpoint remove" => Some(serde_json::json!({
+            "use_when": ["Need to remove one CLI-owned logpoint without touching a human-owned breakpoint."],
+            "output": "owner-checked logpoint removal JSON",
+            "side_effects": ["removes the matching Android Studio logpoint"],
+            "prerequisites": ["the supplied --owner must match; default is shadowdroid"],
+            "next_actions": ["debug logpoint list", "debug logpoint add"]
+        })),
+        "debug logpoint clear" => Some(serde_json::json!({
+            "use_when": ["Need to remove all CLI-owned logpoints in an optional project scope."],
+            "output": "owner-scoped cleanup JSON",
+            "side_effects": ["removes only Android Studio logpoints matching --owner"],
+            "next_actions": ["debug logpoint list", "debug breakpoints"]
         })),
         "debug pause" => Some(serde_json::json!({
             "use_when": ["Need to interrupt a running debug session so stack/variables/eval become available."],

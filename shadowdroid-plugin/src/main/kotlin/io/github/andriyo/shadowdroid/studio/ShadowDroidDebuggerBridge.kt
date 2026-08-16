@@ -55,13 +55,14 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
     companion object {
         private val LOG = Logger.getInstance(ShadowDroidDebuggerBridge::class.java)
         private const val DEFAULT_PORT = 50576
-        private const val API_VERSION = 1
+        private const val API_VERSION = 2
 
         private val projects = CopyOnWriteArrayList<Project>()
         private val watches = CopyOnWriteArrayList<WatchSpec>()
         private val listenedProjects = ConcurrentHashMap.newKeySet<String>()
         private val listenedSessions = ConcurrentHashMap.newKeySet<String>()
         private val watchValues = SessionWatchCache<WatchValue>()
+        private val logpointSessions = ConcurrentHashMap<String, LogpointSessionSnapshot>()
         private val objectHandles = ConcurrentHashMap<String, ObjectHandleEntry>()
         private val sessionHandleEpochs = ConcurrentHashMap<String, Int>()
         // Weak keys avoid retaining stopped IDE sessions. Synchronization keeps
@@ -111,11 +112,18 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
             })
             project.messageBus.connect(project).subscribe(XBreakpointListener.TOPIC, object : XBreakpointListener<XBreakpoint<*>> {
                 override fun breakpointLogMessage(breakpoint: XBreakpoint<*>, session: XDebugSession, message: String) {
-                    // Suspending breakpoints are counted by the sessionPaused
-                    // path; counting both would double-record suspend+log ones.
                     if (breakpoint.suspendPolicy == SuspendPolicy.NONE) {
-                        recordBreakpointHit(project, breakpoint)
+                        BreakpointBridge.recordLogpointMessage(
+                            project,
+                            breakpoint,
+                            logpointSessionSnapshotFor(session),
+                            message,
+                        )
                     }
+                }
+
+                override fun breakpointChanged(breakpoint: XBreakpoint<*>) {
+                    BreakpointBridge.breakpointChanged(breakpoint)
                 }
 
                 override fun breakpointRemoved(breakpoint: XBreakpoint<*>) {
@@ -127,6 +135,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
         private fun installSessionListeners(project: Project) {
             for (session in XDebuggerManager.getInstance(project).debugSessions) {
                 val key = sessionKey(session)
+                cacheLogpointSessionSnapshot(session, key)
                 if (!listenedSessions.add(key)) continue
                 session.addSessionListener(object : XDebugSessionListener {
                     override fun sessionPaused() {
@@ -144,6 +153,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
 
                     override fun sessionStopped() {
                         listenedSessions.remove(key)
+                        logpointSessions.remove(key)
                         watchValues.stopSession(key)
                         clearSessionHandles(session)
                     }
@@ -332,6 +342,33 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                     )
                     BridgeRoutes.BREAKPOINT_UPDATE -> BreakpointBridge.update(query, liveProjects(), selectRequestedProject(query))
                     BridgeRoutes.BREAKPOINT_REMOVE -> BreakpointBridge.remove(query, liveProjects(), selectRequestedProject(query))
+                    BridgeRoutes.LOGPOINTS -> BreakpointBridge.listLogpoints(
+                        query,
+                        liveProjects(),
+                        selectRequestedProject(query),
+                    )
+                    BridgeRoutes.LOGPOINT_ADD -> BreakpointBridge.addLogpoint(
+                        query,
+                        selectProject(query, query[BridgeQuery.FILE], requireUnambiguous = true),
+                    )
+                    BridgeRoutes.LOGPOINT_EVENTS -> {
+                        // Refresh the cached ddmlib ClientData identity on the
+                        // request thread. processStarted can precede package/
+                        // process discovery, while the hit callback must stay
+                        // O(1) and never scan debugger clients.
+                        installAllSessionListeners()
+                        BreakpointBridge.logpointEvents(query)
+                    }
+                    BridgeRoutes.LOGPOINT_REMOVE -> BreakpointBridge.removeLogpoint(
+                        query,
+                        liveProjects(),
+                        selectRequestedProject(query),
+                    )
+                    BridgeRoutes.LOGPOINT_CLEAR -> BreakpointBridge.clearLogpoints(
+                        query,
+                        liveProjects(),
+                        selectRequestedProject(query),
+                    )
                     BridgeRoutes.ATTACH -> AndroidAttachBridge.attach(
                         selectProject(query, null, requireUnambiguous = true),
                         query,
@@ -368,6 +405,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
             return BridgeProtocol.ok(
                 "ok", true,
                 "api_version", API_VERSION,
+                "capabilities", bridgeCapabilities(),
                 "url", serverUrl,
                 "projects", projectPayload(),
                 "sessions", sessionPayload,
@@ -1178,6 +1216,53 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
             )
         }
 
+        private fun cacheLogpointSessionSnapshot(session: XDebugSession, key: String) {
+            val client = sessionClient(session)
+            val device = try {
+                client?.device
+            } catch (_: Throwable) {
+                null
+            }
+            val clientData = try {
+                client?.clientData
+            } catch (_: Throwable) {
+                null
+            }
+            logpointSessions[key] = LogpointSessionSnapshot(
+                id = key,
+                name = session.sessionName,
+                deviceSerial = device?.serialNumber,
+                deviceAvd = device?.let(::deviceAvdName),
+                packageName = try {
+                    clientData?.packageName
+                } catch (_: Throwable) {
+                    null
+                },
+                processName = try {
+                    clientData?.processName
+                } catch (_: Throwable) {
+                    null
+                },
+                pid = try {
+                    clientData?.pid?.takeIf { it > 0 }
+                } catch (_: Throwable) {
+                    null
+                },
+            )
+        }
+
+        /**
+         * O(1) callback-path lookup. Device and ClientData discovery happens
+         * when listeners are installed and is refreshed by event reads.
+         */
+        internal fun logpointSessionSnapshotFor(session: XDebugSession): LogpointSessionSnapshot {
+            val key = sessionKey(session)
+            return logpointSessions[key] ?: LogpointSessionSnapshot(
+                id = key,
+                name = session.sessionName,
+            )
+        }
+
         private fun layoutDebuggerTarget(session: XDebugSession): LayoutDebuggerSessionTarget? {
             // A resolved ddmlib client is the evidence that this is an Android
             // app debugger session. Do not block Layout Inspector merely
@@ -1406,6 +1491,17 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
         private fun projectPayload(): List<Map<String, Any?>> =
             liveProjects().map(::projectInfo)
 
+        private fun bridgeCapabilities(): Map<String, Any?> = BridgeProtocol.map(
+            "structured_logpoints", BridgeProtocol.map(
+                "version", 1,
+                "event_capacity", DEFAULT_LOGPOINT_EVENT_CAPACITY,
+                "default_max_message_chars", DEFAULT_LOGPOINT_MAX_MESSAGE_CHARS,
+                "max_configurable_message_chars", MAX_LOGPOINT_MESSAGE_CHARS,
+                "default_max_events_per_second", DEFAULT_LOGPOINT_MAX_EVENTS_PER_SECOND,
+                "max_followers", BreakpointBridge.MAX_LOGPOINT_FOLLOWERS,
+            ),
+        )
+
         private fun writeRegistry() {
             val url = serverUrl ?: return
             try {
@@ -1413,6 +1509,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                 Files.createDirectories(dir.toPath())
                 val body = BridgeProtocol.obj(
                     "api_version", API_VERSION,
+                    "capabilities", bridgeCapabilities(),
                     "url", url,
                     "pid", ProcessHandle.current().pid(),
                     "updated_at", Instant.now().toString(),

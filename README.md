@@ -140,9 +140,11 @@ $ shadowdroid why
   recomposition counts when Android Studio's Layout Inspector is live.
 - **Sees _why_, not just _what_** — a bounded Android Studio debugger exposed
   as JSON: debugger control and breakpoints, call stack, threads, variables,
-  watches, expression eval, native/tombstone readiness, and coroutine insight.
+  watches, expression eval, first-class non-suspending logpoints, native/
+  tombstone readiness, and coroutine insight.
 - **One live event stream** — `watch` emits screen diffs, crashes, toasts,
-  popup-watcher actions, and decrypted HTTP(S) on a single timeline.
+  popup-watcher actions, structured logpoint hits, and decrypted HTTP(S) on a
+  single timeline.
 - **Crash-safe screen video** — `video record` captures segmented Android
   screen video into a protected evidence bundle; detached
   `start` / `mark` / `status` / `stop` verbs cover longer interactive runs.
@@ -514,8 +516,8 @@ costs as few round-trips as possible.
    echoes the matched element; a timeout returns `top_texts` so you see what the
    screen became instead of guessing.
 7. **Watch when timing matters.** `shadowdroid watch` streams screen diffs,
-   crashes, ANRs, toasts, watcher actions, and (with `net` running) HTTP events
-   on one JSONL timeline.
+   crashes, ANRs, toasts, watcher actions, Android Studio logpoint hits, and
+   (with `net` running) HTTP events on one JSONL timeline.
 8. **Triage failures with one read.** After any surprise, `shadowdroid why`
    returns a verdict + evidence; `shadowdroid log --last 5m` gives the structured
    logcat behind it. You rarely need both plus a screenshot — start with `why`.
@@ -538,11 +540,12 @@ structured `detail`. Use those fields instead of parsing `msg`. Raw reads can
 omit `ok`, so exit code zero is their success signal.
 
 Streaming commands are explicit JSONL exceptions (`watch`, `log`, `net log`,
-and `debug replay`); `test` passes through the wrapped command and adds a
-ShadowDroid trailer. Stream errors have the same `code`, `retryable`, `detail`,
-and non-empty `next_actions` recovery fields, while terminal stream summaries
-carry follow-up actions. Human, source, and wrapped-command pass-through output
-cannot embed the JSON field; their exact follow-ups remain available from
+`debug logpoint follow`, and `debug replay`); `test` passes through the wrapped
+command and adds a ShadowDroid trailer. Stream errors have the same `code`,
+`retryable`, `detail`, and non-empty `next_actions` recovery fields, while
+terminal stream summaries carry follow-up actions. Human, source, and
+wrapped-command pass-through output cannot embed the JSON field; their exact
+follow-ups remain available from
 `commands --json --describe '<path>'`. Interop exports such as HAR, curl, and
 fixtures write an artifact and emit a small terminal action naming its path and
 byte count. Some setup/report commands default to human output and offer
@@ -794,10 +797,10 @@ selector (then optionally activates it) — the TV analog of `ui tap` /
 | **Session/diagnostics** | `devices`, `connect`, `disconnect`, `test`, `doctor`, `collect`, `why`, `log` |
 | **UI automation** | `ui dump`, `ui audit`, `ui gen`, `ui screenshot`, `ui find`, `ui tap`, `ui set-progress`, `ui double-tap`, `ui long-tap`, `ui swipe`, `ui drag`, `ui swipe-ext`, `ui pinch`, `ui scroll-to`, `ui focus`, `ui text`, `ui pin`, `ui key`, `ui hide-keyboard`, `ui back`, `ui home`, `ui wait`, `ui toast` (action verbs take `--observe`, `--if-screen`, and `--if-interaction`; tap/progress/text also accept `--handle`) |
 | **Triage** | `why` (one-read verdict + evidence), `log` (structured app-scoped logcat + parsed crashes) |
-| **Live timeline** | `watch` (screen changes, crashes, ANRs, toasts, watcher actions, and HTTP events when network capture is active) |
+| **Live timeline** | `watch` (screen changes, crashes, ANRs, toasts, watcher actions, Android Studio logpoint hits, and HTTP events when network capture is active) |
 | **Screen video** | `video record -o DIR [--duration 30s]`; detached `video start -o DIR`, `video status`, `video mark LABEL`, `video stop` |
 | **Layout / Compose** | `layout snapshot`, `layout diff`, `layout source`, `layout recompositions` |
-| **Debugger** | `debug auto`, `snapshot`, `record`, `replay`, `status`, `sessions`, `clients`, `attach`, `break`, `breakpoints`, `pause`, `resume`, `step-in`, `step-over`, `step-out`, `stop`, `stack`, `threads`, `variables`, `eval`, `inspect`, `coroutines`, `continue-until`, `watch`, `step-until-screen-change`, `step-until-log`, `run-until-crash`, `native`, `tombstones` |
+| **Debugger** | `debug auto`, `snapshot`, `record`, `replay`, `status`, `sessions`, `clients`, `attach`, `break`, `breakpoints`, `logpoint add` / `list` / `events` / `follow` / `remove` / `clear`, `pause`, `resume`, `step-in`, `step-over`, `step-out`, `stop`, `stack`, `threads`, `variables`, `eval`, `inspect`, `coroutines`, `continue-until`, `watch`, `step-until-screen-change`, `step-until-log`, `run-until-crash`, `native`, `tombstones` |
 | **App lifecycle/state** | `app start`, `stop`, `install`, `reinstall`, `clear`, `info`, `wait`, `current`; `app state snapshot`, `restore`, `recover`, `cleanup` |
 | **Permissions/app-ops** | `perm grant`, `revoke`, `list`, `reset`; `appops get`, `set` |
 | **Device/system** | `device info`, `shell`, `wake`, `sleep`, `unlock`, `orientation`, `clipboard`, `notifications`, `quick-settings`, `open-url` |
@@ -915,12 +918,12 @@ one frame: ShadowDroid preserves that segment, reports `playable: false`, marks
 the session `partial`, and does not publish a misleading `video.mp4`.
 
 `watch` is the streaming workhorse — it emits debounced, hash-diffed `screen`
-events plus `crash`, `toast`, `watcher_fired`, and `http` events when a `net`
-proxy is running (plus a `tls_error` when an app rejects the proxy CA, so a
-failed interception is visible instead of just missing). If network capture is
-not available, `watch` emits a structured `warning` event with the suggested
-recovery command, so an agent can decide whether to run `net start` or continue
-UI/crash-only (`watch --no-net`).
+events plus `crash`, `toast`, `watcher_fired`, structured Android Studio
+`logpoint` hits, and `http` events when a `net` proxy is running (plus a
+`tls_error` when an app rejects the proxy CA, so a failed interception is
+visible instead of just missing). A missing Studio bridge or proxy produces a
+structured warning while the other producers continue; use `--no-logpoints` or
+`--no-net` when that source is intentionally absent.
 
 `net` is a host-side MITM proxy built into the single binary — no Python, no
 external mitmproxy. `net start` spawns the proxy, wires the device through
@@ -1056,17 +1059,19 @@ Backed by an optional Android Studio plugin:
   launch it, attach the Studio debugger when available, then return a full
   snapshot with setup guidance if the bridge is missing.
 - **`debug`** — attach to the running app; set breakpoints (line, exception,
-  method, field watchpoint; conditional, temporary, logpoints); read the call
-  stack, local variables, and watches; evaluate/inspect expressions (`this`,
+  method, field watchpoint; conditional and temporary) and owner-scoped,
+  non-suspending logpoints; read the call stack, local variables, and watches;
+  evaluate/inspect expressions (`this`,
   locals, fields, array indexes) and follow object handles while the session
   remains suspended. Treat evaluation as real debugger evaluation rather than
   assuming arbitrary expressions are side-effect-free. Requests are bounded —
   they return structured failure instead of blocking without a suspended frame.
 - **`debug snapshot`** — one shot: device + build, foreground app, screen tree,
-  screenshot, recent logcat, and the live debugger stack / variables /
-  breakpoints in a single JSON object.
+  screenshot, recent logcat, the live debugger stack / variables / breakpoints,
+  and a bounded page of recent logpoint events in a single JSON object.
 - **`debug record` / `debug replay`** — JSONL timelines of screen changes,
-  lifecycle, logcat, and replayable actions (taps, text, keys, swipes, drags).
+  lifecycle, logcat, structured logpoint hits, and replayable actions (taps,
+  text, keys, swipes, drags).
 - **`debug run-until-crash` / `step-until-screen-change` / `step-until-log`** —
   let the app run until something interesting happens, then return a full
   snapshot; crash waits emit parsed Java/native/ANR events and can write local
@@ -1078,6 +1083,78 @@ Backed by an optional Android Studio plugin:
 - **`layout`** — UI-tree snapshots and diffs, enriched (when Studio's Layout
   Inspector is live) with Compose source locations, semantics, and recomposition
   counters.
+
+### Non-suspending logpoints
+
+Logpoints observe a source line without leaving the app paused on successful
+hits. They require the ShadowDroid Android Studio plugin, the matching Android
+project open in Studio, and a debuggable app attached to the Studio debugger.
+The source must match the installed build. Conditions and expressions run in
+the app's debugger context and can call code, mutate state, block, or throw;
+stack rendering and high-frequency hits add more overhead. “Non-suspending” is
+not the same as free or side-effect-free.
+
+| Command | Purpose |
+| --- | --- |
+| `debug logpoint add` | Transactionally add or update a line logpoint with `--expression`, `--log-message`, and/or `--log-stack`; optional `--condition`, `--pass-count`, `--temporary`, ownership, rate, and message-size bounds apply in the same operation. |
+| `debug logpoint list` | List configured logpoints, optionally filtered by project, id, or owner. |
+| `debug logpoint events` | Read one bounded page of structured hit events, optionally strictly after a paired `--after <cursor> --stream-id <stream_id>`. |
+| `debug logpoint follow` | Follow new hits as JSONL; it starts at the live tail unless paired `--after` / `--stream-id` values or `--replay-existing` are supplied, and can stop by duration or event count. |
+| `debug logpoint remove` | Remove one ShadowDroid-owned logpoint when its id and owner match. |
+| `debug logpoint clear` | Remove only ShadowDroid-owned logpoints in the requested project/owner scope. |
+
+`debug logpoint add` immediately disables a newly registered breakpoint,
+validates the condition and expression, applies every logging option plus
+suspend policy `none`, then enables it in one Studio operation. A validation or
+configuration failure rolls back a newly created logpoint and leaves an existing
+one unchanged, so no partially configured breakpoint survives the request. The
+public JetBrains API does not expose create-disabled registration; on an already
+attached, extremely hot line there is therefore a theoretical interval before
+the same IDE task applies the initial disable. Prefer adding instrumentation
+before attach when even that narrow platform-level race is unacceptable. At
+least one of `--expression`,
+`--log-message`, or `--log-stack` is required. `--force` skips set-time
+expression validation; a bad expression can then fail at runtime, where the
+failure is recorded and a non-suspending logpoint resumes without an IDE-blocking
+dialog. Use it deliberately because evaluation can still have side effects.
+`--temporary` retains the first structured hit, then asynchronously removes the
+still-owned logpoint because Studio does not auto-remove non-suspending actions.
+
+Each hit is a structured event with a monotonic cursor plus logpoint, source,
+project, debugger-session/device, and ownership context. The payload contains
+JetBrains' composite rendered message: expression output, the optional default
+hit message, and an optional rendered stack can share that one string and are
+not promised as separately parsed fields. `debug snapshot` includes a bounded
+recent page; `debug record` and `watch` interleave hits as ordered timeline
+records; the dedicated `events` and `follow` commands support narrower project/
+session/id/owner filters.
+
+The Studio-side history is bounded. Pages report a `stream_id` and
+`oldest_cursor`, `latest_cursor`, and `next_cursor`; `--after` means strictly
+newer than that cursor. Cursors belong to one stream, so resuming requires both
+`--after <cursor>` and the page's `--stream-id <stream_id>`. A one-shot read
+rejects a mismatched stream instead of returning ambiguous events; a follower
+discards the mismatched page and resets to the new live tail with a warning.
+Studio restart changes the stream id. If a consumer
+falls behind the retained history, `overflowed:true`, `evicted_total`, and a
+cursor-gap warning make the loss explicit. Bound hot sites with `--condition`,
+`--pass-count`, or `--max-events-per-second`; page-level `rate_limited_total`
+reports suppressed hits instead of allowing memory to grow without limit.
+`--max-message-chars` marks oversized events with `message_truncated:true` and
+retains `original_message_chars`; its supported range is 256 through 65,536.
+Global `--redact` scrubs supported JSON/JSONL
+output, including snapshots and recordings, but it cannot stop the expression
+from being evaluated or the unredacted value from reaching Android Studio first.
+
+Ownership is the cleanup boundary. The default is `shadowdroid`; concurrent
+agents should use distinct `--owner` labels and pass the same label to `remove`
+or `clear`. These lifecycle commands neither repurpose nor delete ordinary
+human-created Studio breakpoints or logpoints owned by somebody else. Prefer
+them over generic `debug break remove` for temporary agent instrumentation. If
+a human edits an owned logpoint in Studio, ShadowDroid relinquishes ownership.
+Ownership is also intentionally process-local: after Studio restarts, a
+persisted logpoint becomes unowned/manual rather than eligible for a later
+owner-wide deletion.
 
 Multiple devices debugged in one Studio are addressable: `debug sessions`
 reports each session's device, stable `id` (for that Studio debug-session

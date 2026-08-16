@@ -32,6 +32,11 @@ pub(crate) mod route {
     pub(crate) const BREAKPOINT_FIELD: &str = "/v1/breakpoints/field";
     pub(crate) const BREAKPOINT_UPDATE: &str = "/v1/breakpoints/update";
     pub(crate) const BREAKPOINT_REMOVE: &str = "/v1/breakpoints/remove";
+    pub(crate) const LOGPOINTS: &str = "/v1/logpoints";
+    pub(crate) const LOGPOINT_ADD: &str = "/v1/logpoints/add";
+    pub(crate) const LOGPOINT_EVENTS: &str = "/v1/logpoints/events";
+    pub(crate) const LOGPOINT_REMOVE: &str = "/v1/logpoints/remove";
+    pub(crate) const LOGPOINT_CLEAR: &str = "/v1/logpoints/clear";
     pub(crate) const ATTACH: &str = "/v1/attach";
     pub(crate) const LAYOUT_SNAPSHOT: &str = "/v1/layout/snapshot";
     pub(crate) const LAYOUT_RECOMPOSITIONS: &str = "/v1/layout/recompositions";
@@ -41,6 +46,7 @@ pub(crate) mod route {
 pub(crate) mod query {
     pub(crate) const ACCESS: &str = "access";
     pub(crate) const ACTION: &str = "action";
+    pub(crate) const AFTER: &str = "after";
     pub(crate) const BOUNDS: &str = "bounds";
     pub(crate) const CAUGHT: &str = "caught";
     pub(crate) const CLASS: &str = "class";
@@ -69,12 +75,15 @@ pub(crate) mod query {
     pub(crate) const LOG_EXPRESSION: &str = "log_expression";
     pub(crate) const LOG_MESSAGE: &str = "log_message";
     pub(crate) const LOG_STACK: &str = "log_stack";
+    pub(crate) const MAX_EVENTS_PER_SECOND: &str = "max_events_per_second";
+    pub(crate) const MAX_MESSAGE_CHARS: &str = "max_message_chars";
     pub(crate) const MAX_ARRAY_ITEMS: &str = "max_array_items";
     pub(crate) const MAX_FIELDS: &str = "max_fields";
     pub(crate) const METHOD: &str = "method";
     pub(crate) const MODE: &str = "mode";
     pub(crate) const MODIFICATION: &str = "modification";
     pub(crate) const NAME: &str = "name";
+    pub(crate) const OWNER: &str = "owner";
     pub(crate) const PACKAGE: &str = "package";
     pub(crate) const PASS_COUNT: &str = "pass_count";
     pub(crate) const PATH: &str = "path";

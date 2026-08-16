@@ -87,6 +87,13 @@ bridge for source-aware agent debugging:
 - `shadowdroid debug attach` attaches Studio's Android debugger to a process.
 - `debug break ...` creates, updates, and removes line, exception, method,
   and field breakpoints with stable IDs.
+- `debug logpoint ...` creates owner-scoped, non-suspending line logpoints and
+  reads their rendered output as structured events. `/v1/logpoints/events`
+  exposes a process-local cursor stream (`stream_id`, `seq`, and
+  `next_cursor`) with a 512-event buffer. Messages default to 16,384 Unicode
+  code points and 100 accepted events per breakpoint per second; both limits
+  can be overridden when the logpoint is created, with a hard 65,536-code-point
+  ceiling for rendered messages.
 - `debug stack`, `threads`, `variables`, `eval`, and `watch` expose bounded
   JSON state for suspended sessions.
 - `shadowdroid debug snapshot` enriches device/UI snapshots with Studio debugger
@@ -99,6 +106,42 @@ bridge for source-aware agent debugging:
 The plugin source is Kotlin. Keep bridge classes small and split by API area;
 when touching Android Studio's bundled debugger or Layout Inspector APIs, verify
 the Gradle Kotlin compiler version and target Android Studio version together.
+
+Logpoint event `message` is Android Studio's composite rendered text, preserved
+faithfully apart from configured Unicode-safe truncation. Depending on the
+logpoint options it can contain the standard hit message, stack trace, and
+expression result. `breakpoint_type` identifies the IDE breakpoint type; event
+`type` is always `logpoint`, with top-level `schema_version: 1`. Timestamps use
+explicit epoch-millisecond `timestamp_ms` values. `original_message_chars`
+reports Java/Kotlin UTF-16 code units (`String.length`) so its computation
+remains constant-time even when the incoming composite message is very large.
+When Android Studio's debugger client mapping is available, events also carry
+top-level `package`, `process_name`, and `pid` identity captured before the
+callback; missing identity stays explicit as `null` rather than being guessed.
+
+Bridge API v2 advertises `capabilities.structured_logpoints` in both
+`/v1/status` and the registry, including the event capacity and default safety
+limits plus `max_configurable_message_chars`. The plugin preserves the raw
+bounded Studio message; CLI `--redact` processing and its standard `redaction`
+metadata are the authoritative output boundary.
+
+Ownership is intentionally in-memory. ShadowDroid can remove or clear only
+logpoints it created in the current Studio process for the matching owner.
+Manual IDE logpoints are listed and captured but never owner-cleared, and an IDE
+edit relinquishes ownership. After Studio restarts, persisted logpoints are
+therefore treated as manual rather than guessed and deleted.
+
+Managed temporary logpoints buffer their first hit before scheduling an
+ownership-checked IDE removal. This preserves one-shot behavior even though
+Studio does not auto-remove temporary breakpoints with suspend policy `NONE`.
+
+The public IntelliJ breakpoint API registers a new line breakpoint before it
+lets callers disable it. ShadowDroid disables it immediately on the IDE thread,
+validates both expressions, applies the full non-suspending configuration, and
+enables it last; rejected or failed creations are rolled back. There remains a
+narrow IDE-internal registration window that cannot be removed without relying
+on private implementation ABI, so real-debuggee E2E validation remains a
+release gate for transactional logpoint creation and non-suspending behavior.
 
 ## Publishing the plugin
 

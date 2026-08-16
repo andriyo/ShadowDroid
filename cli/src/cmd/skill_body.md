@@ -147,6 +147,7 @@ The optional Studio plugin adds debugger control and Layout Inspector data
 (start from `debug auto Example`). Expression evaluation is real evaluation
 with possible side effects. With several debug sessions prefer stable session
 `id`s; if ambiguous, stop and choose — never act on an arbitrary session.
+`debug logpoint` observes without suspending.
 Read `commands --guide debugger` before debugger or layout work.
 
 ## Network debugging

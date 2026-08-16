@@ -305,17 +305,19 @@ impl Policy {
         let mut changes = 0usize;
 
         // Logcat and GraphQL bodies frequently carry a complete JSON document
-        // inside one string. Preserve that document's shape while redacting its
-        // nested values, then continue with generic string patterns.
+        // inside one string. Redact its nested values structurally and return
+        // the serialized document immediately. Running the line-oriented
+        // header patterns over serialized JSON can consume closing quotes and
+        // the rest of the object (for example when a value contains
+        // `Authorization: Bearer ...`), which would make stdout invalid JSON.
+        // `redact_value` already applies all generic and configured string
+        // patterns recursively to the document's string values.
         if (trimmed.starts_with('{') || trimmed.starts_with('['))
             && let Ok(mut nested) = serde_json::from_str::<Value>(trimmed)
         {
             let nested_change = self.redact_value(&mut nested);
-            if nested_change.values > 0
-                && let Ok(serialized) = serde_json::to_string(&nested)
-            {
-                output = serialized;
-                changes += nested_change.values;
+            if let Ok(serialized) = serde_json::to_string(&nested) {
+                return (serialized, nested_change.values);
             }
         }
 
@@ -696,6 +698,24 @@ mod tests {
         assert!(!output.contains("Bearer abc.def.ghi"));
         assert!(!output.contains("do-not-print"));
         assert!(output.contains("<redacted:ip>"));
+    }
+
+    #[test]
+    fn complete_json_with_bearer_text_remains_valid_json() {
+        let policy = Policy::builtin();
+        let input = json!({
+            "log_expression": "\"Authorization: Bearer e2e.token.value \" + payload",
+            "message": "Authorization: Bearer e2e.token.value payload",
+            "line": 119,
+        })
+        .to_string();
+
+        let output = policy.redact_text(&input);
+        let parsed: Value = serde_json::from_str(&output).expect("redacted JSON must stay valid");
+
+        assert_eq!(parsed["line"], 119);
+        assert!(!output.contains("e2e.token.value"));
+        assert!(output.contains("<redacted:token>"));
     }
 
     #[test]

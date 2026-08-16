@@ -1,5 +1,6 @@
 package io.github.andriyo.shadowdroid.studio
 
+import com.intellij.xdebugger.XBreakpointBehaviorPolicy.BreakpointErrorAction
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -75,6 +76,22 @@ class EvaluationErrorLogTest {
         // A cleared expression is no longer managed.
         assertTrue(
             BreakpointExpressionGuard.managedKindsFor(emptyMap(), "count == 3", null).isEmpty(),
+        )
+    }
+
+    @Test
+    fun managedErrorPolicyResumesLogpointsAndPausesSuspendingBreakpoints() {
+        assertEquals(
+            BreakpointErrorAction.RESUME,
+            BreakpointExpressionGuard.errorActionFor(managed = true, nonSuspending = true),
+        )
+        assertEquals(
+            BreakpointErrorAction.PAUSE,
+            BreakpointExpressionGuard.errorActionFor(managed = true, nonSuspending = false),
+        )
+        assertEquals(
+            BreakpointErrorAction.UNHANDLED,
+            BreakpointExpressionGuard.errorActionFor(managed = false, nonSuspending = true),
         )
     }
 }

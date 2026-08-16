@@ -57,6 +57,10 @@ pub struct WatchConfig {
     pub screen_format: ScreenFormat,
     /// Interleave live `http` events from a running `net` proxy daemon.
     pub net: bool,
+    /// Interleave structured non-suspending logpoint events from Android Studio.
+    pub logpoints: bool,
+    /// Optional Android Studio bridge override for logpoint events.
+    pub studio_url: Option<String>,
 }
 
 #[derive(Default)]
@@ -95,6 +99,15 @@ pub async fn run(cfg: WatchConfig) -> Result<()> {
     if cfg.net {
         producers.push(spawn_net_events(
             cfg.serial.clone(),
+            event_tx.clone(),
+            stopping.clone(),
+        ));
+    }
+    if cfg.logpoints {
+        producers.push(spawn_logpoint_events(
+            cfg.serial.clone(),
+            cfg.studio_url.clone(),
+            cfg.app_filter.clone(),
             event_tx.clone(),
             stopping.clone(),
         ));
@@ -194,6 +207,188 @@ fn spawn_net_events(
                     ts: now_ts(),
                 })
                 .await;
+        }
+    })
+}
+
+fn spawn_logpoint_events(
+    serial: Serial,
+    studio_url: Option<String>,
+    app_filter: Option<String>,
+    event_tx: mpsc::Sender<Event>,
+    stopping: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        use crate::cmd::debugger::{
+            BridgeClient, LogpointEventFilters, logpoint_event_matches_package,
+            logpoint_page_high_water, logpoint_page_metadata,
+        };
+
+        let bridge = match BridgeClient::with_device(studio_url.as_deref(), Some(serial.as_str())) {
+            Ok(bridge) => bridge,
+            Err(err) => {
+                let _ = event_tx
+                    .send(Event::Warning {
+                        stage: "logpoint_watch".to_string(),
+                        code: "logpoint_events_unavailable".to_string(),
+                        msg: format!("Android Studio logpoint events unavailable: {err}"),
+                        detail: serde_json::json!({"ui_crash_and_network_streams_continue": true}),
+                        next_actions: vec![
+                            "shadowdroid studio status --json".to_string(),
+                            "shadowdroid watch --no-logpoints".to_string(),
+                        ],
+                        ts: now_ts(),
+                    })
+                    .await;
+                return;
+            }
+        };
+        let filters = LogpointEventFilters::default();
+        let initial = match bridge.read_logpoint_events(None, 1, 0, &filters).await {
+            Ok(value) => value,
+            Err(err) => {
+                if shutdown_in_progress(&stopping).await {
+                    return;
+                }
+                let _ = event_tx
+                    .send(Event::Warning {
+                        stage: "logpoint_watch".to_string(),
+                        code: "logpoint_events_unavailable".to_string(),
+                        msg: format!("Android Studio logpoint events unavailable: {err}"),
+                        detail: serde_json::json!({"ui_crash_and_network_streams_continue": true}),
+                        next_actions: vec![
+                            "shadowdroid studio status --json".to_string(),
+                            "shadowdroid watch --no-logpoints".to_string(),
+                        ],
+                        ts: now_ts(),
+                    })
+                    .await;
+                return;
+            }
+        };
+        let mut stream_id = initial
+            .get("stream_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let mut cursor = initial
+            .get("latest_cursor")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+
+        while !stopping.load(Ordering::Acquire) {
+            let response = match bridge
+                .read_logpoint_events(Some(cursor), 100, 1_000, &filters)
+                .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    if shutdown_in_progress(&stopping).await {
+                        return;
+                    }
+                    let _ = event_tx
+                        .send(Event::Warning {
+                            stage: "logpoint_watch".to_string(),
+                            code: "logpoint_stream_interrupted".to_string(),
+                            msg: format!("Android Studio logpoint stream stopped: {err}"),
+                            detail: serde_json::json!({"last_cursor": cursor}),
+                            next_actions: vec![
+                                "shadowdroid studio status --json".to_string(),
+                                "restart `shadowdroid watch` after the Studio bridge is available"
+                                    .to_string(),
+                            ],
+                            ts: now_ts(),
+                        })
+                        .await;
+                    return;
+                }
+            };
+
+            let response_stream = response
+                .get("stream_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if stream_id
+                .as_deref()
+                .is_some_and(|known| Some(known) != response_stream.as_deref())
+            {
+                let previous_stream_id = stream_id.clone();
+                cursor = logpoint_page_high_water(&response, 0);
+                stream_id = response_stream;
+                let _ = event_tx
+                    .send(Event::Warning {
+                        stage: "logpoint_watch".to_string(),
+                        code: "logpoint_stream_reset".to_string(),
+                        msg: "Android Studio restarted its logpoint event stream; watch resumed at the new live tail".to_string(),
+                        detail: serde_json::json!({
+                            "previous_stream_id": previous_stream_id,
+                            "stream_id": stream_id,
+                            "cursor": cursor,
+                        }),
+                        next_actions: vec!["shadowdroid debug logpoint events".to_string()],
+                        ts: now_ts(),
+                    })
+                    .await;
+                continue;
+            }
+            stream_id = response_stream;
+            if response
+                .get("latest_cursor")
+                .and_then(Value::as_u64)
+                .is_some_and(|latest| latest < cursor)
+            {
+                cursor = logpoint_page_high_water(&response, 0);
+                continue;
+            }
+
+            if response.get("overflowed").and_then(Value::as_bool) == Some(true) {
+                let _ = event_tx
+                    .send(Event::Warning {
+                        stage: "logpoint_watch".to_string(),
+                        code: "logpoint_cursor_gap".to_string(),
+                        msg: "logpoint events were evicted before watch consumed them".to_string(),
+                        detail: logpoint_page_metadata(&response),
+                        next_actions: vec![
+                            "reduce logpoint frequency or raise its capture rate limit".to_string(),
+                            "use a narrower logpoint condition or pass count".to_string(),
+                        ],
+                        ts: now_ts(),
+                    })
+                    .await;
+            }
+
+            if let Some(items) = response.get("events").and_then(Value::as_array) {
+                for event in items {
+                    if !logpoint_event_matches_package(event, app_filter.as_deref()) {
+                        continue;
+                    }
+                    let Some(object) = event.as_object() else {
+                        let _ = event_tx
+                            .send(Event::Warning {
+                                stage: "logpoint_watch".to_string(),
+                                code: "logpoint_event_invalid".to_string(),
+                                msg: "Android Studio returned a non-object logpoint event"
+                                    .to_string(),
+                                detail: serde_json::json!({"event": event}),
+                                next_actions: vec![
+                                    "update the ShadowDroid Android Studio plugin and CLI"
+                                        .to_string(),
+                                ],
+                                ts: now_ts(),
+                            })
+                            .await;
+                        continue;
+                    };
+                    let mut fields = object.clone();
+                    fields.remove("type");
+                    if event_tx.send(Event::Logpoint { fields }).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            cursor = response
+                .get("next_cursor")
+                .and_then(Value::as_u64)
+                .unwrap_or(cursor);
         }
     })
 }

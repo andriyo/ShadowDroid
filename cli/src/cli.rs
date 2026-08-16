@@ -293,6 +293,10 @@ pub enum Cmd {
         /// Only emit app-scoped events for this package. Permission dialogs are still allowed.
         #[arg(long)]
         app: Option<String>,
+        /// Android Studio plugin bridge URL used for structured logpoint events.
+        /// Defaults to config, then the plugin registry.
+        #[arg(long, env = "SHADOWDROID_STUDIO_DEBUGGER_URL")]
+        studio_url: Option<String>,
         /// Safety-net poll interval (ms). Catches in-screen changes that emit no
         /// logcat transition — a counter ticking, async content loading — by
         /// re-dumping on this cadence. Navigation changes are caught immediately
@@ -328,6 +332,9 @@ pub enum Cmd {
         /// Do not try to attach live HTTP events from a running `net` proxy daemon.
         #[arg(long)]
         no_net: bool,
+        /// Do not try to attach structured logpoint events from Android Studio.
+        #[arg(long)]
+        no_logpoints: bool,
     },
 
     // ── resource namespaces (nested) ──────────────────────────
@@ -2047,6 +2054,7 @@ async fn run_inner() -> Result<()> {
         }
         Cmd::Watch {
             app,
+            studio_url,
             poll_ms,
             debounce_ms,
             no_stdin,
@@ -2055,6 +2063,7 @@ async fn run_inner() -> Result<()> {
             permission_dialogs,
             watcher_file,
             no_net,
+            no_logpoints,
         } => {
             let app = resolve_app_package(&config, Some(&serial), app).await?;
             let screen_format = if full {
@@ -2074,6 +2083,8 @@ async fn run_inner() -> Result<()> {
                 permission_dialog_policy: permission_dialogs,
                 screen_format,
                 net: !no_net,
+                logpoints: !no_logpoints,
+                studio_url,
             })
             .await?;
         }
@@ -2552,6 +2563,7 @@ fn apply_config_defaults(cmd: &mut Cmd, config: &ShadowDroidConfig) {
         Cmd::Net(args) => apply_net_config(args, config),
         Cmd::Debug(args) => apply_debug_config(args, config),
         Cmd::Layout(args) => apply_layout_config(args, config),
+        Cmd::Watch { studio_url, .. } => fill_studio_url(studio_url, config),
         _ => {}
     }
 }
@@ -2795,6 +2807,38 @@ fn apply_debugger_config(cmd: &mut DebuggerCmd, config: &ShadowDroidConfig) {
             crate::cmd::debugger::BreakCmd::Remove { project, .. } => {
                 if project.is_none() {
                     *project = config.project.clone();
+                }
+            }
+        },
+        DebuggerCmd::Logpoint(logpoint_cmd) => match logpoint_cmd {
+            crate::cmd::debugger::LogpointCmd::Add(args) => {
+                if args.project.is_none() {
+                    args.project = config.project.clone();
+                }
+            }
+            crate::cmd::debugger::LogpointCmd::List(args) => {
+                if args.filters.project.is_none() {
+                    args.filters.project = config.project.clone();
+                }
+            }
+            crate::cmd::debugger::LogpointCmd::Events(args) => {
+                if args.filters.project.is_none() {
+                    args.filters.project = config.project.clone();
+                }
+            }
+            crate::cmd::debugger::LogpointCmd::Follow(args) => {
+                if args.filters.project.is_none() {
+                    args.filters.project = config.project.clone();
+                }
+            }
+            crate::cmd::debugger::LogpointCmd::Remove(args) => {
+                if args.project.is_none() {
+                    args.project = config.project.clone();
+                }
+            }
+            crate::cmd::debugger::LogpointCmd::Clear(args) => {
+                if args.project.is_none() {
+                    args.project = config.project.clone();
                 }
             }
         },

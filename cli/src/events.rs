@@ -110,6 +110,13 @@ pub enum Event {
         next_actions: Vec<String>,
         ts: f64,
     },
+    /// A non-suspending Android Studio logpoint hit. The plugin owns the
+    /// versioned payload schema; flattening it here preserves that schema while
+    /// still routing hits through watch's sole, redacting event emitter.
+    Logpoint {
+        #[serde(flatten)]
+        fields: serde_json::Map<String, serde_json::Value>,
+    },
     /// A completed HTTP(S) transaction through the `net` proxy. Compact by
     /// design — full headers/bodies are fetched on demand via `net show <id>`.
     /// Field shape mirrors the `net` capture wire format so the timeline can
@@ -2082,6 +2089,26 @@ mod tests {
             value["next_actions"],
             serde_json::json!(["shadowdroid -d 'emulator-5554; unsafe' net start"])
         );
+    }
+
+    #[test]
+    fn logpoint_event_preserves_plugin_payload_under_canonical_type() {
+        let mut fields = serde_json::json!({
+            "seq": 7,
+            "breakpoint_id": "bp_counter",
+            "message": "counter=3",
+            "message_truncated": false,
+            "source": {"file": "/tmp/MainActivity.kt", "line": 119}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        fields.remove("type");
+        let value = serde_json::to_value(Event::Logpoint { fields }).unwrap();
+        assert_eq!(value["type"], "logpoint");
+        assert_eq!(value["seq"], 7);
+        assert_eq!(value["message"], "counter=3");
+        assert_eq!(value["source"]["line"], 119);
     }
 
     #[test]

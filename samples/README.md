@@ -86,6 +86,70 @@ shadowdroid ui tap --rid noop_button --observe
 shadowdroid ui tap --rid unstable_updates_button --observe
 ```
 
+### Counter logpoint
+
+The counter mutation is intentionally simple enough for a deterministic
+non-suspending logpoint check. This walkthrough requires the sample project to
+be open in Android Studio with the ShadowDroid plugin running, and the debug APK
+to be attached to Studio's debugger. From the repository root, resolve the
+fixture line from its stable statement instead of pinning a line number that
+will drift as the sample changes:
+
+```bash
+SAMPLE_PROJECT="$PWD/samples/shadowdroid-test-app"
+COUNTER_FILE="$SAMPLE_PROJECT/app/src/main/kotlin/io/github/andriyo/shadowdroid/sample/MainActivity.kt"
+COUNTER_LINE="$(rg -n -F 'setStatus("Counter incremented to $counter")' "$COUNTER_FILE" | cut -d: -f1)"
+
+shadowdroid debug attach \
+  --project "$SAMPLE_PROJECT" \
+  --package io.github.andriyo.shadowdroid.sample \
+  --configuration app
+shadowdroid debug logpoint add \
+  --file "$COUNTER_FILE" \
+  --line "$COUNTER_LINE" \
+  --expression '"counter=" + counter' \
+  --project "$SAMPLE_PROJECT" \
+  --owner sample-counter-e2e
+```
+
+In one terminal, follow exactly the three new hits. `follow` starts at the live
+tail, so start it before tapping the fixture:
+
+```bash
+SAMPLE_PROJECT="$PWD/samples/shadowdroid-test-app"
+shadowdroid debug logpoint follow \
+  --project "$SAMPLE_PROJECT" \
+  --owner sample-counter-e2e \
+  --max-events 3
+```
+
+In another terminal, open **Lab**, reveal the native counter, and tap it three
+times:
+
+```bash
+shadowdroid ui tap --rid nav_lab --expect-text "Challenge catalog"
+shadowdroid ui scroll-to --rid counter_button
+shadowdroid ui tap --rid counter_button --expect-text "Counter incremented to 1"
+shadowdroid ui tap --rid counter_button --expect-text "Counter incremented to 2"
+shadowdroid ui tap --rid counter_button --expect-text "Counter incremented to 3"
+```
+
+The follower should emit three ordered JSONL records with `type:"logpoint"`;
+their composite JetBrains-rendered messages contain `counter=1`, `counter=2`,
+and `counter=3`, and the app remains responsive throughout. Clean up by owner
+and confirm that only that test instrumentation is gone—human Studio
+breakpoints are preserved:
+
+```bash
+SAMPLE_PROJECT="$PWD/samples/shadowdroid-test-app"
+shadowdroid debug logpoint clear \
+  --project "$SAMPLE_PROJECT" \
+  --owner sample-counter-e2e
+shadowdroid debug logpoint list \
+  --project "$SAMPLE_PROJECT" \
+  --owner sample-counter-e2e
+```
+
 ### Network channel
 
 Run the local Ktor WS/WSS room in one terminal, then start the proxy:

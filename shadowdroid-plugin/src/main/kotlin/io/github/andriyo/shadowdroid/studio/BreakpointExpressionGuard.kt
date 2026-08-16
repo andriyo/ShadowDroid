@@ -2,9 +2,11 @@ package io.github.andriyo.shadowdroid.studio
 
 import com.intellij.debugger.JavaDebuggerBundle
 import com.intellij.openapi.diagnostic.Logger
+import com.intellij.openapi.project.Project
 import com.intellij.xdebugger.BreakpointErrorData
 import com.intellij.xdebugger.XBreakpointBehaviorPolicy.BreakpointErrorAction
 import com.intellij.xdebugger.XDebugSession
+import com.intellij.xdebugger.breakpoints.SuspendPolicy
 import com.intellij.xdebugger.breakpoints.XBreakpoint
 import java.awt.Toolkit
 import java.awt.AWTEvent
@@ -23,8 +25,9 @@ import javax.swing.JDialog
  * dialog on the EDT and park the debugger manager thread on it — the debuggee
  * stays frozen and every bridge request times out until a human answers.
  * [onEvaluationError] (via the breakpointBehaviorPolicy extension) answers
- * "pause" without any dialog for expressions the bridge owns, and records the
- * failure so `debug breakpoints`/`status` can explain what happened.
+ * without any dialog for expressions the bridge owns: suspending breakpoints
+ * pause, non-suspending logpoints resume, and both record the failure so
+ * `debug breakpoints`/`status` can explain what happened.
  *
  * Expressions the bridge never touched keep the stock IDE dialog; the guard
  * only records them (and tracks the open dialog) so bridge timeouts can point
@@ -104,8 +107,26 @@ internal object BreakpointExpressionGuard {
                     else -> kinds.isNotEmpty()
                 }
             }
-            recordError(session, breakpoint, data, isManaged)
-            if (isManaged) BreakpointErrorAction.PAUSE else BreakpointErrorAction.UNHANDLED
+            val nonSuspending = breakpoint.suspendPolicy == SuspendPolicy.NONE
+            val action = errorActionFor(
+                managed = isManaged,
+                nonSuspending = nonSuspending,
+            )
+            recordError(session, breakpoint, data, action)
+            if (isManaged && nonSuspending) {
+                runCatching {
+                    BreakpointBridge.recordLogpointEvaluationError(
+                        project = session.project,
+                        breakpoint = breakpoint,
+                        session = ShadowDroidDebuggerBridge.logpointSessionSnapshotFor(session),
+                        message = data.message,
+                        kind = kind,
+                        title = data.title,
+                        action = recordedAction(action),
+                    )
+                }.onFailure { LOG.debug("unable to record structured logpoint evaluation error", it) }
+            }
+            action
         } catch (t: Throwable) {
             LOG.warn("breakpoint error policy failed; falling back to the IDE dialog", t)
             BreakpointErrorAction.UNHANDLED
@@ -126,9 +147,41 @@ internal object BreakpointExpressionGuard {
         return kinds
     }
 
+    /** Pure policy selector kept separate so non-suspending behavior is unit-testable. */
+    fun errorActionFor(managed: Boolean, nonSuspending: Boolean): BreakpointErrorAction = when {
+        !managed -> BreakpointErrorAction.UNHANDLED
+        nonSuspending -> BreakpointErrorAction.RESUME
+        else -> BreakpointErrorAction.PAUSE
+    }
+
     fun recentErrors(): List<Map<String, Any?>> = errors.recent(STATUS_ERROR_LIMIT)
 
     fun lastErrorFor(breakpointId: String): Map<String, Any?>? = errors.lastFor(breakpointId)
+
+    /**
+     * Android Studio can render a failed log expression through the ordinary
+     * log-message callback without invoking [onEvaluationError]. Keep that
+     * high-confidence failure visible in the same bounded status history.
+     */
+    fun recordRenderedLogpointError(
+        project: Project,
+        session: LogpointSessionSnapshot,
+        breakpointId: String,
+        message: String,
+        error: LogpointEvaluationError,
+    ) {
+        errors.add(
+            BridgeProtocol.map(
+                "at", BridgeProtocol.nowMs(),
+                "breakpoint_id", breakpointId,
+                "kind", error.kind,
+                "message", message,
+                "action", error.action,
+                "session_name", session.name,
+                "project", project.basePath ?: project.name,
+            ),
+        )
+    }
 
     /** A fresh expression supersedes the failure history of the old one. */
     fun clearErrorsFor(breakpointId: String) = errors.clearFor(breakpointId)
@@ -164,7 +217,7 @@ internal object BreakpointExpressionGuard {
         session: XDebugSession,
         breakpoint: XBreakpoint<*>,
         data: BreakpointErrorData,
-        handled: Boolean,
+        action: BreakpointErrorAction,
     ) {
         val breakpointId = try {
             // No ReadAction here: onEvaluationError runs on the debugger manager
@@ -185,11 +238,17 @@ internal object BreakpointExpressionGuard {
                 "breakpoint_id", breakpointId,
                 "kind", errorKind(data.title),
                 "message", data.message,
-                "action", if (handled) "paused_without_dialog" else "left_to_ide_dialog",
+                "action", recordedAction(action),
                 "session_name", session.sessionName,
                 "project", session.project.basePath ?: session.project.name,
             ),
         )
+    }
+
+    private fun recordedAction(action: BreakpointErrorAction): String = when (action) {
+        BreakpointErrorAction.PAUSE -> "paused_without_dialog"
+        BreakpointErrorAction.RESUME -> "resumed_without_dialog"
+        BreakpointErrorAction.UNHANDLED -> "left_to_ide_dialog"
     }
 
     private fun errorKind(title: String?): String = when (title) {

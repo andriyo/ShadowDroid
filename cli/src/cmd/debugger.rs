@@ -4,7 +4,7 @@
 //! loopback HTTP bridge. They do not need the on-device ShadowDroid server.
 
 use anyhow::{Context, Result};
-use clap::{Args, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, Subcommand, ValueEnum};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -87,6 +87,9 @@ pub enum DebuggerCmd {
     /// Breakpoint commands.
     #[command(subcommand)]
     Break(BreakCmd),
+    /// Non-suspending debugger logpoints and their structured hit stream.
+    #[command(subcommand)]
+    Logpoint(LogpointCmd),
     /// List breakpoints known to Android Studio.
     Breakpoints,
     /// Pause the selected debug session.
@@ -229,6 +232,206 @@ pub enum BreakCmd {
         #[arg(long)]
         project: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+pub enum LogpointCmd {
+    /// Transactionally configure a non-suspending line logpoint.
+    Add(LogpointAddArgs),
+    /// List configured logpoints.
+    List(LogpointListArgs),
+    /// Read a bounded page of structured logpoint-hit events.
+    Events(LogpointEventsArgs),
+    /// Follow structured logpoint-hit events as JSONL.
+    Follow(LogpointFollowArgs),
+    /// Remove one ShadowDroid-owned logpoint by stable id.
+    Remove(LogpointRemoveArgs),
+    /// Remove ShadowDroid-owned logpoints matching the supplied scope.
+    Clear(LogpointClearArgs),
+}
+
+#[derive(Args)]
+#[command(group(
+    ArgGroup::new("logpoint_output")
+        .required(true)
+        .multiple(true)
+        .args(["expression", "log_message", "log_stack"])
+))]
+pub struct LogpointAddArgs {
+    /// Source file path.
+    #[arg(long)]
+    pub file: PathBuf,
+    /// One-based source line number.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=2_147_483_647))]
+    pub line: u32,
+    /// Project name or absolute project path when multiple projects are open.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Create the logpoint disabled.
+    #[arg(long)]
+    pub disabled: bool,
+    /// Remove the logpoint after its first hit.
+    #[arg(long)]
+    pub temporary: bool,
+    /// Expression whose rendered value is logged at each matching hit.
+    #[arg(long, value_parser = parse_nonblank_expression)]
+    pub expression: Option<String>,
+    /// Include Android Studio's default breakpoint-hit message.
+    #[arg(long)]
+    pub log_message: bool,
+    /// Include a stack trace in Android Studio's rendered logpoint message.
+    #[arg(long)]
+    pub log_stack: bool,
+    /// Boolean condition evaluated before logging.
+    #[arg(long)]
+    pub condition: Option<String>,
+    /// Log only after this many matching passes. Use 0 to disable filtering.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=2_147_483_647))]
+    pub pass_count: Option<u32>,
+    /// Set expressions even if Android Studio's validation rejects them.
+    #[arg(long)]
+    pub force: bool,
+    /// Ownership label used for safe remove/clear operations.
+    #[arg(long, default_value = "shadowdroid", value_parser = parse_nonblank_owner)]
+    pub owner: String,
+    /// Maximum structured events captured per second for this logpoint.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=10_000))]
+    pub max_events_per_second: Option<u32>,
+    /// Maximum rendered-message characters retained per structured event.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(256..=65_536))]
+    pub max_message_chars: Option<u32>,
+}
+
+#[derive(Args, Clone, Debug, Default)]
+pub struct LogpointFilterArgs {
+    /// Project name or absolute project path.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Stable debugger session id.
+    #[arg(long)]
+    pub session: Option<String>,
+    /// Stable logpoint/breakpoint id.
+    #[arg(long = "id")]
+    pub breakpoint_id: Option<String>,
+    /// Ownership label to filter by.
+    #[arg(long, value_parser = parse_nonblank_owner)]
+    pub owner: Option<String>,
+}
+
+#[derive(Args)]
+pub struct LogpointListArgs {
+    #[command(flatten)]
+    pub filters: LogpointFilterArgs,
+}
+
+#[derive(Args)]
+pub struct LogpointEventsArgs {
+    /// Return events strictly newer than this cursor.
+    #[arg(long, requires = "stream_id")]
+    pub after: Option<u64>,
+    /// Event-stream id that issued --after; both options must be supplied together.
+    #[arg(long, requires = "after", value_parser = parse_nonblank_stream_id)]
+    pub stream_id: Option<String>,
+    /// Maximum number of events to return.
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=200))]
+    pub limit: u32,
+    #[command(flatten)]
+    pub filters: LogpointFilterArgs,
+}
+
+#[derive(Args)]
+pub struct LogpointFollowArgs {
+    /// Resume strictly after this cursor instead of starting at the live tail.
+    #[arg(long, conflicts_with = "replay_existing", requires = "stream_id")]
+    pub after: Option<u64>,
+    /// Event-stream id that issued --after; both options must be supplied together.
+    #[arg(long, requires = "after", value_parser = parse_nonblank_stream_id)]
+    pub stream_id: Option<String>,
+    /// Maximum events requested from the bridge in one page.
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=200))]
+    pub limit: u32,
+    /// Maximum bridge long-poll wait in milliseconds.
+    #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u32).range(50..=5_000))]
+    pub poll_ms: u32,
+    /// Stop after this many milliseconds. Omit to follow until Ctrl-C.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub duration_ms: Option<u64>,
+    /// Stop after emitting this many logpoint events.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub max_events: Option<u64>,
+    /// Emit the current bounded event history before following new hits.
+    #[arg(long)]
+    pub replay_existing: bool,
+    #[command(flatten)]
+    pub filters: LogpointFilterArgs,
+}
+
+#[derive(Args)]
+pub struct LogpointRemoveArgs {
+    /// Stable id from `debug logpoint list` or `debug logpoint add`.
+    #[arg(long)]
+    pub id: String,
+    /// Project name or absolute project path.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Ownership label that must match the logpoint.
+    #[arg(long, default_value = "shadowdroid", value_parser = parse_nonblank_owner)]
+    pub owner: String,
+}
+
+#[derive(Args)]
+pub struct LogpointClearArgs {
+    /// Project name or absolute project path.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Remove only logpoints with this ownership label.
+    #[arg(long, default_value = "shadowdroid", value_parser = parse_nonblank_owner)]
+    pub owner: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LogpointEventFilters {
+    pub project: Option<String>,
+    pub session: Option<String>,
+    pub breakpoint_id: Option<String>,
+    pub owner: Option<String>,
+}
+
+impl From<&LogpointFilterArgs> for LogpointEventFilters {
+    fn from(filters: &LogpointFilterArgs) -> Self {
+        Self {
+            project: filters.project.clone(),
+            session: filters.session.clone(),
+            breakpoint_id: filters.breakpoint_id.clone(),
+            owner: filters.owner.clone(),
+        }
+    }
+}
+
+fn parse_nonblank_owner(value: &str) -> std::result::Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        Err("owner must not be blank".to_string())
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+fn parse_nonblank_expression(value: &str) -> std::result::Result<String, String> {
+    if value.trim().is_empty() {
+        Err("expression must not be blank".to_string())
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+fn parse_nonblank_stream_id(value: &str) -> std::result::Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        Err("stream id must not be blank".to_string())
+    } else {
+        Ok(value.to_string())
+    }
 }
 
 #[derive(Args)]
@@ -735,6 +938,68 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
             ];
             bridge.get(route::BREAKPOINT_REMOVE, &params).await?
         }
+        DebuggerCmd::Logpoint(LogpointCmd::Add(args)) => {
+            let canonical = canonicalize_for_bridge(&args.file)?;
+            let line_s = args.line.to_string();
+            let enabled_s = (!args.disabled).to_string();
+            let temporary_s = args.temporary.to_string();
+            let log_message_s = args.log_message.to_string();
+            let log_stack_s = args.log_stack.to_string();
+            let pass_count_s = args.pass_count.map(|value| value.to_string());
+            let validate_s = args.force.then_some("false");
+            let max_events_per_second_s = args.max_events_per_second.map(|value| value.to_string());
+            let max_message_chars_s = args.max_message_chars.map(|value| value.to_string());
+            let params = [
+                (query::FILE, Some(canonical.as_str())),
+                (query::LINE, Some(line_s.as_str())),
+                (query::PROJECT, args.project.as_deref()),
+                (query::ENABLED, Some(enabled_s.as_str())),
+                (query::TEMPORARY, Some(temporary_s.as_str())),
+                (query::LOG_EXPRESSION, args.expression.as_deref()),
+                (query::LOG_MESSAGE, Some(log_message_s.as_str())),
+                (query::LOG_STACK, Some(log_stack_s.as_str())),
+                (query::CONDITION, args.condition.as_deref()),
+                (query::PASS_COUNT, pass_count_s.as_deref()),
+                (query::VALIDATE, validate_s),
+                (query::OWNER, Some(args.owner.as_str())),
+                (
+                    query::MAX_EVENTS_PER_SECOND,
+                    max_events_per_second_s.as_deref(),
+                ),
+                (query::MAX_MESSAGE_CHARS, max_message_chars_s.as_deref()),
+            ];
+            bridge.get(route::LOGPOINT_ADD, &params).await?
+        }
+        DebuggerCmd::Logpoint(LogpointCmd::List(args)) => {
+            let params = logpoint_filter_params(&args.filters);
+            bridge.get(route::LOGPOINTS, &params).await?
+        }
+        DebuggerCmd::Logpoint(LogpointCmd::Events(args)) => {
+            let filters = LogpointEventFilters::from(&args.filters);
+            let page = bridge
+                .read_logpoint_events(args.after, args.limit, 0, &filters)
+                .await?;
+            validate_logpoint_stream(&page, args.stream_id.as_deref(), args.after)?;
+            page
+        }
+        DebuggerCmd::Logpoint(LogpointCmd::Follow(args)) => {
+            return follow_logpoint_events(&bridge, args).await;
+        }
+        DebuggerCmd::Logpoint(LogpointCmd::Remove(args)) => {
+            let params = [
+                (query::ID, Some(args.id.as_str())),
+                (query::PROJECT, args.project.as_deref()),
+                (query::OWNER, Some(args.owner.as_str())),
+            ];
+            bridge.get(route::LOGPOINT_REMOVE, &params).await?
+        }
+        DebuggerCmd::Logpoint(LogpointCmd::Clear(args)) => {
+            let params = [
+                (query::PROJECT, args.project.as_deref()),
+                (query::OWNER, Some(args.owner.as_str())),
+            ];
+            bridge.get(route::LOGPOINT_CLEAR, &params).await?
+        }
         DebuggerCmd::Breakpoints => bridge.get(route::BREAKPOINTS, &[]).await?,
         DebuggerCmd::Pause(selector) => control(&bridge, session_action::PAUSE, selector).await?,
         DebuggerCmd::Resume(selector) => control(&bridge, session_action::RESUME, selector).await?,
@@ -1017,6 +1282,290 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
     }
     emit(&value)?;
     Ok(())
+}
+
+fn logpoint_filter_params(filters: &LogpointFilterArgs) -> [(&'static str, Option<&str>); 4] {
+    [
+        (query::PROJECT, filters.project.as_deref()),
+        (query::SESSION, filters.session.as_deref()),
+        (query::ID, filters.breakpoint_id.as_deref()),
+        (query::OWNER, filters.owner.as_deref()),
+    ]
+}
+
+async fn follow_logpoint_events(bridge: &BridgeClient, args: &LogpointFollowArgs) -> Result<()> {
+    let filters = LogpointEventFilters::from(&args.filters);
+    let limit = args.limit.max(1);
+    let poll_ms = args.poll_ms.clamp(50, 5_000);
+    let started = std::time::Instant::now();
+    let mut emitted = 0u64;
+    let mut cursor = args.after.unwrap_or(0);
+    let mut stream_id = args.stream_id.clone();
+    let mut evicted_total = 0u64;
+    let mut rate_limited_total = 0u64;
+
+    if args.after.is_none() {
+        let initial = bridge.read_logpoint_events(None, 1, 0, &filters).await?;
+        stream_id = Some(required_logpoint_stream_id(&initial)?.to_string());
+        evicted_total = cursor_field(&initial, "evicted_total").unwrap_or(0);
+        rate_limited_total = cursor_field(&initial, "rate_limited_total").unwrap_or(0);
+        cursor = initial_logpoint_follow_cursor(&initial, args.replay_existing, cursor);
+        if args.replay_existing {
+            // Page forward from the stream origin so every still-retained
+            // event is replayed in sequence. A null-cursor read returns only a
+            // newest tail page, which would silently skip older retained hits.
+            debug_assert_eq!(cursor, 0);
+        }
+    }
+
+    let mut stop = Box::pin(tokio::signal::ctrl_c());
+    let reason = loop {
+        if args.max_events.is_some_and(|maximum| emitted >= maximum) {
+            break "max_events";
+        }
+        if args
+            .duration_ms
+            .is_some_and(|duration| started.elapsed() >= Duration::from_millis(duration))
+        {
+            break "duration";
+        }
+
+        let timeout_ms = args
+            .duration_ms
+            .map(|duration| {
+                let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let remaining = duration.saturating_sub(elapsed);
+                u32::try_from(remaining.min(u64::from(poll_ms))).unwrap_or(poll_ms)
+            })
+            .unwrap_or(poll_ms)
+            .max(1);
+        let request = bridge.read_logpoint_events(Some(cursor), limit, timeout_ms, &filters);
+        let page = tokio::select! {
+            result = request => result?,
+            result = &mut stop => {
+                result.context("waiting for ctrl-c")?;
+                break "interrupt";
+            }
+        };
+
+        let page_stream_id = required_logpoint_stream_id(&page)?.to_string();
+        if let Some(previous) = stream_id.as_deref()
+            && previous != page_stream_id
+        {
+            crate::events::emit(&serde_json::json!({
+                "type": "warning",
+                "stream": "debug_logpoint_follow",
+                "stage": "logpoint_follow",
+                "code": "logpoint_stream_reset",
+                "msg": "Android Studio restarted its logpoint event stream; following from the new live tail",
+                "retryable": true,
+                "detail": {
+                    "previous_stream_id": previous,
+                    "stream_id": page_stream_id,
+                    "previous_cursor": cursor,
+                },
+                "next_actions": ["shadowdroid debug logpoint events"],
+                "ts": crate::events::now_ts(),
+            }));
+            cursor = logpoint_page_high_water(&page, 0);
+            stream_id = Some(page_stream_id);
+            continue;
+        }
+        if stream_id.is_none() {
+            stream_id = Some(page_stream_id);
+        }
+
+        let latest = cursor_field(&page, "latest_cursor").unwrap_or(cursor);
+        if cursor > latest {
+            crate::events::emit(&serde_json::json!({
+                "type": "warning",
+                "stream": "debug_logpoint_follow",
+                "stage": "logpoint_follow",
+                "code": "logpoint_cursor_reset",
+                "msg": "the requested logpoint cursor is ahead of this Studio event stream; following from its live tail",
+                "retryable": true,
+                "detail": {"requested_cursor": cursor, "latest_cursor": latest},
+                "next_actions": ["shadowdroid debug logpoint events"],
+                "ts": crate::events::now_ts(),
+            }));
+            cursor = latest;
+            continue;
+        }
+
+        if let Some(oldest) = cursor_field(&page, "oldest_cursor")
+            && cursor.saturating_add(1) < oldest
+        {
+            crate::events::emit(&serde_json::json!({
+                "type": "warning",
+                "stream": "debug_logpoint_follow",
+                "stage": "logpoint_follow",
+                "code": "logpoint_cursor_gap",
+                "msg": "logpoint events were evicted before this follower consumed them",
+                "retryable": false,
+                "detail": {
+                    "after": cursor,
+                    "oldest_cursor": oldest,
+                    "latest_cursor": latest,
+                    "missed_at_least": oldest.saturating_sub(cursor.saturating_add(1)),
+                    "overflowed": page.get("overflowed").and_then(Value::as_bool).unwrap_or(false),
+                    "evicted_total": cursor_field(&page, "evicted_total"),
+                },
+                "next_actions": [
+                    "increase --limit or reduce logpoint hit rate",
+                    "shadowdroid debug logpoint events --limit 200",
+                ],
+                "ts": crate::events::now_ts(),
+            }));
+        }
+
+        evicted_total = cursor_field(&page, "evicted_total").unwrap_or(evicted_total);
+        rate_limited_total =
+            cursor_field(&page, "rate_limited_total").unwrap_or(rate_limited_total);
+        if emit_logpoint_page(&page, &mut cursor, &mut emitted, args.max_events) {
+            cursor = cursor_field(&page, "next_cursor").unwrap_or(cursor);
+        }
+    };
+
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    crate::events::emit_action(
+        "debug_logpoint_follow",
+        &serde_json::json!({
+            "status": "stopped",
+            "reason": reason,
+            "events_emitted": emitted,
+            "cursor": cursor,
+            "stream_id": stream_id,
+            "elapsed_ms": elapsed_ms,
+            "evicted_total": evicted_total,
+            "rate_limited_total": rate_limited_total,
+        }),
+    );
+    Ok(())
+}
+
+fn emit_logpoint_page(
+    page: &Value,
+    cursor: &mut u64,
+    emitted: &mut u64,
+    max_events: Option<u64>,
+) -> bool {
+    let Some(events) = page.get("events").and_then(Value::as_array) else {
+        return true;
+    };
+    for event in events {
+        if max_events.is_some_and(|maximum| *emitted >= maximum) {
+            return false;
+        }
+        crate::events::emit(event);
+        *emitted = emitted.saturating_add(1);
+        if let Some(sequence) = cursor_field(event, "seq") {
+            *cursor = sequence;
+        }
+    }
+    true
+}
+
+fn cursor_field(value: &Value, field: &str) -> Option<u64> {
+    value
+        .get(field)
+        .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
+}
+
+fn string_field<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
+    value.get(field).and_then(Value::as_str)
+}
+
+pub(crate) fn logpoint_page_high_water(page: &Value, fallback: u64) -> u64 {
+    cursor_field(page, "latest_cursor")
+        .or_else(|| cursor_field(page, "next_cursor"))
+        .unwrap_or(fallback)
+}
+
+fn initial_logpoint_follow_cursor(page: &Value, replay_existing: bool, fallback: u64) -> u64 {
+    if replay_existing {
+        0
+    } else {
+        logpoint_page_high_water(page, fallback)
+    }
+}
+
+pub(crate) fn logpoint_event_matches_package(event: &Value, expected: Option<&str>) -> bool {
+    expected.is_none_or(|expected| {
+        event
+            .get("package")
+            .and_then(Value::as_str)
+            .is_some_and(|actual| actual == expected)
+    })
+}
+
+pub(crate) fn logpoint_page_metadata(page: &Value) -> Value {
+    const FIELDS: [&str; 8] = [
+        "stream_id",
+        "oldest_cursor",
+        "latest_cursor",
+        "next_cursor",
+        "overflowed",
+        "evicted_total",
+        "rate_limited_total",
+        "buffer_capacity",
+    ];
+    let mut metadata = serde_json::Map::new();
+    for field in FIELDS {
+        if let Some(value) = page.get(field) {
+            metadata.insert(field.to_string(), value.clone());
+        }
+    }
+    Value::Object(metadata)
+}
+
+fn required_logpoint_stream_id(page: &Value) -> Result<&str> {
+    string_field(page, "stream_id")
+        .filter(|stream_id| !stream_id.trim().is_empty())
+        .ok_or_else(|| {
+            crate::diagnostic::DiagnosticError::new(
+                "debugger_bridge_protocol",
+                "debugger",
+                "Android Studio omitted the logpoint event stream id",
+            )
+            .retryable(true)
+            .detail(serde_json::json!({"bridge_reply": page}))
+            .next_actions([
+                "update the ShadowDroid Android Studio plugin and CLI together",
+                "shadowdroid debug logpoint events",
+            ])
+            .into()
+        })
+}
+
+fn validate_logpoint_stream(
+    page: &Value,
+    expected_stream_id: Option<&str>,
+    after: Option<u64>,
+) -> Result<()> {
+    let Some(expected_stream_id) = expected_stream_id else {
+        return Ok(());
+    };
+    let actual_stream_id = required_logpoint_stream_id(page)?;
+    if actual_stream_id == expected_stream_id {
+        return Ok(());
+    }
+    Err(crate::diagnostic::DiagnosticError::new(
+        "logpoint_stream_changed",
+        "debugger",
+        "Android Studio restarted its logpoint event stream; the supplied cursor cannot be used",
+    )
+    .retryable(true)
+    .detail(serde_json::json!({
+        "expected_stream_id": expected_stream_id,
+        "stream_id": actual_stream_id,
+        "after": after,
+        "latest_cursor": cursor_field(page, "latest_cursor"),
+    }))
+    .next_actions([
+        "read `shadowdroid debug logpoint events` without --after to obtain the current stream_id and cursor",
+        "restart the consumer at the current live tail rather than reusing the old numeric cursor",
+    ])
+    .into())
 }
 
 async fn continue_until(bridge: &BridgeClient, args: &ContinueUntilArgs) -> Result<Value> {
@@ -1356,6 +1905,28 @@ impl BridgeClient {
         self.device.as_deref()
     }
 
+    pub(crate) async fn read_logpoint_events(
+        &self,
+        after: Option<u64>,
+        limit: u32,
+        timeout_ms: u32,
+        filters: &LogpointEventFilters,
+    ) -> Result<Value> {
+        let after_s = after.map(|value| value.to_string());
+        let limit_s = limit.max(1).to_string();
+        let timeout_ms_s = timeout_ms.to_string();
+        let params = [
+            (query::AFTER, after_s.as_deref()),
+            (query::LIMIT, Some(limit_s.as_str())),
+            (query::TIMEOUT_MS, Some(timeout_ms_s.as_str())),
+            (query::PROJECT, filters.project.as_deref()),
+            (query::SESSION, filters.session.as_deref()),
+            (query::ID, filters.breakpoint_id.as_deref()),
+            (query::OWNER, filters.owner.as_deref()),
+        ];
+        self.get(route::LOGPOINT_EVENTS, &params).await
+    }
+
     pub(crate) async fn get(&self, path: &str, params: &[(&str, Option<&str>)]) -> Result<Value> {
         let url = self.url(path, params);
         let response = self.http.get(&url).send().await.map_err(|error| {
@@ -1411,16 +1982,45 @@ impl BridgeClient {
             )
             .into());
         }
+        if status == reqwest::StatusCode::NOT_FOUND && path.starts_with("/v1/logpoints") {
+            return Err(crate::diagnostic::DiagnosticError::new(
+                "studio_plugin_upgrade_required",
+                "debugger",
+                "the installed Android Studio plugin does not support structured logpoints",
+            )
+            .detail(serde_json::json!({
+                "route": path,
+                "status": status.as_u16(),
+                "bridge_reply": value,
+            }))
+            .next_actions([
+                "build or download the matching ShadowDroid Android Studio plugin",
+                "shadowdroid studio install --plugin <shadowdroid-plugin.zip>",
+                "restart Android Studio after installing the plugin, then retry",
+            ])
+            .into());
+        }
         if !status.is_success() {
             let message = value
                 .get("error")
                 .and_then(Value::as_str)
                 .unwrap_or("request failed");
             if bridge_error_code(&value) == Some("invalid_expression") {
+                let is_logpoint = path.starts_with("/v1/logpoints");
+                let subject = if is_logpoint {
+                    "logpoint expression"
+                } else {
+                    "breakpoint expression"
+                };
+                let forced_hit_action = if is_logpoint {
+                    "re-run with --force to set it anyway; a later evaluation failure is captured as a structured logpoint event and execution remains non-suspending"
+                } else {
+                    "re-run with --force to set it anyway; if it then fails at a hit, the session pauses and the error appears in `shadowdroid debug breakpoints`"
+                };
                 return Err(crate::diagnostic::DiagnosticError::new(
                     "debug_expression_invalid",
                     "debugger",
-                    format!("Android Studio rejected the breakpoint expression: {message}"),
+                    format!("Android Studio rejected the {subject}: {message}"),
                 )
                 .detail(serde_json::json!({
                     "route": path,
@@ -1430,7 +2030,33 @@ impl BridgeClient {
                 .next_actions([
                     "fix the expression for the breakpoint's language (Kotlin files evaluate Kotlin syntax, Java files Java) — detail.bridge_reply.problems lists what failed",
                     "check names with `shadowdroid debug variables` on a suspended frame",
-                    "re-run with --force to set it anyway; if it then fails at a hit, the session pauses and the error appears in `shadowdroid debug breakpoints`",
+                    forced_hit_action,
+                ])
+                .into());
+            }
+            if path.starts_with("/v1/logpoints")
+                && let Some(
+                    code @ ("logpoint_conflict"
+                    | "logpoint_not_owned"
+                    | "logpoint_owner_mismatch"
+                    | "logpoint_ownership_changed"
+                    | "logpoint_follow_limit"),
+                ) = bridge_error_code(&value)
+            {
+                return Err(crate::diagnostic::DiagnosticError::new(
+                    code,
+                    "debugger",
+                    message,
+                )
+                .retryable(code == "logpoint_follow_limit")
+                .detail(serde_json::json!({
+                    "route": path,
+                    "status": status.as_u16(),
+                    "bridge_reply": value,
+                }))
+                .next_actions([
+                    "shadowdroid debug logpoint list",
+                    "inspect the existing logpoint owner and choose a different source line or owner",
                 ])
                 .into());
             }
@@ -1491,10 +2117,13 @@ impl BridgeClient {
 
 /// Routes that operate on a single debug session, so the client's `--device`
 /// can pick the matching one. The session-control/stack/variables/evaluate/
-/// inspect/coroutines endpoints all live under `/v1/session/`; the watches list
-/// (`/v1/watches`) also refreshes against a suspended session.
+/// inspect/coroutines endpoints all live under `/v1/session/`; watch values and
+/// logpoint list/event reads also accept device/session filtering.
 fn route_is_session_scoped(path: &str) -> bool {
-    path.starts_with("/v1/session/") || path == route::WATCHES
+    path.starts_with("/v1/session/")
+        || path == route::WATCHES
+        || path == route::LOGPOINTS
+        || path == route::LOGPOINT_EVENTS
 }
 
 fn resolve_url(explicit_url: Option<&str>) -> Result<String> {
@@ -1538,6 +2167,8 @@ mod tests {
         assert!(route_is_session_scoped(route::SESSION_CONTROL));
         assert!(route_is_session_scoped(route::SESSION_COROUTINES_FLOW));
         assert!(route_is_session_scoped(route::WATCHES));
+        assert!(route_is_session_scoped(route::LOGPOINTS));
+        assert!(route_is_session_scoped(route::LOGPOINT_EVENTS));
         assert!(!route_is_session_scoped(route::STATUS));
         assert!(!route_is_session_scoped(route::SESSIONS));
         assert!(!route_is_session_scoped(route::WATCHES_ADD));
@@ -1570,6 +2201,11 @@ mod tests {
         assert!(
             bridge
                 .url(route::WATCHES, &[])
+                .contains("device=emulator-5556")
+        );
+        assert!(
+            bridge
+                .url(route::LOGPOINT_EVENTS, &[(query::AFTER, Some("17"))])
                 .contains("device=emulator-5556")
         );
     }
@@ -1658,6 +2294,145 @@ mod tests {
     }
 
     #[test]
+    fn cursor_fields_accept_json_numbers_and_numeric_strings() {
+        assert_eq!(
+            cursor_field(&json!({"next_cursor": 42}), "next_cursor"),
+            Some(42)
+        );
+        assert_eq!(
+            cursor_field(&json!({"next_cursor": "43"}), "next_cursor"),
+            Some(43)
+        );
+        assert_eq!(
+            cursor_field(&json!({"next_cursor": "invalid"}), "next_cursor"),
+            None
+        );
+    }
+
+    #[test]
+    fn resumed_logpoint_cursor_is_bound_to_its_stream() {
+        let page = json!({
+            "stream_id": "stream-b",
+            "latest_cursor": 12,
+            "events": [{"seq": 12, "message": "must not leak"}],
+        });
+        let error = validate_logpoint_stream(&page, Some("stream-a"), Some(11)).unwrap_err();
+        assert_eq!(crate::cli::error_code_of(&error), "logpoint_stream_changed");
+        let diagnostic = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<crate::diagnostic::DiagnosticError>())
+            .unwrap();
+        assert_eq!(diagnostic.detail["expected_stream_id"], "stream-a");
+        assert_eq!(diagnostic.detail["stream_id"], "stream-b");
+        assert_eq!(diagnostic.detail["after"], 11);
+        assert!(diagnostic.retryable);
+
+        validate_logpoint_stream(&page, Some("stream-b"), Some(11)).unwrap();
+        assert_eq!(logpoint_page_high_water(&page, 0), 12);
+    }
+
+    #[test]
+    fn scoped_logpoint_events_require_an_exact_package() {
+        let event = json!({"type": "logpoint", "package": "com.example.target"});
+        assert!(logpoint_event_matches_package(
+            &event,
+            Some("com.example.target")
+        ));
+        assert!(!logpoint_event_matches_package(
+            &event,
+            Some("com.example.other")
+        ));
+        assert!(!logpoint_event_matches_package(
+            &json!({"type": "logpoint"}),
+            Some("com.example.target")
+        ));
+        assert!(logpoint_event_matches_package(&event, None));
+    }
+
+    #[test]
+    fn overflow_warning_metadata_cannot_leak_mixed_package_events() {
+        let page = json!({
+            "stream_id": "stream-a",
+            "oldest_cursor": 7,
+            "latest_cursor": 12,
+            "next_cursor": 12,
+            "overflowed": true,
+            "evicted_total": 6,
+            "rate_limited_total": 2,
+            "buffer_capacity": 512,
+            "events": [
+                {
+                    "type": "logpoint",
+                    "package": "com.example.target",
+                    "message": "target-value",
+                },
+                {
+                    "type": "logpoint",
+                    "package": "com.example.other",
+                    "message": "OTHER_PACKAGE_SECRET",
+                },
+            ],
+        });
+
+        let metadata = logpoint_page_metadata(&page);
+        assert_eq!(metadata["stream_id"], "stream-a");
+        assert_eq!(metadata["overflowed"], true);
+        assert_eq!(metadata["evicted_total"], 6);
+        assert!(metadata.get("events").is_none());
+        let rendered = serde_json::to_string(&metadata).unwrap();
+        assert!(!rendered.contains("com.example.other"));
+        assert!(!rendered.contains("OTHER_PACKAGE_SECRET"));
+        assert!(!rendered.contains("com.example.target"));
+        assert!(!rendered.contains("target-value"));
+    }
+
+    #[test]
+    fn replay_existing_starts_at_origin_while_live_follow_starts_at_tail() {
+        let page = json!({"latest_cursor": 120, "next_cursor": 120});
+        assert_eq!(initial_logpoint_follow_cursor(&page, true, 9), 0);
+        assert_eq!(initial_logpoint_follow_cursor(&page, false, 9), 120);
+    }
+
+    #[tokio::test]
+    async fn one_shot_logpoint_events_reject_a_cursor_from_another_stream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let reply = json!({
+            "ok": true,
+            "stream_id": "stream-new",
+            "latest_cursor": 3,
+            "events": [{"type": "logpoint", "seq": 3, "message": "wrong stream"}],
+        })
+        .to_string();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                reply.len(),
+                reply
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let command = DebuggerCmd::Logpoint(LogpointCmd::Events(LogpointEventsArgs {
+            after: Some(2),
+            stream_id: Some("stream-old".to_string()),
+            limit: 100,
+            filters: LogpointFilterArgs::default(),
+        }));
+        let error = run(&command, None, Some(&format!("http://{address}")))
+            .await
+            .unwrap_err();
+        assert_eq!(crate::cli::error_code_of(&error), "logpoint_stream_changed");
+    }
+
+    #[test]
     fn layout_debugger_conflict_is_typed_and_names_the_exact_session_stop() {
         let reply = json!({
             "ok": false,
@@ -1732,6 +2507,115 @@ mod tests {
             diagnostic.detail["bridge_reply"]["session"]["id"],
             "session_9"
         );
+    }
+
+    #[tokio::test]
+    async fn missing_logpoint_route_requests_a_plugin_upgrade() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let reply =
+            json!({"ok": false, "error": "not_found", "path": route::LOGPOINT_EVENTS}).to_string();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                reply.len(),
+                reply
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let bridge = BridgeClient::new(Some(&format!("http://{address}"))).unwrap();
+        let error = bridge
+            .read_logpoint_events(None, 10, 0, &LogpointEventFilters::default())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            crate::cli::error_code_of(&error),
+            "studio_plugin_upgrade_required"
+        );
+        assert_eq!(crate::cli::error_stage_of(&error), "debugger");
+    }
+
+    #[tokio::test]
+    async fn logpoint_conflict_preserves_the_bridge_error_code() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let reply = json!({
+            "ok": false,
+            "error": "an unowned breakpoint already exists at Foo.kt:42",
+            "error_code": "logpoint_conflict",
+            "existing_breakpoint_id": "bp_manual"
+        })
+        .to_string();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                reply.len(),
+                reply
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let bridge = BridgeClient::new(Some(&format!("http://{address}"))).unwrap();
+        let error = bridge.get(route::LOGPOINT_ADD, &[]).await.unwrap_err();
+        assert_eq!(crate::cli::error_code_of(&error), "logpoint_conflict");
+        assert_eq!(crate::cli::error_stage_of(&error), "debugger");
+    }
+
+    #[tokio::test]
+    async fn forced_logpoint_expression_failure_stays_non_suspending() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let reply = json!({
+            "ok": false,
+            "error": "cannot resolve counter",
+            "error_code": "invalid_expression",
+        })
+        .to_string();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                reply.len(),
+                reply
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let bridge = BridgeClient::new(Some(&format!("http://{address}"))).unwrap();
+        let error = bridge.get(route::LOGPOINT_ADD, &[]).await.unwrap_err();
+        assert_eq!(
+            crate::cli::error_code_of(&error),
+            "debug_expression_invalid"
+        );
+        let diagnostic = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<crate::diagnostic::DiagnosticError>())
+            .unwrap();
+        assert!(diagnostic.message.contains("logpoint expression"));
+        let force_action = diagnostic.next_actions.last().unwrap();
+        assert!(force_action.contains("remains non-suspending"));
+        assert!(!force_action.contains("session pauses"));
     }
 
     #[tokio::test]
