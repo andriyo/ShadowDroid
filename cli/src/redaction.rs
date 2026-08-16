@@ -15,7 +15,7 @@ use std::net::Ipv6Addr;
 use std::str::FromStr;
 use std::sync::{LazyLock, OnceLock, RwLock};
 
-pub const POLICY_VERSION: u32 = 1;
+pub const POLICY_VERSION: u32 = 2;
 
 static EMAIL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,63}\b").expect("email regex")
@@ -33,6 +33,9 @@ static HEADER_LINE: LazyLock<Regex> = LazyLock::new(|| {
 static QUERY_SECRET: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(access_token|refresh_token|token|session_id|device_id|transaction_id|password|passcode|api_key|email)=([^&\s]+)")
         .expect("query secret regex")
+});
+static URLISH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\b(?:https?|wss?)://[^\s\"'<>]+"#).expect("URL-like text regex")
 });
 static JSON_STRING_PAIR: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)"([A-Za-z0-9_.-]+)"\s*:\s*"((?:\\.|[^"\\])*)""#)
@@ -134,6 +137,12 @@ impl Policy {
         }
     }
 
+    pub fn fingerprint(&self) -> String {
+        let bytes = serde_json::to_vec(&(POLICY_VERSION, &self.spec))
+            .expect("redaction policy spec is serializable");
+        blake3::hash(&bytes).to_hex().to_string()
+    }
+
     pub fn redact_output(&self, mut value: Value) -> Value {
         let mut literals = BTreeMap::new();
         self.collect_sensitive_literals(&value, &mut literals);
@@ -175,6 +184,26 @@ impl Policy {
         self.redact_string(text).0
     }
 
+    /// Redact absolute URLs embedded in diagnostic text, including
+    /// percent-encoded query names that the generic text patterns cannot
+    /// classify without decoding.
+    pub fn redact_urlish_text(&self, text: &str) -> String {
+        let with_urls = URLISH
+            .replace_all(text, |captures: &regex::Captures<'_>| {
+                let url = &captures[0];
+                let Some((scheme, rest)) = url.split_once("://") else {
+                    return url.to_string();
+                };
+                let split = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+                let (authority, target) = rest.split_at(split);
+                let authority = self.redact_text(authority);
+                let (target, _) = self.redact_request_target(target);
+                format!("{scheme}://{authority}{target}")
+            })
+            .into_owned();
+        self.redact_text(&with_urls)
+    }
+
     pub fn text_is_sensitive(&self, text: &str) -> bool {
         self.redact_string(text).1 > 0
     }
@@ -190,7 +219,93 @@ impl Policy {
         (redacted, count > 0)
     }
 
+    /// Redact a persisted HTTP/WebSocket request target without changing the
+    /// bytes sent on the wire. Query names are decoded before classification so
+    /// encoded spellings such as `access%5Ftoken` cannot bypass the policy;
+    /// unchanged components retain their original encoding and order.
+    pub fn redact_request_target(&self, target: &str) -> (String, bool) {
+        let (path_and_query, fragment) = target
+            .split_once('#')
+            .map_or((target, None), |(head, tail)| (head, Some(tail)));
+        let (path, query) = path_and_query
+            .split_once('?')
+            .map_or((path_and_query, None), |(head, tail)| (head, Some(tail)));
+
+        let mut changed = false;
+        let redacted_path = path
+            .split('/')
+            .map(|segment| self.redact_encoded_component(segment, &mut changed))
+            .collect::<Vec<_>>()
+            .join("/");
+        let mut output = redacted_path;
+
+        if let Some(query) = query {
+            output.push('?');
+            output.push_str(
+                &query
+                    .split('&')
+                    .map(|parameter| {
+                        let Some((raw_name, raw_value)) = parameter.split_once('=') else {
+                            return self.redact_encoded_component(parameter, &mut changed);
+                        };
+                        let decoded_name = decode_url_component(raw_name);
+                        let redacted_value = if let Some(kind) =
+                            sensitive_kind(decoded_name.as_ref(), &self.custom_keys)
+                        {
+                            if raw_value.is_empty() {
+                                String::new()
+                            } else {
+                                let decoded_value = decode_url_component(raw_value);
+                                let replacement = urlencoding::encode(placeholder(
+                                    kind,
+                                    Some(decoded_value.as_ref()),
+                                ))
+                                .into_owned();
+                                changed |= replacement != raw_value;
+                                replacement
+                            }
+                        } else {
+                            self.redact_encoded_component(raw_value, &mut changed)
+                        };
+                        format!("{raw_name}={redacted_value}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("&"),
+            );
+        }
+
+        if let Some(fragment) = fragment {
+            output.push('#');
+            output.push_str(&self.redact_encoded_component(fragment, &mut changed));
+        }
+        (output, changed)
+    }
+
+    fn redact_encoded_component(&self, raw: &str, changed: &mut bool) -> String {
+        let decoded = decode_url_component(raw);
+        let redacted = self.redact_text(decoded.as_ref());
+        if redacted == decoded {
+            raw.to_string()
+        } else {
+            *changed = true;
+            urlencoding::encode(&redacted).into_owned()
+        }
+    }
+
     pub fn redact_flow_record(&self, flow: &mut crate::net::flow::FlowRecord) {
+        let host = self.redact_text(&flow.host);
+        flow.host_redacted |= host != flow.host;
+        flow.host = host;
+
+        let (path, path_changed) = self.redact_request_target(&flow.path);
+        flow.path_redacted |= path_changed;
+        flow.path = path;
+
+        if let Some(error) = flow.error.as_mut() {
+            let redacted = self.redact_urlish_text(error);
+            flow.error_redacted |= redacted != *error;
+            *error = redacted;
+        }
         for (name, value) in &mut flow.req_headers {
             *value = self.redact_header_value(name, value);
         }
@@ -372,6 +487,10 @@ impl Policy {
         }
         (output, changes)
     }
+}
+
+fn decode_url_component(input: &str) -> Cow<'_, str> {
+    urlencoding::decode(input).unwrap_or(Cow::Borrowed(input))
 }
 
 fn redact_known_literals(value: &mut Value, literals: &BTreeMap<String, &'static str>) -> usize {
@@ -698,6 +817,77 @@ mod tests {
         assert!(!output.contains("Bearer abc.def.ghi"));
         assert!(!output.contains("do-not-print"));
         assert!(output.contains("<redacted:ip>"));
+    }
+
+    #[test]
+    fn request_target_redaction_decodes_names_values_and_preserves_safe_pairs() {
+        let policy = Policy::builtin();
+        let input = "/users/person%40example.com?access%5Ftoken=secret-one&safe=visible&email=person%40example.com&safe=second&token=secret-two&token=";
+        let (output, changed) = policy.redact_request_target(input);
+
+        assert!(changed);
+        for secret in [
+            "person@example.com",
+            "person%40example.com",
+            "secret-one",
+            "secret-two",
+        ] {
+            assert!(
+                !output.contains(secret),
+                "request target leaked {secret}: {output}"
+            );
+        }
+        assert!(output.contains("safe=visible"));
+        assert!(output.contains("safe=visible&email="));
+        assert!(output.contains("safe=second"));
+        assert!(output.ends_with("&token="));
+        assert!(output.contains("access%5Ftoken=%3Credacted%3Atoken%3E"));
+        assert!(output.contains("email=%3Credacted%3Aemail%3E"));
+
+        let (second, changed_again) = policy.redact_request_target(&output);
+        assert_eq!(second, output);
+        assert!(!changed_again, "redaction must be idempotent");
+    }
+
+    #[test]
+    fn flow_metadata_is_redacted_before_persistence_without_changing_lengths() {
+        let policy = Policy::new(PolicySpec {
+            json_keys: vec!["customerCode".into()],
+            patterns: vec!["ORDER-[0-9]+".into()],
+        })
+        .unwrap();
+        let mut flow = crate::net::flow::FlowRecord {
+            host: "10.2.3.4".into(),
+            path: "/ORDER-42?customerCode=customer-secret&safe=visible".into(),
+            req_len: 91,
+            resp_len: 123,
+            error: Some(
+                "upstream https://10.2.3.4/v1?customer%43ode=url-secret&access%5Ftoken=encoded-secret rejected person@example.com for ORDER-42"
+                    .into(),
+            ),
+            ..Default::default()
+        };
+
+        policy.redact_flow_record(&mut flow);
+
+        let persisted = serde_json::to_string(&flow).unwrap();
+        for secret in [
+            "10.2.3.4",
+            "customer-secret",
+            "url-secret",
+            "encoded-secret",
+            "person@example.com",
+            "ORDER-42",
+        ] {
+            assert!(!persisted.contains(secret), "flow metadata leaked {secret}");
+        }
+        assert!(flow.path.contains("safe=visible"));
+        assert!(flow.host_redacted);
+        assert!(flow.path_redacted);
+        assert!(flow.error_redacted);
+        assert_eq!(flow.req_len, 91);
+        assert_eq!(flow.resp_len, 123);
+        assert_eq!(flow.redaction_policy_version, Some(POLICY_VERSION));
     }
 
     #[test]

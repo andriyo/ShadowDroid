@@ -529,17 +529,61 @@ fn report_tls_error(ctx: &ProxyContext, host: &str, err: &std::io::Error) {
             return; // already reported this host this session
         }
     }
+    let fields = persisted_tls_error_fields(
+        host,
+        &tls_failure_reason(err),
+        ctx.shared.redaction.as_ref(),
+    );
     let ev = Event::TlsError {
         ts: events::now_ts(),
         capture_session_id: ctx.capture_session_id.clone(),
-        host: host.to_string(),
-        reason: tls_failure_reason(err),
+        host: fields.host,
+        reason: fields.reason,
+        host_redacted: fields.host_redacted,
+        reason_redacted: fields.reason_redacted,
+        redaction_policy: fields.redaction_policy,
+        redaction_policy_version: fields.redaction_policy_version,
         next_actions: crate::net::tls_error_next_actions(&ctx.serial),
     };
     if let Err(error) = crate::net::store::append_event(&ctx.serial, &ev) {
         ctx.shared.record_persistence_error("tls_error", &error);
     }
     let _ = ctx.shared.events.send(Arc::new(ev));
+}
+
+struct PersistedTlsErrorFields {
+    host: String,
+    reason: String,
+    host_redacted: bool,
+    reason_redacted: bool,
+    redaction_policy: Option<String>,
+    redaction_policy_version: Option<u32>,
+}
+
+fn persisted_tls_error_fields(
+    host: &str,
+    reason: &str,
+    policy: Option<&crate::redaction::Policy>,
+) -> PersistedTlsErrorFields {
+    let mut fields = PersistedTlsErrorFields {
+        host: host.to_string(),
+        reason: reason.to_string(),
+        host_redacted: false,
+        reason_redacted: false,
+        redaction_policy: None,
+        redaction_policy_version: None,
+    };
+    if let Some(policy) = policy {
+        let host = policy.redact_text(&fields.host);
+        fields.host_redacted = host != fields.host;
+        fields.host = host;
+        let reason = policy.redact_urlish_text(&fields.reason);
+        fields.reason_redacted = reason != fields.reason;
+        fields.reason = reason;
+        fields.redaction_policy = Some(policy.label().to_string());
+        fields.redaction_policy_version = Some(crate::redaction::POLICY_VERSION);
+    }
+    fields
 }
 
 /// Turn a `TlsAcceptor::accept` error into an agent-actionable reason. A fatal
@@ -726,6 +770,8 @@ async fn proxy_websocket(
         scheme: ws_scheme.to_string(),
         host: host.clone(),
         path: path.clone(),
+        host_redacted: false,
+        path_redacted: false,
         status,
         subprotocol: flow::header_get(&resp_headers, "sec-websocket-protocol").map(str::to_string),
         permessage_deflate: deflate.enabled,
@@ -736,7 +782,7 @@ async fn proxy_websocket(
     };
     // The handshake carries Cookie/Authorization; redact them like HTTP flows.
     if let Some(policy) = &ctx.shared.redaction {
-        session.redact_headers(policy);
+        session.redact(policy);
     }
     let meta = ws::WsSessionMeta {
         id: session.id.clone(),
@@ -1936,6 +1982,8 @@ fn make_flow(p: FlowParts<'_>) -> FlowRecord {
         scheme: p.scheme.to_string(),
         host: p.host.to_string(),
         path: p.path.to_string(),
+        host_redacted: false,
+        path_redacted: false,
         status: p.status,
         dur_ms: Some(p.dur_ms),
         req_headers: p.req_headers.to_vec(),
@@ -1958,6 +2006,7 @@ fn make_flow(p: FlowParts<'_>) -> FlowRecord {
         modified: p.modified,
         upstream_bypassed: false,
         error: p.error,
+        error_redacted: false,
         streamed: false,
         req_streamed: p.req_streamed,
     }
@@ -2985,7 +3034,8 @@ mod tests {
         ContentEncoding, DecodeFailure, DecodeOutcome, EncodingDisposition, HeldFlow, HoldDecision,
         ReleaseHeldResult, TerminalHoldHistory, decode_capped, decompress_bounded_with_cap,
         encoding_disposition, frame_stream_body, graphql_operation_matches, host_glob_match,
-        release_held, resolve_held, tls_failure_reason, upstream_headers, ws_tls_connector,
+        persisted_tls_error_fields, release_held, resolve_held, tls_failure_reason,
+        upstream_headers, ws_tls_connector,
     };
     use crate::net::Mutation;
     use crate::net::flow::FlowRecord;
@@ -3587,6 +3637,31 @@ mod tests {
         let reason = tls_failure_reason(&reset);
         assert!(reason.contains("failed before any request"), "{reason}");
         assert!(!reason.contains("net trust"), "{reason}");
+    }
+
+    #[test]
+    fn tls_error_fields_are_redacted_only_when_capture_policy_is_enabled() {
+        let host = "10.2.3.4";
+        let reason = "handshake for person@example.com failed at 10.2.3.4";
+
+        let raw = persisted_tls_error_fields(host, reason, None);
+        assert_eq!(raw.host, host);
+        assert_eq!(raw.reason, reason);
+        assert!(!raw.host_redacted);
+        assert!(!raw.reason_redacted);
+        assert!(raw.redaction_policy.is_none());
+
+        let redacted =
+            persisted_tls_error_fields(host, reason, Some(&crate::redaction::Policy::builtin()));
+        assert!(!redacted.host.contains(host));
+        assert!(!redacted.reason.contains(host));
+        assert!(!redacted.reason.contains("person@example.com"));
+        assert!(redacted.host_redacted);
+        assert!(redacted.reason_redacted);
+        assert_eq!(
+            redacted.redaction_policy_version,
+            Some(crate::redaction::POLICY_VERSION)
+        );
     }
 
     fn insert_held(

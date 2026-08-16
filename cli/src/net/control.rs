@@ -109,6 +109,20 @@ fn public_rule(id: &str, spec: &RuleSpec) -> Value {
     value
 }
 
+fn capture_redaction_status(policy: Option<&crate::redaction::Policy>) -> Value {
+    match policy {
+        Some(policy) => json!({
+            "enabled": true,
+            "policy": policy.label(),
+            "version": crate::redaction::POLICY_VERSION,
+            "fingerprint": policy.fingerprint(),
+            "custom_json_keys": policy.spec().json_keys.len(),
+            "custom_patterns": policy.spec().patterns.len(),
+        }),
+        None => json!({"enabled": false}),
+    }
+}
+
 fn request_u32_field(req: &Value, field: &str, default: u32) -> Result<u32> {
     let Some(value) = req.get(field).filter(|value| !value.is_null()) else {
         return Ok(default);
@@ -203,18 +217,24 @@ pub async fn serve_client(
                 let held = shared.held.lock().unwrap();
                 held.values()
                     .map(|h| {
+                        let mut meta = h.meta.clone();
+                        if let Some(policy) = &shared.redaction {
+                            policy.redact_flow_record(&mut meta);
+                        }
                         json!({
-                            "id": h.meta.id,
-                            "capture_session_id": h.meta.capture_session_id,
+                            "id": meta.id,
+                            "capture_session_id": meta.capture_session_id,
                             "phase": h.phase,
                             "state": "held",
                             "held_at": h.held_at,
                             "expires_at": h.expires_at,
                             "client_connected": h.tx.as_ref().is_some_and(|tx| !tx.is_closed()),
-                            "method": h.meta.method,
-                            "host": h.meta.host,
-                            "path": h.meta.path,
-                            "status": h.meta.status,
+                            "method": meta.method,
+                            "host": meta.host,
+                            "path": meta.path,
+                            "host_redacted": meta.host_redacted,
+                            "path_redacted": meta.path_redacted,
+                            "status": meta.status,
                         })
                     })
                     .collect()
@@ -263,6 +283,7 @@ pub async fn serve_client(
                     "started": state.started,
                     "capture_session_id": state.capture_session_id,
                     "ca_fingerprint": state.ca_fingerprint,
+                    "capture_redaction": capture_redaction_status(shared.redaction.as_ref()),
                     "flows": state.flow_count.load(Ordering::Relaxed),
                     "dropped_flows": shared.dropped_flows.load(Ordering::Relaxed),
                     "persistence_errors": shared.persistence_errors.load(Ordering::Relaxed),
@@ -1401,6 +1422,24 @@ mod tests {
     }
 
     #[test]
+    fn capture_redaction_status_is_explicit_without_exposing_custom_patterns() {
+        assert_eq!(capture_redaction_status(None), json!({"enabled": false}));
+
+        let policy = crate::redaction::Policy::new(crate::redaction::PolicySpec {
+            json_keys: vec!["customerCode".into()],
+            patterns: vec!["SENTINEL-PRIVATE-PATTERN".into()],
+        })
+        .unwrap();
+        let status = capture_redaction_status(Some(&policy));
+        assert_eq!(status["enabled"], true);
+        assert_eq!(status["version"], crate::redaction::POLICY_VERSION);
+        assert_eq!(status["custom_json_keys"], 1);
+        assert_eq!(status["custom_patterns"], 1);
+        assert_eq!(status["fingerprint"], policy.fingerprint());
+        assert!(!status.to_string().contains("SENTINEL-PRIVATE-PATTERN"));
+    }
+
+    #[test]
     fn respond_rule_is_atomic_validated_and_publicly_summarized() {
         let spec = RuleSpec {
             kind: "respond".into(),
@@ -1638,6 +1677,10 @@ mod tests {
             capture_session_id: "n-test".into(),
             host: "appconfigs.disney-plus.net".into(),
             reason: "rejected".into(),
+            host_redacted: false,
+            reason_redacted: false,
+            redaction_policy: None,
+            redaction_policy_version: None,
             next_actions: vec!["shadowdroid net check --fresh".into()],
         };
         // Relayed to watch (previously the catch-all dropped everything non-HTTP).

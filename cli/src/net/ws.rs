@@ -993,6 +993,10 @@ pub struct WsSessionRecord {
     pub scheme: String,
     pub host: String,
     pub path: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub host_redacted: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub path_redacted: bool,
     pub status: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subprotocol: Option<String>,
@@ -1013,10 +1017,14 @@ impl WsSessionRecord {
         format!("{}://{}{}", self.scheme, self.host, self.path)
     }
 
-    /// Redact the handshake headers (a WSS upgrade carries `Cookie`/
-    /// `Authorization` just like an HTTP request), mirroring how completed HTTP
-    /// flows are redacted before persistence. Forwarded traffic is untouched.
-    pub fn redact_headers(&mut self, policy: &crate::redaction::Policy) {
+    /// Redact persisted handshake metadata. Forwarded traffic is untouched.
+    pub fn redact(&mut self, policy: &crate::redaction::Policy) {
+        let host = policy.redact_text(&self.host);
+        self.host_redacted |= host != self.host;
+        self.host = host;
+        let (path, changed) = policy.redact_request_target(&self.path);
+        self.path_redacted |= changed;
+        self.path = path;
         for (name, value) in self
             .req_headers
             .iter_mut()
@@ -1056,6 +1064,8 @@ impl WsSessionRecord {
             "host": self.host,
             "path": self.path,
             "url": self.url(),
+            "host_redacted": self.host_redacted,
+            "path_redacted": self.path_redacted,
             "status": self.status,
             "subprotocol": self.subprotocol,
             "permessage_deflate": self.permessage_deflate,
@@ -1080,6 +1090,8 @@ pub struct WsMessageRecord {
     pub capture_session_id: String,
     pub ts: f64,
     pub host: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub host_redacted: bool,
     pub dir: String,
     pub seq: u64,
     pub opcode: String,
@@ -1170,6 +1182,7 @@ impl WsMessageRecord {
             "capture_session_id": self.capture_session_id,
             "ts": self.ts,
             "host": self.host,
+            "host_redacted": self.host_redacted,
             "dir": self.dir,
             "seq": self.seq,
             "opcode": self.opcode,
@@ -1201,18 +1214,23 @@ impl WsMessageRecord {
     /// `net export` when the proxy captured without `--redact` but a policy is
     /// active at export time (matching the HTTP flow re-redaction path).
     pub fn redact(&mut self, policy: &crate::redaction::Policy) {
+        let host = policy.redact_text(&self.host);
+        self.host_redacted |= host != self.host;
+        self.host = host;
         if let Some(text) = self.text.as_mut() {
-            let (redacted, changed) = policy.redact_body(text);
+            let redacted = policy.redact_urlish_text(text);
+            let changed = redacted != *text;
             *text = redacted;
             self.body_redacted |= changed;
         }
         if let Some(reason) = self.close_reason.as_mut() {
-            let (redacted, changed) = policy.redact_body(reason);
+            let redacted = policy.redact_urlish_text(reason);
+            let changed = redacted != *reason;
             *reason = redacted;
             self.body_redacted |= changed;
         }
         if let Some(preview) = self.preview.as_mut() {
-            *preview = policy.redact_text(preview);
+            *preview = policy.redact_urlish_text(preview);
         }
         self.redaction_policy = Some(policy.label().to_string());
         self.redaction_policy_version = Some(crate::redaction::POLICY_VERSION);
@@ -1257,10 +1275,14 @@ pub struct WsCloseRecord {
     pub started_ts: f64,
     pub dur_ms: u64,
     pub host: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub host_redacted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub close_code: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub close_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub close_reason_redacted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub close_initiator: Option<String>,
     pub c2s_msgs: u64,
@@ -1269,14 +1291,25 @@ pub struct WsCloseRecord {
     pub s2c_bytes: u64,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub dropped: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redaction_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redaction_policy_version: Option<u32>,
 }
 
 impl WsCloseRecord {
     /// Redact the app-supplied close reason (for `net export` re-redaction).
     pub fn redact(&mut self, policy: &crate::redaction::Policy) {
+        let host = policy.redact_text(&self.host);
+        self.host_redacted |= host != self.host;
+        self.host = host;
         if let Some(reason) = self.close_reason.as_mut() {
-            *reason = policy.redact_text(reason);
+            let redacted = policy.redact_urlish_text(reason);
+            self.close_reason_redacted |= redacted != *reason;
+            *reason = redacted;
         }
+        self.redaction_policy = Some(policy.label().to_string());
+        self.redaction_policy_version = Some(crate::redaction::POLICY_VERSION);
     }
 
     pub fn close_event(&self, serial: &Serial) -> Event {
@@ -1310,14 +1343,18 @@ impl WsCloseRecord {
             "started_ts": self.started_ts,
             "dur_ms": self.dur_ms,
             "host": self.host,
+            "host_redacted": self.host_redacted,
             "close_code": self.close_code,
             "close_reason": self.close_reason,
+            "close_reason_redacted": self.close_reason_redacted,
             "close_initiator": self.close_initiator,
             "c2s_msgs": self.c2s_msgs,
             "s2c_msgs": self.s2c_msgs,
             "c2s_bytes": self.c2s_bytes,
             "s2c_bytes": self.s2c_bytes,
             "dropped": self.dropped,
+            "redaction_policy": self.redaction_policy,
+            "redaction_policy_version": self.redaction_policy_version,
         })
     }
 }
@@ -1455,19 +1492,26 @@ fn build_message_record(
     ts: f64,
 ) -> WsMessageRecord {
     let (mut text, data_b64, close_code, mut close_reason) = encode_payload(message);
+    let mut host = meta.host.clone();
+    let mut host_redacted = false;
     let mut body_redacted = false;
     let mut redaction_policy = None;
     let mut redaction_policy_version = None;
     if let Some(policy) = redaction {
+        let redacted = policy.redact_text(&host);
+        host_redacted = redacted != host;
+        host = redacted;
         if let Some(payload) = text.as_mut() {
-            let (redacted, changed) = policy.redact_body(payload);
+            let redacted = policy.redact_urlish_text(payload);
+            let changed = redacted != *payload;
             *payload = redacted;
             body_redacted |= changed;
         }
         // The close reason is app-supplied text too, and feeds the preview; it
         // must be redacted alongside `text` (which for a close frame is a copy).
         if let Some(reason) = close_reason.as_mut() {
-            let (redacted, changed) = policy.redact_body(reason);
+            let redacted = policy.redact_urlish_text(reason);
+            let changed = redacted != *reason;
             *reason = redacted;
             body_redacted |= changed;
         }
@@ -1488,7 +1532,8 @@ fn build_message_record(
         flow_sequence: crate::net::flow::next_sequence(),
         capture_session_id: meta.capture_session_id.clone(),
         ts,
-        host: meta.host.clone(),
+        host,
+        host_redacted,
         dir: direction.as_str().to_string(),
         seq,
         opcode: message.opcode.as_str().to_string(),
@@ -2291,14 +2336,18 @@ async fn drain_loop(
         started_ts: meta.started_ts,
         dur_ms: ((ended - meta.started_ts).max(0.0) * 1000.0) as u64,
         host: meta.host.clone(),
+        host_redacted: false,
         close_code,
         close_reason,
+        close_reason_redacted: false,
         close_initiator,
         c2s_msgs: stats.c2s_msgs.load(Ordering::Relaxed),
         s2c_msgs: stats.s2c_msgs.load(Ordering::Relaxed),
         c2s_bytes: stats.c2s_bytes.load(Ordering::Relaxed),
         s2c_bytes: stats.s2c_bytes.load(Ordering::Relaxed),
         dropped: stats.dropped.load(Ordering::Relaxed),
+        redaction_policy: None,
+        redaction_policy_version: None,
     };
     redact_close_for_live_capture(&mut record, ctx.shared.redaction.as_ref());
     let event = record.close_event(&ctx.serial);
@@ -3096,8 +3145,10 @@ mod tests {
             capture_session_id: "n-test".to_string(),
             ts: 1.0,
             scheme: "wss".to_string(),
-            host: "chat.example.com".to_string(),
-            path: "/socket".to_string(),
+            host: "10.2.3.4".to_string(),
+            path: "/socket?access_token=ws-secret&safe=visible".to_string(),
+            host_redacted: false,
+            path_redacted: false,
             status: 101,
             subprotocol: None,
             permessage_deflate: false,
@@ -3112,7 +3163,7 @@ mod tests {
             redaction_policy: None,
             redaction_policy_version: None,
         };
-        session.redact_headers(&crate::redaction::Policy::builtin());
+        session.redact(&crate::redaction::Policy::builtin());
         let joined: String = session
             .req_headers
             .iter()
@@ -3127,6 +3178,11 @@ mod tests {
         assert!(!joined.contains("sk-abc123"), "bearer leaked: {joined}");
         assert!(!joined.contains("leak-me"), "set-cookie leaked: {joined}");
         assert!(session.redaction_policy.is_some());
+        assert!(session.host_redacted);
+        assert!(session.path_redacted);
+        assert!(!session.host.contains("10.2.3.4"));
+        assert!(!session.path.contains("ws-secret"));
+        assert!(session.path.contains("safe=visible"));
     }
 
     #[test]
@@ -3160,7 +3216,9 @@ mod tests {
         // Finding #4: a close frame's reason (and the preview built from it) must
         // be redacted, not just the `text` copy.
         let mut payload = 1008u16.to_be_bytes().to_vec();
-        payload.extend_from_slice(b"blocked user alice@example.com from 10.2.3.4");
+        payload.extend_from_slice(
+            b"blocked https://chat.example/v1?access%5Ftoken=WS-CLOSE-SECRET&safe=visible user alice@example.com from 10.2.3.4",
+        );
         let records = pipeline(
             Direction::ServerToClient,
             DeflateParams::default(),
@@ -3177,6 +3235,11 @@ mod tests {
             "reason leaked: {reason}"
         );
         assert!(!reason.contains("10.2.3.4"), "reason leaked ip: {reason}");
+        assert!(
+            !reason.contains("WS-CLOSE-SECRET"),
+            "reason leaked URL: {reason}"
+        );
+        assert!(reason.contains("safe=visible"));
         let preview = record.preview.as_deref().unwrap();
         assert!(
             !preview.contains("alice@example.com"),
@@ -3196,24 +3259,34 @@ mod tests {
             ts: 2.0,
             started_ts: 1.0,
             dur_ms: 1000,
-            host: "chat.example.com".to_string(),
+            host: "10.2.3.4".to_string(),
+            host_redacted: false,
             close_code: Some(1008),
             close_reason: Some(
-                "Bearer sk-live-secret for alice@example.com from 10.2.3.4".to_string(),
+                "Bearer sk-live-secret for alice@example.com from 10.2.3.4; https://chat.example/v1?access%5Ftoken=WS-TERMINAL-SECRET&safe=visible"
+                    .to_string(),
             ),
+            close_reason_redacted: false,
             close_initiator: Some("s2c".to_string()),
             c2s_msgs: 2,
             s2c_msgs: 2,
             c2s_bytes: 20,
             s2c_bytes: 20,
             dropped: 0,
+            redaction_policy: None,
+            redaction_policy_version: None,
         };
         redact_close_for_live_capture(&mut record, Some(&crate::redaction::Policy::builtin()));
 
         let persisted = serde_json::to_string(&record).unwrap();
         let broadcast =
             serde_json::to_string(&record.close_event(&Serial::new("emulator-5554"))).unwrap();
-        for secret in ["sk-live-secret", "alice@example.com", "10.2.3.4"] {
+        for secret in [
+            "sk-live-secret",
+            "alice@example.com",
+            "10.2.3.4",
+            "WS-TERMINAL-SECRET",
+        ] {
             assert!(
                 !persisted.contains(secret),
                 "persisted close leaked {secret}"
@@ -3225,6 +3298,16 @@ mod tests {
                 .close_reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains("<redacted:"))
+        );
+        assert!(record.host_redacted);
+        assert!(record.close_reason_redacted);
+        assert!(record.redaction_policy.is_some());
+        assert!(
+            record
+                .close_reason
+                .as_deref()
+                .unwrap()
+                .contains("safe=visible")
         );
     }
 
@@ -3239,7 +3322,8 @@ mod tests {
             flow_sequence: 1,
             capture_session_id: "n".to_string(),
             ts: 1.0,
-            host: "h".to_string(),
+            host: "10.2.3.4".to_string(),
+            host_redacted: false,
             dir: "c2s".to_string(),
             seq: 1,
             opcode: "text".to_string(),
@@ -3265,6 +3349,7 @@ mod tests {
         };
         record.redact(&crate::redaction::Policy::builtin());
         assert!(record.body_redacted);
+        assert!(record.host_redacted);
         assert!(record.redaction_policy.is_some());
         assert!(!record.text.as_deref().unwrap().contains("bob@example.com"));
         assert!(

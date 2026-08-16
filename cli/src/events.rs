@@ -131,6 +131,10 @@ pub enum Event {
         host: String,
         path: String,
         url: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        host_redacted: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        path_redacted: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<u16>,
         ok: bool,
@@ -154,6 +158,8 @@ pub enum Event {
         upstream_bypassed: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        error_redacted: bool,
         /// Response body was streamed (SSE/oversized), not captured; `resp_len` is a hint.
         #[serde(default, skip_serializing_if = "is_false")]
         streamed: bool,
@@ -204,6 +210,14 @@ pub enum Event {
         capture_session_id: String,
         host: String,
         reason: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        host_redacted: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        reason_redacted: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        redaction_policy: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        redaction_policy_version: Option<u32>,
         next_actions: Vec<String>,
     },
     /// A WebSocket connection completed its upgrade (`101`) through the proxy.
@@ -2140,6 +2154,10 @@ mod tests {
             capture_session_id: "n-test".into(),
             host: "api.example.com".into(),
             reason: "certificate rejected".into(),
+            host_redacted: false,
+            reason_redacted: false,
+            redaction_policy: None,
+            redaction_policy_version: None,
             next_actions: vec!["shadowdroid net check com.example".into()],
         })
         .unwrap();

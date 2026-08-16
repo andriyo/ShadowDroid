@@ -393,6 +393,8 @@ mod tests {
             scheme: "https".into(),
             host: "api.example.com".into(),
             path: "/v1/me".into(),
+            host_redacted: false,
+            path_redacted: false,
             status: Some(200),
             dur_ms: Some(12),
             req_headers: vec![],
@@ -415,6 +417,7 @@ mod tests {
             modified: false,
             upstream_bypassed: false,
             error: None,
+            error_redacted: false,
             streamed: false,
             req_streamed: false,
         }

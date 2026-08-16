@@ -3,6 +3,7 @@ package io.github.andriyo.shadowdroid.agent.okhttp
 import io.github.andriyo.shadowdroid.agent.Capture
 import io.github.andriyo.shadowdroid.agent.CapturedFlow
 import io.github.andriyo.shadowdroid.agent.Intercept
+import okhttp3.HttpUrl
 import okhttp3.Interceptor
 import okhttp3.Response
 import org.json.JSONObject
@@ -50,7 +51,7 @@ class ShadowDroidCaptureInterceptor : Interceptor {
 
         val url = request.url
         val host = url.host
-        val path = url.encodedPath
+        val path = capturedRequestTarget(url)
         val respType = runCatching { response.body?.contentType()?.toString() }.getOrNull()
         val respBody = readResponseBody(response, respType)
 
@@ -128,7 +129,7 @@ class ShadowDroidCaptureInterceptor : Interceptor {
                     method = request.method,
                     scheme = url.scheme,
                     host = url.host,
-                    path = url.encodedPath,
+                    path = capturedRequestTarget(url),
                     status = status,
                     durMs = durMs,
                     reqType = reqType,
@@ -178,3 +179,12 @@ class ShadowDroidCaptureInterceptor : Interceptor {
         const val PREVIEW_CAP = 512
     }
 }
+
+internal fun capturedRequestTarget(url: HttpUrl): String =
+    buildString {
+        append(url.encodedPath)
+        url.encodedQuery?.let {
+            append('?')
+            append(it)
+        }
+    }

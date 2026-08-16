@@ -34,6 +34,10 @@ pub struct FlowRecord {
     pub scheme: String,
     pub host: String,
     pub path: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub host_redacted: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub path_redacted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -78,6 +82,8 @@ pub struct FlowRecord {
     pub upstream_bypassed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub error_redacted: bool,
     /// The response body was streamed through (SSE / oversized), not buffered, so
     /// it isn't captured and response rules/intercept didn't run. `resp_len` is
     /// the `content-length` hint when the server sent one, else 0.
@@ -122,6 +128,8 @@ impl FlowRecord {
             host: self.host.clone(),
             path: self.path.clone(),
             url: format!("{}://{}{}", self.scheme, self.host, self.path),
+            host_redacted: self.host_redacted,
+            path_redacted: self.path_redacted,
             status: self.status,
             ok: self.ok(),
             dur_ms: self.dur_ms,
@@ -135,6 +143,7 @@ impl FlowRecord {
             modified: self.modified,
             upstream_bypassed: self.upstream_bypassed,
             error: self.error.clone(),
+            error_redacted: self.error_redacted,
             streamed: self.streamed,
             req_streamed: self.req_streamed,
             redaction_policy: self.redaction_policy.clone(),
@@ -157,6 +166,8 @@ impl FlowRecord {
             "host": self.host,
             "path": self.path,
             "url": format!("{}://{}{}", self.scheme, self.host, self.path),
+            "host_redacted": self.host_redacted,
+            "path_redacted": self.path_redacted,
             "status": self.status,
             "ok": self.ok(),
             "dur_ms": self.dur_ms,
@@ -176,6 +187,7 @@ impl FlowRecord {
             "modified": self.modified,
             "upstream_bypassed": self.upstream_bypassed,
             "error": self.error,
+            "error_redacted": self.error_redacted,
             "streamed": self.streamed,
             "req_streamed": self.req_streamed,
         });
@@ -370,6 +382,8 @@ mod tests {
             scheme: "https".into(),
             host: "api.livd.app".into(),
             path: "/v1/login".into(),
+            host_redacted: false,
+            path_redacted: false,
             status: Some(401),
             dur_ms: Some(10),
             req_headers: vec![(
@@ -395,6 +409,7 @@ mod tests {
             modified: false,
             upstream_bypassed: false,
             error: None,
+            error_redacted: false,
             streamed: false,
             req_streamed: false,
         };

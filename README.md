@@ -637,11 +637,16 @@ commands and add key names or Rust-regex patterns; user and project additions
 are merged, with the nearest `enabled` value winning.
 
 `net start --redact` also applies the same policy to completed capture copies
-before they reach the session log; request/response bytes forwarded to the app
-or upstream are never changed. `ui screenshot` reports raw pixels as
-potentially sensitive. Explicit `--redact-pixels` (PNG only) blacks out matching
-accessibility bounds, but still reports that Android may not expose every
-rendered glyph.
+before they reach the session log, including URL path/query values, hosts,
+connection errors, WebSocket metadata, and TLS failures. In-app OkHttp flows
+drained by `aar capture` cross the same policy boundary before stdout, JSONL,
+fixtures, or the shared store. A live daemon reports its capture-policy
+fingerprint; requesting `--redact` refuses to reuse an unredacted or differently
+configured daemon and asks for an explicit stop/start. Request/response bytes
+forwarded to the app or upstream are never changed. `ui screenshot` reports raw
+pixels as potentially sensitive. Explicit `--redact-pixels` (PNG only) blacks
+out matching accessibility bounds, but still reports that Android may not
+expose every rendered glyph.
 
 Video is a stricter boundary: global `--redact` does not alter MP4 pixels.
 Every `video` bundle is marked as containing sensitive, unencrypted data; review
@@ -1015,8 +1020,10 @@ context takeover — those are forwarded unchanged and marked `refused_deflate`;
 `net start --anticomp` negotiates an uncompressed session where they fully apply.
 Global `--redact` on `net start` applies the built-in/configured policy to
 authorization/cookie headers, nested JSON/GraphQL body fields, JWTs, email/IP
-values, and configured patterns before completed captures are persisted (the
-session log is written `0600` either way). Forwarded traffic is unchanged.
+values, URL path/query values (including percent-encoded names and values),
+hosts, errors, and configured patterns before completed captures are persisted
+(the session log is written `0600` either way). Records flag redacted routing
+or error fields and carry policy version 2. Forwarded traffic is unchanged.
 
 Completed flows enter a bounded in-memory queue; `net status` exposes
 `dropped_flows` if sustained traffic outruns storage. The session JSONL keeps

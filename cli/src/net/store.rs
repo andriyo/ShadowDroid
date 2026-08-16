@@ -1220,6 +1220,8 @@ fn find_ws_session_from(
                 scheme: String::new(),
                 host,
                 path: String::new(),
+                host_redacted: false,
+                path_redacted: false,
                 status: 0,
                 subprotocol: None,
                 permessage_deflate: false,

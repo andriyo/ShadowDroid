@@ -147,8 +147,9 @@ pub async fn capture(
         .get("flows")
         .cloned()
         .unwrap_or_else(|| Value::Array(vec![]));
-    let flows: Vec<FlowRecord> =
+    let mut flows: Vec<FlowRecord> =
         serde_json::from_value(flows_json).context("parse captured flows from agent")?;
+    redact_captured_flows(&mut flows, crate::redaction::active_policy().as_ref());
 
     let mut outputs = serde_json::Map::new();
     if store_flows {
@@ -201,6 +202,16 @@ pub async fn capture(
         }
     }
     Ok(())
+}
+
+/// Apply the active privacy policy at the in-app-agent boundary before any
+/// captured flow can reach stdout, JSONL, fixtures, or the shared session log.
+fn redact_captured_flows(flows: &mut [FlowRecord], policy: Option<&crate::redaction::Policy>) {
+    if let Some(policy) = policy {
+        for flow in flows {
+            policy.redact_flow_record(flow);
+        }
+    }
 }
 
 /// `aar intercept` — arm in-app interception for matching flows.
@@ -566,6 +577,42 @@ mod tests {
         let rendered = render_status(&status);
         assert!(rendered.contains("capture provider:          MISSING"));
         assert!(rendered.contains("next: wire the OkHttp companion"));
+    }
+
+    #[test]
+    fn capture_redacts_agent_metadata_before_every_output_surface() {
+        let mut flows = vec![FlowRecord {
+            host: "10.2.3.4".into(),
+            path: "/users/person%40example.com?access_token=e2e-secret&safe=visible".into(),
+            error: Some("failed for person@example.com at 10.2.3.4".into()),
+            ..Default::default()
+        }];
+
+        redact_captured_flows(&mut flows, Some(&crate::redaction::Policy::builtin()));
+
+        let persisted = serde_json::to_string(&flows).unwrap();
+        for secret in [
+            "10.2.3.4",
+            "person@example.com",
+            "person%40example.com",
+            "e2e-secret",
+        ] {
+            assert!(!persisted.contains(secret), "agent capture leaked {secret}");
+        }
+        assert!(persisted.contains("safe=visible"));
+        assert!(flows[0].host_redacted);
+        assert!(flows[0].path_redacted);
+        assert!(flows[0].error_redacted);
+
+        let mut opted_out = vec![FlowRecord {
+            host: "10.2.3.4".into(),
+            path: "/users?access_token=e2e-secret".into(),
+            error: Some("person@example.com".into()),
+            ..Default::default()
+        }];
+        let before = serde_json::to_string(&opted_out).unwrap();
+        redact_captured_flows(&mut opted_out, None);
+        assert_eq!(serde_json::to_string(&opted_out).unwrap(), before);
     }
 
     #[test]

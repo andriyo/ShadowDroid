@@ -628,6 +628,71 @@ fn net_lifecycle_serial(serial: &Serial) -> Serial {
     Serial::new(format!("net:{serial}"))
 }
 
+fn require_running_capture_redaction(
+    daemon_status: &serde_json::Value,
+    requested_enabled: bool,
+    requested_spec: &crate::redaction::PolicySpec,
+    serial: &Serial,
+) -> Result<()> {
+    if !requested_enabled {
+        return Ok(());
+    }
+    let requested = crate::redaction::Policy::new(requested_spec.clone())?;
+    let running = daemon_status.get("capture_redaction");
+    let running_enabled = running
+        .and_then(|value| value.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let running_version = running
+        .and_then(|value| value.get("version"))
+        .and_then(serde_json::Value::as_u64);
+    let running_fingerprint = running
+        .and_then(|value| value.get("fingerprint"))
+        .and_then(serde_json::Value::as_str);
+    let requested_fingerprint = requested.fingerprint();
+    let matches = running_enabled
+        && running_version == Some(u64::from(crate::redaction::POLICY_VERSION))
+        && running_fingerprint == Some(requested_fingerprint.as_str());
+    if matches {
+        return Ok(());
+    }
+
+    Err(crate::diagnostic::DiagnosticError::new(
+        "net_daemon_redaction_mismatch",
+        "net",
+        "the running network daemon does not use the requested capture redaction policy",
+    )
+    .detail(json!({
+        "device": serial.as_str(),
+        "requested": {
+            "enabled": true,
+            "version": crate::redaction::POLICY_VERSION,
+            "fingerprint": requested_fingerprint,
+            "custom_json_keys": requested.spec().json_keys.len(),
+            "custom_patterns": requested.spec().patterns.len(),
+        },
+        "running": running.cloned().unwrap_or_else(|| json!({
+            "enabled": false,
+            "status_metadata_missing": true,
+        })),
+    }))
+    .next_actions([
+        format!(
+            "shadowdroid -d {} net stop",
+            crate::events::shell_token(serial.as_str())
+        ),
+        format!(
+            "shadowdroid --redact -d {} net start",
+            crate::events::shell_token(serial.as_str())
+        ),
+        format!(
+            "shadowdroid -d {} net status",
+            crate::events::shell_token(serial.as_str())
+        ),
+    ])
+    .into())
+}
+
 /// The device-side state ShadowDroid owns for one proxy session. Persist this
 /// before wiring so `net stop` can recover after either process crashes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -689,6 +754,7 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
             control::request(serial, json!({"op": "status"})).await?,
         )?;
         require_daemon_serial(&daemon_status, serial)?;
+        require_running_capture_redaction(&daemon_status, redact, &redaction, serial)?;
         let daemon_port = daemon_port_field(&daemon_status, "port")?.unwrap_or(port);
         let Some(host_port) = daemon_port_field(&daemon_status, "host_port")? else {
             return Err(crate::diagnostic::DiagnosticError::new(
@@ -786,6 +852,7 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
                 "rewired": true,
                 "rules_preserved": true,
                 "state_recovered": !state_existed,
+                "capture_redaction": daemon_status.get("capture_redaction"),
                 "ca_warning": ca_mismatch,
             }),
         );
@@ -2423,7 +2490,11 @@ fn redact_export_record(
     value: serde_json::Value,
     policy: &crate::redaction::Policy,
 ) -> serde_json::Value {
-    fn typed<T, F>(value: serde_json::Value, redact: F) -> serde_json::Value
+    fn typed<T, F>(
+        value: serde_json::Value,
+        policy: &crate::redaction::Policy,
+        redact: F,
+    ) -> serde_json::Value
     where
         T: serde::de::DeserializeOwned + serde::Serialize,
         F: FnOnce(&mut T),
@@ -2431,21 +2502,129 @@ fn redact_export_record(
         match serde_json::from_value::<T>(value.clone()) {
             Ok(mut record) => {
                 redact(&mut record);
-                serde_json::to_value(&record).unwrap_or(value)
+                serde_json::to_value(&record)
+                    .unwrap_or_else(|_| redact_raw_network_export(value, policy))
             }
-            Err(_) => value,
+            Err(_) => redact_raw_network_export(value, policy),
         }
     }
     match value.get("type").and_then(serde_json::Value::as_str) {
         Some("ws_open") => {
-            typed::<crate::net::ws::WsSessionRecord, _>(value, |r| r.redact_headers(policy))
+            typed::<crate::net::ws::WsSessionRecord, _>(value, policy, |r| r.redact(policy))
         }
-        Some("ws_msg") => typed::<crate::net::ws::WsMessageRecord, _>(value, |r| r.redact(policy)),
-        Some("ws_close") => typed::<crate::net::ws::WsCloseRecord, _>(value, |r| r.redact(policy)),
-        // HTTP flows have no `type` tag; everything else (tls_error) → generic.
-        None => typed::<crate::net::flow::FlowRecord, _>(value, |r| policy.redact_flow_record(r)),
-        Some(_) => policy.redact_output(value),
+        Some("ws_msg") => {
+            typed::<crate::net::ws::WsMessageRecord, _>(value, policy, |r| r.redact(policy))
+        }
+        Some("ws_close") => {
+            typed::<crate::net::ws::WsCloseRecord, _>(value, policy, |r| r.redact(policy))
+        }
+        Some("tls_error") => redact_raw_network_export(value, policy),
+        // HTTP flows have no `type` tag; unknown future records use the generic policy.
+        None => typed::<crate::net::flow::FlowRecord, _>(value, policy, |r| {
+            policy.redact_flow_record(r);
+        }),
+        Some(_) => redact_raw_network_export(value, policy),
     }
+}
+
+fn redact_raw_network_export(
+    mut value: serde_json::Value,
+    policy: &crate::redaction::Policy,
+) -> serde_json::Value {
+    if let serde_json::Value::Object(fields) = &mut value {
+        fn redact_string_field(
+            fields: &mut serde_json::Map<String, serde_json::Value>,
+            name: &str,
+            redact: impl FnOnce(&str) -> String,
+        ) -> bool {
+            let Some(original) = fields
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+            else {
+                return false;
+            };
+            let redacted = redact(&original);
+            let changed = redacted != original;
+            fields.insert(name.into(), redacted.into());
+            changed
+        }
+
+        if redact_string_field(fields, "host", |host| policy.redact_text(host)) {
+            fields.insert("host_redacted".into(), true.into());
+        }
+        if redact_string_field(fields, "path", |path| policy.redact_request_target(path).0) {
+            fields.insert("path_redacted".into(), true.into());
+        }
+        if redact_string_field(fields, "error", |error| policy.redact_urlish_text(error)) {
+            fields.insert("error_redacted".into(), true.into());
+        }
+        if redact_string_field(fields, "reason", |reason| policy.redact_urlish_text(reason)) {
+            fields.insert("reason_redacted".into(), true.into());
+        }
+        if redact_string_field(fields, "close_reason", |reason| {
+            policy.redact_urlish_text(reason)
+        }) {
+            fields.insert("close_reason_redacted".into(), true.into());
+            fields.insert("body_redacted".into(), true.into());
+        }
+        for body_field in ["text", "preview", "req_body", "resp_body"] {
+            if redact_string_field(fields, body_field, |text| policy.redact_urlish_text(text)) {
+                fields.insert("body_redacted".into(), true.into());
+                if matches!(body_field, "req_body" | "resp_body") {
+                    fields.insert(format!("{body_field}_redacted"), true.into());
+                }
+            }
+        }
+        let _ = redact_string_field(fields, "url", |url| policy.redact_urlish_text(url));
+
+        for header_field in ["req_headers", "resp_headers"] {
+            let Some(serde_json::Value::Array(headers)) = fields.get_mut(header_field) else {
+                continue;
+            };
+            for header in headers {
+                match header {
+                    serde_json::Value::Array(pair) if pair.len() >= 2 => {
+                        let Some(name) = pair[0].as_str().map(str::to_string) else {
+                            continue;
+                        };
+                        let Some(original) = pair[1].as_str().map(str::to_string) else {
+                            continue;
+                        };
+                        pair[1] = policy.redact_header_value(&name, &original).into();
+                    }
+                    serde_json::Value::Object(header) => {
+                        let Some(name) = header
+                            .get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                        else {
+                            continue;
+                        };
+                        let Some(original) = header
+                            .get("value")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                        else {
+                            continue;
+                        };
+                        header.insert(
+                            "value".into(),
+                            policy.redact_header_value(&name, &original).into(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        fields.insert("redaction_policy".into(), policy.label().into());
+        fields.insert(
+            "redaction_policy_version".into(),
+            crate::redaction::POLICY_VERSION.into(),
+        );
+    }
+    policy.redact_output(value)
 }
 
 /// Durable line-per-record export (the machine-readable WebSocket format). Full
@@ -2494,7 +2673,7 @@ async fn export_har(serial: &Serial, id: Option<String>, out: Option<PathBuf>) -
             policy.redact_flow_record(flow);
         }
         for session in &mut sessions {
-            session.open.redact_headers(&policy);
+            session.open.redact(&policy);
             for message in &mut session.messages {
                 message.redact(&policy);
             }
@@ -2877,6 +3056,55 @@ mod tests {
     }
 
     #[test]
+    fn live_daemon_must_match_requested_redaction_policy() {
+        let builtin = crate::redaction::PolicySpec::default();
+        let serial = Serial::new("emulator-5554");
+        let unredacted = json!({"capture_redaction": {"enabled": false}});
+        assert!(require_running_capture_redaction(&unredacted, false, &builtin, &serial).is_ok());
+        let error =
+            require_running_capture_redaction(&unredacted, true, &builtin, &serial).unwrap_err();
+        assert_eq!(
+            crate::cli::error_code_of(&error),
+            "net_daemon_redaction_mismatch"
+        );
+
+        let custom = crate::redaction::PolicySpec {
+            json_keys: vec!["customerCode".into()],
+            patterns: vec!["SENTINEL-SECRET-PATTERN-[0-9]+".into()],
+        };
+        let custom_policy = crate::redaction::Policy::new(custom.clone()).unwrap();
+        let matching = json!({
+            "capture_redaction": {
+                "enabled": true,
+                "version": crate::redaction::POLICY_VERSION,
+                "fingerprint": custom_policy.fingerprint(),
+                "custom_json_keys": 1,
+                "custom_patterns": 1,
+            }
+        });
+        assert!(require_running_capture_redaction(&matching, true, &custom, &serial).is_ok());
+        assert!(
+            require_running_capture_redaction(&matching, false, &builtin, &serial).is_ok(),
+            "a stricter already-running daemon is privacy-safe"
+        );
+
+        let legacy_status = json!({"running": true});
+        assert!(
+            require_running_capture_redaction(&legacy_status, false, &builtin, &serial).is_ok()
+        );
+        let error =
+            require_running_capture_redaction(&legacy_status, true, &custom, &serial).unwrap_err();
+        let serialized = serde_json::to_string(
+            &error
+                .downcast_ref::<crate::diagnostic::DiagnosticError>()
+                .unwrap()
+                .detail,
+        )
+        .unwrap();
+        assert!(!serialized.contains("SENTINEL-SECRET-PATTERN"));
+    }
+
+    #[test]
     fn net_log_since_accepts_explicit_units_and_rejects_ambiguous_values() {
         assert_eq!(parse_since_duration("500ms").unwrap().as_millis(), 500);
         assert_eq!(parse_since_duration("2m").unwrap().as_secs(), 120);
@@ -3031,6 +3259,95 @@ mod tests {
                 .unwrap()
                 .starts_with("shadowdroid -d 'emulator-5554; unsafe' net ")
         }));
+    }
+
+    #[test]
+    fn legacy_tls_export_redacts_encoded_urls_and_marks_changed_fields() {
+        let policy = crate::redaction::Policy::new(crate::redaction::PolicySpec {
+            json_keys: vec!["customerCode".into()],
+            patterns: vec![],
+        })
+        .unwrap();
+        let output = redact_export_record(
+            json!({
+                "type": "tls_error",
+                "host": "10.2.3.4",
+                "reason": "failed https://10.2.3.4/v1?customer%43ode=e2e-secret&safe=visible",
+                "next_actions": [],
+            }),
+            &policy,
+        );
+        let serialized = output.to_string();
+        assert!(!serialized.contains("10.2.3.4"));
+        assert!(!serialized.contains("e2e-secret"));
+        assert!(serialized.contains("safe=visible"));
+        assert_eq!(output["host_redacted"], true);
+        assert_eq!(output["reason_redacted"], true);
+        assert_eq!(
+            output["redaction_policy_version"],
+            crate::redaction::POLICY_VERSION
+        );
+    }
+
+    #[test]
+    fn partial_legacy_network_records_cannot_bypass_export_redaction() {
+        let policy = crate::redaction::Policy::new(crate::redaction::PolicySpec {
+            json_keys: vec!["customerCode".into()],
+            patterns: vec![],
+        })
+        .unwrap();
+        let records = [
+            json!({
+                "host": "10.2.3.4",
+                "path": "/person%40example.com?access%5Ftoken=HTTP-SECRET&safe=visible",
+                "error": "failed https://10.2.3.4/v1?customer%43ode=ERROR-SECRET&safe=visible",
+                "req_headers": [["Authorization", "Bearer HEADER-SECRET"]],
+            }),
+            json!({
+                "type": "ws_open",
+                "host": "10.2.3.4",
+                "path": "/chat?access%5Ftoken=OPEN-SECRET&safe=visible",
+                "req_headers": [{"name": "Cookie", "value": "session=COOKIE-SECRET"}],
+            }),
+            json!({
+                "type": "ws_msg",
+                "host": "10.2.3.4",
+                "text": "visit https://chat.example/v1?customer%43ode=MESSAGE-SECRET&safe=visible",
+                "preview": "person@example.com",
+            }),
+            json!({
+                "type": "ws_close",
+                "host": "10.2.3.4",
+                "close_reason": "closed https://chat.example/v1?access%5Ftoken=CLOSE-SECRET&safe=visible",
+            }),
+        ];
+
+        for record in records {
+            let output = redact_export_record(record, &policy);
+            let serialized = output.to_string();
+            for secret in [
+                "10.2.3.4",
+                "person%40example.com",
+                "person@example.com",
+                "HTTP-SECRET",
+                "ERROR-SECRET",
+                "HEADER-SECRET",
+                "OPEN-SECRET",
+                "COOKIE-SECRET",
+                "MESSAGE-SECRET",
+                "CLOSE-SECRET",
+            ] {
+                assert!(
+                    !serialized.contains(secret),
+                    "partial record leaked {secret}: {serialized}"
+                );
+            }
+            assert!(serialized.contains("safe=visible"));
+            assert_eq!(
+                output["redaction_policy_version"],
+                crate::redaction::POLICY_VERSION
+            );
+        }
     }
 
     fn spec(kind: &str, arg: &str) -> RuleSpec {
