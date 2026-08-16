@@ -441,8 +441,21 @@ fn ensure_agent_ok(resp: &Value) -> Result<()> {
         .unwrap_or_else(|| {
             vec!["run `shadowdroid aar agent` and inspect the current agent state".to_string()]
         });
+    let code = match resp.get("resultCode").and_then(Value::as_str) {
+        Some("deadline_expired") => "aar_intercept_deadline_expired",
+        Some("client_interrupted") => "aar_intercept_client_interrupted",
+        Some("already_released") => "aar_intercept_already_released",
+        Some("unknown_id") => "aar_intercept_unknown_id",
+        _ => "aar_agent_command_rejected",
+    };
     Err(
-        crate::diagnostic::DiagnosticError::new("aar_agent_command_rejected", "aar_agent", error)
+        crate::diagnostic::DiagnosticError::new(code, "aar_agent", error)
+            .retryable(matches!(
+                code,
+                "aar_intercept_deadline_expired"
+                    | "aar_intercept_client_interrupted"
+                    | "aar_intercept_unknown_id"
+            ))
             .detail(serde_json::json!({"agent_response": resp}))
             .next_actions(next_actions)
             .into(),
@@ -630,6 +643,37 @@ mod tests {
         assert_eq!(diagnostic.message, "no capture provider");
         assert_eq!(diagnostic.detail["agent_response"], response);
         assert_eq!(diagnostic.next_actions, ["wire the OkHttp companion"]);
+    }
+
+    #[test]
+    fn intercept_terminal_results_become_exact_cli_error_codes() {
+        for (result_code, expected_code, retryable) in [
+            ("deadline_expired", "aar_intercept_deadline_expired", true),
+            (
+                "client_interrupted",
+                "aar_intercept_client_interrupted",
+                true,
+            ),
+            ("already_released", "aar_intercept_already_released", false),
+            ("unknown_id", "aar_intercept_unknown_id", true),
+        ] {
+            let response = serde_json::json!({
+                "ok": false,
+                "resultCode": result_code,
+                "error": "terminal hold state",
+                "hint": "inspect current held flows"
+            });
+            let error = ensure_agent_ok(&response).unwrap_err();
+            let diagnostic = error
+                .downcast_ref::<crate::diagnostic::DiagnosticError>()
+                .unwrap();
+            assert_eq!(diagnostic.code, expected_code);
+            assert_eq!(diagnostic.retryable, retryable);
+            assert_eq!(
+                diagnostic.detail["agent_response"]["resultCode"],
+                result_code
+            );
+        }
     }
 
     #[test]

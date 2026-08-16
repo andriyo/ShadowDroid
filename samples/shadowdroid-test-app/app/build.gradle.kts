@@ -38,8 +38,11 @@ kotlin {
 }
 
 dependencies {
-    // shadowdroid-agent (managed by `shadowdroid aar`) — debug-only in-app debug agent
+    // shadowdroid-agent (managed by `shadowdroid aar`) — debug-only in-app debug agent.
+    // The optional OkHttp companion is wired into Field Lab's WebSocket client
+    // from src/debug so `shadowdroid aar capture/intercept` has a real E2E surface.
     debugImplementation(files(rootProject.file("shadowdroid/shadowdroid-agent.aar")))
+    debugImplementation(files(rootProject.file("shadowdroid/shadowdroid-agent-okhttp.aar")))
     // Exercises the in-app coroutine dump (`shadowdroid aar coroutines`).
     // Tracking additionally needs the probes activation block below (wired by
     // `shadowdroid aar install --coroutine-probes`).
@@ -49,6 +52,7 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")
     implementation("com.squareup.okhttp3:okhttp:5.4.0")
+    testImplementation("junit:junit:4.13.2")
 }
 
 // >>> shadowdroid coroutine probes (managed by `shadowdroid aar`) — do not edit

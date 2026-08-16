@@ -59,7 +59,6 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
@@ -70,7 +69,7 @@ import java.util.concurrent.TimeUnit
 
 class WebSocketChatActivity : ComponentActivity() {
     private val client =
-        OkHttpClient.Builder()
+        fieldLabOkHttpClientBuilder()
             .pingInterval(5, TimeUnit.SECONDS)
             .build()
 

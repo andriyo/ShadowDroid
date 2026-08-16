@@ -82,6 +82,7 @@ shadowdroid app start io.github.andriyo.shadowdroid.sample \
 | Clipboard | Writes a sample clip | `device clipboard` |
 | Logs/crashes/ANR | Log spam, deliberate crash, deliberate main-thread block | `watch`, `collect`, `debug run-until-crash`, `doctor` |
 | Network MITM | HTTP GET, HTTPS GET, JSON POST, GraphQL-shaped POST, error status, slow response, large body | `net check`, `net trust`, `net start`, `net log`, `net show`, `net export fixtures`, `net rule`, `net override` |
+| In-app OkHttp interception | The debug WebSocket client installs `ShadowDroidCaptureInterceptor` from the optional companion AAR | `aar agent`, `aar capture`, `aar intercept`, `aar resume`, `aar drop` |
 | WebSocket proxy | Native chat UI backed by a local Ktor WS/WSS room; client and server messages, ping/pong, compression, and normal close | `net log --protocol websocket`, `net ws`, `net show w1.1`, `watch` |
 | WebView | Loads the configured URL into a platform WebView | `net log`, `ui dump`, `watch` |
 | Coroutine dumps | `CoroutinesActivity` starts a misbehaving coroutine zoo: a leaked heartbeat, parked channel workers, a clogged no-buffer `SharedFlow` (slow collector + suspended emitter), plus a button that grows the pool | `aar coroutines`, `aar agent` |

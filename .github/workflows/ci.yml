@@ -186,11 +186,13 @@ jobs:
             :shadowdroid-agent-okhttp:testDebugUnitTest \
             :shadowdroid-agent-okhttp:assembleRelease
 
-      - name: Stage the agent AAR used by the sample
+      - name: Stage the agent AARs used by the sample
         run: |
           mkdir -p samples/shadowdroid-test-app/shadowdroid
           cp agent/shadowdroid-agent/build/outputs/aar/shadowdroid-agent-release.aar \
             samples/shadowdroid-test-app/shadowdroid/shadowdroid-agent.aar
+          cp agent/shadowdroid-agent-okhttp/build/outputs/aar/shadowdroid-agent-okhttp-release.aar \
+            samples/shadowdroid-test-app/shadowdroid/shadowdroid-agent-okhttp.aar
 
       - name: Check, test, and assemble sample app
         working-directory: samples/shadowdroid-test-app
@@ -198,7 +200,8 @@ jobs:
           ./gradlew --no-daemon \
             :app:lintDebug \
             :app:testDebugUnitTest \
-            :app:assembleDebug
+            :app:assembleDebug \
+            :app:assembleRelease
 
   studio-plugin:
     name: Android Studio plugin

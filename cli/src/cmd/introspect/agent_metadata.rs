@@ -1261,8 +1261,8 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "next_actions": ["aar status"]
         })),
         "aar agent" => Some(serde_json::json!({
-            "use_when": ["Need running in-app agent status: package, capture-provider availability/name, armed matcher, held flows, and capture count."],
-            "output": "running agent status JSON/human report",
+            "use_when": ["Need running in-app agent status: package, capture-provider availability/name, armed matcher, actionable held flows, terminal hold history, and capture count."],
+            "output": "running agent status JSON/human report; JSON includes bounded terminal history and over-capacity fail-open count",
             "side_effects": ["none"],
             "prerequisites": ["debug build with AAR installed must be running"],
             "next_actions": ["aar capture", "aar intercept", "doctor --app <pkg>"]
@@ -1277,19 +1277,19 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         "aar intercept" => Some(serde_json::json!({
             "use_when": ["Need to arm or clear above-TLS interception for flows seen by the optional OkHttp application interceptor."],
             "output": "intercept arm/clear JSON",
-            "side_effects": ["matching in-app flows may be held until resume/drop"],
+            "side_effects": ["up to 32 matching in-app flows may be held until resume/drop or their absolute deadline; timeout, interruption, and over-capacity calls fail open"],
             "prerequisites": ["debug build with both AARs and ShadowDroidCaptureInterceptor wired into the target OkHttpClient must be running"],
             "next_actions": ["aar agent", "aar resume <id>", "aar drop <id>"]
         })),
         "aar resume" => Some(serde_json::json!({
             "use_when": ["Need to release a held in-app agent flow, optionally mutating status/body/content type."],
-            "output": "resume result JSON",
+            "output": "resume result JSON; terminal failures distinguish deadline_expired, client_interrupted, already_released, and unknown_id",
             "side_effects": ["unblocks a held in-app flow"],
             "next_actions": ["aar agent", "aar capture", "ui dump"]
         })),
         "aar drop" => Some(serde_json::json!({
             "use_when": ["Need the app to experience a held in-app agent flow as a connection failure."],
-            "output": "drop result JSON",
+            "output": "drop result JSON; terminal failures distinguish deadline_expired, client_interrupted, already_released, and unknown_id",
             "side_effects": ["unblocks a held in-app flow with failure behavior"],
             "next_actions": ["aar agent", "ui dump"]
         })),

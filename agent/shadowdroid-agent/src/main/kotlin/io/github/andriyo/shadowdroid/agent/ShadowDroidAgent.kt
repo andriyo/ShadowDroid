@@ -135,13 +135,24 @@ object ShadowDroidAgent {
             payload.isEmpty() -> JSONObject()
             else -> JSONObject(payload)
         }
-        val resolved = Intercept.resolve(id, action)
-        return JSONObject().apply {
-            put("ok", resolved)
-            put("id", id)
-            if (!resolved) {
-                put("error", "no held flow with id '$id'")
-                put("hint", "Run `shadowdroid aar agent` and use an id listed under held flows.")
+        val result = Intercept.resolveDetailed(id, action)
+        return result.toJson(id).apply {
+            if (!result.released) {
+                val message = when (result.code) {
+                    Intercept.ResultCode.DEADLINE_EXPIRED ->
+                        "held flow '$id' already reached its deadline"
+                    Intercept.ResultCode.CLIENT_INTERRUPTED ->
+                        "the app call waiting on held flow '$id' was interrupted"
+                    Intercept.ResultCode.ALREADY_RELEASED ->
+                        "held flow '$id' was already released"
+                    Intercept.ResultCode.UNKNOWN_ID -> "no held flow with id '$id'"
+                    Intercept.ResultCode.RELEASED -> error("released result cannot be an error")
+                }
+                put("error", message)
+                put(
+                    "hint",
+                    "Run `shadowdroid aar agent` and use an id currently listed under held flows.",
+                )
             }
         }.toString()
     }

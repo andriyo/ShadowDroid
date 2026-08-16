@@ -1069,6 +1069,15 @@ actually registered before `aar capture`/`aar intercept` are used. The core AAR
 alone does not capture HTTP, and the companion does not instrument Cronet,
 QUIC, or other stacks.
 
+`aar intercept` holds at most 32 matching calls and gives each one an absolute
+monotonic deadline. Unresolved, interrupted, or over-capacity calls fail open.
+At or after the deadline, `aar resume`/`aar drop` returns a non-zero typed
+`aar_intercept_deadline_expired` error instead of claiming that a late action
+was delivered while that record remains in the bounded terminal history;
+concurrent resolvers likewise have exactly one winner. `aar agent` exposes live
+holds plus that history so an automation can distinguish expiration,
+interruption, an earlier release, and an unknown or evicted id.
+
 Run `shadowdroid commands --json --depth 1` for a compact catalog,
 `commands --json --describe '<path>'` for one command, or `--help` for a human
 view.
