@@ -1340,6 +1340,11 @@ mod tests {
         Matcher, RuleAction, RuleMatchOn, RuleMatcher, RuleSpec, RuleTerminal, RuleTransform,
         SyntheticResponseSpec,
     };
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering as AtomicOrdering};
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
 
     fn spec(kind: &str, args: &[&str]) -> RuleSpec {
         legacy_spec(kind, Matcher::default(), None, None, None, None, args).unwrap()
@@ -1723,6 +1728,228 @@ mod tests {
         assert_eq!(summary["replaced"], 1);
         assert_eq!(summary["applied"], 2);
         assert_eq!(slot.read().unwrap().len(), 2);
+    }
+
+    fn atomic_replace_property_config() -> ProptestConfig {
+        ProptestConfig {
+            cases: 192,
+            rng_seed: proptest::test_runner::RngSeed::Fixed(0x5344_5255_4c45_5357),
+            ..ProptestConfig::default()
+        }
+    }
+
+    fn generated_atomic_rule(scope: &str, index: usize, seed: u16) -> RuleSpec {
+        RuleSpec {
+            match_on: if seed & 1 == 0 {
+                RuleMatchOn::Original
+            } else {
+                RuleMatchOn::Transformed
+            },
+            matcher: RuleMatcher::All {
+                matchers: vec![
+                    RuleMatcher::Host {
+                        contains: format!("{scope}-{index}-{seed}"),
+                    },
+                    RuleMatcher::Method {
+                        equals: if seed & 2 == 0 { "GET" } else { "POST" }.into(),
+                    },
+                ],
+            },
+            action: RuleAction::Delay {
+                milliseconds: u32::from(seed) + 1,
+            },
+        }
+    }
+
+    fn impossible_atomic_rule() -> RuleSpec {
+        RuleSpec {
+            match_on: RuleMatchOn::Original,
+            matcher: RuleMatcher::Any {
+                matchers: Vec::new(),
+            },
+            action: RuleAction::Delay { milliseconds: 1 },
+        }
+    }
+
+    type RuleSnapshot = Vec<(String, RuleSpec)>;
+
+    fn rule_snapshot(
+        slot: &std::sync::RwLock<Vec<(String, crate::net::CompiledRule)>>,
+    ) -> RuleSnapshot {
+        slot.read()
+            .unwrap()
+            .iter()
+            .map(|(id, rule)| (id.clone(), rule.spec.clone()))
+            .collect()
+    }
+
+    proptest! {
+        #![proptest_config(atomic_replace_property_config())]
+
+        #[test]
+        fn generated_rule_set_replacement_is_one_atomic_publication(
+            old_seeds in prop::collection::vec(any::<u16>(), 0..9),
+            candidate_seeds in prop::collection::vec(any::<u16>(), 1..9),
+            reject_candidate in any::<bool>(),
+            invalid_index in any::<usize>(),
+        ) {
+            let old_specs = old_seeds
+                .iter()
+                .enumerate()
+                .map(|(index, seed)| generated_atomic_rule("old", index, *seed))
+                .collect::<Vec<_>>();
+            let old_ids = old_seeds
+                .iter()
+                .enumerate()
+                .map(|(index, seed)| format!("old-{index}-{seed}"))
+                .collect::<Vec<_>>();
+            let old_active = old_ids
+                .iter()
+                .cloned()
+                .zip(old_specs.iter().cloned().map(|spec| compile_rule(spec).unwrap()))
+                .collect::<Vec<_>>();
+            let slot = Arc::new(std::sync::RwLock::new(old_active));
+            let old_snapshot = old_ids
+                .iter()
+                .cloned()
+                .zip(old_specs.iter().cloned())
+                .collect::<RuleSnapshot>();
+
+            let candidate = candidate_seeds
+                .iter()
+                .enumerate()
+                .map(|(index, seed)| generated_atomic_rule("candidate", index, *seed))
+                .collect::<Vec<_>>();
+            let mut attempted = candidate.clone();
+            if reject_candidate {
+                let insertion = invalid_index % (attempted.len() + 1);
+                attempted.insert(insertion, impossible_atomic_rule());
+            }
+
+            const READER_COUNT: usize = 3;
+            let start = Arc::new(Barrier::new(READER_COUNT + 1));
+            let stop = Arc::new(AtomicBool::new(false));
+            // 0 = before replacement, 1 = replacement call in progress,
+            // 2 = replacement returned. The tag is diagnostic only: every
+            // snapshot is classified by its complete ordered value below.
+            let phase = Arc::new(AtomicU8::new(0));
+            // Unbounded delivery keeps readers sampling the lock throughout
+            // publication instead of blocking them behind a full test channel.
+            let (observed_tx, observed_rx) =
+                std::sync::mpsc::channel::<(usize, u8, RuleSnapshot)>();
+            let mut readers = Vec::with_capacity(READER_COUNT);
+            for reader_id in 0..READER_COUNT {
+                let slot = Arc::clone(&slot);
+                let start = Arc::clone(&start);
+                let stop = Arc::clone(&stop);
+                let phase = Arc::clone(&phase);
+                let observed_tx = observed_tx.clone();
+                readers.push(std::thread::spawn(move || {
+                    start.wait();
+                    loop {
+                        let snapshot = rule_snapshot(&slot);
+                        let tagged_phase = phase.load(AtomicOrdering::Acquire);
+                        if observed_tx
+                            .send((reader_id, tagged_phase, snapshot))
+                            .is_err()
+                        {
+                            break;
+                        }
+                        if stop.load(AtomicOrdering::Acquire) {
+                            break;
+                        }
+                        std::thread::yield_now();
+                    }
+                }));
+            }
+            drop(observed_tx);
+            start.wait();
+
+            let mut observations = Vec::new();
+            let mut readers_seen_before = BTreeSet::new();
+            while readers_seen_before.len() < READER_COUNT {
+                let observation = observed_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("concurrent rule reader must start");
+                if observation.1 == 0 {
+                    prop_assert_eq!(&observation.2, &old_snapshot);
+                    readers_seen_before.insert(observation.0);
+                }
+                observations.push(observation);
+            }
+
+            phase.store(1, AtomicOrdering::Release);
+            let result = replace_rule_set(&slot, attempted);
+            phase.store(2, AtomicOrdering::Release);
+            let final_snapshot = rule_snapshot(&slot);
+
+            // Require evidence from a real reader after the call returned, not
+            // only main-thread before/final reads around the writer.
+            loop {
+                let observation = observed_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("concurrent rule reader must observe the final publication");
+                let saw_final_after_return = observation.1 == 2 && observation.2 == final_snapshot;
+                observations.push(observation);
+                if saw_final_after_return {
+                    break;
+                }
+            }
+            stop.store(true, AtomicOrdering::Release);
+            while let Ok(observation) = observed_rx.recv() {
+                observations.push(observation);
+            }
+            for reader in readers {
+                reader.join().expect("concurrent rule reader must not panic");
+            }
+
+            if reject_candidate {
+                prop_assert!(result.is_err());
+                prop_assert_eq!(&final_snapshot, &old_snapshot);
+                prop_assert!(
+                    observations
+                        .iter()
+                        .all(|(_, _, snapshot)| snapshot == &old_snapshot),
+                    "a rejected candidate exposed a non-old snapshot: {observations:?}",
+                );
+            } else {
+                let summary = result.unwrap();
+                prop_assert_eq!(&summary["publication"], "single_swap");
+                prop_assert_eq!(summary["replaced"].as_u64(), Some(old_specs.len() as u64));
+                prop_assert_eq!(summary["applied"].as_u64(), Some(candidate.len() as u64));
+
+                let new_specs = final_snapshot
+                    .iter()
+                    .map(|(_, spec)| spec.clone())
+                    .collect::<Vec<_>>();
+                prop_assert_eq!(&new_specs, &candidate);
+                prop_assert!(
+                    observations.iter().all(|(_, _, snapshot)|
+                        snapshot == &old_snapshot || snapshot == &final_snapshot),
+                    "reader observed a prefix, union, or mixed publication: old={old_snapshot:?}, new={final_snapshot:?}, observations={observations:?}",
+                );
+
+                let active_ids = final_snapshot
+                    .iter()
+                    .map(|(id, _)| id.clone())
+                    .collect::<Vec<_>>();
+                let published_ids = summary["ids"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|id| id.as_str().unwrap().to_string())
+                    .collect::<Vec<_>>();
+                prop_assert_eq!(published_ids, active_ids);
+
+                let public_rules = summary["rules"].as_array().unwrap();
+                prop_assert_eq!(public_rules.len(), candidate.len());
+                for (public, expected) in public_rules.iter().zip(candidate.iter()) {
+                    prop_assert_eq!(&public["match_on"], &serde_json::to_value(expected.match_on).unwrap());
+                    prop_assert_eq!(&public["matcher"], &serde_json::to_value(&expected.matcher).unwrap());
+                    prop_assert_eq!(&public["action"], &crate::net::rule::action_summary(&expected.action));
+                }
+            }
+        }
     }
 
     #[test]

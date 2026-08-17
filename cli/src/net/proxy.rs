@@ -3157,13 +3157,129 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Rewind<T> {
 }
 
 #[cfg(test)]
+fn shared_with_rules(rules: Vec<(String, CompiledRule)>) -> SharedState {
+    let (events, _) = broadcast::channel(8);
+    SharedState {
+        anticache: false,
+        anticomp: false,
+        redaction: None,
+        host_filters: vec![],
+        intercept: RwLock::new(None),
+        held: Mutex::new(HashMap::new()),
+        terminal_holds: Mutex::new(TerminalHoldHistory::default()),
+        events,
+        rules: RwLock::new(rules),
+        replay: RwLock::new(None),
+        tls_errors_seen: Mutex::new(HashSet::new()),
+        dropped_flows: AtomicU64::new(0),
+        persistence_errors: AtomicU64::new(0),
+        held_bytes: Arc::new(AtomicU64::new(0)),
+        rejected_holds: AtomicU64::new(0),
+        ws_control: Mutex::new(HashMap::new()),
+        ws_intercept: RwLock::new(None),
+        ws_held: Mutex::new(HashMap::new()),
+    }
+}
+
+/// Test-only observation of a compiled rule through the real HTTP/WebSocket
+/// application paths. Callers provide an always-matching rule and compare this
+/// concrete outcome with an independently constructed expectation.
+#[cfg(test)]
+pub(crate) fn rule_runtime_observation(rule: CompiledRule) -> serde_json::Value {
+    match rule.spec.phase() {
+        RulePhase::Request => {
+            let rules = vec![("property".into(), rule)];
+            let shared = shared_with_rules(rules);
+            let mut url =
+                "https://original.example.test/original/fixture?operationName=OriginalOperation"
+                    .to_string();
+            let mut headers = vec![("x-initial".into(), "original".into())];
+            let outcome = apply_request_rules(
+                &shared,
+                "GET",
+                "original.example.test",
+                "/original/fixture?operationName=OriginalOperation",
+                br#"{"operationName":"OriginalOperation"}"#,
+                &mut url,
+                &mut headers,
+            );
+            let short_circuit = outcome.short_circuit.map(|(status, headers, body)| {
+                serde_json::json!({
+                    "status": status,
+                    "headers": headers,
+                    "body": body.as_ref(),
+                })
+            });
+            serde_json::json!({
+                "phase": "request",
+                "url": url,
+                "headers": headers,
+                "short_circuit": short_circuit,
+                "delay_ms": outcome.delay_ms,
+                "modified": outcome.modified,
+                "rule_ids": outcome.rule_ids,
+            })
+        }
+        RulePhase::Response => {
+            let rules = vec![("property".into(), rule)];
+            let shared = shared_with_rules(rules);
+            let mut status = Some(201);
+            let mut headers = vec![("content-type".into(), "application/json".into())];
+            let mut body = Bytes::from_static(b"original fixture body");
+            let rule_ids = apply_response_rules(
+                &shared,
+                "GET",
+                "original.example.test",
+                "/original/fixture",
+                "https://original.example.test/original/fixture",
+                &mut status,
+                &mut headers,
+                &mut body,
+                true,
+            );
+            serde_json::json!({
+                "phase": "response",
+                "status": status,
+                "headers": headers,
+                "body": body.as_ref(),
+                "rule_ids": rule_ids,
+            })
+        }
+        RulePhase::Websocket => {
+            let rules = vec![("property".into(), rule)];
+            match ws::apply_ws_rules(
+                &rules,
+                "original.chat.example.test",
+                ws::Direction::ClientToServer,
+                "text",
+            ) {
+                ws::WsRuleAction::Forward => {
+                    serde_json::json!({"phase": "websocket", "outcome": "forward"})
+                }
+                ws::WsRuleAction::Drop(id) => serde_json::json!({
+                    "phase": "websocket",
+                    "outcome": "drop",
+                    "rule_id": id,
+                }),
+                ws::WsRuleAction::Modify(id, payload) => serde_json::json!({
+                    "phase": "websocket",
+                    "outcome": "modify",
+                    "rule_id": id,
+                    "payload": payload,
+                }),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         ContentEncoding, DecodeFailure, DecodeOutcome, EncodingDisposition, HeldFlow, HoldDecision,
-        ReleaseHeldResult, SharedState, TerminalHoldHistory, apply_request_mutation,
-        apply_request_rules, apply_response_rules, decode_capped, decompress_bounded_with_cap,
-        encoding_disposition, frame_stream_body, host_glob_match, persisted_tls_error_fields,
-        release_held, resolve_held, tls_failure_reason, upstream_headers, ws_tls_connector,
+        ReleaseHeldResult, TerminalHoldHistory, apply_request_mutation, apply_request_rules,
+        apply_response_rules, decode_capped, decompress_bounded_with_cap, encoding_disposition,
+        frame_stream_body, host_glob_match, persisted_tls_error_fields, release_held, resolve_held,
+        shared_with_rules, tls_failure_reason, upstream_headers, ws_tls_connector,
     };
     use crate::net::flow::FlowRecord;
     use crate::net::{Mutation, RuleAction, RuleMatchOn, RuleMatcher, RuleSpec, RuleTransform};
@@ -3172,35 +3288,11 @@ mod tests {
     use hyper::body::Frame;
     use std::collections::HashMap;
     use std::io;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::Poll;
     use std::time::Duration;
     use tokio::sync::oneshot;
-
-    fn shared_with_rules(rules: Vec<(String, crate::net::CompiledRule)>) -> SharedState {
-        let (events, _) = tokio::sync::broadcast::channel(8);
-        SharedState {
-            anticache: false,
-            anticomp: false,
-            redaction: None,
-            host_filters: vec![],
-            intercept: std::sync::RwLock::new(None),
-            held: Mutex::new(HashMap::new()),
-            terminal_holds: Mutex::new(TerminalHoldHistory::default()),
-            events,
-            rules: std::sync::RwLock::new(rules),
-            replay: std::sync::RwLock::new(None),
-            tls_errors_seen: Mutex::new(std::collections::HashSet::new()),
-            dropped_flows: AtomicU64::new(0),
-            persistence_errors: AtomicU64::new(0),
-            held_bytes: Arc::new(AtomicU64::new(0)),
-            rejected_holds: AtomicU64::new(0),
-            ws_control: Mutex::new(HashMap::new()),
-            ws_intercept: std::sync::RwLock::new(None),
-            ws_held: Mutex::new(HashMap::new()),
-        }
-    }
 
     async fn self_signed_tls_handshake(verify_upstream: bool) -> bool {
         let rcgen::CertifiedKey { cert, signing_key } =

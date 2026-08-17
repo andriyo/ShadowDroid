@@ -3532,6 +3532,7 @@ pub fn render_payload(payload: &[u8], format: &str) -> (serde_json::Value, Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     /// Encode a client (masked) or server (unmasked) frame for decoder tests.
     fn frame(fin: bool, rsv1: bool, opcode: u8, payload: &[u8], mask: Option<[u8; 4]>) -> Vec<u8> {
@@ -3640,6 +3641,790 @@ mod tests {
             );
         }
         codes
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct MessageObservation {
+        opcode: Opcode,
+        payload: Vec<u8>,
+        payload_len: u64,
+        wire_len: u64,
+        truncated: bool,
+        frame_count: u32,
+        compressed: bool,
+        decompressed: bool,
+        frames: Vec<(String, u64, bool, bool)>,
+        protocol_violations: Vec<String>,
+    }
+
+    impl From<Message> for MessageObservation {
+        fn from(message: Message) -> Self {
+            Self {
+                opcode: message.opcode,
+                payload: message.payload,
+                payload_len: message.payload_len,
+                wire_len: message.wire_len,
+                truncated: message.truncated,
+                frame_count: message.frame_count,
+                compressed: message.compressed,
+                decompressed: message.decompressed,
+                frames: message
+                    .frames
+                    .into_iter()
+                    .map(|frame| (frame.opcode, frame.len, frame.fin, frame.rsv1))
+                    .collect(),
+                protocol_violations: message.protocol_violations,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PumpMessageObservation {
+        dir: String,
+        seq: u64,
+        opcode: String,
+        payload_len: u64,
+        wire_len: u64,
+        retained_len: u64,
+        frame_count: u32,
+        protocol_violations: Vec<String>,
+        evidence_reliable: bool,
+        frames: Vec<(String, u64, bool, bool)>,
+        truncated: bool,
+        compressed: bool,
+        decompressed: bool,
+        text: Option<String>,
+        data_b64: Option<String>,
+        preview: Option<String>,
+        close_code: Option<u16>,
+        close_reason: Option<String>,
+    }
+
+    impl PumpMessageObservation {
+        fn from_model(direction: Direction, seq: u64, observation: &MessageObservation) -> Self {
+            let (text, data_b64, close_code, close_reason) = model_payload_fields(observation);
+            let preview = build_preview(
+                text.as_deref(),
+                observation.payload_len,
+                close_code,
+                close_reason.as_deref(),
+            );
+            Self {
+                dir: direction.as_str().to_string(),
+                seq,
+                opcode: observation.opcode.as_str().to_string(),
+                payload_len: observation.payload_len,
+                wire_len: observation.wire_len,
+                retained_len: observation.payload.len() as u64,
+                frame_count: observation.frame_count,
+                protocol_violations: observation.protocol_violations.clone(),
+                evidence_reliable: observation.protocol_violations.is_empty()
+                    && !observation.truncated
+                    && (!observation.compressed || observation.decompressed),
+                frames: if observation.frame_count > 1 {
+                    observation.frames.clone()
+                } else {
+                    Vec::new()
+                },
+                truncated: observation.truncated,
+                compressed: observation.compressed,
+                decompressed: observation.decompressed,
+                text,
+                data_b64,
+                preview,
+                close_code,
+                close_reason,
+            }
+        }
+    }
+
+    impl From<WsMessageRecord> for PumpMessageObservation {
+        fn from(record: WsMessageRecord) -> Self {
+            let evidence_reliable = record.effective_evidence_reliable();
+            Self {
+                dir: record.dir,
+                seq: record.seq,
+                opcode: record.opcode,
+                payload_len: record.payload_len,
+                wire_len: record.wire_len,
+                retained_len: record.retained_len,
+                frame_count: record.frame_count,
+                protocol_violations: record.protocol_violations,
+                evidence_reliable,
+                frames: record
+                    .frames
+                    .into_iter()
+                    .map(|frame| (frame.opcode, frame.len, frame.fin, frame.rsv1))
+                    .collect(),
+                truncated: record.truncated,
+                compressed: record.compressed,
+                decompressed: record.decompressed,
+                text: record.text,
+                data_b64: record.data_b64,
+                preview: record.preview,
+                close_code: record.close_code,
+                close_reason: record.close_reason,
+            }
+        }
+    }
+
+    fn model_close_code_reason(observation: &MessageObservation) -> (u16, String) {
+        if observation.payload.len() < 2 {
+            return (1005, String::new());
+        }
+        (
+            u16::from_be_bytes([observation.payload[0], observation.payload[1]]),
+            String::from_utf8_lossy(&observation.payload[2..]).into_owned(),
+        )
+    }
+
+    fn model_payload_fields(
+        observation: &MessageObservation,
+    ) -> (Option<String>, Option<String>, Option<u16>, Option<String>) {
+        if observation.opcode == Opcode::Close {
+            let (code, reason) = model_close_code_reason(observation);
+            let text = (!reason.is_empty()).then(|| reason.clone());
+            return (text, None, Some(code), Some(reason));
+        }
+        if observation.payload.is_empty() {
+            return (None, None, None, None);
+        }
+        if observation.compressed && !observation.decompressed {
+            return (None, Some(b64_encode(&observation.payload)), None, None);
+        }
+        if observation.opcode == Opcode::Text {
+            return (
+                Some(String::from_utf8_lossy(&observation.payload).into_owned()),
+                None,
+                None,
+                None,
+            );
+        }
+        match std::str::from_utf8(&observation.payload) {
+            Ok(text) => (Some(text.to_string()), None, None, None),
+            Err(_) => (None, Some(b64_encode(&observation.payload)), None, None),
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct FrameObservation {
+        fin: bool,
+        rsv1: bool,
+        opcode: Opcode,
+        masked: bool,
+        payload: Vec<u8>,
+        payload_len: u64,
+        truncated: bool,
+        violations: Vec<ViolationObservation>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct ViolationObservation {
+        code: String,
+        scope: String,
+        action: String,
+        fatal: bool,
+        opcode: Option<String>,
+        detail: String,
+    }
+
+    impl From<ProtocolViolation> for ViolationObservation {
+        fn from(violation: ProtocolViolation) -> Self {
+            Self {
+                code: violation.code.to_string(),
+                scope: violation.scope.to_string(),
+                action: violation.action.to_string(),
+                fatal: violation.fatal,
+                opcode: violation.opcode,
+                detail: serde_json::to_string(&violation.detail)
+                    .expect("protocol violation detail is JSON"),
+            }
+        }
+    }
+
+    impl From<WsProtocolViolationRecord> for ViolationObservation {
+        fn from(record: WsProtocolViolationRecord) -> Self {
+            Self {
+                code: record.violation,
+                scope: record.scope,
+                action: record.action,
+                fatal: record.fatal,
+                opcode: record.opcode,
+                detail: serde_json::to_string(&record.detail)
+                    .expect("protocol violation detail is JSON"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct PumpViolationObservation {
+        dir: String,
+        finding: ViolationObservation,
+    }
+
+    impl From<&RawFrame> for FrameObservation {
+        fn from(frame: &RawFrame) -> Self {
+            Self {
+                fin: frame.fin,
+                rsv1: frame.rsv1,
+                opcode: frame.opcode,
+                masked: frame.masked,
+                payload: frame.payload.clone(),
+                payload_len: frame.payload_len,
+                truncated: frame.truncated,
+                violations: canonical_violations(frame.violations.clone()),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct StreamObservation {
+        frames: Vec<FrameObservation>,
+        messages: Vec<MessageObservation>,
+        violations: Vec<ViolationObservation>,
+        frame_finish_findings: Vec<ViolationObservation>,
+        message_finish_findings: Vec<ViolationObservation>,
+        desynced: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PumpStatsObservation {
+        c2s_msgs: u64,
+        s2c_msgs: u64,
+        c2s_bytes: u64,
+        s2c_bytes: u64,
+        dropped: u64,
+        unreliable_messages: u64,
+        c2s_protocol_violations: u64,
+        s2c_protocol_violations: u64,
+        c2s_decode_desynced: bool,
+        s2c_decode_desynced: bool,
+        violation_counter: u64,
+        evidence_reliable: bool,
+        close: Option<(Option<u16>, Option<String>, String)>,
+    }
+
+    impl PumpStatsObservation {
+        fn from_stats(stats: &WsStats) -> Self {
+            let close = stats.close.lock().unwrap().as_ref().map(|close| {
+                (
+                    close.code,
+                    close.reason.clone(),
+                    close.initiator.as_str().to_string(),
+                )
+            });
+            Self {
+                c2s_msgs: stats.c2s_msgs.load(Ordering::Relaxed),
+                s2c_msgs: stats.s2c_msgs.load(Ordering::Relaxed),
+                c2s_bytes: stats.c2s_bytes.load(Ordering::Relaxed),
+                s2c_bytes: stats.s2c_bytes.load(Ordering::Relaxed),
+                dropped: stats.dropped.load(Ordering::Relaxed),
+                unreliable_messages: stats.unreliable_messages.load(Ordering::Relaxed),
+                c2s_protocol_violations: stats.c2s_protocol_violations.load(Ordering::Relaxed),
+                s2c_protocol_violations: stats.s2c_protocol_violations.load(Ordering::Relaxed),
+                c2s_decode_desynced: stats.c2s_decode_desynced.load(Ordering::Relaxed),
+                s2c_decode_desynced: stats.s2c_decode_desynced.load(Ordering::Relaxed),
+                violation_counter: stats.violation_counter.load(Ordering::Relaxed),
+                evidence_reliable: stats.evidence_reliable(),
+                close,
+            }
+        }
+
+        fn from_model(
+            direction: Direction,
+            model: &StreamObservation,
+            violations: &[PumpViolationObservation],
+        ) -> Self {
+            let message_count = model.messages.len() as u64;
+            let payload_bytes = model
+                .messages
+                .iter()
+                .map(|message| message.payload_len)
+                .sum();
+            let unreliable_messages = model
+                .messages
+                .iter()
+                .filter(|message| {
+                    !message.protocol_violations.is_empty()
+                        || message.truncated
+                        || (message.compressed && !message.decompressed)
+                })
+                .count() as u64;
+            let violation_count = violations.len() as u64;
+            let fatal = violations.iter().any(|violation| violation.finding.fatal);
+            let close = model
+                .messages
+                .iter()
+                .find(|message| message.opcode == Opcode::Close)
+                .map(|message| {
+                    let (code, reason) = model_close_code_reason(message);
+                    (Some(code), Some(reason), direction.as_str().to_string())
+                });
+            let (
+                c2s_msgs,
+                s2c_msgs,
+                c2s_bytes,
+                s2c_bytes,
+                c2s_protocol_violations,
+                s2c_protocol_violations,
+                c2s_decode_desynced,
+                s2c_decode_desynced,
+            ) = match direction {
+                Direction::ClientToServer => (
+                    message_count,
+                    0,
+                    payload_bytes,
+                    0,
+                    violation_count,
+                    0,
+                    fatal,
+                    false,
+                ),
+                Direction::ServerToClient => (
+                    0,
+                    message_count,
+                    0,
+                    payload_bytes,
+                    0,
+                    violation_count,
+                    false,
+                    fatal,
+                ),
+            };
+            Self {
+                c2s_msgs,
+                s2c_msgs,
+                c2s_bytes,
+                s2c_bytes,
+                dropped: 0,
+                unreliable_messages,
+                c2s_protocol_violations,
+                s2c_protocol_violations,
+                c2s_decode_desynced,
+                s2c_decode_desynced,
+                violation_counter: violation_count,
+                evidence_reliable: violation_count == 0 && unreliable_messages == 0,
+                close,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PumpObservation {
+        forwarded: Vec<u8>,
+        messages: Vec<PumpMessageObservation>,
+        violations: Vec<PumpViolationObservation>,
+        stats: PumpStatsObservation,
+    }
+
+    fn canonical_violations(
+        violations: impl IntoIterator<Item = ProtocolViolation>,
+    ) -> Vec<ViolationObservation> {
+        let mut observations = violations
+            .into_iter()
+            .map(ViolationObservation::from)
+            .collect::<Vec<_>>();
+        // A single push can complete earlier frames and discover a later fatal
+        // header at once, while chunked pushes discover those findings in
+        // separate calls. Finding order is not protocol evidence; multiplicity
+        // and the full machine-readable fields are.
+        observations.sort();
+        observations
+    }
+
+    /// Mirror the observe-mode pump invariant: each read is forwarded once
+    /// before a copy is decoded. `chunk_sizes` contains only positive sizes so
+    /// every generated partition advances the stream.
+    fn observe_partition(
+        direction: Direction,
+        deflate: DeflateParams,
+        wire: &[u8],
+        chunk_sizes: &[usize],
+    ) -> StreamObservation {
+        assert!(!wire.is_empty());
+        assert!(!chunk_sizes.is_empty());
+        assert!(chunk_sizes.iter().all(|size| *size > 0));
+
+        let mut decoder = FrameDecoder::new();
+        let mut assembler = MessageAssembler::new(direction, deflate);
+        let mut frames_observed = Vec::new();
+        let mut messages = Vec::new();
+        let mut violations = Vec::new();
+        for chunk in partition_wire(wire, chunk_sizes) {
+            let frames = decoder.push(&chunk);
+            violations.extend(decoder.take_violations());
+            for frame in frames {
+                frames_observed.push(FrameObservation::from(&frame));
+                if let Some(message) = assembler.accept(frame) {
+                    messages.push(message.into());
+                }
+                violations.extend(assembler.take_violations());
+            }
+        }
+        let desynced = decoder.desynced();
+        let frame_finish_findings = canonical_violations(decoder.finish_stream());
+        let message_finish_findings = canonical_violations(assembler.finish_stream());
+
+        StreamObservation {
+            frames: frames_observed,
+            messages,
+            violations: canonical_violations(violations),
+            frame_finish_findings,
+            message_finish_findings,
+            desynced,
+        }
+    }
+
+    fn model_pump_messages(
+        direction: Direction,
+        model: &StreamObservation,
+    ) -> Vec<PumpMessageObservation> {
+        model
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                PumpMessageObservation::from_model(direction, index as u64 + 1, message)
+            })
+            .collect()
+    }
+
+    fn model_pump_violations(
+        direction: Direction,
+        model: &StreamObservation,
+    ) -> Vec<PumpViolationObservation> {
+        let mut findings = model
+            .violations
+            .iter()
+            .chain(&model.frame_finish_findings)
+            .chain(&model.message_finish_findings)
+            .cloned()
+            .map(|finding| PumpViolationObservation {
+                dir: direction.as_str().to_string(),
+                finding,
+            })
+            .collect::<Vec<_>>();
+        findings.sort();
+        findings
+    }
+
+    fn partition_wire(wire: &[u8], chunk_sizes: &[usize]) -> Vec<Vec<u8>> {
+        assert!(!wire.is_empty());
+        assert!(!chunk_sizes.is_empty());
+        assert!(chunk_sizes.iter().all(|size| *size > 0));
+        let mut chunks = Vec::new();
+        let mut offset = 0usize;
+        let mut partition_index = 0usize;
+        while offset < wire.len() {
+            let requested = chunk_sizes[partition_index % chunk_sizes.len()];
+            let end = wire.len().min(offset + requested);
+            chunks.push(wire[offset..end].to_vec());
+            offset = end;
+            partition_index += 1;
+        }
+        chunks
+    }
+
+    struct PartitionedReader {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+        offset: usize,
+    }
+
+    impl PartitionedReader {
+        fn new(wire: &[u8], chunk_sizes: &[usize]) -> Self {
+            Self {
+                chunks: partition_wire(wire, chunk_sizes).into(),
+                offset: 0,
+            }
+        }
+    }
+
+    impl AsyncRead for PartitionedReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let Some(chunk) = self.chunks.front() else {
+                return std::task::Poll::Ready(Ok(()));
+            };
+            let chunk_len = chunk.len();
+            let take = (chunk_len - self.offset).min(buf.remaining());
+            buf.put_slice(&chunk[self.offset..self.offset + take]);
+            self.offset += take;
+            if self.offset == chunk_len {
+                self.chunks.pop_front();
+                self.offset = 0;
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturingWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl AsyncWrite for CapturingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.bytes.lock().unwrap().extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Exercise the production observe-mode pump with a reader that exposes the
+    /// exact generated partition. Retain and drain its real observation channel
+    /// so partition invariance covers message/violation routing and EOF findings,
+    /// not only the decoder model and forwarded bytes.
+    fn pump_observe_partition(
+        direction: Direction,
+        deflate: DeflateParams,
+        wire: &[u8],
+        chunk_sizes: &[usize],
+    ) -> PumpObservation {
+        static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        static CONTEXT: std::sync::OnceLock<Arc<ProxyContext>> = std::sync::OnceLock::new();
+        let runtime = RUNTIME.get_or_init(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("property runtime")
+        });
+        let ctx = CONTEXT.get_or_init(pump_test_context).clone();
+        let meta = Arc::new(WsSessionMeta {
+            id: "w-chunk-property".to_string(),
+            capture_session_id: "n-chunk-property".to_string(),
+            host: "ws.property.invalid".to_string(),
+            started_ts: 0.0,
+            deflate,
+        });
+        let stats = Arc::new(WsStats::default());
+        let counter = Arc::new(AtomicU64::new(1));
+        let (observed_tx, mut observed_rx) = mpsc::channel(4096);
+        let (_inject_tx, inject_rx) = mpsc::channel(1);
+        let writer = CapturingWriter::default();
+        let captured = writer.bytes.clone();
+        let reader = PartitionedReader::new(wire, chunk_sizes);
+
+        runtime.block_on(pump(
+            ctx,
+            meta,
+            direction,
+            reader,
+            writer,
+            MessageAssembler::new(direction, deflate),
+            stats.clone(),
+            counter,
+            observed_tx,
+            inject_rx,
+        ));
+
+        let mut messages = Vec::new();
+        let mut violations = Vec::new();
+        while let Ok(record) = observed_rx.try_recv() {
+            match record {
+                WsObservedRecord::Message(record) => messages.push(record.into()),
+                WsObservedRecord::Violation(record) => {
+                    let dir = record.dir.clone();
+                    violations.push(PumpViolationObservation {
+                        dir,
+                        finding: record.into(),
+                    });
+                }
+            }
+        }
+        violations.sort();
+        let forwarded = captured.lock().unwrap().clone();
+        PumpObservation {
+            forwarded,
+            messages,
+            violations,
+            stats: PumpStatsObservation::from_stats(&stats),
+        }
+    }
+
+    fn bounded_wire_atom() -> BoxedStrategy<Vec<u8>> {
+        let complete = (
+            0u8..6,
+            any::<bool>(),
+            prop::collection::vec(any::<u8>(), 0..192),
+            any::<bool>(),
+            any::<[u8; 4]>(),
+        )
+            .prop_map(|(kind, rsv1, payload, masked, key)| {
+                let opcode = [0x1, 0x2, 0x8, 0x9, 0xA, 0x0][kind as usize];
+                frame(true, rsv1, opcode, &payload, masked.then_some(key))
+            });
+        let fragmented = (
+            any::<bool>(),
+            prop::collection::vec(any::<u8>(), 0..48),
+            prop::collection::vec(any::<u8>(), 0..48),
+            any::<bool>(),
+            any::<[u8; 4]>(),
+            any::<bool>(),
+        )
+            .prop_map(|(text, first, last, masked, key, interleave_ping)| {
+                let mask = masked.then_some(key);
+                let mut wire = frame(false, false, if text { 0x1 } else { 0x2 }, &first, mask);
+                if interleave_ping {
+                    wire.extend(frame(true, false, 0x9, b"p", mask));
+                }
+                wire.extend(frame(true, false, 0x0, &last, mask));
+                wire
+            });
+        let bounded_header_violation = (
+            0u8..4,
+            prop::collection::vec(any::<u8>(), 0..64),
+            any::<bool>(),
+            any::<[u8; 4]>(),
+        )
+            .prop_map(|(kind, payload, masked, key)| {
+                let (fin, opcode) = match kind {
+                    0 => (true, 0x1),
+                    1 => (true, 0x2),
+                    2 => (true, 0x3),
+                    _ => (false, 0x9),
+                };
+                let mut wire = frame(fin, false, opcode, &payload, masked.then_some(key));
+                if kind == 0 {
+                    wire[0] |= 0x20;
+                } else if kind == 1 {
+                    wire[0] |= 0x10;
+                }
+                wire
+            });
+        let non_minimal_16 = (0usize..126, prop::collection::vec(any::<u8>(), 0..8)).prop_map(
+            |(payload_len, tail)| {
+                let mut wire = vec![0x81, 126, 0, payload_len as u8];
+                wire.extend(std::iter::repeat_n(b'x', payload_len));
+                wire.extend(tail);
+                wire
+            },
+        );
+        let non_minimal_64 = (0u64..512, prop::collection::vec(any::<u8>(), 0..8)).prop_map(
+            |(payload_len, tail)| {
+                let mut wire = vec![0x82, 127];
+                wire.extend(payload_len.to_be_bytes());
+                wire.extend(std::iter::repeat_n(b'y', payload_len as usize));
+                wire.extend(tail);
+                wire
+            },
+        );
+        let fatal_length = (any::<bool>(), prop::collection::vec(any::<u8>(), 0..32)).prop_map(
+            |(msb_set, tail)| {
+                let mut wire = vec![0x82, 127];
+                let length = if msb_set {
+                    1u64 << 63
+                } else {
+                    MAX_FRAME_LEN + 1
+                };
+                wire.extend(length.to_be_bytes());
+                wire.extend(tail);
+                wire
+            },
+        );
+        let incomplete = (
+            any::<bool>(),
+            0u8..16,
+            prop::collection::vec(any::<u8>(), 0..64),
+            any::<bool>(),
+            any::<[u8; 4]>(),
+            any::<u16>(),
+        )
+            .prop_map(|(fin, opcode, payload, masked, key, cut_seed)| {
+                let mut wire = frame(fin, false, opcode, &payload, masked.then_some(key));
+                let keep = 1 + usize::from(cut_seed) % (wire.len() - 1);
+                wire.truncate(keep);
+                wire
+            });
+        let arbitrary = prop::collection::vec(any::<u8>(), 1..96);
+
+        prop_oneof![
+            6 => complete,
+            4 => fragmented,
+            3 => bounded_header_violation,
+            2 => non_minimal_16,
+            2 => non_minimal_64,
+            2 => fatal_length,
+            3 => incomplete,
+            2 => arbitrary,
+        ]
+        .boxed()
+    }
+
+    fn bounded_wire_stream() -> BoxedStrategy<Vec<u8>> {
+        prop::collection::vec(bounded_wire_atom(), 1..7)
+            .prop_map(|atoms| atoms.into_iter().flatten().collect())
+            .boxed()
+    }
+
+    fn websocket_chunk_property_config() -> ProptestConfig {
+        ProptestConfig {
+            cases: 192,
+            rng_seed: proptest::test_runner::RngSeed::Fixed(0x5344_5753_4348_554e),
+            ..ProptestConfig::default()
+        }
+    }
+
+    proptest! {
+        #![proptest_config(websocket_chunk_property_config())]
+
+        #[test]
+        fn decoder_and_assembler_are_invariant_to_nonempty_chunk_partitions(
+            wire in bounded_wire_stream(),
+            chunk_sizes in prop::collection::vec(1usize..97, 1..33),
+            client_to_server in any::<bool>(),
+            deflate_enabled in any::<bool>(),
+            client_no_context_takeover in any::<bool>(),
+            server_no_context_takeover in any::<bool>(),
+        ) {
+            let direction = if client_to_server {
+                Direction::ClientToServer
+            } else {
+                Direction::ServerToClient
+            };
+            let deflate = DeflateParams {
+                enabled: deflate_enabled,
+                client_no_context_takeover,
+                server_no_context_takeover,
+            };
+            let one_shot = observe_partition(direction, deflate, &wire, &[wire.len()]);
+            let chunked = observe_partition(direction, deflate, &wire, &chunk_sizes);
+            let one_shot_pump =
+                pump_observe_partition(direction, deflate, &wire, &[wire.len()]);
+            let chunked_pump =
+                pump_observe_partition(direction, deflate, &wire, &chunk_sizes);
+            let expected_messages = model_pump_messages(direction, &one_shot);
+            let expected_violations = model_pump_violations(direction, &one_shot);
+            let expected_stats =
+                PumpStatsObservation::from_model(direction, &one_shot, &expected_violations);
+
+            prop_assert_eq!(&one_shot, &chunked);
+            prop_assert_eq!(&one_shot_pump, &chunked_pump);
+            prop_assert_eq!(&one_shot_pump.forwarded, &wire);
+            prop_assert_eq!(one_shot_pump.forwarded.len(), wire.len());
+            prop_assert_eq!(&one_shot_pump.messages, &expected_messages);
+            prop_assert_eq!(&one_shot_pump.violations, &expected_violations);
+            prop_assert_eq!(&one_shot_pump.stats, &expected_stats);
+        }
     }
 
     #[test]

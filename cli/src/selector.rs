@@ -204,6 +204,46 @@ impl Selector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    fn property_config() -> ProptestConfig {
+        ProptestConfig {
+            cases: 192,
+            rng_seed: proptest::test_runner::RngSeed::Fixed(0x5344_5345_4c45_4354),
+            ..ProptestConfig::default()
+        }
+    }
+
+    proptest! {
+        #![proptest_config(property_config())]
+
+        #[test]
+        fn normalization_is_idempotent(chars in prop::collection::vec(any::<char>(), 0..256)) {
+            let input = chars.into_iter().collect::<String>();
+            let once = normalize(&input);
+            prop_assert_eq!(normalize(&once), once);
+        }
+
+        #[test]
+        fn invisible_controls_do_not_change_identity(
+            values in prop::collection::vec((any::<char>(), any::<bool>()), 0..128),
+            control in prop::sample::select(vec![
+                '\u{200B}', '\u{200C}', '\u{200D}', '\u{200E}', '\u{200F}',
+                '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}',
+                '\u{2060}', '\u{FEFF}',
+            ]),
+        ) {
+            let clean = values.iter().map(|(value, _)| *value).collect::<String>();
+            let mut decorated = String::new();
+            for (value, insert_control) in values {
+                decorated.push(value);
+                if insert_control {
+                    decorated.push(control);
+                }
+            }
+            prop_assert_eq!(normalize(&decorated), normalize(&clean));
+        }
+    }
 
     #[test]
     fn normalize_collapses_and_trims_unicode_whitespace() {

@@ -12,8 +12,50 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.random.Random
 
 class InterceptTest {
+    @Test
+    fun `randomized lifecycle traces have exactly one stable terminal outcome`() {
+        val random = Random(0x51AD0D)
+        val clock = FakeClock()
+        val registry = clock.registry(terminalHistoryCap = 128)
+        registry.arm(JSONObject().put("holdMs", 100L))
+
+        repeat(96) { index ->
+            val id = "property-$index"
+            val pending = registry.startHold(id)
+            awaitHeld(registry, id)
+
+            val (expected, expectedState) = when (random.nextInt(3)) {
+                0 -> {
+                    val action = JSONObject().put("drop", random.nextBoolean())
+                    assertEquals(Intercept.ResultCode.RELEASED, registry.resolve(id, action).code)
+                    Intercept.ResultCode.ALREADY_RELEASED to "released"
+                }
+                1 -> {
+                    clock.nanos.addAndGet(TimeUnit.MILLISECONDS.toNanos(101L))
+                    clock.wallMs.addAndGet(101L)
+                    registry.status()
+                    Intercept.ResultCode.DEADLINE_EXPIRED to "deadline_expired"
+                }
+                else -> {
+                    pending.thread.interrupt()
+                    Intercept.ResultCode.CLIENT_INTERRUPTED to "client_interrupted"
+                }
+            }
+            pending.join()
+
+            repeat(random.nextInt(1, 6)) {
+                assertEquals(expected, registry.resolve(id, JSONObject().put("drop", true)).code)
+            }
+            val terminal = registry.status().getJSONArray("terminal")
+            val record = terminal.getJSONObject(terminal.length() - 1)
+            assertEquals(id, record.getString("id"))
+            assertEquals(expectedState, record.getString("state"))
+        }
+    }
+
     @Test
     fun `release at the absolute deadline fails open and reports deadline details`() {
         val clock = FakeClock(nanos = 0L, wallMs = 1_000L)

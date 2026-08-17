@@ -986,6 +986,866 @@ fn matcher_is_impossible(matcher: &RuleMatcher) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    fn property_config() -> ProptestConfig {
+        ProptestConfig {
+            cases: 128,
+            rng_seed: proptest::test_runner::RngSeed::Fixed(0x5344_5255_4c45_5052),
+            ..ProptestConfig::default()
+        }
+    }
+
+    fn match_on() -> impl Strategy<Value = RuleMatchOn> {
+        prop_oneof![Just(RuleMatchOn::Original), Just(RuleMatchOn::Transformed),]
+    }
+
+    #[derive(Debug, Clone)]
+    struct MatcherCase {
+        matcher: RuleMatcher,
+        original: bool,
+        transformed: bool,
+    }
+
+    impl MatcherCase {
+        fn leaf(matcher: RuleMatcher, original: bool, transformed: bool) -> Self {
+            Self {
+                matcher,
+                original,
+                transformed,
+            }
+        }
+
+        fn all(children: Vec<Self>) -> Self {
+            Self {
+                original: children.iter().all(|child| child.original),
+                transformed: children.iter().all(|child| child.transformed),
+                matcher: RuleMatcher::All {
+                    matchers: children.into_iter().map(|child| child.matcher).collect(),
+                },
+            }
+        }
+
+        fn any(children: Vec<Self>) -> Self {
+            Self {
+                original: children.iter().any(|child| child.original),
+                transformed: children.iter().any(|child| child.transformed),
+                matcher: RuleMatcher::Any {
+                    matchers: children.into_iter().map(|child| child.matcher).collect(),
+                },
+            }
+        }
+
+        fn not(child: Self) -> Self {
+            Self {
+                original: !child.original,
+                transformed: !child.transformed,
+                matcher: RuleMatcher::Not {
+                    matcher: Box::new(child.matcher),
+                },
+            }
+        }
+    }
+
+    fn matcher_leaf(phase: RulePhase) -> BoxedStrategy<MatcherCase> {
+        let cases = match phase {
+            RulePhase::Request => vec![
+                MatcherCase::leaf(
+                    RuleMatcher::Host {
+                        contains: "original.example.test".into(),
+                    },
+                    true,
+                    false,
+                ),
+                MatcherCase::leaf(
+                    RuleMatcher::Host {
+                        contains: "transformed.example.test".into(),
+                    },
+                    false,
+                    true,
+                ),
+                MatcherCase::leaf(
+                    RuleMatcher::Path {
+                        contains: "/transformed/".into(),
+                    },
+                    false,
+                    true,
+                ),
+                MatcherCase::leaf(
+                    RuleMatcher::Path {
+                        contains: "/original/fixture".into(),
+                    },
+                    true,
+                    true,
+                ),
+                MatcherCase::leaf(
+                    RuleMatcher::Path {
+                        contains: "/absent/".into(),
+                    },
+                    false,
+                    false,
+                ),
+                MatcherCase::leaf(
+                    RuleMatcher::Method {
+                        equals: "get".into(),
+                    },
+                    true,
+                    true,
+                ),
+                MatcherCase::leaf(
+                    RuleMatcher::Method {
+                        equals: "POST".into(),
+                    },
+                    false,
+                    false,
+                ),
+                MatcherCase::leaf(
+                    RuleMatcher::GraphqlOperation {
+                        equals: "OriginalOperation".into(),
+                    },
+                    true,
+                    true,
+                ),
+                MatcherCase::leaf(
+                    RuleMatcher::GraphqlOperation {
+                        equals: "AbsentOperation".into(),
+                    },
+                    false,
+                    false,
+                ),
+            ],
+            RulePhase::Response => vec![
+                MatcherCase::leaf(
+                    RuleMatcher::Host {
+                        contains: "original.example.test".into(),
+                    },
+                    true,
+                    false,
+                ),
+                MatcherCase::leaf(
+                    RuleMatcher::Host {
+                        contains: "transformed.example.test".into(),
+                    },
+                    false,
+                    true,
+                ),
+                MatcherCase::leaf(
+                    RuleMatcher::Path {
+                        contains: "/transformed/".into(),
+                    },
+                    false,
+                    true,
+                ),
+                MatcherCase::leaf(
+                    RuleMatcher::Path {
+                        contains: "/original/fixture".into(),
+                    },
+                    true,
+                    true,
+                ),
+                MatcherCase::leaf(
+                    RuleMatcher::Path {
+                        contains: "/absent/".into(),
+                    },
+                    false,
+                    false,
+                ),
+                MatcherCase::leaf(
+                    RuleMatcher::Method {
+                        equals: "GET".into(),
+                    },
+                    true,
+                    true,
+                ),
+                MatcherCase::leaf(
+                    RuleMatcher::Method {
+                        equals: "POST".into(),
+                    },
+                    false,
+                    false,
+                ),
+                MatcherCase::leaf(RuleMatcher::Status { equals: 201 }, true, false),
+                MatcherCase::leaf(RuleMatcher::Status { equals: 418 }, false, true),
+                MatcherCase::leaf(
+                    RuleMatcher::ContentType {
+                        contains: "json".into(),
+                    },
+                    true,
+                    false,
+                ),
+                MatcherCase::leaf(
+                    RuleMatcher::ContentType {
+                        contains: "text/plain".into(),
+                    },
+                    false,
+                    true,
+                ),
+            ],
+            RulePhase::Websocket => vec![
+                MatcherCase::leaf(
+                    RuleMatcher::Host {
+                        contains: "original.chat".into(),
+                    },
+                    true,
+                    false,
+                ),
+                MatcherCase::leaf(
+                    RuleMatcher::Host {
+                        contains: "transformed.chat".into(),
+                    },
+                    false,
+                    true,
+                ),
+                MatcherCase::leaf(
+                    RuleMatcher::Direction {
+                        equals: WsDirection::C2s,
+                    },
+                    true,
+                    false,
+                ),
+                MatcherCase::leaf(
+                    RuleMatcher::Direction {
+                        equals: WsDirection::S2c,
+                    },
+                    false,
+                    true,
+                ),
+                MatcherCase::leaf(
+                    RuleMatcher::Opcode {
+                        equals: WsOpcode::Text,
+                    },
+                    true,
+                    false,
+                ),
+                MatcherCase::leaf(
+                    RuleMatcher::Opcode {
+                        equals: WsOpcode::Binary,
+                    },
+                    false,
+                    true,
+                ),
+                MatcherCase::leaf(
+                    RuleMatcher::Opcode {
+                        equals: WsOpcode::Close,
+                    },
+                    false,
+                    false,
+                ),
+            ],
+        };
+        prop::sample::select(cases).boxed()
+    }
+
+    fn matcher_tree(phase: RulePhase) -> BoxedStrategy<MatcherCase> {
+        let recursive = matcher_leaf(phase).prop_recursive(3, 32, 3, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..4).prop_map(MatcherCase::all),
+                prop::collection::vec(inner.clone(), 1..4).prop_map(MatcherCase::any),
+                inner.prop_map(MatcherCase::not),
+            ]
+        });
+
+        let nested = match phase {
+            RulePhase::Request | RulePhase::Response => {
+                (recursive, matcher_leaf(phase), matcher_leaf(phase))
+                    .prop_map(|(tree, left, right)| {
+                        MatcherCase::all(vec![
+                            tree,
+                            MatcherCase::any(vec![left, MatcherCase::not(right)]),
+                        ])
+                    })
+                    .boxed()
+            }
+            RulePhase::Websocket => {
+                let direction = prop::sample::select(vec![
+                    MatcherCase::leaf(
+                        RuleMatcher::Direction {
+                            equals: WsDirection::C2s,
+                        },
+                        true,
+                        false,
+                    ),
+                    MatcherCase::leaf(
+                        RuleMatcher::Direction {
+                            equals: WsDirection::S2c,
+                        },
+                        false,
+                        true,
+                    ),
+                ]);
+                let opcode = prop::sample::select(vec![
+                    MatcherCase::leaf(
+                        RuleMatcher::Opcode {
+                            equals: WsOpcode::Text,
+                        },
+                        true,
+                        false,
+                    ),
+                    MatcherCase::leaf(
+                        RuleMatcher::Opcode {
+                            equals: WsOpcode::Binary,
+                        },
+                        false,
+                        true,
+                    ),
+                ]);
+                (recursive, direction, opcode)
+                    .prop_map(|(tree, direction, opcode)| {
+                        MatcherCase::all(vec![
+                            tree,
+                            MatcherCase::any(vec![direction, MatcherCase::not(opcode)]),
+                        ])
+                    })
+                    .boxed()
+            }
+        };
+
+        nested
+            .prop_filter(
+                "matcher must produce one true and one false fixed-context result",
+                |case| case.original != case.transformed,
+            )
+            .boxed()
+    }
+
+    fn header() -> impl Strategy<Value = (String, String)> {
+        ("[a-z]{1,8}", "[A-Za-z0-9 ._-]{0,24}")
+            .prop_map(|(suffix, value)| (format!("x-property-{suffix}"), value))
+    }
+
+    #[derive(Debug, Clone)]
+    struct ActionCase {
+        action: RuleAction,
+        expected: Value,
+    }
+
+    fn request_expected(
+        url: String,
+        headers: Vec<(String, String)>,
+        short_circuit: Option<Value>,
+        delay_ms: u32,
+        modified: bool,
+    ) -> Value {
+        json!({
+            "phase": "request",
+            "url": url,
+            "headers": headers,
+            "short_circuit": short_circuit,
+            "delay_ms": delay_ms,
+            "modified": modified,
+            "rule_ids": ["property"],
+        })
+    }
+
+    fn request_actions() -> BoxedStrategy<Vec<ActionCase>> {
+        (
+            0u32..=30_000,
+            "[a-z]{1,8}",
+            "[a-z]{1,8}",
+            header(),
+            200u16..=599,
+            200u16..=599,
+            prop::collection::vec(header(), 0..3),
+            prop::collection::vec(any::<u8>(), 0..64),
+        )
+            .prop_map(
+                |(
+                    milliseconds,
+                    target_host,
+                    target_path,
+                    (header_name, header_value),
+                    block_status,
+                    response_status,
+                    response_headers,
+                    response_body,
+                )| {
+                    let original_url = "https://original.example.test/original/fixture?operationName=OriginalOperation";
+                    let original_headers = vec![("x-initial".into(), "original".into())];
+                    let target = format!("https://{target_host}.example.test/{target_path}");
+                    let mapped_url = format!(
+                        "{target}/original/fixture?operationName=OriginalOperation"
+                    );
+                    let mut changed_headers = original_headers.clone();
+                    changed_headers.push((header_name.clone(), header_value.clone()));
+                    let map_local_body = include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/Cargo.toml"
+                    ));
+                    vec![
+                        ActionCase {
+                            action: RuleAction::Delay { milliseconds },
+                            expected: request_expected(
+                                original_url.into(),
+                                original_headers.clone(),
+                                None,
+                                milliseconds,
+                                false,
+                            ),
+                        },
+                        ActionCase {
+                            action: RuleAction::Transform {
+                                transform: RuleTransform::MapRemote { target },
+                            },
+                            expected: request_expected(
+                                mapped_url,
+                                original_headers.clone(),
+                                None,
+                                0,
+                                true,
+                            ),
+                        },
+                        ActionCase {
+                            action: RuleAction::Transform {
+                                transform: RuleTransform::SetRequestHeader {
+                                    name: header_name,
+                                    value: header_value,
+                                },
+                            },
+                            expected: request_expected(
+                                original_url.into(),
+                                changed_headers,
+                                None,
+                                0,
+                                true,
+                            ),
+                        },
+                        ActionCase {
+                            action: RuleAction::Terminal {
+                                terminal: RuleTerminal::Block {
+                                    status: block_status,
+                                },
+                            },
+                            expected: request_expected(
+                                original_url.into(),
+                                original_headers.clone(),
+                                Some(json!({
+                                    "status": block_status,
+                                    "headers": Vec::<(String, String)>::new(),
+                                    "body": Vec::<u8>::new(),
+                                })),
+                                0,
+                                true,
+                            ),
+                        },
+                        ActionCase {
+                            action: RuleAction::Terminal {
+                                terminal: RuleTerminal::Respond {
+                                    response: SyntheticResponseSpec {
+                                        status: response_status,
+                                        headers: response_headers.clone(),
+                                        body: response_body.clone(),
+                                    },
+                                },
+                            },
+                            expected: request_expected(
+                                original_url.into(),
+                                original_headers.clone(),
+                                Some(json!({
+                                    "status": response_status,
+                                    "headers": response_headers,
+                                    "body": response_body,
+                                })),
+                                0,
+                                true,
+                            ),
+                        },
+                        ActionCase {
+                            action: RuleAction::Terminal {
+                                terminal: RuleTerminal::MapLocal {
+                                    path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                                        .join("Cargo.toml"),
+                                },
+                            },
+                            expected: request_expected(
+                                original_url.into(),
+                                original_headers,
+                                Some(json!({
+                                    "status": 200,
+                                    "headers": [("content-type", "application/octet-stream")],
+                                    "body": map_local_body.as_slice(),
+                                })),
+                                0,
+                                true,
+                            ),
+                        },
+                    ]
+                },
+            )
+            .boxed()
+    }
+
+    fn response_expected(status: u16, headers: Vec<(String, String)>, body: &[u8]) -> Value {
+        json!({
+            "phase": "response",
+            "status": status,
+            "headers": headers,
+            "body": body,
+            "rule_ids": ["property"],
+        })
+    }
+
+    fn response_actions() -> BoxedStrategy<Vec<ActionCase>> {
+        (
+            200u16..=599,
+            header(),
+            prop::sample::select(vec!["original", "fixture", "body"]),
+            "[A-Za-z0-9_.-]{0,16}".prop_map(|suffix| format!("changed-{suffix}")),
+        )
+            .prop_map(
+                |(status, (header_name, header_value), pattern, replacement)| {
+                    let original_headers = vec![("content-type".into(), "application/json".into())];
+                    let mut changed_headers = original_headers.clone();
+                    changed_headers.push((header_name.clone(), header_value.clone()));
+                    let changed_body = match pattern {
+                        "original" => format!("{replacement} fixture body"),
+                        "fixture" => format!("original {replacement} body"),
+                        "body" => format!("original fixture {replacement}"),
+                        _ => unreachable!("strategy emits only known literal patterns"),
+                    };
+                    vec![
+                        ActionCase {
+                            action: RuleAction::Transform {
+                                transform: RuleTransform::SetStatus { status },
+                            },
+                            expected: response_expected(
+                                status,
+                                original_headers.clone(),
+                                b"original fixture body",
+                            ),
+                        },
+                        ActionCase {
+                            action: RuleAction::Transform {
+                                transform: RuleTransform::SetResponseHeader {
+                                    name: header_name,
+                                    value: header_value,
+                                },
+                            },
+                            expected: response_expected(
+                                201,
+                                changed_headers,
+                                b"original fixture body",
+                            ),
+                        },
+                        ActionCase {
+                            action: RuleAction::Transform {
+                                transform: RuleTransform::ReplaceBody {
+                                    pattern: pattern.into(),
+                                    replacement,
+                                },
+                            },
+                            expected: response_expected(
+                                201,
+                                original_headers,
+                                changed_body.as_bytes(),
+                            ),
+                        },
+                    ]
+                },
+            )
+            .boxed()
+    }
+
+    fn websocket_actions() -> BoxedStrategy<Vec<ActionCase>> {
+        "[A-Za-z0-9 _.-]{0,32}"
+            .prop_map(|text| {
+                vec![
+                    ActionCase {
+                        action: RuleAction::Transform {
+                            transform: RuleTransform::SetWebsocketText { text: text.clone() },
+                        },
+                        expected: json!({
+                            "phase": "websocket",
+                            "outcome": "modify",
+                            "rule_id": "property",
+                            "payload": text.as_bytes(),
+                        }),
+                    },
+                    ActionCase {
+                        action: RuleAction::Terminal {
+                            terminal: RuleTerminal::DropWebsocket,
+                        },
+                        expected: json!({
+                            "phase": "websocket",
+                            "outcome": "drop",
+                            "rule_id": "property",
+                        }),
+                    },
+                ]
+            })
+            .boxed()
+    }
+
+    fn phase_actions(phase: RulePhase) -> BoxedStrategy<Vec<ActionCase>> {
+        match phase {
+            RulePhase::Request => request_actions(),
+            RulePhase::Response => response_actions(),
+            RulePhase::Websocket => websocket_actions(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn context(
+        host: &'static str,
+        path: &'static str,
+        method: &'static str,
+        status: Option<u16>,
+        content_type: Option<&'static str>,
+        body: &'static [u8],
+        direction: Option<WsDirection>,
+        opcode: Option<&'static str>,
+    ) -> MatchContext<'static> {
+        MatchContext {
+            host,
+            path,
+            method,
+            status,
+            content_type,
+            body,
+            direction,
+            opcode,
+        }
+    }
+
+    fn context_pair(phase: RulePhase) -> (MatchContext<'static>, MatchContext<'static>) {
+        match phase {
+            RulePhase::Request => (
+                context(
+                    "original.example.test",
+                    "/original/fixture?operationName=OriginalOperation",
+                    "GET",
+                    None,
+                    None,
+                    br#"{"operationName":"OriginalOperation"}"#,
+                    None,
+                    None,
+                ),
+                context(
+                    "transformed.example.test",
+                    "/transformed/original/fixture?operationName=OriginalOperation",
+                    "GET",
+                    None,
+                    None,
+                    br#"{"operationName":"OriginalOperation"}"#,
+                    None,
+                    None,
+                ),
+            ),
+            RulePhase::Response => (
+                context(
+                    "original.example.test",
+                    "/original/fixture",
+                    "GET",
+                    Some(201),
+                    Some("application/json"),
+                    b"original fixture body",
+                    None,
+                    None,
+                ),
+                context(
+                    "transformed.example.test",
+                    "/transformed/original/fixture",
+                    "GET",
+                    Some(418),
+                    Some("text/plain"),
+                    b"original fixture body",
+                    None,
+                    None,
+                ),
+            ),
+            RulePhase::Websocket => (
+                context(
+                    "original.chat.example.test",
+                    "",
+                    "",
+                    None,
+                    None,
+                    &[],
+                    Some(WsDirection::C2s),
+                    Some("text"),
+                ),
+                context(
+                    "transformed.chat.example.test",
+                    "",
+                    "",
+                    None,
+                    None,
+                    &[],
+                    Some(WsDirection::S2c),
+                    Some("binary"),
+                ),
+            ),
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct RulePropertyCase {
+        phase: RulePhase,
+        match_on: RuleMatchOn,
+        matcher: MatcherCase,
+        actions: Vec<ActionCase>,
+    }
+
+    fn rule_case_for_phase(phase: RulePhase) -> BoxedStrategy<RulePropertyCase> {
+        (match_on(), matcher_tree(phase), phase_actions(phase))
+            .prop_map(move |(match_on, matcher, actions)| RulePropertyCase {
+                phase,
+                match_on,
+                matcher,
+                actions,
+            })
+            .boxed()
+    }
+
+    fn rule_case() -> BoxedStrategy<RulePropertyCase> {
+        prop_oneof![
+            rule_case_for_phase(RulePhase::Request),
+            rule_case_for_phase(RulePhase::Response),
+            rule_case_for_phase(RulePhase::Websocket),
+        ]
+        .boxed()
+    }
+
+    fn compiled_fingerprint(rule: &CompiledRule) -> Value {
+        let local_response = rule.local_response.as_ref().map(|response| {
+            json!({
+                "status": response.status,
+                "headers": &response.headers,
+                "body": response.body.as_ref(),
+            })
+        });
+        json!({
+            "spec": &rule.spec,
+            "replace_regex": rule.replace_regex.as_ref().map(Regex::as_str),
+            "local_response": local_response,
+        })
+    }
+
+    fn matcher_observation(matcher: &RuleMatcher, context: &MatchContext<'_>) -> (bool, Value) {
+        let matched = matcher.matches(context);
+        (matched, matcher.explain(context))
+    }
+
+    proptest! {
+        #![proptest_config(property_config())]
+
+        #[test]
+        fn canonical_rules_compile_evaluate_and_explain_deterministically(case in rule_case()) {
+            let representative_action = case.actions.first().expect("every phase has actions");
+            let spec = RuleSpec {
+                match_on: case.match_on,
+                matcher: case.matcher.matcher.clone(),
+                action: representative_action.action.clone(),
+            };
+            let canonical = serde_json::to_vec(&spec).expect("generated rule serializes");
+            let decoded: RuleSpec = serde_json::from_slice(&canonical)
+                .expect("canonical generated rule deserializes");
+            let reencoded = serde_json::to_vec(&decoded).expect("decoded rule serializes");
+            prop_assert_eq!(&decoded, &spec);
+            prop_assert_eq!(reencoded, canonical);
+
+            let compiled_once = compile_rule(spec.clone()).map_err(|error| {
+                TestCaseError::fail(format!("generated valid rule was rejected: {error}"))
+            })?;
+            let compiled_again = compile_rule(spec).map_err(|error| {
+                TestCaseError::fail(format!("generated valid rule changed validity: {error}"))
+            })?;
+            let compiled_decoded = compile_rule(decoded).map_err(|error| {
+                TestCaseError::fail(format!("round-tripped rule was rejected: {error}"))
+            })?;
+            prop_assert_eq!(compiled_once.spec.phase(), case.phase);
+            prop_assert_eq!(
+                compiled_fingerprint(&compiled_once),
+                compiled_fingerprint(&compiled_again),
+            );
+            prop_assert_eq!(
+                compiled_fingerprint(&compiled_once),
+                compiled_fingerprint(&compiled_decoded),
+            );
+
+            let (original, transformed) = context_pair(case.phase);
+            let original_once = matcher_observation(&compiled_once.spec.matcher, &original);
+            let transformed_once =
+                matcher_observation(&compiled_once.spec.matcher, &transformed);
+            let original_again = matcher_observation(&compiled_once.spec.matcher, &original);
+            let transformed_again =
+                matcher_observation(&compiled_once.spec.matcher, &transformed);
+            let decoded_original =
+                matcher_observation(&compiled_decoded.spec.matcher, &original);
+            let decoded_transformed =
+                matcher_observation(&compiled_decoded.spec.matcher, &transformed);
+            prop_assert_eq!(&original_once, &original_again);
+            prop_assert_eq!(&transformed_once, &transformed_again);
+            prop_assert_eq!(&original_once, &decoded_original);
+            prop_assert_eq!(&transformed_once, &decoded_transformed);
+            prop_assert_ne!(case.matcher.original, case.matcher.transformed);
+            prop_assert_eq!(original_once.0, case.matcher.original);
+            prop_assert_eq!(transformed_once.0, case.matcher.transformed);
+            prop_assert_eq!(
+                original_once.1["matched"].as_bool(),
+                Some(case.matcher.original),
+            );
+            prop_assert_eq!(
+                transformed_once.1["matched"].as_bool(),
+                Some(case.matcher.transformed),
+            );
+
+            let selected = match compiled_once.spec.match_on {
+                RuleMatchOn::Original => original_once.0,
+                RuleMatchOn::Transformed => transformed_once.0,
+            };
+            let selected_expected = match case.match_on {
+                RuleMatchOn::Original => case.matcher.original,
+                RuleMatchOn::Transformed => case.matcher.transformed,
+            };
+            prop_assert_eq!(selected, selected_expected);
+
+            for action_case in &case.actions {
+                let action_spec = RuleSpec {
+                    match_on: case.match_on,
+                    matcher: RuleMatcher::default(),
+                    action: action_case.action.clone(),
+                };
+                let action_json = serde_json::to_vec(&action_spec)
+                    .expect("generated action rule serializes");
+                let decoded_action: RuleSpec = serde_json::from_slice(&action_json)
+                    .expect("generated action rule deserializes");
+                prop_assert_eq!(&decoded_action, &action_spec);
+                prop_assert_eq!(
+                    serde_json::to_vec(&decoded_action)
+                        .expect("decoded action rule serializes"),
+                    action_json,
+                );
+
+                let compiled_action = compile_rule(action_spec.clone()).map_err(|error| {
+                    TestCaseError::fail(format!("generated action was rejected: {error}"))
+                })?;
+                let compiled_action_again = compile_rule(action_spec).map_err(|error| {
+                    TestCaseError::fail(format!("generated action changed validity: {error}"))
+                })?;
+                let compiled_decoded_action = compile_rule(decoded_action).map_err(|error| {
+                    TestCaseError::fail(format!("round-tripped action was rejected: {error}"))
+                })?;
+                prop_assert_eq!(
+                    compiled_fingerprint(&compiled_action),
+                    compiled_fingerprint(&compiled_action_again),
+                );
+                prop_assert_eq!(
+                    compiled_fingerprint(&compiled_action),
+                    compiled_fingerprint(&compiled_decoded_action),
+                );
+
+                let runtime =
+                    crate::net::proxy::rule_runtime_observation(compiled_action);
+                let runtime_again =
+                    crate::net::proxy::rule_runtime_observation(compiled_action_again);
+                let runtime_decoded =
+                    crate::net::proxy::rule_runtime_observation(compiled_decoded_action);
+                prop_assert_eq!(&runtime, &action_case.expected);
+                prop_assert_eq!(&runtime_again, &action_case.expected);
+                prop_assert_eq!(&runtime_decoded, &action_case.expected);
+            }
+        }
+    }
 
     #[test]
     fn legacy_rule_decodes_to_canonical_typed_shape() {

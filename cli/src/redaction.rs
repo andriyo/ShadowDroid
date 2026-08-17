@@ -27,7 +27,7 @@ static JWT: LazyLock<Regex> = LazyLock::new(|| {
 static BEARER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+").expect("bearer regex"));
 static HEADER_LINE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?im)\b(authorization|proxy-authorization|cookie|set-cookie)\s*:\s*[^\r\n]+")
+    Regex::new(r"(?im)\b(authorization|proxy-authorization|cookie|set-cookie)\s*:\s*([^\r\n]+)")
         .expect("header-line regex")
 });
 static QUERY_SECRET: LazyLock<Regex> = LazyLock::new(|| {
@@ -53,6 +53,10 @@ static IPV4: LazyLock<Regex> = LazyLock::new(|| {
 });
 static IPV6_CANDIDATE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[0-9A-Fa-f]*:[0-9A-Fa-f:]+").expect("IPv6 candidate regex"));
+static REDACTION_PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:<redacted:[a-z][a-z0-9_-]*>|%3Credacted%3A[a-z][a-z0-9_-]*%3E)")
+        .expect("redaction placeholder regex")
+});
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicySpec {
@@ -89,6 +93,54 @@ impl Change {
     }
 }
 
+fn split_redaction_metadata(prior: Option<Value>) -> (serde_json::Map<String, Value>, Value) {
+    let Some(Value::Object(mut existing)) = prior else {
+        return (serde_json::Map::new(), Value::Object(Default::default()));
+    };
+
+    // These fields are regenerated below. Removing them also prevents an
+    // already-redacted record from counting its own policy label on pass two.
+    for key in [
+        "enabled",
+        "policy",
+        "version",
+        "redacted_values",
+        "custom_json_keys",
+        "custom_patterns",
+    ] {
+        existing.remove(key);
+    }
+
+    let mut safe = serde_json::Map::new();
+    for key in ["screenshot_pixels_requested", "video_pixels"] {
+        if existing.get(key).is_some_and(Value::is_boolean) {
+            safe.insert(
+                key.to_string(),
+                existing.remove(key).expect("checked metadata field exists"),
+            );
+        }
+    }
+    if existing
+        .get("metadata")
+        .and_then(Value::as_str)
+        .is_some_and(|value| {
+            matches!(
+                value,
+                "marker_labels_only" | "marker_labels_builtin_or_configured_v1" | "not_requested"
+            )
+        })
+    {
+        safe.insert(
+            "metadata".to_string(),
+            existing
+                .remove("metadata")
+                .expect("checked metadata field exists"),
+        );
+    }
+
+    (safe, Value::Object(existing))
+}
+
 impl Policy {
     pub fn new(mut spec: PolicySpec) -> Result<Self> {
         dedupe(&mut spec.json_keys);
@@ -101,7 +153,7 @@ impl Policy {
             .collect();
         let mut custom_patterns = Vec::with_capacity(spec.patterns.len());
         for (index, pattern) in spec.patterns.iter().enumerate() {
-            custom_patterns.push(Regex::new(pattern).map_err(|error| {
+            let compiled = Regex::new(pattern).map_err(|error| {
                 crate::diagnostic::DiagnosticError::new(
                     "invalid_redaction_pattern",
                     "config",
@@ -112,7 +164,33 @@ impl Policy {
                     "fix or remove the invalid redaction pattern",
                     "shadowdroid config validate --json",
                 ])
-            })?);
+            })?;
+            let minimum_len = regex_syntax::Parser::new()
+                .parse(pattern)
+                .ok()
+                .and_then(|hir| hir.properties().minimum_len());
+            if minimum_len.is_none_or(|length| length == 0) {
+                let reason = if minimum_len == Some(0) {
+                    "pattern_can_match_empty_text"
+                } else {
+                    "pattern_minimum_length_unknown"
+                };
+                return Err(crate::diagnostic::DiagnosticError::new(
+                    "invalid_redaction_pattern",
+                    "config",
+                    format!("redaction.patterns[{index}] must consume at least one character"),
+                )
+                .detail(json!({
+                    "pattern_index": index,
+                    "reason": reason
+                }))
+                .next_actions([
+                    "make the pattern match the sensitive text itself, not only a boundary",
+                    "shadowdroid config validate --json",
+                ])
+                .into());
+            }
+            custom_patterns.push(compiled);
         }
         Ok(Self {
             spec,
@@ -144,31 +222,40 @@ impl Policy {
     }
 
     pub fn redact_output(&self, mut value: Value) -> Value {
+        // `/redaction` is a reserved metadata namespace. Canonical fields and
+        // explicitly typed privacy flags stay outside configured matching so a
+        // pattern such as `builtin` cannot rewrite metadata on every pass.
+        // Every unknown member is still untrusted output and goes through the
+        // complete redaction pipeline before it is restored.
+        let prior_redaction = match &mut value {
+            Value::Object(map) => map.remove("redaction"),
+            _ => None,
+        };
+        let previously_redacted = prior_redaction
+            .as_ref()
+            .and_then(|metadata| metadata.get("redacted_values"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let (mut metadata, mut untrusted_metadata) = split_redaction_metadata(prior_redaction);
         let mut literals = BTreeMap::new();
         self.collect_sensitive_literals(&value, &mut literals);
+        self.collect_sensitive_literals(&untrusted_metadata, &mut literals);
         let mut change = self.redact_value(&mut value);
+        change.merge(self.redact_value(&mut untrusted_metadata));
         change.values += redact_known_literals(&mut value, &literals);
+        change.values += redact_known_literals(&mut untrusted_metadata, &literals);
+        let redacted_values = previously_redacted.saturating_add(change.values as u64);
         if let Value::Object(map) = &mut value {
-            let metadata = map
-                .entry("redaction")
-                .or_insert_with(|| Value::Object(Default::default()));
-            if let Value::Object(metadata) = metadata {
-                metadata.insert("enabled".into(), true.into());
-                metadata.insert("policy".into(), self.label().into());
-                metadata.insert("version".into(), POLICY_VERSION.into());
-                metadata.insert("redacted_values".into(), change.values.into());
-                metadata.insert("custom_json_keys".into(), self.spec.json_keys.len().into());
-                metadata.insert("custom_patterns".into(), self.spec.patterns.len().into());
-            } else {
-                *metadata = json!({
-                    "enabled": true,
-                    "policy": self.label(),
-                    "version": POLICY_VERSION,
-                    "redacted_values": change.values,
-                    "custom_json_keys": self.spec.json_keys.len(),
-                    "custom_patterns": self.spec.patterns.len(),
-                });
+            if let Value::Object(untrusted_metadata) = untrusted_metadata {
+                metadata.extend(untrusted_metadata);
             }
+            metadata.insert("enabled".into(), true.into());
+            metadata.insert("policy".into(), self.label().into());
+            metadata.insert("version".into(), POLICY_VERSION.into());
+            metadata.insert("redacted_values".into(), redacted_values.into());
+            metadata.insert("custom_json_keys".into(), self.spec.json_keys.len().into());
+            metadata.insert("custom_patterns".into(), self.spec.patterns.len().into());
+            map.insert("redaction".into(), Value::Object(metadata));
             if change.body {
                 map.insert("body_redacted".into(), true.into());
             }
@@ -209,6 +296,9 @@ impl Policy {
     }
 
     pub fn redact_header_value(&self, name: &str, value: &str) -> String {
+        if is_redaction_placeholder(value) {
+            return value.to_string();
+        }
         sensitive_kind(name, &self.custom_keys)
             .map(|kind| placeholder(kind, Some(value)).to_string())
             .unwrap_or_else(|| self.redact_text(value))
@@ -256,13 +346,17 @@ impl Policy {
                                 String::new()
                             } else {
                                 let decoded_value = decode_url_component(raw_value);
-                                let replacement = urlencoding::encode(placeholder(
-                                    kind,
-                                    Some(decoded_value.as_ref()),
-                                ))
-                                .into_owned();
-                                changed |= replacement != raw_value;
-                                replacement
+                                if is_redaction_placeholder(decoded_value.as_ref()) {
+                                    raw_value.to_string()
+                                } else {
+                                    let replacement = urlencoding::encode(placeholder(
+                                        kind,
+                                        Some(decoded_value.as_ref()),
+                                    ))
+                                    .into_owned();
+                                    changed |= replacement != raw_value;
+                                    replacement
+                                }
                             }
                         } else {
                             self.redact_encoded_component(raw_value, &mut changed)
@@ -395,7 +489,7 @@ impl Policy {
                     if let Some(kind) = sensitive_kind(key, &self.custom_keys)
                         && let Some(value) = value.as_str()
                         && value.len() >= 4
-                        && !value.starts_with("<redacted:")
+                        && !is_redaction_placeholder(value)
                     {
                         literals.insert(value.to_string(), placeholder(kind, Some(value)));
                     }
@@ -412,7 +506,7 @@ impl Policy {
     }
 
     fn redact_string(&self, input: &str) -> (String, usize) {
-        if input.starts_with("<redacted:") && input.ends_with('>') {
+        if is_redaction_placeholder(input) {
             return (input.to_string(), 0);
         }
         let trimmed = input.trim();
@@ -455,14 +549,28 @@ impl Policy {
         output = replace_count(&BEARER, &output, "<redacted:token>", &mut changes);
         output = HEADER_LINE
             .replace_all(&output, |captures: &regex::Captures<'_>| {
-                changes += 1;
-                format!("{}: <redacted:token>", &captures[1])
+                let original = &captures[0];
+                if is_redaction_placeholder(captures[2].trim()) {
+                    return original.to_string();
+                }
+                let replacement = format!("{}: <redacted:token>", &captures[1]);
+                if replacement != original {
+                    changes += 1;
+                }
+                replacement
             })
             .into_owned();
         output = QUERY_SECRET
             .replace_all(&output, |captures: &regex::Captures<'_>| {
-                changes += 1;
-                format!("{}=<redacted:secret>", &captures[1])
+                let original = &captures[0];
+                if is_redaction_placeholder(&captures[2]) {
+                    return original.to_string();
+                }
+                let replacement = format!("{}=<redacted:secret>", &captures[1]);
+                if replacement != original {
+                    changes += 1;
+                }
+                replacement
             })
             .into_owned();
         output = replace_count(&IPV4, &output, "<redacted:ip>", &mut changes);
@@ -478,12 +586,7 @@ impl Policy {
             })
             .into_owned();
         for pattern in &self.custom_patterns {
-            output = pattern
-                .replace_all(&output, |_captures: &regex::Captures<'_>| {
-                    changes += 1;
-                    "<redacted:pattern>"
-                })
-                .into_owned();
+            output = replace_count(pattern, &output, "<redacted:pattern>", &mut changes);
         }
         (output, changes)
     }
@@ -508,9 +611,10 @@ fn redact_known_literals(value: &mut Value, literals: &BTreeMap<String, &'static
             let mut ordered = literals.iter().collect::<Vec<_>>();
             ordered.sort_by_key(|(literal, _)| std::cmp::Reverse(literal.len()));
             for (literal, placeholder) in ordered {
-                let count = text.matches(literal).count();
+                let (redacted, count) =
+                    replace_literal_preserving_placeholders(text, literal, placeholder);
                 if count > 0 {
-                    *text = text.replace(literal, placeholder);
+                    *text = redacted;
                     replacements += count;
                 }
             }
@@ -534,7 +638,7 @@ fn redact_json_string_pairs(
             let Some(kind) = sensitive_kind(key, custom_keys) else {
                 return captures[0].to_string();
             };
-            if value.starts_with("<redacted:") {
+            if is_redaction_placeholder(value) {
                 return captures[0].to_string();
             }
             *changes += 1;
@@ -549,12 +653,76 @@ fn redact_json_string_pairs(
 }
 
 fn replace_count(regex: &Regex, input: &str, replacement: &str, changes: &mut usize) -> String {
-    let count = regex.find_iter(input).count();
-    if count == 0 {
-        return input.to_string();
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0usize;
+    for placeholder in REDACTION_PLACEHOLDER.find_iter(input) {
+        output.push_str(&replace_count_in_unredacted_span(
+            regex,
+            &input[cursor..placeholder.start()],
+            replacement,
+            changes,
+        ));
+        output.push_str(placeholder.as_str());
+        cursor = placeholder.end();
     }
-    *changes += count;
-    regex.replace_all(input, replacement).into_owned()
+    output.push_str(&replace_count_in_unredacted_span(
+        regex,
+        &input[cursor..],
+        replacement,
+        changes,
+    ));
+    output
+}
+
+fn replace_count_in_unredacted_span(
+    regex: &Regex,
+    input: &str,
+    replacement: &str,
+    changes: &mut usize,
+) -> String {
+    regex
+        .replace_all(input, |captures: &regex::Captures<'_>| {
+            let matched = captures.get(0).expect("regex capture zero exists");
+            if matched.as_str() == replacement {
+                return matched.as_str().to_string();
+            }
+            *changes += 1;
+            replacement.to_string()
+        })
+        .into_owned()
+}
+
+fn replace_literal_preserving_placeholders(
+    input: &str,
+    literal: &str,
+    replacement: &str,
+) -> (String, usize) {
+    if literal.is_empty() || literal == replacement {
+        return (input.to_string(), 0);
+    }
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0usize;
+    let mut changes = 0usize;
+    for placeholder in REDACTION_PLACEHOLDER.find_iter(input) {
+        let span = &input[cursor..placeholder.start()];
+        changes += span.matches(literal).count();
+        output.push_str(&span.replace(literal, replacement));
+        output.push_str(placeholder.as_str());
+        cursor = placeholder.end();
+    }
+    let span = &input[cursor..];
+    changes += span.matches(literal).count();
+    output.push_str(&span.replace(literal, replacement));
+    if changes == 0 {
+        return (input.to_string(), 0);
+    }
+    (output, changes)
+}
+
+fn is_redaction_placeholder(value: &str) -> bool {
+    REDACTION_PLACEHOLDER
+        .find(value)
+        .is_some_and(|matched| matched.start() == 0 && matched.end() == value.len())
 }
 
 fn normalize_key(key: &str) -> String {
@@ -631,9 +799,7 @@ fn placeholder(kind: &str, value: Option<&str>) -> &'static str {
 }
 
 fn is_placeholder(value: &Value) -> bool {
-    value
-        .as_str()
-        .is_some_and(|value| value.starts_with("<redacted:") && value.ends_with('>'))
+    value.as_str().is_some_and(is_redaction_placeholder)
 }
 
 fn is_body_key(key: &str) -> bool {
@@ -775,6 +941,270 @@ fn redact_png(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    fn property_config() -> ProptestConfig {
+        ProptestConfig {
+            cases: 160,
+            rng_seed: proptest::test_runner::RngSeed::Fixed(0x5344_5245_4441_4354),
+            ..ProptestConfig::default()
+        }
+    }
+
+    fn realistic_text() -> BoxedStrategy<String> {
+        prop_oneof![
+            1 => prop::collection::vec(any::<char>(), 0..256)
+                .prop_map(|chars| chars.into_iter().collect()),
+            3 => "[A-Za-z0-9]{8,32}".prop_map(|secret| format!("token={secret}&safe=visible")),
+            3 => "[A-Za-z0-9._~-]{8,32}"
+                .prop_map(|secret| format!("Authorization: Bearer {secret}")),
+            2 => "[A-Za-z0-9]{8,32}".prop_map(|secret| {
+                json!({
+                    "message": format!("token={secret}"),
+                    "nested": {"authorization": secret},
+                })
+                .to_string()
+            }),
+            2 => Just(
+                "Authorization: <redacted:token>\n\
+                 token=<redacted:secret>&encoded=%3Credacted%3Atoken%3E"
+                    .to_string(),
+            ),
+        ]
+        .boxed()
+    }
+
+    proptest! {
+        #![proptest_config(property_config())]
+
+        #[test]
+        fn text_redaction_is_idempotent(input in realistic_text()) {
+            let policy = Policy::builtin();
+            let once = policy.redact_text(&input);
+            prop_assert_eq!(policy.redact_text(&once), once);
+        }
+
+        #[test]
+        fn structured_output_redaction_is_idempotent(
+            secret in "[A-Za-z0-9]{8,32}",
+            safe_tail in "[A-Za-z0-9 ._/-]{0,48}",
+            order in 0u32..100_000,
+            message_kind in 0u8..6,
+        ) {
+            let policy = Policy::new(PolicySpec {
+                json_keys: vec!["customerCode".into()],
+                patterns: vec![r"ORDER-[0-9]+".into(), "redacted".into()],
+            })
+            .unwrap();
+            let message = match message_kind {
+                0 => format!("token={secret}&safe={safe_tail}"),
+                1 => format!("Authorization: Bearer {secret}"),
+                2 => format!(
+                    "already redacted outside <redacted:token> ORDER-{order} {safe_tail}"
+                ),
+                3 => format!(
+                    "token=<redacted:secret>&encoded=%3Credacted%3Atoken%3E ORDER-{order}"
+                ),
+                4 => json!({"authorization": secret, "safe": safe_tail}).to_string(),
+                _ => format!("ORDER-{order} {safe_tail}"),
+            };
+            let input = json!({
+                "access_token": secret.clone(),
+                "message": message,
+                "echo": secret,
+                "customerCode": format!("customer-{order}"),
+                "nested": {"email": "person@example.invalid"},
+            });
+            let once = policy.redact_output(input);
+            let twice = policy.redact_output(once.clone());
+            prop_assert_eq!(twice, once);
+        }
+
+        #[test]
+        fn generated_query_redaction_matches_the_exact_independent_target(
+            secret_a in "[A-Za-z0-9]{8,32}",
+            secret_b in "[A-Za-z0-9]{8,32}",
+            safe_values in prop::collection::vec("[a-z0-9_-]{0,16}", 1..8),
+            parameter_kinds in prop::collection::vec(0u8..8, 1..24),
+        ) {
+            let policy = Policy::builtin();
+            let mut input_parameters = Vec::with_capacity(parameter_kinds.len());
+            let mut expected_parameters = Vec::with_capacity(parameter_kinds.len());
+            for (index, kind) in parameter_kinds.into_iter().enumerate() {
+                let safe = &safe_values[index % safe_values.len()];
+                let (input, expected) = match kind {
+                    0 => (
+                        format!("access%5Ftoken={secret_a}"),
+                        "access%5Ftoken=%3Credacted%3Atoken%3E".to_string(),
+                    ),
+                    1 => (
+                        format!("token={secret_b}"),
+                        "token=%3Credacted%3Atoken%3E".to_string(),
+                    ),
+                    2 => (
+                        "email=person%40example.invalid".to_string(),
+                        "email=%3Credacted%3Aemail%3E".to_string(),
+                    ),
+                    3 => (
+                        format!("password={secret_a}"),
+                        "password=%3Credacted%3Asecret%3E".to_string(),
+                    ),
+                    // Separate arms deliberately produce duplicate `safe`
+                    // names. Their order and values must remain byte-for-byte
+                    // stable rather than being normalized as a map.
+                    4 | 5 => (format!("safe={safe}"), format!("safe={safe}")),
+                    6 => (format!("page={safe}"), format!("page={safe}")),
+                    _ => ("token=".to_string(), "token=".to_string()),
+                };
+                input_parameters.push(input);
+                expected_parameters.push(expected);
+            }
+            let input = format!("/v1/items?{}#section", input_parameters.join("&"));
+            let expected = format!("/v1/items?{}#section", expected_parameters.join("&"));
+            let (once, changed) = policy.redact_request_target(&input);
+            let (twice, changed_again) = policy.redact_request_target(&once);
+            prop_assert_eq!(&once, &expected);
+            prop_assert_eq!(changed, input != expected);
+            prop_assert_eq!(twice, once);
+            prop_assert!(!changed_again);
+        }
+    }
+
+    #[test]
+    fn inline_and_configured_placeholders_preserve_counts_on_repeated_output_redaction() {
+        let policy = Policy::new(PolicySpec {
+            json_keys: vec![],
+            patterns: vec!["redacted".into(), r"ORDER-[0-9]+".into()],
+        })
+        .unwrap();
+        let first = policy.redact_output(json!({
+            "message": "token=first\nAuthorization: Bearer second\nexisting token=<redacted:secret> <redacted:pattern> %3Credacted%3Atoken%3E ORDER-42",
+        }));
+        let first_count = first["redaction"]["redacted_values"].clone();
+        let second = policy.redact_output(first.clone());
+
+        assert_eq!(second, first);
+        assert_eq!(second["redaction"]["redacted_values"], first_count);
+    }
+
+    #[test]
+    fn sensitive_literals_never_rewrite_the_placeholder_that_replaced_them() {
+        let policy = Policy::builtin();
+        let first = policy.redact_output(json!({
+            "access_token": "redacted",
+            "message": "echo redacted",
+        }));
+
+        assert_eq!(first["access_token"], "<redacted:token>");
+        assert_eq!(first["message"], "echo <redacted:token>");
+        assert_eq!(first["redaction"]["redacted_values"], 2);
+        assert_eq!(policy.redact_output(first.clone()), first);
+    }
+
+    #[test]
+    fn minimized_known_literal_idempotence_regression_is_pinned_by_value() {
+        // Former proptest seed
+        // 101f699bd05fc081b05c17874a6ee0ae59a9ae5574183b30777eff0670c25c48
+        // shrank to this exact secret and empty message. Pin the minimized value
+        // directly so future strategy changes cannot silently change the case.
+        let policy = Policy::builtin();
+        let first = policy.redact_output(json!({
+            "access_token": "AA0aAaaA",
+            "message": "",
+            "echo": "AA0aAaaA",
+        }));
+
+        assert_eq!(first["access_token"], "<redacted:token>");
+        assert_eq!(first["message"], "");
+        assert_eq!(first["echo"], "<redacted:token>");
+        assert_eq!(first["redaction"]["redacted_values"], 2);
+        assert_eq!(policy.redact_output(first.clone()), first);
+    }
+
+    #[test]
+    fn flattened_plugin_redaction_metadata_cannot_bypass_policy() {
+        let policy = Policy::builtin();
+        let first = policy.redact_output(json!({
+            "type": "logpoint",
+            "redaction": {
+                "screenshot_pixels_requested": true,
+                "video_pixels": false,
+                "metadata": "marker_labels_only",
+                "note": "Authorization: Bearer plugin-secret",
+                "access_token": "metadata-secret",
+                "echo": "metadata-secret",
+            },
+        }));
+
+        let metadata = &first["redaction"];
+        assert_eq!(metadata["screenshot_pixels_requested"], true);
+        assert_eq!(metadata["video_pixels"], false);
+        assert_eq!(metadata["metadata"], "marker_labels_only");
+        assert_eq!(metadata["note"], "Authorization: <redacted:token>");
+        assert_eq!(metadata["access_token"], "<redacted:token>");
+        assert_eq!(metadata["echo"], "<redacted:token>");
+        assert_eq!(metadata["redacted_values"], 3);
+        assert_eq!(policy.redact_output(first.clone()), first);
+    }
+
+    #[test]
+    fn custom_redaction_patterns_must_consume_text() {
+        for pattern in [r"\b", r"[a&&b]|"] {
+            let error = Policy::new(PolicySpec {
+                json_keys: vec![],
+                patterns: vec![pattern.into()],
+            })
+            .unwrap_err();
+            let diagnostic = error
+                .downcast_ref::<crate::diagnostic::DiagnosticError>()
+                .unwrap();
+            assert_eq!(diagnostic.code, "invalid_redaction_pattern");
+        }
+    }
+
+    #[test]
+    fn json_fragments_only_treat_exact_placeholders_as_opaque() {
+        let policy = Policy::builtin();
+        for input in [
+            r#"prefix "password":"<redacted:token>suffix-secret" tail"#,
+            r#"prefix \"password\":\"<redacted:token>suffix-secret\" tail"#,
+        ] {
+            let output = policy.redact_text(input);
+            assert!(
+                !output.contains("suffix-secret"),
+                "fragment leaked: {output}"
+            );
+            assert!(output.contains("<redacted:secret>"));
+        }
+
+        for input in [
+            r#"prefix "password":"%3Credacted%3Atoken%3E" tail"#,
+            r#"prefix \"password\":\"%3Credacted%3Atoken%3E\" tail"#,
+        ] {
+            assert_eq!(policy.redact_text(input), input);
+        }
+    }
+
+    #[test]
+    fn generated_redaction_metadata_is_outside_custom_policy_matching() {
+        let policy = Policy::new(PolicySpec {
+            json_keys: vec!["policy".into()],
+            patterns: vec!["builtin".into()],
+        })
+        .unwrap();
+        let first = policy.redact_output(json!({
+            "policy": "outside-policy-value",
+            "message": "builtin outside metadata",
+            "redaction": {"screenshot_pixels_requested": true},
+        }));
+
+        assert_eq!(first["policy"], "<redacted:configured>");
+        assert_eq!(first["message"], "<redacted:pattern> outside metadata");
+        assert_eq!(first["redaction"]["policy"], "builtin+config");
+        assert_eq!(first["redaction"]["screenshot_pixels_requested"], true);
+        assert_eq!(first["redaction"]["redacted_values"], 2);
+        assert_eq!(policy.redact_output(first.clone()), first);
+    }
 
     #[test]
     fn nested_json_and_graphql_body_keep_shape_and_typed_placeholders() {

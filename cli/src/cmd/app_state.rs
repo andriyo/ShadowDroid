@@ -2293,6 +2293,87 @@ fn protect_host_file(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    fn property_config() -> ProptestConfig {
+        ProptestConfig {
+            cases: 128,
+            rng_seed: proptest::test_runner::RngSeed::Fixed(0x5344_4150_5053_5441),
+            ..ProptestConfig::default()
+        }
+    }
+
+    proptest! {
+        #![proptest_config(property_config())]
+
+        #[cfg(unix)]
+        #[test]
+        fn shell_arguments_round_trip_through_a_real_shell_without_value_loss(
+            chars in prop::collection::vec(
+                prop_oneof![
+                    3 => prop::sample::select(vec![
+                        '\'', '\\', ' ', '\t', '\n', '"', '$', '`', ';', '&', '|', '<', '>', '*', '?',
+                    ]),
+                    1 => any::<char>().prop_filter(
+                        "NUL cannot be transported in a process argument",
+                        |ch| *ch != '\0',
+                    ),
+                ],
+                0..128,
+            ),
+        ) {
+            let value = chars.into_iter().collect::<String>();
+            let script = format!("printf '%s' {}", shell_quote(&value));
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .output()
+                .map_err(|error| TestCaseError::fail(format!("start shell oracle: {error}")))?;
+            prop_assert!(
+                output.status.success(),
+                "shell oracle failed: {}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            prop_assert_eq!(output.stdout.as_slice(), value.as_bytes());
+        }
+
+        #[test]
+        fn transaction_root_metadata_round_trips_generated_safe_roots(
+            entries in prop::collection::btree_map("[a-z][a-z0-9_]{0,12}", any::<bool>(), 1..16),
+        ) {
+            let expected = entries
+                .into_iter()
+                .map(|(name, existed)| TransactionRoot {
+                    path: format!("files/{name}"),
+                    existed,
+                })
+                .collect::<Vec<_>>();
+            let encoded = expected
+                .iter()
+                .map(|root| format!("{}\t{}\n", root.path, u8::from(root.existed)))
+                .collect::<String>();
+            prop_assert_eq!(parse_transaction_roots(&encoded).unwrap(), expected);
+        }
+
+        #[test]
+        fn every_valid_pending_transaction_has_one_terminal_interpretation(
+            name in "[a-z0-9]{1,16}",
+            pid in 1u32..u32::MAX,
+            nonce in 1u32..u32::MAX,
+        ) {
+            let transaction = format!("txn-{name}-{pid}-{nonce}");
+            let pending = format!("__shadowdroid_pending__{transaction}\n");
+            let terminal = format!("__shadowdroid_terminal__{transaction}\n");
+            prop_assert_eq!(
+                parse_pending_terminal_state(&pending, &transaction).unwrap(),
+                PendingTerminalState::Pending(transaction.clone()),
+            );
+            prop_assert_eq!(
+                parse_pending_terminal_state(&terminal, &transaction).unwrap(),
+                PendingTerminalState::Terminal,
+            );
+        }
+    }
 
     #[test]
     fn private_paths_are_normalized_and_reserved_storage_is_refused() {

@@ -1511,7 +1511,16 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use serde_json::json;
+
+    fn property_config() -> ProptestConfig {
+        ProptestConfig {
+            cases: 96,
+            rng_seed: proptest::test_runner::RngSeed::Fixed(0x5344_5245_504c_4159),
+            ..ProptestConfig::default()
+        }
+    }
 
     fn sample_flow(id: &str, path: &str, request: &str, response: &str) -> FlowRecord {
         FlowRecord {
@@ -1550,6 +1559,61 @@ mod tests {
         );
         let summary = write_bundle(&[source(&flow)], dir).unwrap();
         (flow, summary)
+    }
+
+    proptest! {
+        #![proptest_config(property_config())]
+
+        #[test]
+        fn bundle_and_wire_round_trip_preserve_exact_request_identity(
+            host_label in "[a-z][a-z0-9]{0,10}",
+            path_segment in "[a-z][a-z0-9_-]{0,16}",
+            query_value in "[A-Za-z0-9._~-]{0,24}",
+            variable_value in "[A-Za-z0-9 _.-]{0,24}",
+            response_value in "[A-Za-z0-9 _.-]{0,24}",
+        ) {
+            let request = serde_json::to_string(&json!({
+                "operationName": "PropertyRoundTrip",
+                "variables": {"value": variable_value},
+            })).unwrap();
+            let response = serde_json::to_string(&json!({
+                "echo": response_value,
+            })).unwrap();
+            let path = format!("/{path_segment}?case={query_value}");
+            let mut flow = sample_flow("property", &path, &request, &response);
+            flow.host = format!("{host_label}.example.test");
+            flow.port = Some(443);
+
+            let built = build_bundle(&[ReplaySource::from_flow(&flow).unwrap()]).unwrap();
+            let set = built.into_replay_set(None).unwrap();
+            let active_set_sha256 = set.active_set_sha256().to_owned();
+            let restored = ReplaySet::from_payload(set.to_payload()).unwrap();
+            prop_assert_eq!(restored.active_set_sha256(), active_set_sha256);
+
+            let exact_request = ReplayRequest {
+                method: "post",
+                scheme: "HTTPS",
+                host: &flow.host.to_ascii_uppercase(),
+                effective_port: 443,
+                path_and_query: &flow.path,
+                body: request.as_bytes(),
+            };
+            let ReplayLookup::Hit(replayed) = restored.lookup(&exact_request).unwrap() else {
+                return Err(TestCaseError::fail("exact replay request missed after round trip"));
+            };
+            prop_assert_eq!(replayed.status, 207);
+            prop_assert_eq!(replayed.body, response);
+
+            let different_body = serde_json::to_vec(&json!({
+                "operationName": "PropertyRoundTrip",
+                "variables": {"value": format!("{variable_value}!")},
+            })).unwrap();
+            let mismatch = ReplayRequest {
+                body: &different_body,
+                ..exact_request
+            };
+            prop_assert_eq!(restored.lookup(&mismatch).unwrap(), ReplayLookup::Miss);
+        }
     }
 
     #[test]

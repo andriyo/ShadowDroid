@@ -835,6 +835,172 @@ pub fn expand_config_path(value: &Option<String>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    fn optional_name() -> impl Strategy<Value = Option<String>> {
+        prop::option::of("[A-Za-z0-9._/-]{0,16}")
+    }
+
+    fn property_config() -> ProptestConfig {
+        ProptestConfig {
+            cases: 128,
+            rng_seed: proptest::test_runner::RngSeed::Fixed(0x5344_434f_4e46_4947),
+            ..ProptestConfig::default()
+        }
+    }
+
+    fn redaction_config() -> impl Strategy<Value = Option<RedactionConfig>> {
+        prop::option::of(
+            (
+                prop::option::of(any::<bool>()),
+                prop::collection::vec("[A-Za-z][A-Za-z0-9_]{0,8}", 0..4),
+                prop::collection::vec("[A-Za-z0-9._-]{0,12}", 0..4),
+            )
+                .prop_map(|(enabled, json_keys, patterns)| RedactionConfig {
+                    enabled,
+                    json_keys,
+                    patterns,
+                }),
+        )
+    }
+
+    fn proxy_config() -> impl Strategy<Value = Option<ProxyConfig>> {
+        prop::option::of(
+            (
+                prop::collection::vec(optional_name(), 2),
+                prop::collection::vec(prop::option::of(any::<bool>()), 5),
+                prop::option::of(1u16..=u16::MAX),
+                prop::collection::vec("[a-z]{1,8}\\.example", 0..3),
+                prop::option::of(prop_oneof![
+                    Just("system".to_string()),
+                    Just("user".to_string()),
+                    Just("push".to_string()),
+                ]),
+            )
+                .prop_map(|(paths, flags, port, hosts, trust_store)| ProxyConfig {
+                    ca_cert: paths[0].clone(),
+                    ca_key: paths[1].clone(),
+                    ca_trusted: flags[0],
+                    port,
+                    hosts,
+                    trust_store,
+                    verify_upstream: flags[1],
+                    anticache: flags[2],
+                    anticomp: flags[3],
+                    redact: flags[4],
+                }),
+        )
+    }
+
+    fn app_config() -> impl Strategy<Value = AppConfig> {
+        ("[a-z]{1,8}", prop::collection::vec(optional_name(), 5)).prop_map(|(package, fields)| {
+            AppConfig {
+                package: format!("com.example.{package}"),
+                project: fields[0].clone(),
+                run_configuration: fields[1].clone(),
+                debugger: fields[2].clone(),
+                debug_mode: fields[3].clone(),
+                target: fields[4].clone(),
+            }
+        })
+    }
+
+    fn app_map() -> impl Strategy<Value = BTreeMap<String, AppConfig>> {
+        prop::collection::btree_map("[a-d]", app_config(), 0..5)
+    }
+
+    fn target_config() -> impl Strategy<Value = DeviceTargetConfig> {
+        (
+            optional_name(),
+            optional_name(),
+            prop::option::of(prop_oneof![
+                Just(TargetStartPolicy::Never),
+                Just(TargetStartPolicy::IfNeeded),
+            ]),
+            prop::option::of(prop_oneof![
+                Just(TargetFormFactor::Mobile),
+                Just(TargetFormFactor::Tv),
+            ]),
+            prop::option::of(any::<bool>()),
+            prop::option::of(0u64..10_000),
+        )
+            .prop_map(
+                |(avd, serial, start, form_factor, cold_boot, boot_timeout_seconds)| {
+                    DeviceTargetConfig {
+                        avd,
+                        serial,
+                        start,
+                        form_factor,
+                        cold_boot,
+                        boot_timeout_seconds,
+                    }
+                },
+            )
+    }
+
+    fn target_map() -> impl Strategy<Value = BTreeMap<String, DeviceTargetConfig>> {
+        prop::collection::btree_map("[a-d]", target_config(), 0..5)
+    }
+
+    fn config() -> impl Strategy<Value = ShadowDroidConfig> {
+        (
+            prop::collection::vec(optional_name(), 10),
+            prop::option::of(any::<bool>()),
+            redaction_config(),
+            proxy_config(),
+            app_map(),
+            target_map(),
+        )
+            .prop_map(|(scalars, usage_log, redaction, proxy, apps, targets)| {
+                let mut scalars = scalars.into_iter();
+                ShadowDroidConfig {
+                    device: scalars.next().expect("device scalar exists"),
+                    default_target: scalars.next().expect("target scalar exists"),
+                    app: scalars.next().expect("app scalar exists"),
+                    project: scalars.next().expect("project scalar exists"),
+                    studio_url: scalars.next().expect("studio URL scalar exists"),
+                    android_studio: scalars.next().expect("studio path scalar exists"),
+                    studio_plugin: scalars.next().expect("studio plugin scalar exists"),
+                    debugger: scalars.next().expect("debugger scalar exists"),
+                    debug_mode: scalars.next().expect("debug mode scalar exists"),
+                    run_configuration: scalars.next().expect("run configuration scalar exists"),
+                    usage_log,
+                    redaction,
+                    proxy,
+                    apps,
+                    targets,
+                    ..Default::default()
+                }
+            })
+    }
+
+    fn merged(mut base: ShadowDroidConfig, over: ShadowDroidConfig) -> ShadowDroidConfig {
+        base.merge(over);
+        base
+    }
+
+    fn comparable(config: &ShadowDroidConfig) -> serde_json::Value {
+        serde_json::to_value(config).expect("config serializes")
+    }
+
+    proptest! {
+        #![proptest_config(property_config())]
+
+        #[test]
+        fn merge_has_an_empty_identity(value in config()) {
+            let left = merged(ShadowDroidConfig::default(), value.clone());
+            let right = merged(value.clone(), ShadowDroidConfig::default());
+            prop_assert_eq!(comparable(&left), comparable(&value));
+            prop_assert_eq!(comparable(&right), comparable(&value));
+        }
+
+        #[test]
+        fn merge_is_associative(a in config(), b in config(), c in config()) {
+            let left = merged(merged(a.clone(), b.clone()), c.clone());
+            let right = merged(a, merged(b, c));
+            prop_assert_eq!(comparable(&left), comparable(&right));
+        }
+    }
 
     #[test]
     fn project_config_overrides_user_config_and_merges_apps() {
