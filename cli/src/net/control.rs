@@ -26,7 +26,7 @@ use crate::net::flow::FlowRecord;
 use crate::net::proxy::{
     ActiveReplay, HoldDecision, InterceptCfg, ReleaseHeldResult, SharedState, TerminalHold,
 };
-use crate::net::rule::compile_rule;
+use crate::net::rule::{compile_rule, lint_rules};
 use crate::net::{Matcher, Mutation, RuleSpec, flow, paths, store};
 
 /// In-daemon state the control handlers read/mutate.
@@ -66,6 +66,64 @@ fn public_rule(id: &str, spec: &RuleSpec) -> Value {
         "action": action,
     });
     value
+}
+
+fn compile_rule_set(specs: Vec<RuleSpec>) -> Result<Vec<crate::net::CompiledRule>, String> {
+    let lint = lint_rules(&specs);
+    if let Some(issue) = lint.iter().find(|issue| issue.severity == "error") {
+        return Err(format!(
+            "rule {} failed {}: {}",
+            issue.rule_index, issue.code, issue.message
+        ));
+    }
+    specs
+        .into_iter()
+        .enumerate()
+        .map(|(index, spec)| {
+            compile_rule(spec).map_err(|error| format!("rule {index} is invalid: {error}"))
+        })
+        .collect()
+}
+
+fn publish_rule_set(
+    slot: &std::sync::RwLock<Vec<(String, crate::net::CompiledRule)>>,
+    compiled: Vec<crate::net::CompiledRule>,
+) -> Value {
+    let staged: Vec<_> = compiled
+        .into_iter()
+        .map(|rule| (next_rule_id(), rule))
+        .collect();
+    let public: Vec<_> = staged
+        .iter()
+        .map(|(id, rule)| public_rule(id, &rule.spec))
+        .collect();
+    let ids: Vec<_> = public
+        .iter()
+        .filter_map(|rule| rule["id"].as_str().map(str::to_string))
+        .collect();
+    let mut guard = slot.write().unwrap();
+    let replaced = guard.len();
+    *guard = staged;
+    json!({
+        "ok": true,
+        "mode": "replace",
+        "publication": "single_swap",
+        "replaced": replaced,
+        "applied": guard.len(),
+        "ids": ids,
+        "rules": public,
+        "previous_rules_preserved_on_error": true,
+    })
+}
+
+fn replace_rule_set(
+    slot: &std::sync::RwLock<Vec<(String, crate::net::CompiledRule)>>,
+    specs: Vec<RuleSpec>,
+) -> Result<Value, String> {
+    // No write lock is acquired until every matcher, regex, header, response,
+    // and local file has compiled successfully.
+    let compiled = compile_rule_set(specs)?;
+    Ok(publish_rule_set(slot, compiled))
 }
 
 fn capture_redaction_status(policy: Option<&crate::redaction::Policy>) -> Value {
@@ -615,11 +673,12 @@ pub async fn serve_client(
                     )
                     .await?
                 }
-                Ok(spec) => match compile_rule(spec) {
+                Ok(spec) => match compile_rule_set(vec![spec]) {
                     Err(error) => {
                         write_json(&mut wr, &json!({"ok": false, "error": error})).await?
                     }
-                    Ok(rule) => {
+                    Ok(mut rules) => {
+                        let rule = rules.pop().expect("one compiled rule");
                         let id = next_rule_id();
                         let mut reply = public_rule(&id, &rule.spec);
                         shared.rules.write().unwrap().push((id.clone(), rule));
@@ -629,6 +688,44 @@ pub async fn serve_client(
                         write_json(&mut wr, &reply).await?;
                     }
                 },
+            }
+        }
+        "rules_replace_v1" => {
+            let replacement = req
+                .get("specs")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "missing `specs` JSON array".to_string())
+                .and_then(|values| {
+                    values
+                        .iter()
+                        .cloned()
+                        .enumerate()
+                        .map(|(index, value)| {
+                            serde_json::from_value::<RuleSpec>(value).map_err(|error| {
+                                format!("rule {index} could not be decoded: {error}")
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .and_then(|specs| replace_rule_set(&shared.rules, specs));
+            match replacement {
+                Ok(reply) => {
+                    write_json(&mut wr, &reply).await?;
+                }
+                Err(error) => {
+                    let preserved = shared.rules.read().unwrap().len();
+                    write_json(
+                        &mut wr,
+                        &json!({
+                            "ok": false,
+                            "code": "rule_set_rejected",
+                            "error": error,
+                            "active_rules_preserved": preserved,
+                            "publication": "none",
+                        }),
+                    )
+                    .await?;
+                }
             }
         }
         "rule_list" => {
@@ -1600,6 +1697,31 @@ mod tests {
         let file = dir.path().join("body.json");
         std::fs::write(&file, b"{}").unwrap();
         assert!(validate_rule(&spec("map-local", &[file.to_str().unwrap()])).is_ok());
+    }
+
+    #[test]
+    fn bulk_rule_replacement_compiles_all_before_one_swap() {
+        let existing = crate::net::rule::compile_rule(spec("delay", &["7"])).unwrap();
+        let slot = std::sync::RwLock::new(vec![("existing".into(), existing)]);
+        let valid = spec("set-status", &["503"]);
+        let invalid = RuleSpec {
+            match_on: RuleMatchOn::Original,
+            matcher: RuleMatcher::Any { matchers: vec![] },
+            action: RuleAction::Delay { milliseconds: 1 },
+        };
+
+        let rejected = replace_rule_set(&slot, vec![valid.clone(), invalid]);
+        assert!(rejected.is_err());
+        let active = slot.read().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].0, "existing");
+        drop(active);
+
+        let summary = replace_rule_set(&slot, vec![valid, spec("delay", &["3"])]).unwrap();
+        assert_eq!(summary["publication"], "single_swap");
+        assert_eq!(summary["replaced"], 1);
+        assert_eq!(summary["applied"], 2);
+        assert_eq!(slot.read().unwrap().len(), 2);
     }
 
     #[test]

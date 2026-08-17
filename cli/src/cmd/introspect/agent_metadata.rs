@@ -1243,8 +1243,8 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "net rules" => Some(serde_json::json!({
             "use_when": ["Need to apply a bulk JSON rule file for a repeatable network scenario."],
-            "output": "bulk rule apply JSON",
-            "side_effects": ["replaces or mutates active proxy rules from a file"],
+            "output": "atomic bulk rule replacement JSON with old/new counts and all assigned ids",
+            "side_effects": ["validates and compiles the complete candidate, then replaces active proxy rules in one swap; any error preserves the prior set"],
             "next_actions": ["net rule list", "watch", "ui dump"]
         })),
         "aar" => Some(serde_json::json!({

@@ -3257,31 +3257,15 @@ fn explain_map_remote(host: &mut String, path: &mut String, target: &str) {
 }
 
 pub async fn rules_apply(serial: &Serial, file: &Path) -> Result<()> {
-    let text = std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
-    // Accept a JSON array of rule specs, or one spec per line.
-    let specs: Vec<RuleSpec> = if text.trim_start().starts_with('[') {
-        serde_json::from_str(&text).context("parse rules JSON array")?
-    } else {
-        text.lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(serde_json::from_str)
-            .collect::<std::result::Result<_, _>>()
-            .context("parse rules JSONL")?
-    };
-    let mut ids = Vec::new();
-    for spec in &specs {
-        let reply = checked_control_reply(
-            "rule_add",
-            control::request(serial, json!({"op": "rule_add", "spec": spec})).await?,
-        )?;
-        if let Some(id) = reply.get("id").and_then(|v| v.as_str()) {
-            ids.push(id.to_string());
-        }
+    let specs = load_rule_specs(file)?;
+    let mut reply = checked_control_reply(
+        "rules_replace_v1",
+        control::request(serial, json!({"op": "rules_replace_v1", "specs": specs})).await?,
+    )?;
+    if let Some(fields) = reply.as_object_mut() {
+        fields.insert("from".into(), json!(file.display().to_string()));
     }
-    emit(
-        "net_rules_apply",
-        json!({"applied": ids.len(), "ids": ids, "from": file.display().to_string()}),
-    );
+    emit("net_rules_apply", reply);
     Ok(())
 }
 

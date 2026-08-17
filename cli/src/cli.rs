@@ -1312,7 +1312,7 @@ pub enum NetCmd {
         #[arg(long, value_name = "PATH")]
         file: PathBuf,
     },
-    /// Apply a bulk rules file (JSON array of rules).
+    /// Atomically replace active rules from a validated JSON array/JSONL file.
     Rules { file: PathBuf },
     /// Atomically serve a validated fixtures bundle without a backend.
     Replay {

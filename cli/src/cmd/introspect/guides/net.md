@@ -172,6 +172,10 @@ shadowdroid net rule explain rules.json --host api.example.com --path /v1/users 
 shadowdroid net rule explain rules.json --host api.example.com --status 200
 ```
 
+`net rules rules.json` validates and compiles the complete candidate first,
+then replaces the active set with one swap. A bad regex, unreadable local file,
+impossible matcher, or any other error leaves every previously active rule in
+place.
 
 ## Optional in-app AAR
 
