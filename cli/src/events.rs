@@ -271,12 +271,36 @@ pub enum Event {
         /// `dropped` / `modified` / `refused_deflate` (managed mode).
         #[serde(skip_serializing_if = "Option::is_none")]
         disposition: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        protocol_violations: Vec<String>,
+        evidence_reliable: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         close_code: Option<u16>,
         #[serde(skip_serializing_if = "Option::is_none")]
         preview: Option<String>,
         #[serde(default, skip_serializing_if = "is_false")]
         body_redacted: bool,
+        next_actions: Vec<String>,
+    },
+    /// A machine-readable RFC 6455 violation. The `action` says whether the
+    /// original frame was forwarded unchanged, observation ended incomplete,
+    /// or capture fell back to an untapped raw tunnel because frame boundaries
+    /// became unknowable.
+    WsProtocolViolation {
+        ts: f64,
+        id: String,
+        session_id: String,
+        flow_sequence: u64,
+        capture_session_id: String,
+        host: String,
+        dir: String,
+        violation: String,
+        scope: String,
+        action: String,
+        fatal: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        opcode: Option<String>,
+        detail: serde_json::Value,
         next_actions: Vec<String>,
     },
     /// A WebSocket frame paused by `net intercept --dir …`, awaiting the agent's
@@ -316,6 +340,17 @@ pub enum Event {
         s2c_bytes: u64,
         #[serde(default, skip_serializing_if = "is_zero_u64")]
         dropped: u64,
+        #[serde(default, skip_serializing_if = "is_zero_u64")]
+        unreliable_messages: u64,
+        #[serde(default, skip_serializing_if = "is_zero_u64")]
+        c2s_protocol_violations: u64,
+        #[serde(default, skip_serializing_if = "is_zero_u64")]
+        s2c_protocol_violations: u64,
+        #[serde(default, skip_serializing_if = "is_false")]
+        c2s_decode_desynced: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        s2c_decode_desynced: bool,
+        evidence_reliable: bool,
         next_actions: Vec<String>,
     },
 }

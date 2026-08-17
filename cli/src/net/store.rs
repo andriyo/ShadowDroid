@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use crate::events::Event;
 use crate::net::flow::FlowRecord;
-use crate::net::ws::{WsCloseRecord, WsMessageRecord, WsSessionRecord};
+use crate::net::ws::{WsCloseRecord, WsMessageRecord, WsProtocolViolationRecord, WsSessionRecord};
 use crate::net::{Matcher, paths};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -41,7 +41,8 @@ pub struct ClearRecord {
 
 /// Which protocols `net log` interleaves. WebSocket per-message frames are a
 /// firehose, so the default shows session lifecycle (`ws_open`/`ws_close`)
-/// alongside HTTP but withholds `ws_msg` until asked (`WebSocket`/`All`).
+/// alongside HTTP, including protocol-quality violations, but withholds
+/// `ws_msg` until asked (`WebSocket`/`All`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Protocol {
     /// HTTP flows + TLS errors + WebSocket lifecycle (no per-message frames).
@@ -49,7 +50,7 @@ pub enum Protocol {
     Default,
     /// HTTP flows + TLS errors only.
     Http,
-    /// WebSocket only: upgrades, messages, and closes.
+    /// WebSocket only: upgrades, messages, protocol violations, and closes.
     WebSocket,
     /// Everything, including every WebSocket message.
     All,
@@ -114,6 +115,14 @@ pub fn append_ws_session(serial: &Serial, rec: &WsSessionRecord) -> Result<()> {
 
 /// Append one reassembled WebSocket message (`ws_msg`) line.
 pub fn append_ws_message(serial: &Serial, rec: &WsMessageRecord) -> Result<()> {
+    append_line(serial, &serde_json::to_string(rec)?)
+}
+
+/// Append one machine-readable WebSocket protocol violation.
+pub fn append_ws_protocol_violation(
+    serial: &Serial,
+    rec: &WsProtocolViolationRecord,
+) -> Result<()> {
     append_line(serial, &serde_json::to_string(rec)?)
 }
 
@@ -251,6 +260,7 @@ enum StoredLine {
     TlsError(serde_json::Value),
     WsOpen(serde_json::Value),
     WsMsg(serde_json::Value),
+    WsViolation(serde_json::Value),
     WsClose(serde_json::Value),
     Checkpoint(CheckpointRecord),
     Clear(ClearRecord),
@@ -290,6 +300,7 @@ fn visit_records(path: &Path, mut visit: impl FnMut(StoredLine)) -> Result<()> {
                 Some("tls_error") => visit(StoredLine::TlsError(value)),
                 Some("ws_open") => visit(StoredLine::WsOpen(value)),
                 Some("ws_msg") => visit(StoredLine::WsMsg(value)),
+                Some("ws_protocol_violation") => visit(StoredLine::WsViolation(value)),
                 Some("ws_close") => visit(StoredLine::WsClose(value)),
                 Some("capture_checkpoint") => {
                     if let Ok(checkpoint) = serde_json::from_value(value) {
@@ -350,6 +361,7 @@ fn read_all_from(path: &Path) -> Result<Vec<FlowRecord>> {
         StoredLine::TlsError(_)
         | StoredLine::WsOpen(_)
         | StoredLine::WsMsg(_)
+        | StoredLine::WsViolation(_)
         | StoredLine::WsClose(_)
         | StoredLine::Checkpoint(_) => {}
     })?;
@@ -391,6 +403,7 @@ pub fn read_filtered(serial: &Serial, m: &Matcher, limit: usize) -> Result<Vec<F
         StoredLine::TlsError(_)
         | StoredLine::WsOpen(_)
         | StoredLine::WsMsg(_)
+        | StoredLine::WsViolation(_)
         | StoredLine::WsClose(_)
         | StoredLine::Checkpoint(_) => {}
     })?;
@@ -416,6 +429,7 @@ fn find_by_id_from(path: &Path, id: &str) -> Result<Option<FlowRecord>> {
         StoredLine::TlsError(_)
         | StoredLine::WsOpen(_)
         | StoredLine::WsMsg(_)
+        | StoredLine::WsViolation(_)
         | StoredLine::WsClose(_)
         | StoredLine::Checkpoint(_) => {}
     })?;
@@ -691,6 +705,31 @@ fn read_recent_timeline_query_from(
                         })
                 }
             }
+            StoredLine::WsViolation(value) if query.protocol.include_ws_lifecycle() => {
+                if !ws_value_matches(&value, &query.matcher, false) {
+                    None
+                } else if ws_before_boundary(&value, floor, query) {
+                    excluded_count = excluded_count.saturating_add(1);
+                    older_events_excluded = true;
+                    None
+                } else if ws_session_excluded(&value, query) {
+                    None
+                } else {
+                    serde_json::from_value::<WsProtocolViolationRecord>(value)
+                        .ok()
+                        .and_then(|record| {
+                            let ts = record.ts;
+                            serde_json::to_value(record.violation_event(serial))
+                                .ok()
+                                .map(|value| RankedEvent {
+                                    ts,
+                                    kind: 4,
+                                    sequence,
+                                    value,
+                                })
+                        })
+                }
+            }
             StoredLine::WsClose(value) if query.protocol.include_ws_lifecycle() => {
                 if !ws_value_matches(&value, &query.matcher, false) {
                     None
@@ -709,7 +748,7 @@ fn read_recent_timeline_query_from(
                                 .ok()
                                 .map(|value| RankedEvent {
                                     ts,
-                                    kind: 4,
+                                    kind: 5,
                                     sequence,
                                     value,
                                 })
@@ -791,6 +830,7 @@ fn read_checkpoint_from(path: &Path, checkpoint_id: &str) -> Result<Option<Check
         | StoredLine::TlsError(_)
         | StoredLine::WsOpen(_)
         | StoredLine::WsMsg(_)
+        | StoredLine::WsViolation(_)
         | StoredLine::WsClose(_)
         | StoredLine::Checkpoint(_) => {}
     })?;
@@ -822,6 +862,7 @@ fn read_tls_errors_from(
         | StoredLine::TlsError(_)
         | StoredLine::WsOpen(_)
         | StoredLine::WsMsg(_)
+        | StoredLine::WsViolation(_)
         | StoredLine::WsClose(_)
         | StoredLine::Checkpoint(_) => {}
     })?;
@@ -863,6 +904,48 @@ pub struct WsMessageQuery {
     pub limit: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct WsViolationQuery {
+    pub session_id: Option<String>,
+    pub host: Option<String>,
+    pub dir: Option<String>,
+    pub opcode: Option<String>,
+    pub since_ts: Option<f64>,
+    pub capture_session_id: Option<String>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct WsSessionItemQuery {
+    pub session_id: Option<String>,
+    pub host: Option<String>,
+    pub dir: Option<String>,
+    pub opcode: Option<String>,
+    pub grep: Option<String>,
+    pub since_ts: Option<f64>,
+    pub capture_session_id: Option<String>,
+    pub limit: usize,
+}
+
+/// One row in the merged `net ws <session>` evidence stream. The store reads
+/// both variants in a single pass so their durable persistence order remains
+/// stable before applying the one combined tail limit.
+#[derive(Debug, Clone)]
+pub enum WsSessionItem {
+    Message(WsMessageRecord),
+    Violation(WsProtocolViolationRecord),
+}
+
+fn normalize_ws_message_evidence(mut record: WsMessageRecord) -> WsMessageRecord {
+    record.evidence_reliable = record.effective_evidence_reliable();
+    record
+}
+
+fn normalize_ws_close_evidence(mut record: WsCloseRecord) -> WsCloseRecord {
+    record.evidence_reliable = record.effective_evidence_reliable();
+    record
+}
+
 /// One row of `net ws`: an upgrade plus its running/final per-direction totals.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WsSessionSummary {
@@ -893,6 +976,17 @@ pub struct WsSessionSummary {
     pub c2s_bytes: u64,
     pub s2c_bytes: u64,
     pub dropped: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub unreliable_messages: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub c2s_protocol_violations: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub s2c_protocol_violations: u64,
+    pub evidence_reliable: bool,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 fn record_after_floor(value: &serde_json::Value, floor: u64) -> bool {
@@ -913,6 +1007,8 @@ struct WsSessionAgg {
     capture_session_id: Option<String>,
     first_ts: f64,
     live: (u64, u64, u64, u64),
+    live_unreliable_messages: u64,
+    live_violations: (u64, u64),
 }
 
 fn read_ws_sessions_from(path: &Path, query: &WsSessionQuery) -> Result<Vec<WsSessionSummary>> {
@@ -948,6 +1044,7 @@ fn read_ws_sessions_from(path: &Path, query: &WsSessionQuery) -> Result<Vec<WsSe
         }
         StoredLine::WsClose(value) if record_after_floor(&value, floor) => {
             if let Ok(close) = serde_json::from_value::<WsCloseRecord>(value) {
+                let close = normalize_ws_close_evidence(close);
                 touch(&mut aggs, &mut order, &close.session_id, close.ts);
                 let agg = aggs.get_mut(&close.session_id).unwrap();
                 agg.host.get_or_insert_with(|| close.host.clone());
@@ -992,6 +1089,43 @@ fn read_ws_sessions_from(path: &Path, query: &WsSessionQuery) -> Result<Vec<WsSe
                 agg.live.1 += 1;
                 agg.live.3 += len;
             }
+            let evidence_reliable = serde_json::from_value::<WsMessageRecord>(value)
+                .map(normalize_ws_message_evidence)
+                .map(|record| record.evidence_reliable)
+                .unwrap_or(false);
+            if !evidence_reliable {
+                agg.live_unreliable_messages += 1;
+            }
+        }
+        StoredLine::WsViolation(value) if record_after_floor(&value, floor) => {
+            let session = value
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let ts = value
+                .get("ts")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0);
+            touch(&mut aggs, &mut order, &session, ts);
+            let agg = aggs.get_mut(&session).unwrap();
+            if agg.host.is_none() {
+                agg.host = value
+                    .get("host")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+            }
+            if agg.capture_session_id.is_none() {
+                agg.capture_session_id = value
+                    .get("capture_session_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+            }
+            if value.get("dir").and_then(serde_json::Value::as_str) == Some("c2s") {
+                agg.live_violations.0 += 1;
+            } else {
+                agg.live_violations.1 += 1;
+            }
         }
         StoredLine::Clear(clear) => {
             floor = clear.after_flow_sequence;
@@ -1019,8 +1153,12 @@ fn read_ws_sessions_from(path: &Path, query: &WsSessionQuery) -> Result<Vec<WsSe
         .map(|(id, agg)| {
             let close = agg.close.as_ref();
             let live = agg.live;
+            let live_unreliable_messages = agg.live_unreliable_messages;
+            let live_violations = agg.live_violations;
             let host = agg.host.unwrap_or_default();
             let counts = |c: Option<u64>, l: u64| c.unwrap_or(l);
+            let quality_counts = |c: Option<u64>, l: u64| c.map_or(l, |count| count.max(l));
+            let live_evidence_reliable = live_violations == (0, 0) && live_unreliable_messages == 0;
             match agg.open {
                 Some(open) => WsSessionSummary {
                     url: open.url(),
@@ -1033,6 +1171,21 @@ fn read_ws_sessions_from(path: &Path, query: &WsSessionQuery) -> Result<Vec<WsSe
                     c2s_bytes: counts(close.map(|c| c.c2s_bytes), live.2),
                     s2c_bytes: counts(close.map(|c| c.s2c_bytes), live.3),
                     dropped: close.map(|c| c.dropped).unwrap_or(0),
+                    unreliable_messages: quality_counts(
+                        close.map(|c| c.unreliable_messages),
+                        live_unreliable_messages,
+                    ),
+                    c2s_protocol_violations: quality_counts(
+                        close.map(|c| c.c2s_protocol_violations),
+                        live_violations.0,
+                    ),
+                    s2c_protocol_violations: quality_counts(
+                        close.map(|c| c.s2c_protocol_violations),
+                        live_violations.1,
+                    ),
+                    evidence_reliable: close
+                        .map(|close| close.effective_evidence_reliable() && live_evidence_reliable)
+                        .unwrap_or(live_evidence_reliable),
                     id: open.id,
                     capture_session_id: open.capture_session_id,
                     ts: open.ts,
@@ -1065,6 +1218,21 @@ fn read_ws_sessions_from(path: &Path, query: &WsSessionQuery) -> Result<Vec<WsSe
                     c2s_bytes: counts(close.map(|c| c.c2s_bytes), live.2),
                     s2c_bytes: counts(close.map(|c| c.s2c_bytes), live.3),
                     dropped: close.map(|c| c.dropped).unwrap_or(0),
+                    unreliable_messages: quality_counts(
+                        close.map(|c| c.unreliable_messages),
+                        live_unreliable_messages,
+                    ),
+                    c2s_protocol_violations: quality_counts(
+                        close.map(|c| c.c2s_protocol_violations),
+                        live_violations.0,
+                    ),
+                    s2c_protocol_violations: quality_counts(
+                        close.map(|c| c.s2c_protocol_violations),
+                        live_violations.1,
+                    ),
+                    evidence_reliable: close
+                        .map(|close| close.effective_evidence_reliable() && live_evidence_reliable)
+                        .unwrap_or(live_evidence_reliable),
                 },
             }
         })
@@ -1093,6 +1261,7 @@ fn read_ws_messages_from(path: &Path, query: &WsMessageQuery) -> Result<Vec<WsMe
             let Ok(message) = serde_json::from_value::<WsMessageRecord>(value) else {
                 return;
             };
+            let message = normalize_ws_message_evidence(message);
             let matches = query
                 .session_id
                 .as_deref()
@@ -1145,6 +1314,165 @@ pub fn read_ws_messages(serial: &Serial, query: &WsMessageQuery) -> Result<Vec<W
     read_ws_messages_from(&paths::session_log_path(serial)?, query)
 }
 
+fn read_ws_protocol_violations_from(
+    path: &Path,
+    query: &WsViolationQuery,
+) -> Result<Vec<WsProtocolViolationRecord>> {
+    if query.limit == 0 {
+        return Ok(Vec::new());
+    }
+    let host = query.host.as_deref().map(str::to_lowercase);
+    let mut recent = VecDeque::new();
+    let mut floor = 0_u64;
+    visit_records(path, |record| match record {
+        StoredLine::WsViolation(value) if record_after_floor(&value, floor) => {
+            let Ok(violation) = serde_json::from_value::<WsProtocolViolationRecord>(value) else {
+                return;
+            };
+            let matches = query
+                .session_id
+                .as_deref()
+                .is_none_or(|id| violation.session_id == id)
+                && host
+                    .as_deref()
+                    .is_none_or(|needle| violation.host.to_lowercase().contains(needle))
+                && query.dir.as_deref().is_none_or(|dir| violation.dir == dir)
+                && query
+                    .opcode
+                    .as_deref()
+                    .is_none_or(|opcode| violation.opcode.as_deref() == Some(opcode))
+                && query.since_ts.is_none_or(|since| violation.ts >= since)
+                && query
+                    .capture_session_id
+                    .as_deref()
+                    .is_none_or(|session| violation.capture_session_id == session);
+            if matches {
+                recent.push_back(violation);
+                if recent.len() > query.limit {
+                    recent.pop_front();
+                }
+            }
+        }
+        StoredLine::Clear(clear) => {
+            floor = clear.after_flow_sequence;
+            recent.clear();
+        }
+        _ => {}
+    })?;
+    Ok(recent.into_iter().collect())
+}
+
+/// WebSocket protocol findings (oldest first), most recent `limit` after
+/// filtering. These remain queryable even when no application message could be
+/// assembled from the malformed stream.
+pub fn read_ws_protocol_violations(
+    serial: &Serial,
+    query: &WsViolationQuery,
+) -> Result<Vec<WsProtocolViolationRecord>> {
+    read_ws_protocol_violations_from(&paths::session_log_path(serial)?, query)
+}
+
+fn read_ws_session_items_from(
+    path: &Path,
+    query: &WsSessionItemQuery,
+) -> Result<Vec<WsSessionItem>> {
+    if query.limit == 0 {
+        return Ok(Vec::new());
+    }
+    let host = query.host.as_deref().map(str::to_lowercase);
+    let grep = query.grep.as_deref().map(str::to_lowercase);
+    let mut recent = VecDeque::new();
+    let mut floor = 0_u64;
+    visit_records(path, |record| match record {
+        StoredLine::WsMsg(value) if record_after_floor(&value, floor) => {
+            let Ok(message) = serde_json::from_value::<WsMessageRecord>(value) else {
+                return;
+            };
+            let message = normalize_ws_message_evidence(message);
+            let matches = query
+                .session_id
+                .as_deref()
+                .is_none_or(|id| message.session_id == id)
+                && host
+                    .as_deref()
+                    .is_none_or(|needle| message.host.to_lowercase().contains(needle))
+                && query.dir.as_deref().is_none_or(|dir| message.dir == dir)
+                && query
+                    .opcode
+                    .as_deref()
+                    .is_none_or(|opcode| message.opcode == opcode)
+                && query.since_ts.is_none_or(|since| message.ts >= since)
+                && query
+                    .capture_session_id
+                    .as_deref()
+                    .is_none_or(|session| message.capture_session_id == session)
+                && grep.as_deref().is_none_or(|needle| {
+                    message
+                        .text
+                        .as_deref()
+                        .is_some_and(|text| text.to_lowercase().contains(needle))
+                        || message
+                            .preview
+                            .as_deref()
+                            .is_some_and(|preview| preview.to_lowercase().contains(needle))
+                });
+            if matches {
+                recent.push_back(WsSessionItem::Message(message));
+                if recent.len() > query.limit {
+                    recent.pop_front();
+                }
+            }
+        }
+        // `--grep` is defined only for message text/preview. Suppress violation
+        // rows entirely when it is present, matching the existing CLI contract.
+        StoredLine::WsViolation(value)
+            if query.grep.is_none() && record_after_floor(&value, floor) =>
+        {
+            let Ok(violation) = serde_json::from_value::<WsProtocolViolationRecord>(value) else {
+                return;
+            };
+            let matches = query
+                .session_id
+                .as_deref()
+                .is_none_or(|id| violation.session_id == id)
+                && host
+                    .as_deref()
+                    .is_none_or(|needle| violation.host.to_lowercase().contains(needle))
+                && query.dir.as_deref().is_none_or(|dir| violation.dir == dir)
+                && query
+                    .opcode
+                    .as_deref()
+                    .is_none_or(|opcode| violation.opcode.as_deref() == Some(opcode))
+                && query.since_ts.is_none_or(|since| violation.ts >= since)
+                && query
+                    .capture_session_id
+                    .as_deref()
+                    .is_none_or(|session| violation.capture_session_id == session);
+            if matches {
+                recent.push_back(WsSessionItem::Violation(violation));
+                if recent.len() > query.limit {
+                    recent.pop_front();
+                }
+            }
+        }
+        StoredLine::Clear(clear) => {
+            floor = clear.after_flow_sequence;
+            recent.clear();
+        }
+        _ => {}
+    })?;
+    Ok(recent.into_iter().collect())
+}
+
+/// Merged messages and protocol findings for `net ws <session>`, oldest first
+/// within the most recent combined `limit` rows.
+pub fn read_ws_session_items(
+    serial: &Serial,
+    query: &WsSessionItemQuery,
+) -> Result<Vec<WsSessionItem>> {
+    read_ws_session_items_from(&paths::session_log_path(serial)?, query)
+}
+
 fn find_ws_session_from(
     path: &Path,
     id: &str,
@@ -1152,8 +1480,8 @@ fn find_ws_session_from(
     let mut open = None;
     let mut close = None;
     // Fallback identity (host, ts, capture_session_id) from a surviving
-    // message/close when the `ws_open` itself predates a clear, so `net show
-    // <id>` resolves the orphan the same way `net ws` lists it.
+    // message/violation/close when the `ws_open` itself predates a clear, so
+    // `net show <id>` resolves the orphan the same way `net ws` lists it.
     let mut orphan: Option<(String, f64, String)> = None;
     let mut floor = 0_u64;
     visit_records(path, |record| match record {
@@ -1168,6 +1496,7 @@ fn find_ws_session_from(
             if let Ok(record) = serde_json::from_value::<WsCloseRecord>(value)
                 && record.session_id == id
             {
+                let record = normalize_ws_close_evidence(record);
                 orphan.get_or_insert((
                     record.host.clone(),
                     record.ts,
@@ -1177,6 +1506,27 @@ fn find_ws_session_from(
             }
         }
         StoredLine::WsMsg(value) if record_after_floor(&value, floor) => {
+            if value.get("session_id").and_then(serde_json::Value::as_str) == Some(id)
+                && orphan.is_none()
+            {
+                let host = value
+                    .get("host")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let ts = value
+                    .get("ts")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0);
+                let capture_session_id = value
+                    .get("capture_session_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                orphan = Some((host, ts, capture_session_id));
+            }
+        }
+        StoredLine::WsViolation(value) if record_after_floor(&value, floor) => {
             if value.get("session_id").and_then(serde_json::Value::as_str) == Some(id)
                 && orphan.is_none()
             {
@@ -1208,7 +1558,7 @@ fn find_ws_session_from(
     if let Some(open) = open {
         return Ok(Some((open, close)));
     }
-    // Synthesize a partial session from the surviving frames.
+    // Synthesize a partial session from the surviving evidence.
     Ok(orphan.map(|(host, ts, capture_session_id)| {
         (
             WsSessionRecord {
@@ -1251,7 +1601,7 @@ fn find_ws_message_from(path: &Path, id: &str) -> Result<Option<WsMessageRecord>
             if let Ok(record) = serde_json::from_value::<WsMessageRecord>(value)
                 && record.id == id
             {
-                found = Some(record);
+                found = Some(normalize_ws_message_evidence(record));
             }
         }
         StoredLine::Clear(clear) => {
@@ -1288,11 +1638,13 @@ fn read_ws_har_sessions_from(path: &Path) -> Result<Vec<WsHarSession>> {
         }
         StoredLine::WsClose(value) if record_after_floor(&value, floor) => {
             if let Ok(close) = serde_json::from_value::<WsCloseRecord>(value) {
+                let close = normalize_ws_close_evidence(close);
                 closes.insert(close.session_id.clone(), close);
             }
         }
         StoredLine::WsMsg(value) if record_after_floor(&value, floor) => {
             if let Ok(message) = serde_json::from_value::<WsMessageRecord>(value) {
+                let message = normalize_ws_message_evidence(message);
                 messages
                     .entry(message.session_id.clone())
                     .or_default()
@@ -1327,6 +1679,22 @@ fn export_jsonl_from(
     protocol: Protocol,
     capture_session: Option<&str>,
 ) -> Result<Vec<serde_json::Value>> {
+    fn effective_message_evidence(mut value: serde_json::Value) -> serde_json::Value {
+        if let Ok(record) = serde_json::from_value::<WsMessageRecord>(value.clone()) {
+            value["evidence_reliable"] =
+                serde_json::Value::Bool(record.effective_evidence_reliable());
+        }
+        value
+    }
+
+    fn effective_close_evidence(mut value: serde_json::Value) -> serde_json::Value {
+        if let Ok(record) = serde_json::from_value::<WsCloseRecord>(value.clone()) {
+            value["evidence_reliable"] =
+                serde_json::Value::Bool(record.effective_evidence_reliable());
+        }
+        value
+    }
+
     let session_ok = |value: &serde_json::Value| {
         capture_session.is_none_or(|session| {
             value
@@ -1360,6 +1728,13 @@ fn export_jsonl_from(
                 && record_after_floor(&value, floor)
                 && session_ok(&value) =>
         {
+            out.push(effective_message_evidence(value));
+        }
+        StoredLine::WsViolation(value)
+            if protocol.include_ws_lifecycle()
+                && record_after_floor(&value, floor)
+                && session_ok(&value) =>
+        {
             out.push(value);
         }
         StoredLine::WsClose(value)
@@ -1367,7 +1742,7 @@ fn export_jsonl_from(
                 && record_after_floor(&value, floor)
                 && session_ok(&value) =>
         {
-            out.push(value);
+            out.push(effective_close_evidence(value));
         }
         StoredLine::Clear(clear) => {
             floor = clear.after_flow_sequence;
@@ -1393,11 +1768,12 @@ mod tests {
     #[cfg(unix)]
     use super::secure_existing_log;
     use super::{
-        CheckpointRecord, ClearRecord, LogQuery, Protocol, WsMessageQuery, WsSessionQuery,
-        acquire_log_lock, acquire_log_read_lock, export_jsonl_from, find_by_id_from,
-        find_ws_message_from, find_ws_session_from, read_all_from, read_checkpoint_from,
-        read_recent_timeline_from, read_recent_timeline_query_from, read_tls_errors_from,
-        read_ws_messages_from, read_ws_sessions_from,
+        CheckpointRecord, ClearRecord, LogQuery, Protocol, WsMessageQuery, WsSessionItem,
+        WsSessionItemQuery, WsSessionQuery, WsViolationQuery, acquire_log_lock,
+        acquire_log_read_lock, export_jsonl_from, find_by_id_from, find_ws_message_from,
+        find_ws_session_from, read_all_from, read_checkpoint_from, read_recent_timeline_from,
+        read_recent_timeline_query_from, read_tls_errors_from, read_ws_messages_from,
+        read_ws_protocol_violations_from, read_ws_session_items_from, read_ws_sessions_from,
     };
     use crate::ids::Serial;
     use crate::net::Matcher;
@@ -1798,6 +2174,24 @@ mod tests {
         })
     }
 
+    fn ws_violation(
+        id: &str,
+        session: &str,
+        seq: u64,
+        ts: f64,
+        host: &str,
+        dir: &str,
+        violation: &str,
+    ) -> serde_json::Value {
+        json!({
+            "type": "ws_protocol_violation", "id": id, "session_id": session,
+            "flow_sequence": seq, "capture_session_id": "n-one", "ts": ts,
+            "host": host, "dir": dir, "violation": violation, "scope": "frame",
+            "action": "forwarded_unmodified", "fatal": false,
+            "opcode": "text", "detail": {"masked": false}
+        })
+    }
+
     fn ws_log(dir: &Path) -> std::path::PathBuf {
         let path = dir.join("device.jsonl");
         write_lines(
@@ -1840,6 +2234,182 @@ mod tests {
             true,
         );
         path
+    }
+
+    #[test]
+    fn websocket_protocol_violations_are_recalled_exported_and_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.jsonl");
+        let mut close = ws_close("w1", 4, 4.0, "chat.example");
+        close["c2s_protocol_violations"] = json!(1);
+        close["s2c_protocol_violations"] = json!(0);
+        close["unreliable_messages"] = json!(1);
+        close["evidence_reliable"] = json!(false);
+        let mut message = ws_msg("w1.1", "w1", 2, 2.0, "chat.example", "c2s", "text", "hello");
+        message["evidence_reliable"] = json!(false);
+        write_lines(
+            &path,
+            &[
+                line(ws_open("w1", 1, 1.0, "chat.example", "/ws")),
+                line(message),
+                line(ws_violation(
+                    "w1.v1",
+                    "w1",
+                    3,
+                    3.0,
+                    "chat.example",
+                    "c2s",
+                    "incorrect_masking",
+                )),
+                line(close),
+            ],
+            true,
+        );
+        let serial = Serial::new("emulator-5554");
+        let timeline = read_recent_timeline_query_from(
+            &path,
+            &serial,
+            &LogQuery {
+                protocol: Protocol::WebSocket,
+                limit: 20,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            timeline
+                .items
+                .iter()
+                .map(|value| value["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["ws_open", "ws_msg", "ws_protocol_violation", "ws_close"]
+        );
+        assert_eq!(timeline.items[2]["violation"], "incorrect_masking");
+        assert_eq!(timeline.items[2]["action"], "forwarded_unmodified");
+
+        let exported = export_jsonl_from(&path, Protocol::WebSocket, Some("n-one")).unwrap();
+        assert!(
+            exported
+                .iter()
+                .any(|value| value["type"] == "ws_protocol_violation")
+        );
+
+        let summaries = read_ws_sessions_from(
+            &path,
+            &WsSessionQuery {
+                limit: 20,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].c2s_protocol_violations, 1);
+        assert_eq!(summaries[0].s2c_protocol_violations, 0);
+        assert_eq!(summaries[0].unreliable_messages, 1);
+        assert!(!summaries[0].evidence_reliable);
+    }
+
+    #[test]
+    fn legacy_evidence_quality_is_derived_across_recall_summary_and_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.jsonl");
+
+        let mut dirty_message =
+            ws_msg("w1.1", "w1", 2, 2.0, "chat.example", "c2s", "text", "dirty");
+        dirty_message["truncated"] = json!(true);
+        dirty_message["compressed"] = json!(true);
+        dirty_message["protocol_violations"] = json!(["incorrect_masking"]);
+
+        let mut dirty_close = ws_close("w2", 6, 6.0, "chat.example");
+        dirty_close["dropped"] = json!(1);
+        dirty_close["s2c_protocol_violations"] = json!(1);
+        dirty_close["s2c_decode_desynced"] = json!(true);
+
+        write_lines(
+            &path,
+            &[
+                line(ws_open("w1", 1, 1.0, "chat.example", "/dirty-message")),
+                line(dirty_message),
+                line(ws_close("w1", 3, 3.0, "chat.example")),
+                line(ws_open("w2", 4, 4.0, "chat.example", "/dirty-close")),
+                line(ws_msg(
+                    "w2.1",
+                    "w2",
+                    5,
+                    5.0,
+                    "chat.example",
+                    "s2c",
+                    "text",
+                    "clean payload",
+                )),
+                line(dirty_close),
+                line(ws_open("w3", 7, 7.0, "chat.example", "/clean")),
+                line(ws_msg(
+                    "w3.1",
+                    "w3",
+                    8,
+                    8.0,
+                    "chat.example",
+                    "s2c",
+                    "text",
+                    "clean legacy",
+                )),
+                line(ws_close("w3", 9, 9.0, "chat.example")),
+            ],
+            true,
+        );
+
+        let messages = read_ws_messages_from(
+            &path,
+            &WsMessageQuery {
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(messages.len(), 3);
+        assert!(!messages[0].evidence_reliable);
+        assert!(messages[1].evidence_reliable);
+        assert!(messages[2].evidence_reliable);
+        assert!(
+            !find_ws_message_from(&path, "w1.1")
+                .unwrap()
+                .unwrap()
+                .evidence_reliable
+        );
+
+        let summaries = read_ws_sessions_from(
+            &path,
+            &WsSessionQuery {
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let summary = |id: &str| summaries.iter().find(|summary| summary.id == id).unwrap();
+        assert!(!summary("w1").evidence_reliable);
+        assert_eq!(summary("w1").unreliable_messages, 1);
+        assert!(!summary("w2").evidence_reliable);
+        assert_eq!(summary("w2").dropped, 1);
+        assert_eq!(summary("w2").s2c_protocol_violations, 1);
+        assert!(summary("w3").evidence_reliable);
+
+        let (_, close) = find_ws_session_from(&path, "w2").unwrap().unwrap();
+        assert!(!close.unwrap().evidence_reliable);
+
+        let exported = export_jsonl_from(&path, Protocol::WebSocket, Some("n-one")).unwrap();
+        let exported_reliability = |kind: &str, id: &str| {
+            exported
+                .iter()
+                .find(|value| value["type"] == kind && value["id"] == id)
+                .unwrap()["evidence_reliable"]
+                .as_bool()
+                .unwrap()
+        };
+        assert!(!exported_reliability("ws_msg", "w1.1"));
+        assert!(!exported_reliability("ws_close", "w2"));
+        assert!(exported_reliability("ws_msg", "w3.1"));
+        assert!(exported_reliability("ws_close", "w3"));
     }
 
     #[test]
@@ -2052,6 +2622,104 @@ mod tests {
     }
 
     #[test]
+    fn ws_session_items_interleave_and_apply_one_combined_tail_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.jsonl");
+        write_lines(
+            &path,
+            &[
+                line(ws_open("w1", 1, 1.0, "chat.example", "/ws")),
+                line(ws_msg(
+                    "w1.1",
+                    "w1",
+                    2,
+                    2.0,
+                    "chat.example",
+                    "s2c",
+                    "text",
+                    "first message",
+                )),
+                line(ws_violation(
+                    "w1.v1",
+                    "w1",
+                    3,
+                    3.0,
+                    "chat.example",
+                    "s2c",
+                    "incorrect_masking",
+                )),
+                line(ws_msg(
+                    "w1.2",
+                    "w1",
+                    4,
+                    4.0,
+                    "chat.example",
+                    "s2c",
+                    "text",
+                    "last message",
+                )),
+                line(ws_violation(
+                    "w1.v2",
+                    "w1",
+                    5,
+                    5.0,
+                    "chat.example",
+                    "s2c",
+                    "invalid_text_utf8",
+                )),
+            ],
+            true,
+        );
+
+        let items = read_ws_session_items_from(
+            &path,
+            &WsSessionItemQuery {
+                session_id: Some("w1".into()),
+                limit: 3,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let ids = items
+            .iter()
+            .map(|item| match item {
+                WsSessionItem::Message(message) => message.id.as_str(),
+                WsSessionItem::Violation(violation) => violation.id.as_str(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["w1.v1", "w1.2", "w1.v2"]);
+
+        let last = read_ws_session_items_from(
+            &path,
+            &WsSessionItemQuery {
+                session_id: Some("w1".into()),
+                limit: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            last.as_slice(),
+            [WsSessionItem::Violation(violation)] if violation.id == "w1.v2"
+        ));
+
+        let grepped = read_ws_session_items_from(
+            &path,
+            &WsSessionItemQuery {
+                session_id: Some("w1".into()),
+                grep: Some("last".into()),
+                limit: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            grepped.as_slice(),
+            [WsSessionItem::Message(message)] if message.id == "w1.2"
+        ));
+    }
+
+    #[test]
     fn find_ws_session_and_message_return_records() {
         let dir = tempfile::tempdir().unwrap();
         let path = ws_log(dir.path());
@@ -2186,6 +2854,71 @@ mod tests {
         assert_eq!(open.host, "chat.example.com");
         assert_eq!(open.capture_session_id, "n-one");
         assert!(close.is_some());
+    }
+
+    #[test]
+    fn violation_only_orphan_is_listed_findable_and_queryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.jsonl");
+        let clear = ClearRecord {
+            kind: "capture_clear".into(),
+            capture_session_id: "n-one".into(),
+            cleared_at: 10.5,
+            after_flow_id: Some("w1".into()),
+            after_flow_sequence: 1,
+        };
+        write_lines(
+            &path,
+            &[
+                line(ws_open("w1", 1, 10.0, "chat.example.com", "/s")),
+                line(clear),
+                line(ws_violation(
+                    "w1.v1",
+                    "w1",
+                    2,
+                    11.0,
+                    "chat.example.com",
+                    "c2s",
+                    "continuation_without_message",
+                )),
+            ],
+            true,
+        );
+
+        let sessions = read_ws_sessions_from(
+            &path,
+            &WsSessionQuery {
+                limit: 50,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "w1");
+        assert!(sessions[0].partial);
+        assert_eq!(sessions[0].c2s_msgs, 0);
+        assert_eq!(sessions[0].c2s_protocol_violations, 1);
+        assert!(!sessions[0].evidence_reliable);
+
+        let (open, close) = find_ws_session_from(&path, "w1").unwrap().unwrap();
+        assert_eq!(open.status, 0, "net show can resolve the partial session");
+        assert_eq!(open.host, "chat.example.com");
+        assert!(close.is_none());
+
+        let violations = read_ws_protocol_violations_from(
+            &path,
+            &WsViolationQuery {
+                session_id: Some("w1".into()),
+                dir: Some("c2s".into()),
+                opcode: Some("text".into()),
+                limit: 50,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].id, "w1.v1");
+        assert_eq!(violations[0].violation, "continuation_without_message");
     }
 
     #[test]

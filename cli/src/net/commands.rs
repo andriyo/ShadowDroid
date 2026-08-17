@@ -1821,6 +1821,41 @@ fn show_ws_session(serial: &Serial, id: &str) -> Result<()> {
     if let Some(close) = &close {
         detail["close"] = close.detail();
     }
+    let quality = store::read_ws_sessions(
+        serial,
+        &store::WsSessionQuery {
+            limit: usize::MAX,
+            ..Default::default()
+        },
+    )?
+    .into_iter()
+    .find(|session| session.id == id);
+    let violations = store::read_ws_protocol_violations(
+        serial,
+        &store::WsViolationQuery {
+            session_id: Some(id.to_string()),
+            limit: 100,
+            ..Default::default()
+        },
+    )?;
+    let violation_total = quality
+        .as_ref()
+        .map(|session| {
+            session
+                .c2s_protocol_violations
+                .saturating_add(session.s2c_protocol_violations)
+        })
+        .unwrap_or(violations.len() as u64);
+    detail["evidence_reliable"] = json!(
+        quality
+            .as_ref()
+            .is_none_or(|session| session.evidence_reliable)
+    );
+    detail["protocol_violation_count"] = json!(violation_total);
+    detail["protocol_violations"] = serde_json::to_value(&violations)?;
+    if violation_total > violations.len() as u64 {
+        detail["protocol_violations_truncated"] = json!(true);
+    }
     detail["next_actions"] = json!(crate::net::ws_session_next_actions(serial, id));
     events::emit_result(&detail);
     Ok(())
@@ -2254,35 +2289,55 @@ pub async fn ws(serial: &Serial, opts: WsOpts) -> Result<()> {
         return ws_stats(serial, &session_id).await;
     }
 
-    let messages = store::read_ws_messages(
+    let items = store::read_ws_session_items(
         serial,
-        &store::WsMessageQuery {
+        &store::WsSessionItemQuery {
             session_id: Some(session_id.clone()),
             host: opts.host.clone(),
             dir: opts.dir.clone(),
             opcode: opts.opcode.clone(),
             grep: opts.grep.clone(),
             since_ts,
-            after_ts: None,
-            after_flow_sequence: None,
             capture_session_id: opts.capture_session_id.clone(),
             limit: opts.limit,
         },
     )?;
-    // Distinguish "session has no matching messages" from "no such session".
-    if messages.is_empty() && store::find_ws_session(serial, &session_id)?.is_none() {
+    // Distinguish "session has no matching records" from "no such session".
+    if items.is_empty() && store::find_ws_session(serial, &session_id)?.is_none() {
         return Err(ws_not_found(&session_id, "session"));
     }
-    for message in &messages {
-        events::emit(&message.msg_event(serial));
+    let message_ids = items
+        .iter()
+        .filter_map(|item| match item {
+            store::WsSessionItem::Message(message) => Some(message.id.as_str()),
+            store::WsSessionItem::Violation(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let violation_ids = items
+        .iter()
+        .filter_map(|item| match item {
+            store::WsSessionItem::Message(_) => None,
+            store::WsSessionItem::Violation(violation) => Some(violation.id.as_str()),
+        })
+        .collect::<Vec<_>>();
+    for item in &items {
+        match item {
+            store::WsSessionItem::Message(message) => events::emit(&message.msg_event(serial)),
+            store::WsSessionItem::Violation(violation) => {
+                events::emit(&violation.violation_event(serial));
+            }
+        }
     }
     emit(
         "net_ws",
         json!({
             "mode": "messages",
             "session_id": session_id,
-            "count": messages.len(),
-            "ids": messages.iter().map(|message| &message.id).collect::<Vec<_>>(),
+            "count": message_ids.len(),
+            "ids": message_ids,
+            "violation_count": violation_ids.len(),
+            "violation_ids": violation_ids,
+            "record_count": items.len(),
             "dir": opts.dir,
             "opcode": opts.opcode,
             "grep": opts.grep,
@@ -2306,6 +2361,15 @@ async fn ws_stats(serial: &Serial, session_id: &str) -> Result<()> {
     if messages.is_empty() && store::find_ws_session(serial, session_id)?.is_none() {
         return Err(ws_not_found(session_id, "session"));
     }
+    let quality = store::read_ws_sessions(
+        serial,
+        &store::WsSessionQuery {
+            limit: usize::MAX,
+            ..Default::default()
+        },
+    )?
+    .into_iter()
+    .find(|session| session.id == session_id);
     let mut opcodes: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
     let (mut c2s_msgs, mut c2s_bytes) = (0u64, 0u64);
     let (mut s2c_msgs, mut s2c_bytes) = (0u64, 0u64);
@@ -2359,6 +2423,26 @@ async fn ws_stats(serial: &Serial, session_id: &str) -> Result<()> {
                 "ratio": round1(ratio),
             },
             "truncated": truncated,
+            "evidence_reliable": quality.as_ref().is_none_or(|session| session.evidence_reliable),
+            "unreliable_messages": quality
+                .as_ref()
+                .map(|session| session.unreliable_messages)
+                .unwrap_or(0),
+            "protocol_violations": {
+                "c2s": quality
+                    .as_ref()
+                    .map(|session| session.c2s_protocol_violations)
+                    .unwrap_or(0),
+                "s2c": quality
+                    .as_ref()
+                    .map(|session| session.s2c_protocol_violations)
+                    .unwrap_or(0),
+                "total": quality
+                    .as_ref()
+                    .map(|session| session.c2s_protocol_violations
+                        .saturating_add(session.s2c_protocol_violations))
+                    .unwrap_or(0),
+            },
             "duration_ms": (duration * 1000.0) as u64,
             "rate_msgs_per_sec": round1(rate),
             "next_actions": crate::net::ws_session_next_actions(serial, session_id),
@@ -2560,6 +2644,11 @@ fn redact_export_record(
         Some("ws_msg") => {
             typed::<crate::net::ws::WsMessageRecord, _>(value, policy, |r| r.redact(policy))
         }
+        Some("ws_protocol_violation") => {
+            typed::<crate::net::ws::WsProtocolViolationRecord, _>(value, policy, |r| {
+                r.redact(policy)
+            })
+        }
         Some("ws_close") => {
             typed::<crate::net::ws::WsCloseRecord, _>(value, policy, |r| r.redact(policy))
         }
@@ -2673,8 +2762,9 @@ fn redact_raw_network_export(
 }
 
 /// Durable line-per-record export (the machine-readable WebSocket format). Full
-/// flows and WS session/message/close records, filtered by protocol + capture
-/// session, written to `--out` (default `shadowdroid-network.jsonl`).
+/// flows and WS session/message/protocol-violation/close records, filtered by
+/// protocol + capture session, written to `--out` (default
+/// `shadowdroid-network.jsonl`).
 /// HAR 1.2 export including WebSocket sessions (Chrome `_webSocketMessages`).
 /// `id` selects one HTTP flow (`f…`) or one WS session (`w…`); omitted exports
 /// everything. Re-redacts under an active policy on the way out.
@@ -3742,6 +3832,35 @@ mod tests {
                 crate::redaction::POLICY_VERSION
             );
         }
+    }
+
+    #[test]
+    fn protocol_violation_export_redacts_host_and_preserves_safe_detail() {
+        let output = redact_export_record(
+            json!({
+                "type": "ws_protocol_violation",
+                "id": "w1.v1",
+                "session_id": "w1",
+                "flow_sequence": 3,
+                "capture_session_id": "n-one",
+                "ts": 3.0,
+                "host": "10.2.3.4",
+                "dir": "c2s",
+                "violation": "incorrect_masking",
+                "scope": "frame",
+                "action": "forwarded_unmodified",
+                "fatal": false,
+                "opcode": "text",
+                "detail": {"masked": false, "expected_masked": true},
+            }),
+            &crate::redaction::Policy::builtin(),
+        );
+        let serialized = output.to_string();
+        assert!(!serialized.contains("10.2.3.4"));
+        assert_eq!(output["host_redacted"], true);
+        assert_eq!(output["detail"]["masked"], false);
+        assert_eq!(output["detail"]["expected_masked"], true);
+        assert_eq!(output["violation"], "incorrect_masking");
     }
 
     fn spec(kind: &str, arg: &str) -> RuleSpec {

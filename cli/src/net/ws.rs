@@ -56,9 +56,9 @@ pub const MAX_RETAINED_FRAMES: usize = 256;
 /// Max concurrently-held WebSocket frames before intercept fails open (forwards
 /// the frame unheld) rather than pausing a direction unboundedly.
 pub const MAX_WS_HELD: usize = 64;
-/// A frame whose declared length exceeds this is a protocol error, not real
-/// traffic — refuse it and mark the direction desynced rather than trusting a
-/// bogus 8-byte length field.
+/// Capture-safety ceiling for a declared frame length. Above this, continuing
+/// to count to the next boundary would let a bogus header suppress observation
+/// for hundreds of MiB, so capture degrades to an untapped fail-open tunnel.
 const MAX_FRAME_LEN: u64 = 512 * 1024 * 1024;
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -109,6 +109,7 @@ impl Opcode {
 
     fn is_control(self) -> bool {
         matches!(self, Opcode::Close | Opcode::Ping | Opcode::Pong)
+            || matches!(self, Opcode::Reserved(value) if value & 0x08 != 0)
     }
 
     /// The wire label used in records/events.
@@ -146,6 +147,78 @@ impl Opcode {
             "pong" => Some(Opcode::Pong),
             "close" => Some(Opcode::Close),
             _ => None,
+        }
+    }
+}
+
+/// A machine-readable RFC 6455 violation observed while decoding a frame or
+/// assembling a message. The proxy never rewrites wire traffic in response to
+/// one of these: known-boundary frames are forwarded byte-for-byte, while a
+/// fatal length/header violation makes capture fail open into an untapped raw
+/// tunnel because subsequent frame boundaries are no longer trustworthy.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProtocolViolation {
+    pub code: &'static str,
+    pub scope: &'static str,
+    pub action: &'static str,
+    pub fatal: bool,
+    pub opcode: Option<String>,
+    pub detail: serde_json::Value,
+}
+
+impl ProtocolViolation {
+    fn frame(code: &'static str, opcode: Opcode, detail: serde_json::Value) -> Self {
+        Self {
+            code,
+            scope: "frame",
+            action: "forwarded_unmodified",
+            fatal: false,
+            opcode: Some(opcode.as_str().to_string()),
+            detail,
+        }
+    }
+
+    fn message(code: &'static str, opcode: Opcode, detail: serde_json::Value) -> Self {
+        Self {
+            code,
+            scope: "message",
+            action: "forwarded_unmodified",
+            fatal: false,
+            opcode: Some(opcode.as_str().to_string()),
+            detail,
+        }
+    }
+
+    fn fatal_frame(code: &'static str, detail: serde_json::Value) -> Self {
+        Self {
+            code,
+            scope: "frame",
+            action: "forwarding_untapped",
+            fatal: true,
+            opcode: None,
+            detail,
+        }
+    }
+
+    fn stream_end(code: &'static str, opcode: Option<Opcode>, detail: serde_json::Value) -> Self {
+        Self {
+            code,
+            scope: "frame",
+            action: "observed_incomplete",
+            fatal: false,
+            opcode: opcode.map(|opcode| opcode.as_str().to_string()),
+            detail,
+        }
+    }
+
+    fn message_stream_end(code: &'static str, opcode: Opcode, detail: serde_json::Value) -> Self {
+        Self {
+            code,
+            scope: "message",
+            action: "observed_incomplete",
+            fatal: false,
+            opcode: Some(opcode.as_str().to_string()),
+            detail,
         }
     }
 }
@@ -204,6 +277,8 @@ pub struct RawFrame {
     /// RSV1 — on the first frame of a message it signals `permessage-deflate`.
     pub rsv1: bool,
     pub opcode: Opcode,
+    /// Whether the payload was masked on the wire.
+    pub masked: bool,
     /// Unmasked payload, retained up to the decoder's cap.
     pub payload: Vec<u8>,
     /// Full on-wire payload length (may exceed `payload.len()` if retention
@@ -211,6 +286,8 @@ pub struct RawFrame {
     pub payload_len: u64,
     /// The retained prefix is shorter than `payload_len`.
     pub truncated: bool,
+    /// Header-level violations that do not prevent boundary-safe decoding.
+    pub violations: Vec<ProtocolViolation>,
 }
 
 #[derive(Debug)]
@@ -229,18 +306,20 @@ struct Pending {
     /// chunk boundaries).
     consumed: u64,
     retain_cap: usize,
+    violations: Vec<ProtocolViolation>,
 }
 
 /// Incremental RFC 6455 frame parser for one direction. Feed it wire bytes with
-/// [FrameDecoder::push]; it returns every frame that completed. On a malformed
-/// header it latches `desynced` and stops decoding (the tunnel keeps flowing —
-/// decoding is best-effort observation).
+/// [FrameDecoder::push]; it returns every frame that completed. RFC violations
+/// with known boundaries are returned and reported; only an unsafe/untrackable
+/// length latches `desynced` and stops decoding (the tunnel keeps flowing).
 #[derive(Debug)]
 pub struct FrameDecoder {
     buf: Vec<u8>,
     pending: Option<Pending>,
     retain_cap: usize,
     desynced: bool,
+    violations: Vec<ProtocolViolation>,
 }
 
 impl FrameDecoder {
@@ -252,11 +331,49 @@ impl FrameDecoder {
             // accumulator; the assembler applies the finer per-message cap.
             retain_cap: COMPRESSED_ACCUM_CAP,
             desynced: false,
+            violations: Vec::new(),
         }
     }
 
     pub fn desynced(&self) -> bool {
         self.desynced
+    }
+
+    /// Drain violations that could not be attached to a completed frame (for
+    /// example, a fatal 64-bit length). Non-fatal header findings ride on the
+    /// returned [RawFrame] and are emitted by the message assembler.
+    pub fn take_violations(&mut self) -> Vec<ProtocolViolation> {
+        std::mem::take(&mut self.violations)
+    }
+
+    /// Report a connection that ended between frame boundaries. All bytes seen
+    /// were already forwarded by the pump; this only marks the observation as
+    /// incomplete so an agent cannot mistake a missing message for evidence.
+    pub fn finish_stream(&mut self) -> Vec<ProtocolViolation> {
+        if self.desynced {
+            return self.take_violations();
+        }
+        let mut violations = self.take_violations();
+        if let Some(pending) = self.pending.take() {
+            violations.extend(pending.violations);
+            violations.push(ProtocolViolation::stream_end(
+                "connection_ended_mid_frame",
+                Some(pending.opcode),
+                serde_json::json!({
+                    "payload_len": pending.payload_len,
+                    "payload_bytes_received": pending.consumed,
+                    "payload_bytes_missing": pending.remaining
+                }),
+            ));
+        } else if !self.buf.is_empty() {
+            violations.push(ProtocolViolation::stream_end(
+                "connection_ended_mid_frame_header",
+                self.buf.first().map(|first| Opcode::from_u8(first & 0x0F)),
+                serde_json::json!({"header_bytes_received": self.buf.len()}),
+            ));
+        }
+        self.buf.clear();
+        violations
     }
 
     /// `true` when the decoder is between frames (no partial frame buffered), so
@@ -282,7 +399,8 @@ impl FrameDecoder {
             }
             match parse_header(&self.buf) {
                 HeaderParse::Need => break,
-                HeaderParse::Malformed => {
+                HeaderParse::Malformed(violation) => {
+                    self.violations.push(violation);
                     self.desynced = true;
                     self.buf.clear();
                     break;
@@ -300,6 +418,7 @@ impl FrameDecoder {
                         payload_len: header.payload_len,
                         consumed: 0,
                         retain_cap: self.retain_cap,
+                        violations: header.violations,
                     });
                 }
             }
@@ -336,9 +455,11 @@ impl FrameDecoder {
                 fin: pending.fin,
                 rsv1: pending.rsv1,
                 opcode: pending.opcode,
+                masked: pending.masked,
                 payload: pending.retained,
                 payload_len: pending.payload_len,
                 truncated,
+                violations: pending.violations,
             })
         } else {
             None
@@ -359,6 +480,7 @@ struct FrameHeader {
     masked: bool,
     mask: [u8; 4],
     payload_len: u64,
+    violations: Vec<ProtocolViolation>,
 }
 
 enum HeaderParse {
@@ -370,7 +492,7 @@ enum HeaderParse {
         consumed: usize,
     },
     /// The bytes cannot be a valid frame header.
-    Malformed,
+    Malformed(ProtocolViolation),
 }
 
 fn parse_header(buf: &[u8]) -> HeaderParse {
@@ -381,6 +503,8 @@ fn parse_header(buf: &[u8]) -> HeaderParse {
     let b1 = buf[1];
     let fin = b0 & 0x80 != 0;
     let rsv1 = b0 & 0x40 != 0;
+    let rsv2 = b0 & 0x20 != 0;
+    let rsv3 = b0 & 0x10 != 0;
     let opcode = Opcode::from_u8(b0 & 0x0F);
     let masked = b1 & 0x80 != 0;
     let len7 = b1 & 0x7F;
@@ -398,17 +522,80 @@ fn parse_header(buf: &[u8]) -> HeaderParse {
             }
             let mut raw = [0u8; 8];
             raw.copy_from_slice(&buf[2..10]);
+            if raw[0] & 0x80 != 0 {
+                return HeaderParse::Malformed(ProtocolViolation::fatal_frame(
+                    "length_msb_set",
+                    serde_json::json!({"length_encoding": 127}),
+                ));
+            }
             (u64::from_be_bytes(raw), 8)
         }
         other => (other as u64, 0),
     };
 
-    // Control frames must be <=125 bytes and never fragmented (RFC 6455 §5.5).
-    if opcode.is_control() && (payload_len > 125 || !fin) {
-        return HeaderParse::Malformed;
+    let mut violations = Vec::new();
+    if rsv2 {
+        violations.push(ProtocolViolation::frame(
+            "rsv2_set",
+            opcode,
+            serde_json::json!({"rsv": 2}),
+        ));
+    }
+    if rsv3 {
+        violations.push(ProtocolViolation::frame(
+            "rsv3_set",
+            opcode,
+            serde_json::json!({"rsv": 3}),
+        ));
+    }
+    if let Opcode::Reserved(value) = opcode {
+        violations.push(ProtocolViolation::frame(
+            "reserved_opcode",
+            opcode,
+            serde_json::json!({"opcode": value}),
+        ));
+    }
+    if opcode.is_control() && !fin {
+        violations.push(ProtocolViolation::frame(
+            "fragmented_control_frame",
+            opcode,
+            serde_json::json!({"fin": false}),
+        ));
+    }
+    if opcode.is_control() && payload_len > 125 {
+        violations.push(ProtocolViolation::frame(
+            "oversized_control_frame",
+            opcode,
+            serde_json::json!({"payload_len": payload_len, "maximum": 125}),
+        ));
+    }
+    if len7 == 126 && payload_len < 126 {
+        violations.push(ProtocolViolation::frame(
+            "non_minimal_length",
+            opcode,
+            serde_json::json!({
+                "payload_len": payload_len,
+                "length_encoding": 126,
+                "minimal_encoding": "7-bit"
+            }),
+        ));
+    }
+    if len7 == 127 && payload_len <= u64::from(u16::MAX) {
+        violations.push(ProtocolViolation::frame(
+            "non_minimal_length",
+            opcode,
+            serde_json::json!({
+                "payload_len": payload_len,
+                "length_encoding": 127,
+                "minimal_encoding": if payload_len < 126 { "7-bit" } else { "16-bit" }
+            }),
+        ));
     }
     if payload_len > MAX_FRAME_LEN {
-        return HeaderParse::Malformed;
+        return HeaderParse::Malformed(ProtocolViolation::fatal_frame(
+            "frame_length_limit_exceeded",
+            serde_json::json!({"payload_len": payload_len, "capture_limit": MAX_FRAME_LEN}),
+        ));
     }
 
     let header_len = 2 + len_bytes + if masked { 4 } else { 0 };
@@ -427,6 +614,7 @@ fn parse_header(buf: &[u8]) -> HeaderParse {
             masked,
             mask,
             payload_len,
+            violations,
         },
         consumed: header_len,
     }
@@ -443,6 +631,8 @@ pub struct ManagedFrame {
     pub fin: bool,
     pub rsv1: bool,
     pub opcode: Opcode,
+    pub masked: bool,
+    pub violations: Vec<ProtocolViolation>,
     /// Unmasked, whole payload.
     pub payload: Vec<u8>,
     /// The exact on-wire bytes (header + masked payload).
@@ -456,36 +646,104 @@ pub enum ManagedItem {
     /// Raw bytes to forward verbatim (an oversized/undecodable frame the framer
     /// won't buffer).
     Passthrough(Vec<u8>),
+    /// Boundary metadata for an oversized frame after all of its bytes have
+    /// streamed through verbatim. The empty/truncated payload keeps memory
+    /// bounded while still advancing message-fragmentation state and marking
+    /// the resulting evidence unreliable.
+    ObservedFrame(RawFrame),
+}
+
+struct OversizedFrame {
+    fin: bool,
+    rsv1: bool,
+    opcode: Opcode,
+    masked: bool,
+    payload_len: u64,
+    remaining: u64,
+    violations: Vec<ProtocolViolation>,
 }
 
 /// Full-frame reader for managed mode: buffers each frame whole (up to
 /// [MANAGED_FRAME_CAP]) so it can be dropped, re-encoded, or forwarded exactly.
-/// Oversized/malformed input streams through as [ManagedItem::Passthrough].
+/// Frames above the managed cap and unsafe/untrackable input stream through as
+/// [ManagedItem::Passthrough]. Bounded RFC violations remain decoded for
+/// evidence but are always forwarded byte-identically.
 pub struct ManagedFramer {
     buf: Vec<u8>,
-    /// Remaining bytes of an oversized frame still to stream through raw.
-    oversized_remaining: u64,
+    /// Metadata for an oversized frame whose bytes still stream through raw.
+    /// Keeping the boundary metadata lets the observation assembler preserve
+    /// fragmentation semantics once the frame completes.
+    oversized: Option<OversizedFrame>,
     desynced: bool,
+    violations: Vec<ProtocolViolation>,
 }
 
 impl ManagedFramer {
     pub fn new() -> ManagedFramer {
         ManagedFramer {
             buf: Vec::new(),
-            oversized_remaining: 0,
+            oversized: None,
             desynced: false,
+            violations: Vec::new(),
         }
     }
 
     /// `true` when between frames — safe to splice an injected frame.
     pub fn at_boundary(&self) -> bool {
-        self.buf.is_empty() && self.oversized_remaining == 0
+        self.buf.is_empty() && self.oversized.is_none()
     }
 
     /// `true` once a malformed header forced the framer to give up decoding and
     /// stream the rest raw. Frame boundaries are no longer known after this.
     pub fn desynced(&self) -> bool {
         self.desynced
+    }
+
+    pub fn take_violations(&mut self) -> Vec<ProtocolViolation> {
+        std::mem::take(&mut self.violations)
+    }
+
+    pub fn finish_stream(&mut self) -> Vec<ProtocolViolation> {
+        if self.desynced {
+            return self.take_violations();
+        }
+        let mut violations = self.take_violations();
+        if let Some(oversized) = self.oversized.take() {
+            violations.extend(oversized.violations);
+            violations.push(ProtocolViolation::stream_end(
+                "connection_ended_mid_oversized_frame",
+                Some(oversized.opcode),
+                serde_json::json!({
+                    "payload_len": oversized.payload_len,
+                    "payload_bytes_received": oversized.payload_len.saturating_sub(oversized.remaining),
+                    "payload_bytes_missing": oversized.remaining
+                }),
+            ));
+        } else if !self.buf.is_empty() {
+            let (opcode, payload_len, received, header_violations) = match parse_header(&self.buf) {
+                HeaderParse::Parsed { header, consumed } => (
+                    Some(header.opcode),
+                    Some(header.payload_len),
+                    self.buf.len().saturating_sub(consumed) as u64,
+                    header.violations,
+                ),
+                HeaderParse::Need | HeaderParse::Malformed(_) => (None, None, 0, Vec::new()),
+            };
+            violations.extend(header_violations);
+            let violation = ProtocolViolation::stream_end(
+                "connection_ended_mid_frame",
+                opcode,
+                serde_json::json!({
+                    "buffered_bytes": self.buf.len(),
+                    "payload_len": payload_len,
+                    "payload_bytes_received": received
+                }),
+            );
+            violations.push(violation);
+        }
+        self.buf.clear();
+        self.oversized = None;
+        violations
     }
 
     pub fn push(&mut self, data: &[u8]) -> Vec<ManagedItem> {
@@ -498,19 +756,44 @@ impl ManagedFramer {
         }
         self.buf.extend_from_slice(data);
         loop {
-            if self.oversized_remaining > 0 {
-                let take = self.oversized_remaining.min(self.buf.len() as u64) as usize;
+            if self.oversized.is_some() {
+                let remaining = self
+                    .oversized
+                    .as_ref()
+                    .map(|frame| frame.remaining)
+                    .unwrap_or(0);
+                let take = remaining.min(self.buf.len() as u64) as usize;
                 if take == 0 {
                     break;
                 }
                 let chunk: Vec<u8> = self.buf.drain(..take).collect();
-                self.oversized_remaining -= take as u64;
+                if let Some(oversized) = self.oversized.as_mut() {
+                    oversized.remaining -= take as u64;
+                }
                 out.push(ManagedItem::Passthrough(chunk));
+                if self
+                    .oversized
+                    .as_ref()
+                    .is_some_and(|frame| frame.remaining == 0)
+                {
+                    let oversized = self.oversized.take().unwrap();
+                    out.push(ManagedItem::ObservedFrame(RawFrame {
+                        fin: oversized.fin,
+                        rsv1: oversized.rsv1,
+                        opcode: oversized.opcode,
+                        masked: oversized.masked,
+                        payload: Vec::new(),
+                        payload_len: oversized.payload_len,
+                        truncated: true,
+                        violations: oversized.violations,
+                    }));
+                }
                 continue;
             }
             match parse_header(&self.buf) {
                 HeaderParse::Need => break,
-                HeaderParse::Malformed => {
+                HeaderParse::Malformed(violation) => {
+                    self.violations.push(violation);
                     self.desynced = true;
                     let rest = std::mem::take(&mut self.buf);
                     if !rest.is_empty() {
@@ -523,7 +806,28 @@ impl ManagedFramer {
                         // Oversized: stream the header now, then the payload raw.
                         let header_bytes: Vec<u8> = self.buf.drain(..consumed).collect();
                         out.push(ManagedItem::Passthrough(header_bytes));
-                        self.oversized_remaining = header.payload_len;
+                        // Header findings are immediately reportable even
+                        // though the application message cannot be assembled
+                        // until the oversized payload boundary is reached.
+                        self.violations.extend(header.violations);
+                        let mut violations = Vec::new();
+                        violations.push(ProtocolViolation::frame(
+                            "managed_frame_exceeds_observation_cap",
+                            header.opcode,
+                            serde_json::json!({
+                                "payload_len": header.payload_len,
+                                "managed_frame_cap": MANAGED_FRAME_CAP
+                            }),
+                        ));
+                        self.oversized = Some(OversizedFrame {
+                            fin: header.fin,
+                            rsv1: header.rsv1,
+                            opcode: header.opcode,
+                            masked: header.masked,
+                            payload_len: header.payload_len,
+                            remaining: header.payload_len,
+                            violations,
+                        });
                         continue;
                     }
                     let total = consumed + header.payload_len as usize;
@@ -541,6 +845,8 @@ impl ManagedFramer {
                         fin: header.fin,
                         rsv1: header.rsv1,
                         opcode: header.opcode,
+                        masked: header.masked,
+                        violations: header.violations,
                         payload,
                         raw,
                     }));
@@ -592,6 +898,9 @@ pub struct Message {
     pub decompressed: bool,
     /// Per-frame breakdown (in order), for fragmentation debugging.
     pub frames: Vec<WsFrameMeta>,
+    /// Machine-readable RFC 6455 violations affecting this message. The same
+    /// findings are also emitted as standalone `ws_protocol_violation` events.
+    pub protocol_violations: Vec<String>,
 }
 
 impl Message {
@@ -676,18 +985,24 @@ impl Inflater {
     /// append the empty-block trailer `00 00 FF FF`). Retains at most `retain`
     /// bytes of output but **consumes all input** so the sliding window advances
     /// even when the message is larger than we store — otherwise context takeover
-    /// would desync every later message. `complete=false` marks a decompression
-    /// bomb (over [MAX_DECOMPRESS]): we stopped feeding, so the window (and every
-    /// later compressed message under context takeover) is now unreliable.
-    /// Returns `None` on a genuine zlib error or a dead (BFINAL-terminated) stream.
-    fn inflate(&mut self, compressed: &[u8], retain: usize) -> Option<InflateResult> {
+    /// would desync every later message. An over-limit outcome marks a
+    /// decompression bomb (over [MAX_DECOMPRESS]): we stopped feeding, so the
+    /// window (and every later compressed message under context takeover) is
+    /// now unreliable.
+    /// Returns a typed outcome so malformed, terminal, and over-limit streams
+    /// cannot be mistaken for reliable decoded evidence.
+    fn inflate(
+        &mut self,
+        compressed: &[u8],
+        retain: usize,
+    ) -> Result<InflateResult, InflateFailure> {
         if self.reset_each_message {
             self.decompress.reset(false);
             self.terminated = false;
         } else if self.terminated {
             // A prior message ended the shared stream; anything after is
             // undecodable — report a desync rather than a bogus empty decode.
-            return None;
+            return Err(InflateFailure::ContextTerminated);
         }
         let mut input = Vec::with_capacity(compressed.len() + 4);
         input.extend_from_slice(compressed);
@@ -697,42 +1012,62 @@ impl Inflater {
         let mut out = Vec::new();
         let mut chunk = vec![0u8; 32 * 1024];
         let mut offset = 0usize;
-        let mut complete = true;
+        let mut outcome = InflateOutcome::Complete;
         loop {
             let before_in = self.decompress.total_in();
             let before_out = self.decompress.total_out();
             let status = self
                 .decompress
                 .decompress(&input[offset..], &mut chunk, flate2::FlushDecompress::Sync)
-                .ok()?;
+                .map_err(|_| InflateFailure::InvalidPayload)?;
             let produced = (self.decompress.total_out() - before_out) as usize;
             if out.len() < retain {
                 let take = produced.min(retain - out.len());
                 out.extend_from_slice(&chunk[..take]);
             }
-            offset += (self.decompress.total_in() - before_in) as usize;
+            let consumed = (self.decompress.total_in() - before_in) as usize;
+            offset += consumed;
             if (self.decompress.total_out() - start_out) as usize > MAX_DECOMPRESS {
-                complete = false; // bomb guard: stop consuming, window now desynced
+                outcome = InflateOutcome::LimitExceeded;
                 break;
             }
             match status {
                 flate2::Status::StreamEnd => {
                     self.terminated = true; // BFINAL — the shared stream is now dead
+                    outcome = InflateOutcome::FinalBlock;
                     break;
                 }
                 flate2::Status::Ok | flate2::Status::BufError => {
-                    if offset >= input.len() && produced == 0 {
+                    if consumed == 0 && produced == 0 {
+                        if offset < input.len() {
+                            return Err(InflateFailure::InvalidPayload);
+                        }
                         break;
                     }
                 }
             }
         }
-        Some(InflateResult {
+        Ok(InflateResult {
             retained: out,
             full_len: self.decompress.total_out() - start_out,
-            complete,
+            outcome,
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InflateOutcome {
+    Complete,
+    /// The peer sent BFINAL=1 instead of ending the message with sync-flush.
+    FinalBlock,
+    /// Output crossed [MAX_DECOMPRESS] before the input could be consumed.
+    LimitExceeded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InflateFailure {
+    InvalidPayload,
+    ContextTerminated,
 }
 
 struct InflateResult {
@@ -740,14 +1075,14 @@ struct InflateResult {
     retained: Vec<u8>,
     /// Full decompressed length (may exceed `retained.len()`).
     full_len: u64,
-    /// The whole compressed input was consumed (window stays in sync).
-    complete: bool,
+    outcome: InflateOutcome,
 }
 
 /// Reassembles frames into [Message]s for one direction: concatenates
 /// continuation frames, passes control frames straight through, and inflates
 /// `permessage-deflate` messages.
 pub struct MessageAssembler {
+    direction: Direction,
     deflate: DeflateParams,
     inflater: Option<Inflater>,
     // In-progress fragmented data message.
@@ -762,6 +1097,10 @@ pub struct MessageAssembler {
     /// failure then affects only the current message because the inflater is
     /// reset before the next one.
     reset_deflate_each_message: bool,
+    /// Findings waiting for the pump to persist/broadcast. Kept separately from
+    /// completed messages so orphan continuations and abandoned fragments are
+    /// never silently hidden.
+    pending_violations: Vec<ProtocolViolation>,
 }
 
 struct ActiveMessage {
@@ -773,6 +1112,7 @@ struct ActiveMessage {
     frame_count: u32,
     compressed: bool,
     frames: Vec<WsFrameMeta>,
+    protocol_violations: Vec<String>,
 }
 
 impl MessageAssembler {
@@ -788,12 +1128,14 @@ impl MessageAssembler {
             None
         };
         MessageAssembler {
+            direction,
             deflate,
             inflater,
             active: None,
             retain_cap: RETAIN_CAP,
             deflate_desynced: false,
             reset_deflate_each_message,
+            pending_violations: Vec::new(),
         }
     }
 
@@ -810,8 +1152,101 @@ impl MessageAssembler {
         self.active.is_none()
     }
 
+    pub fn take_violations(&mut self) -> Vec<ProtocolViolation> {
+        std::mem::take(&mut self.pending_violations)
+    }
+
+    pub fn finish_stream(&mut self) -> Vec<ProtocolViolation> {
+        let mut violations = self.take_violations();
+        if let Some(active) = self.active.take() {
+            violations.push(ProtocolViolation::message_stream_end(
+                "connection_ended_mid_fragmented_message",
+                active.opcode,
+                serde_json::json!({
+                    "frame_count": active.frame_count,
+                    "wire_len": active.wire_len
+                }),
+            ));
+        }
+        violations
+    }
+
+    fn safe_to_manage(&self, frame: &ManagedFrame) -> bool {
+        let mut raw = managed_to_raw(frame);
+        self.validate_frame(&mut raw);
+        raw.violations.is_empty()
+            && !(raw.fin
+                && raw.opcode == Opcode::Text
+                && !raw.rsv1
+                && !raw.truncated
+                && std::str::from_utf8(&raw.payload).is_err())
+    }
+
+    fn validate_frame(&self, frame: &mut RawFrame) {
+        let expected_masked = self.direction == Direction::ClientToServer;
+        if frame.masked != expected_masked {
+            frame.violations.push(ProtocolViolation::frame(
+                "incorrect_masking",
+                frame.opcode,
+                serde_json::json!({
+                    "direction": self.direction.as_str(),
+                    "masked": frame.masked,
+                    "expected_masked": expected_masked
+                }),
+            ));
+        }
+        if frame.rsv1 {
+            let code = if frame.opcode.is_control() {
+                Some("rsv1_on_control_frame")
+            } else if frame.opcode == Opcode::Continuation {
+                Some("rsv1_on_continuation")
+            } else if !self.deflate.enabled {
+                Some("rsv1_without_negotiated_extension")
+            } else {
+                None
+            };
+            if let Some(code) = code {
+                frame.violations.push(ProtocolViolation::frame(
+                    code,
+                    frame.opcode,
+                    serde_json::json!({
+                        "rsv": 1,
+                        "permessage_deflate": self.deflate.enabled
+                    }),
+                ));
+            }
+        }
+        if matches!(frame.opcode, Opcode::Text | Opcode::Binary) && self.active.is_some() {
+            frame.violations.push(ProtocolViolation::message(
+                "new_data_frame_before_final_continuation",
+                frame.opcode,
+                serde_json::json!({"abandoned_fragmented_message": true}),
+            ));
+        }
+        if frame.opcode == Opcode::Continuation && self.active.is_none() {
+            frame.violations.push(ProtocolViolation::message(
+                "continuation_without_message",
+                frame.opcode,
+                serde_json::json!({"active_message": false}),
+            ));
+        }
+        if frame.opcode == Opcode::Close {
+            frame
+                .violations
+                .extend(validate_close_payload(self.direction, frame));
+        }
+    }
+
     /// Feed one decoded frame; return a completed [Message] when one finishes.
-    pub fn accept(&mut self, frame: RawFrame) -> Option<Message> {
+    pub fn accept(&mut self, mut frame: RawFrame) -> Option<Message> {
+        self.validate_frame(&mut frame);
+        self.pending_violations
+            .extend(frame.violations.iter().cloned());
+        let frame_violation_codes = frame
+            .violations
+            .iter()
+            .map(|violation| violation.code.to_string())
+            .collect::<Vec<_>>();
         if frame.opcode.is_control() {
             // Control frames are self-contained and may interleave a fragmented
             // data message, so they never touch `active`.
@@ -830,6 +1265,7 @@ impl MessageAssembler {
                     rsv1: frame.rsv1,
                 }],
                 payload: frame.payload,
+                protocol_violations: frame_violation_codes,
             });
         }
 
@@ -846,6 +1282,7 @@ impl MessageAssembler {
                     frame_count: 0,
                     compressed: self.deflate.enabled && frame.rsv1,
                     frames: Vec::new(),
+                    protocol_violations: Vec::new(),
                 };
                 let fin = frame.fin;
                 self.append_frame(&mut active, frame);
@@ -905,6 +1342,12 @@ impl MessageAssembler {
             active.truncated = true;
         }
         active.payload_len += frame.payload_len;
+        active.protocol_violations.extend(
+            frame
+                .violations
+                .iter()
+                .map(|violation| violation.code.to_string()),
+        );
     }
 
     fn finish(&mut self, active: ActiveMessage) -> Message {
@@ -918,19 +1361,32 @@ impl MessageAssembler {
             compressed: active.compressed,
             decompressed: false,
             frames: active.frames,
+            protocol_violations: active.protocol_violations,
         };
         if !message.compressed {
+            self.validate_completed_text(&mut message);
             return message;
         }
         // A compressed message we couldn't buffer whole (`truncated`) can't be
         // inflated. Feeding a partial stream would corrupt a takeover context;
         // with no context takeover the next message starts from a clean inflater.
         if message.truncated {
+            let detail = serde_json::json!({
+                "wire_len": message.wire_len,
+                "retained_compressed_bytes": message.payload.len(),
+                "compressed_accum_cap": COMPRESSED_ACCUM_CAP
+            });
+            self.add_message_violation(&mut message, "permessage_deflate_input_incomplete", detail);
             self.mark_deflate_desynced();
             message.truncated = true; // retained bytes are still compressed
             return message;
         }
         if self.deflate_desynced {
+            self.add_message_violation(
+                &mut message,
+                "permessage_deflate_context_desynced",
+                serde_json::json!({"context_takeover": true}),
+            );
             message.truncated = true; // retained bytes are still compressed
             return message;
         }
@@ -941,26 +1397,129 @@ impl MessageAssembler {
         // application (decompressed) size.
         message.wire_len = message.payload_len;
         match inflater.inflate(&message.payload, self.retain_cap) {
-            Some(result) if result.complete => {
+            Ok(result)
+                if matches!(
+                    result.outcome,
+                    InflateOutcome::Complete | InflateOutcome::FinalBlock
+                ) =>
+            {
                 message.payload = result.retained;
                 message.payload_len = result.full_len;
                 message.truncated = message.payload.len() as u64 != result.full_len;
                 message.decompressed = true;
+                if result.outcome == InflateOutcome::FinalBlock {
+                    self.add_message_violation(
+                        &mut message,
+                        "permessage_deflate_final_block",
+                        serde_json::json!({
+                            "context_takeover": !self.reset_deflate_each_message
+                        }),
+                    );
+                    self.mark_deflate_desynced();
+                }
+                self.validate_completed_text(&mut message);
             }
-            // Hit the decompression-bomb guard: the window is now unreliable for
-            // every later message only when context takeover is active.
-            Some(_) => {
+            Ok(result) => {
+                self.add_message_violation(
+                    &mut message,
+                    "permessage_deflate_decompression_limit_exceeded",
+                    serde_json::json!({
+                        "decompressed_bytes_observed": result.full_len,
+                        "decompression_limit": MAX_DECOMPRESS
+                    }),
+                );
                 self.mark_deflate_desynced();
                 message.truncated = true;
             }
-            // Genuine zlib error: nothing decoded, retained bytes stay compressed.
-            None => {
+            Err(InflateFailure::InvalidPayload) => {
+                let detail = serde_json::json!({"wire_len": message.wire_len});
+                self.add_message_violation(
+                    &mut message,
+                    "permessage_deflate_invalid_payload",
+                    detail,
+                );
+                self.mark_deflate_desynced();
+                message.truncated = true;
+            }
+            Err(InflateFailure::ContextTerminated) => {
+                self.add_message_violation(
+                    &mut message,
+                    "permessage_deflate_context_terminated",
+                    serde_json::json!({"context_takeover": true}),
+                );
                 self.mark_deflate_desynced();
                 message.truncated = true;
             }
         }
         message
     }
+
+    fn add_message_violation(
+        &mut self,
+        message: &mut Message,
+        code: &'static str,
+        detail: serde_json::Value,
+    ) {
+        let violation = ProtocolViolation::message(code, message.opcode, detail);
+        message.protocol_violations.push(code.to_string());
+        self.pending_violations.push(violation);
+    }
+
+    fn validate_completed_text(&mut self, message: &mut Message) {
+        if message.opcode != Opcode::Text || message.truncated {
+            return;
+        }
+        if std::str::from_utf8(&message.payload).is_err() {
+            let violation = ProtocolViolation::message(
+                "invalid_text_utf8",
+                Opcode::Text,
+                serde_json::json!({"payload_len": message.payload_len}),
+            );
+            message.protocol_violations.push(violation.code.to_string());
+            self.pending_violations.push(violation);
+        }
+    }
+}
+
+fn validate_close_payload(direction: Direction, frame: &RawFrame) -> Vec<ProtocolViolation> {
+    let mut violations = Vec::new();
+    if frame.payload_len == 1 {
+        violations.push(ProtocolViolation::message(
+            "invalid_close_payload_length",
+            Opcode::Close,
+            serde_json::json!({"payload_len": 1, "valid": "0 or >=2"}),
+        ));
+        return violations;
+    }
+    if frame.payload_len < 2 || frame.payload.len() < 2 {
+        return violations;
+    }
+    let code = u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
+    if !valid_close_code(code) {
+        violations.push(ProtocolViolation::message(
+            "invalid_close_code",
+            Opcode::Close,
+            serde_json::json!({"close_code": code}),
+        ));
+    } else if code == 1010 && direction == Direction::ServerToClient {
+        violations.push(ProtocolViolation::message(
+            "invalid_close_code_direction",
+            Opcode::Close,
+            serde_json::json!({"close_code": code, "direction": direction.as_str()}),
+        ));
+    }
+    if !frame.truncated && std::str::from_utf8(&frame.payload[2..]).is_err() {
+        violations.push(ProtocolViolation::message(
+            "invalid_close_reason_utf8",
+            Opcode::Close,
+            serde_json::json!({"reason_len": frame.payload_len.saturating_sub(2)}),
+        ));
+    }
+    violations
+}
+
+fn valid_close_code(code: u16) -> bool {
+    matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999) && !matches!(code, 1004..=1006)
 }
 
 // ── Durable records + compact events ──────────────────────────────────────────
@@ -971,6 +1530,20 @@ fn is_false(value: &bool) -> bool {
 
 fn is_zero(value: &u64) -> bool {
     *value == 0
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn message_evidence_reliable(message: &Message) -> bool {
+    message.protocol_violations.is_empty()
+        && !message.truncated
+        && (!message.compressed || message.decompressed)
 }
 
 /// Allocate the next per-daemon WebSocket session id (`w1`, `w2`, …). Distinct
@@ -1099,6 +1672,12 @@ pub struct WsMessageRecord {
     pub wire_len: u64,
     pub retained_len: u64,
     pub frame_count: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protocol_violations: Vec<String>,
+    /// False means the payload/frame evidence was captured but violated one or
+    /// more RFC 6455 invariants and should not be treated as trustworthy input.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub evidence_reliable: bool,
     /// Per-frame breakdown, retained only for fragmented messages (`net show
     /// --frames`); a single-frame message synthesizes this on demand.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1141,6 +1720,17 @@ pub struct WsMessageRecord {
 }
 
 impl WsMessageRecord {
+    /// Effective quality is derived from the evidence fields as well as the
+    /// serialized flag. Older records predate `evidence_reliable`, so serde's
+    /// compatibility default must never override an already-known truncation,
+    /// undecoded compressed payload, or protocol violation.
+    pub fn effective_evidence_reliable(&self) -> bool {
+        self.evidence_reliable
+            && self.protocol_violations.is_empty()
+            && !self.truncated
+            && (!self.compressed || self.decompressed)
+    }
+
     /// The compact streaming event (`net log`/`watch`). Bodies are dropped — the
     /// preview stays; full payloads are fetched via `net show <id> --body`.
     pub fn msg_event(&self, serial: &Serial) -> Event {
@@ -1164,6 +1754,8 @@ impl WsMessageRecord {
             injected: self.injected,
             rule_id: self.rule_id.clone(),
             disposition: self.disposition.clone(),
+            protocol_violations: self.protocol_violations.clone(),
+            evidence_reliable: self.effective_evidence_reliable(),
             close_code: self.close_code,
             preview: self.preview.clone(),
             body_redacted: self.body_redacted,
@@ -1190,6 +1782,8 @@ impl WsMessageRecord {
             "wire_len": self.wire_len,
             "retained_len": self.retained_len,
             "frame_count": self.frame_count,
+            "protocol_violations": self.protocol_violations,
+            "evidence_reliable": self.effective_evidence_reliable(),
             "truncated": self.truncated,
             "compressed": self.compressed,
             "decompressed": self.decompressed,
@@ -1260,6 +1854,72 @@ impl WsMessageRecord {
     }
 }
 
+/// One standalone protocol-quality finding. It is persisted even when no
+/// application message can be produced (for example an orphan continuation or
+/// a fatal 64-bit length), so agents never have to infer decoder trust from a
+/// missing `ws_msg` line.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WsProtocolViolationRecord {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub id: String,
+    pub session_id: String,
+    #[serde(default)]
+    pub flow_sequence: u64,
+    #[serde(default)]
+    pub capture_session_id: String,
+    pub ts: f64,
+    pub host: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub host_redacted: bool,
+    pub dir: String,
+    pub violation: String,
+    pub scope: String,
+    pub action: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fatal: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opcode: Option<String>,
+    #[serde(default)]
+    pub detail: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redaction_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redaction_policy_version: Option<u32>,
+}
+
+impl WsProtocolViolationRecord {
+    pub fn redact(&mut self, policy: &crate::redaction::Policy) {
+        let host = policy.redact_text(&self.host);
+        self.host_redacted |= host != self.host;
+        self.host = host;
+        // `detail` is deliberately limited to numeric/boolean protocol
+        // metadata and fixed labels. Never put payload bytes or close reasons
+        // in it; this keeps live and export paths safe by construction.
+        self.redaction_policy = Some(policy.label().to_string());
+        self.redaction_policy_version = Some(crate::redaction::POLICY_VERSION);
+    }
+
+    pub fn violation_event(&self, serial: &Serial) -> Event {
+        Event::WsProtocolViolation {
+            ts: self.ts,
+            id: self.id.clone(),
+            session_id: self.session_id.clone(),
+            flow_sequence: self.flow_sequence,
+            capture_session_id: self.capture_session_id.clone(),
+            host: self.host.clone(),
+            dir: self.dir.clone(),
+            violation: self.violation.clone(),
+            scope: self.scope.clone(),
+            action: self.action.clone(),
+            fatal: self.fatal,
+            opcode: self.opcode.clone(),
+            detail: self.detail.clone(),
+            next_actions: crate::net::ws_session_next_actions(serial, &self.session_id),
+        }
+    }
+}
+
 /// The `ws_close` line: session teardown + per-direction totals.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WsCloseRecord {
@@ -1291,6 +1951,18 @@ pub struct WsCloseRecord {
     pub s2c_bytes: u64,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub dropped: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unreliable_messages: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub c2s_protocol_violations: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub s2c_protocol_violations: u64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub c2s_decode_desynced: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub s2c_decode_desynced: bool,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub evidence_reliable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redaction_policy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1298,6 +1970,19 @@ pub struct WsCloseRecord {
 }
 
 impl WsCloseRecord {
+    /// Effective terminal quality for both current and legacy records. A close
+    /// written before the explicit flag existed still carries enough counters
+    /// and decoder state to prove when evidence was lossy or untrustworthy.
+    pub fn effective_evidence_reliable(&self) -> bool {
+        self.evidence_reliable
+            && self.dropped == 0
+            && self.unreliable_messages == 0
+            && self.c2s_protocol_violations == 0
+            && self.s2c_protocol_violations == 0
+            && !self.c2s_decode_desynced
+            && !self.s2c_decode_desynced
+    }
+
     /// Redact the app-supplied close reason (for `net export` re-redaction).
     pub fn redact(&mut self, policy: &crate::redaction::Policy) {
         let host = policy.redact_text(&self.host);
@@ -1328,6 +2013,12 @@ impl WsCloseRecord {
             c2s_bytes: self.c2s_bytes,
             s2c_bytes: self.s2c_bytes,
             dropped: self.dropped,
+            unreliable_messages: self.unreliable_messages,
+            c2s_protocol_violations: self.c2s_protocol_violations,
+            s2c_protocol_violations: self.s2c_protocol_violations,
+            c2s_decode_desynced: self.c2s_decode_desynced,
+            s2c_decode_desynced: self.s2c_decode_desynced,
+            evidence_reliable: self.effective_evidence_reliable(),
             next_actions: crate::net::ws_session_next_actions(serial, &self.session_id),
         }
     }
@@ -1353,6 +2044,12 @@ impl WsCloseRecord {
             "c2s_bytes": self.c2s_bytes,
             "s2c_bytes": self.s2c_bytes,
             "dropped": self.dropped,
+            "unreliable_messages": self.unreliable_messages,
+            "c2s_protocol_violations": self.c2s_protocol_violations,
+            "s2c_protocol_violations": self.s2c_protocol_violations,
+            "c2s_decode_desynced": self.c2s_decode_desynced,
+            "s2c_decode_desynced": self.s2c_decode_desynced,
+            "evidence_reliable": self.effective_evidence_reliable(),
             "redaction_policy": self.redaction_policy,
             "redaction_policy_version": self.redaction_policy_version,
         })
@@ -1541,6 +2238,8 @@ fn build_message_record(
         wire_len: message.wire_len,
         retained_len,
         frame_count: message.frame_count,
+        protocol_violations: message.protocol_violations.clone(),
+        evidence_reliable: message_evidence_reliable(message),
         // Only fragmented messages keep the per-frame breakdown — a single-frame
         // message is fully described by its own fields, so persisting one frame
         // entry per `ws_msg` would just bloat the log.
@@ -1594,11 +2293,20 @@ struct WsStats {
     c2s_bytes: AtomicU64,
     s2c_bytes: AtomicU64,
     dropped: AtomicU64,
+    unreliable_messages: AtomicU64,
+    c2s_protocol_violations: AtomicU64,
+    s2c_protocol_violations: AtomicU64,
+    c2s_decode_desynced: std::sync::atomic::AtomicBool,
+    s2c_decode_desynced: std::sync::atomic::AtomicBool,
+    violation_counter: AtomicU64,
     close: Mutex<Option<CloseInfo>>,
 }
 
 impl WsStats {
     fn record(&self, direction: Direction, message: &Message) {
+        if !message_evidence_reliable(message) {
+            self.unreliable_messages.fetch_add(1, Ordering::Relaxed);
+        }
         match direction {
             Direction::ClientToServer => {
                 self.c2s_msgs.fetch_add(1, Ordering::Relaxed);
@@ -1625,6 +2333,48 @@ impl WsStats {
                 });
             }
         }
+    }
+
+    fn record_violation(&self, direction: Direction, fatal: bool) -> u64 {
+        let counter = match direction {
+            Direction::ClientToServer => &self.c2s_protocol_violations,
+            Direction::ServerToClient => &self.s2c_protocol_violations,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        if fatal {
+            self.mark_decode_desynced(direction);
+        }
+        self.violation_counter.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn mark_decode_desynced(&self, direction: Direction) {
+        let flag = match direction {
+            Direction::ClientToServer => &self.c2s_decode_desynced,
+            Direction::ServerToClient => &self.s2c_decode_desynced,
+        };
+        flag.store(true, Ordering::Relaxed);
+    }
+
+    fn evidence_reliable(&self) -> bool {
+        self.dropped.load(Ordering::Relaxed) == 0
+            && self.c2s_protocol_violations.load(Ordering::Relaxed) == 0
+            && self.s2c_protocol_violations.load(Ordering::Relaxed) == 0
+            && self.unreliable_messages.load(Ordering::Relaxed) == 0
+    }
+}
+
+enum WsObservedRecord {
+    Message(WsMessageRecord),
+    Violation(WsProtocolViolationRecord),
+}
+
+fn queue_observed_record(
+    stats: &WsStats,
+    tx: &mpsc::Sender<WsObservedRecord>,
+    record: WsObservedRecord,
+) {
+    if tx.try_send(record).is_err() {
+        stats.dropped.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1777,6 +2527,7 @@ fn injected_record(
         compressed: false,
         decompressed: false,
         frames: Vec::new(),
+        protocol_violations: Vec::new(),
     };
     let mut record = build_message_record(meta, direction, seq, &message, redaction, events_now());
     record.injected = true;
@@ -1831,7 +2582,7 @@ pub async fn tap<Device, Upstream>(
     let counter = Arc::new(AtomicU64::new(1));
     let (device_reader, device_writer) = tokio::io::split(device);
     let (upstream_reader, upstream_writer) = tokio::io::split(upstream);
-    let (tx, rx) = mpsc::channel::<WsMessageRecord>(256);
+    let (tx, rx) = mpsc::channel::<WsObservedRecord>(256);
     // Injection channels: c2s frames go to the server, s2c frames go to the app.
     let (to_server_tx, to_server_rx) = mpsc::channel::<InjectedFrame>(32);
     let (to_client_tx, to_client_rx) = mpsc::channel::<InjectedFrame>(32);
@@ -1880,14 +2631,22 @@ pub async fn tap<Device, Upstream>(
         to_client_rx,
     );
 
-    tokio::select! {
-        _ = async { tokio::join!(client, server); } => {}
-        _ = ctx.shutdown.cancelled() => {}
-    }
+    coordinate_tap_pumps(client, server).await;
     // Deregister control before finalizing so no late `net inject` races a dead
     // session, then let the drain loop write the terminal `ws_close`.
     ctx.shared.ws_control.lock().unwrap().remove(&meta.id);
     let _ = drain.await;
+}
+
+/// Wait for both tap directions to observe shutdown and finalize their frame
+/// decoder plus message assembler. Shutdown must not race this join at the
+/// outer tap layer: dropping either future would lose its partial evidence.
+async fn coordinate_tap_pumps<ClientPump, ServerPump>(client: ClientPump, server: ServerPump)
+where
+    ClientPump: std::future::Future<Output = ()>,
+    ServerPump: std::future::Future<Output = ()>,
+{
+    tokio::join!(client, server);
 }
 
 /// Is this direction under managed control (intercept armed or a `ws-*` rule)?
@@ -1928,9 +2687,11 @@ fn managed_to_raw(frame: &ManagedFrame) -> RawFrame {
         fin: frame.fin,
         rsv1: frame.rsv1,
         opcode: frame.opcode,
+        masked: frame.masked,
         payload,
         payload_len: full,
         truncated,
+        violations: frame.violations.clone(),
     }
 }
 
@@ -1941,7 +2702,7 @@ fn emit_observed(
     direction: Direction,
     counter: &AtomicU64,
     stats: &WsStats,
-    tx: &mpsc::Sender<WsMessageRecord>,
+    tx: &mpsc::Sender<WsObservedRecord>,
     message: &Message,
 ) {
     stats.record(direction, message);
@@ -1954,9 +2715,57 @@ fn emit_observed(
         ctx.shared.redaction.as_ref(),
         events_now(),
     );
-    if tx.try_send(record).is_err() {
-        stats.dropped.fetch_add(1, Ordering::Relaxed);
+    queue_observed_record(stats, tx, WsObservedRecord::Message(record));
+}
+
+fn emit_protocol_violations(
+    ctx: &ProxyContext,
+    meta: &WsSessionMeta,
+    direction: Direction,
+    stats: &WsStats,
+    tx: &mpsc::Sender<WsObservedRecord>,
+    violations: Vec<ProtocolViolation>,
+) {
+    for violation in violations {
+        let ordinal = stats.record_violation(direction, violation.fatal);
+        let mut record = WsProtocolViolationRecord {
+            kind: "ws_protocol_violation".to_string(),
+            id: format!("{}.v{ordinal}", meta.id),
+            session_id: meta.id.clone(),
+            flow_sequence: crate::net::flow::next_sequence(),
+            capture_session_id: meta.capture_session_id.clone(),
+            ts: events_now(),
+            host: meta.host.clone(),
+            host_redacted: false,
+            dir: direction.as_str().to_string(),
+            violation: violation.code.to_string(),
+            scope: violation.scope.to_string(),
+            action: violation.action.to_string(),
+            fatal: violation.fatal,
+            opcode: violation.opcode,
+            detail: violation.detail,
+            redaction_policy: None,
+            redaction_policy_version: None,
+        };
+        if let Some(policy) = ctx.shared.redaction.as_ref() {
+            record.redact(policy);
+        }
+        queue_observed_record(stats, tx, WsObservedRecord::Violation(record));
     }
+}
+
+fn accept_observed_frame(
+    ctx: &ProxyContext,
+    meta: &WsSessionMeta,
+    direction: Direction,
+    assembler: &mut MessageAssembler,
+    stats: &WsStats,
+    tx: &mpsc::Sender<WsObservedRecord>,
+    frame: RawFrame,
+) -> Option<Message> {
+    let message = assembler.accept(frame);
+    emit_protocol_violations(ctx, meta, direction, stats, tx, assembler.take_violations());
+    message
 }
 
 /// Pause a matching frame and await the agent's `net resume`/`net drop`. Fails
@@ -2040,12 +2849,33 @@ async fn handle_managed_frame<Writer>(
     writer: &mut Writer,
     stats: &WsStats,
     counter: &AtomicU64,
-    tx: &mpsc::Sender<WsMessageRecord>,
+    tx: &mpsc::Sender<WsObservedRecord>,
     frame: ManagedFrame,
 ) -> bool
 where
     Writer: AsyncWrite + Unpin,
 {
+    // A frame whose header already violated RFC 6455 is evidence, not a safe
+    // rule/intercept target. Fail open by forwarding its exact bytes and only
+    // observing it; this avoids turning a debugging capture into a repair or a
+    // second protocol mutation.
+    if !assembler.safe_to_manage(&frame) {
+        if writer.write_all(&frame.raw).await.is_err() {
+            return false;
+        }
+        if let Some(message) = accept_observed_frame(
+            ctx,
+            meta,
+            direction,
+            assembler,
+            stats,
+            tx,
+            managed_to_raw(&frame),
+        ) {
+            emit_observed(ctx, meta, direction, counter, stats, tx, &message);
+        }
+        return true;
+    }
     // Only unfragmented single-frame messages are managed; fragmented frames
     // forward raw and record via the assembler so reassembly isn't corrupted.
     let single = frame.fin && !matches!(frame.opcode, Opcode::Continuation);
@@ -2053,7 +2883,15 @@ where
         if writer.write_all(&frame.raw).await.is_err() {
             return false;
         }
-        if let Some(message) = assembler.accept(managed_to_raw(&frame)) {
+        if let Some(message) = accept_observed_frame(
+            ctx,
+            meta,
+            direction,
+            assembler,
+            stats,
+            tx,
+            managed_to_raw(&frame),
+        ) {
             emit_observed(ctx, meta, direction, counter, stats, tx, &message);
         }
         return true;
@@ -2126,7 +2964,15 @@ where
     // toggle then decodes correctly) and yields a correctly decompressed record
     // of what was on the wire. A modified frame instead records its new plaintext
     // payload so the agent sees the edit; forward/drop/refused record as observed.
-    let observed = assembler.accept(managed_to_raw(&frame));
+    let observed = accept_observed_frame(
+        ctx,
+        meta,
+        direction,
+        assembler,
+        stats,
+        tx,
+        managed_to_raw(&frame),
+    );
     let record_message = match modified_payload {
         Some(payload) => Some(Message {
             opcode: frame.opcode,
@@ -2138,6 +2984,7 @@ where
             compressed: false,
             decompressed: false,
             frames: Vec::new(),
+            protocol_violations: Vec::new(),
         }),
         None => observed,
     };
@@ -2154,7 +3001,7 @@ where
         );
         record.rule_id = rule_id;
         record.disposition = disposition;
-        let _ = tx.try_send(record);
+        queue_observed_record(stats, tx, WsObservedRecord::Message(record));
     }
     true
 }
@@ -2172,7 +3019,7 @@ async fn pump<Reader, Writer>(
     mut assembler: MessageAssembler,
     stats: Arc<WsStats>,
     counter: Arc<AtomicU64>,
-    tx: mpsc::Sender<WsMessageRecord>,
+    tx: mpsc::Sender<WsObservedRecord>,
     mut inject_rx: mpsc::Receiver<InjectedFrame>,
 ) where
     Reader: AsyncRead + Unpin,
@@ -2189,6 +3036,9 @@ async fn pump<Reader, Writer>(
     'pump: loop {
         tokio::select! {
             biased;
+            _ = ctx.shutdown.cancelled() => {
+                break 'pump;
+            }
             injected = inject_rx.recv() => {
                 // `None` means control was deregistered (session ending); keep
                 // forwarding until the read side reaches EOF.
@@ -2215,15 +3065,24 @@ async fn pump<Reader, Writer>(
                 // Switch mode only between frames so a partial frame is never
                 // split across the observe and managed paths.
                 let at_boundary = if managed {
-                    framer.at_boundary()
+                    !framer.desynced() && framer.at_boundary()
                 } else {
-                    decoder.at_boundary()
+                    !decoder.desynced() && decoder.at_boundary()
                 };
                 if at_boundary {
                     managed = direction_managed(&ctx, &meta, direction);
                 }
                 if managed {
-                    for item in framer.push(&buf[..read]) {
+                    let items = framer.push(&buf[..read]);
+                    emit_protocol_violations(
+                        &ctx,
+                        &meta,
+                        direction,
+                        &stats,
+                        &tx,
+                        framer.take_violations(),
+                    );
+                    for item in items {
                         match item {
                             ManagedItem::Passthrough(bytes) => {
                                 if writer.write_all(&bytes).await.is_err() {
@@ -2240,14 +3099,52 @@ async fn pump<Reader, Writer>(
                                     break 'pump;
                                 }
                             }
+                            ManagedItem::ObservedFrame(frame) => {
+                                if let Some(message) = accept_observed_frame(
+                                    &ctx,
+                                    &meta,
+                                    direction,
+                                    &mut assembler,
+                                    &stats,
+                                    &tx,
+                                    frame,
+                                ) {
+                                    emit_observed(
+                                        &ctx,
+                                        &meta,
+                                        direction,
+                                        &counter,
+                                        &stats,
+                                        &tx,
+                                        &message,
+                                    );
+                                }
+                            }
                         }
                     }
                 } else {
                     if writer.write_all(&buf[..read]).await.is_err() {
                         break;
                     }
-                    for frame in decoder.push(&buf[..read]) {
-                        if let Some(message) = assembler.accept(frame) {
+                    let frames = decoder.push(&buf[..read]);
+                    emit_protocol_violations(
+                        &ctx,
+                        &meta,
+                        direction,
+                        &stats,
+                        &tx,
+                        decoder.take_violations(),
+                    );
+                    for frame in frames {
+                        if let Some(message) = accept_observed_frame(
+                            &ctx,
+                            &meta,
+                            direction,
+                            &mut assembler,
+                            &stats,
+                            &tx,
+                            frame,
+                        ) {
                             emit_observed(&ctx, &meta, direction, &counter, &stats, &tx, &message);
                         }
                     }
@@ -2291,7 +3188,7 @@ async fn pump<Reader, Writer>(
             let seq = counter.fetch_add(1, Ordering::Relaxed);
             let record =
                 injected_record(&meta, direction, seq, &frame, ctx.shared.redaction.as_ref());
-            let _ = tx.try_send(record);
+            queue_observed_record(&stats, &tx, WsObservedRecord::Message(record));
         }
         // If framing desyncs (either the observe decoder or the managed framer),
         // the tunnel keeps flowing (bytes are already forwarded) but decoding —
@@ -2310,6 +3207,14 @@ async fn pump<Reader, Writer>(
             break;
         }
     }
+    let frame_end_violations = if managed {
+        framer.finish_stream()
+    } else {
+        decoder.finish_stream()
+    };
+    emit_protocol_violations(&ctx, &meta, direction, &stats, &tx, frame_end_violations);
+    let message_end_violations = assembler.finish_stream();
+    emit_protocol_violations(&ctx, &meta, direction, &stats, &tx, message_end_violations);
     let _ = writer.shutdown().await;
 }
 
@@ -2319,13 +3224,26 @@ async fn drain_loop(
     ctx: Arc<ProxyContext>,
     meta: Arc<WsSessionMeta>,
     stats: Arc<WsStats>,
-    mut rx: mpsc::Receiver<WsMessageRecord>,
+    mut rx: mpsc::Receiver<WsObservedRecord>,
 ) {
     while let Some(record) = rx.recv().await {
-        let event = record.msg_event(&ctx.serial);
-        if let Err(error) = store::append_ws_message(&ctx.serial, &record) {
-            ctx.shared.record_persistence_error("ws_msg", &error);
-        }
+        let event = match record {
+            WsObservedRecord::Message(record) => {
+                let event = record.msg_event(&ctx.serial);
+                if let Err(error) = store::append_ws_message(&ctx.serial, &record) {
+                    ctx.shared.record_persistence_error("ws_msg", &error);
+                }
+                event
+            }
+            WsObservedRecord::Violation(record) => {
+                let event = record.violation_event(&ctx.serial);
+                if let Err(error) = store::append_ws_protocol_violation(&ctx.serial, &record) {
+                    ctx.shared
+                        .record_persistence_error("ws_protocol_violation", &error);
+                }
+                event
+            }
+        };
         let _ = ctx.shared.events.send(Arc::new(event));
     }
 
@@ -2358,6 +3276,12 @@ async fn drain_loop(
         c2s_bytes: stats.c2s_bytes.load(Ordering::Relaxed),
         s2c_bytes: stats.s2c_bytes.load(Ordering::Relaxed),
         dropped: stats.dropped.load(Ordering::Relaxed),
+        unreliable_messages: stats.unreliable_messages.load(Ordering::Relaxed),
+        c2s_protocol_violations: stats.c2s_protocol_violations.load(Ordering::Relaxed),
+        s2c_protocol_violations: stats.s2c_protocol_violations.load(Ordering::Relaxed),
+        c2s_decode_desynced: stats.c2s_decode_desynced.load(Ordering::Relaxed),
+        s2c_decode_desynced: stats.s2c_decode_desynced.load(Ordering::Relaxed),
+        evidence_reliable: stats.evidence_reliable(),
         redaction_policy: None,
         redaction_policy_version: None,
     };
@@ -2642,6 +3566,82 @@ mod tests {
         out
     }
 
+    fn pump_test_context() -> Arc<ProxyContext> {
+        let dir = tempfile::tempdir().unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::default();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::DigitalSignature,
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "ShadowDroid pump test CA");
+        let cert = params.self_signed(&key).unwrap();
+        let cert_path = dir.path().join("root.crt");
+        let key_path = dir.path().join("root.key");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        let ca = crate::net::ca::CertAuthority::load_from_files(&cert_path, &key_path).unwrap();
+
+        let (flow_tx, _) = mpsc::channel(1);
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        let shared = crate::net::proxy::SharedState {
+            anticache: false,
+            anticomp: false,
+            redaction: None,
+            host_filters: Vec::new(),
+            intercept: std::sync::RwLock::new(None),
+            held: Mutex::new(std::collections::HashMap::new()),
+            terminal_holds: Mutex::new(crate::net::proxy::TerminalHoldHistory::default()),
+            events,
+            rules: std::sync::RwLock::new(Vec::new()),
+            replay: std::sync::RwLock::new(None),
+            tls_errors_seen: Mutex::new(std::collections::HashSet::new()),
+            dropped_flows: AtomicU64::new(0),
+            persistence_errors: AtomicU64::new(0),
+            held_bytes: Arc::new(AtomicU64::new(0)),
+            rejected_holds: AtomicU64::new(0),
+            ws_control: Mutex::new(std::collections::HashMap::new()),
+            ws_intercept: std::sync::RwLock::new(None),
+            ws_held: Mutex::new(std::collections::HashMap::new()),
+        };
+        Arc::new(ProxyContext {
+            ca,
+            client: crate::net::proxy::build_upstream_client(false),
+            flow_tx,
+            shared: Arc::new(shared),
+            serial: Serial::new("pump-test"),
+            capture_session_id: "n-test".to_string(),
+            verify_upstream: false,
+            tasks: tokio_util::task::TaskTracker::new(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        })
+    }
+
+    fn protocol_codes(direction: Direction, deflate: DeflateParams, wire: &[u8]) -> Vec<String> {
+        let mut decoder = FrameDecoder::new();
+        let mut assembler = MessageAssembler::new(direction, deflate);
+        let frames = decoder.push(wire);
+        let mut codes = decoder
+            .take_violations()
+            .into_iter()
+            .map(|violation| violation.code.to_string())
+            .collect::<Vec<_>>();
+        for frame in frames {
+            let _ = assembler.accept(frame);
+            codes.extend(
+                assembler
+                    .take_violations()
+                    .into_iter()
+                    .map(|violation| violation.code.to_string()),
+            );
+        }
+        codes
+    }
+
     #[test]
     fn decodes_unmasked_text_frame() {
         let mut decoder = FrameDecoder::new();
@@ -2778,15 +3778,579 @@ mod tests {
     }
 
     #[test]
-    fn malformed_header_desyncs_without_panicking() {
+    fn known_boundary_control_violation_stays_synchronized() {
         let mut decoder = FrameDecoder::new();
-        // Control frame claiming >125 bytes is illegal.
-        let bad = vec![0x89, 0x7E, 0x01, 0x00]; // ping, len=256
-        let frames = decoder.push(&bad);
-        assert!(frames.is_empty());
-        assert!(decoder.desynced());
-        // Further bytes are ignored (tunnel keeps flowing elsewhere).
-        assert!(decoder.push(b"anything").is_empty());
+        // Control frame claiming 126 bytes is illegal, but the exact boundary
+        // is still known. Decode/report it and remain synchronized for the next
+        // valid frame instead of hiding the rest of the session.
+        let mut wire = frame(true, false, 0x9, &[b'x'; 126], None);
+        wire.extend(frame(true, false, 0x1, b"after", None));
+        let frames = decoder.push(&wire);
+        assert_eq!(frames.len(), 2);
+        assert!(!decoder.desynced());
+        assert!(
+            frames[0]
+                .violations
+                .iter()
+                .any(|violation| violation.code == "oversized_control_frame")
+        );
+        assert_eq!(frames[1].payload, b"after");
+    }
+
+    #[test]
+    fn header_validation_table_is_machine_readable_and_nonfatal_when_bounded() {
+        let mut rsv2 = frame(true, false, 0x1, b"x", None);
+        rsv2[0] |= 0x20;
+        let mut rsv3 = frame(true, false, 0x1, b"x", None);
+        rsv3[0] |= 0x10;
+        let non_minimal_16 = vec![0x81, 126, 0, 1, b'x'];
+        let mut non_minimal_64 = vec![0x82, 127];
+        non_minimal_64.extend_from_slice(&126u64.to_be_bytes());
+        non_minimal_64.extend(std::iter::repeat_n(b'x', 126));
+
+        let cases = vec![
+            ("rsv2", rsv2, "rsv2_set"),
+            ("rsv3", rsv3, "rsv3_set"),
+            (
+                "reserved data opcode",
+                frame(true, false, 0x3, b"x", None),
+                "reserved_opcode",
+            ),
+            (
+                "fragmented ping",
+                frame(false, false, 0x9, b"x", None),
+                "fragmented_control_frame",
+            ),
+            (
+                "oversized pong",
+                frame(true, false, 0xA, &[b'x'; 126], None),
+                "oversized_control_frame",
+            ),
+            ("non-minimal 16-bit", non_minimal_16, "non_minimal_length"),
+            ("non-minimal 64-bit", non_minimal_64, "non_minimal_length"),
+        ];
+        for (name, wire, expected) in cases {
+            let mut decoder = FrameDecoder::new();
+            let decoded = decoder.push(&wire);
+            assert_eq!(decoded.len(), 1, "{name}");
+            assert!(!decoder.desynced(), "{name}");
+            assert!(
+                decoded[0]
+                    .violations
+                    .iter()
+                    .any(|violation| violation.code == expected
+                        && violation.action == "forwarded_unmodified"
+                        && !violation.fatal),
+                "{name}: {:?}",
+                decoded[0].violations
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_lengths_fail_open_into_untapped_mode() {
+        let cases = [
+            (
+                "length_msb_set",
+                [vec![0x82, 127, 0x80], vec![0; 7]].concat(),
+            ),
+            (
+                "frame_length_limit_exceeded",
+                [vec![0x82, 127], (MAX_FRAME_LEN + 1).to_be_bytes().to_vec()].concat(),
+            ),
+        ];
+        for (expected, wire) in cases {
+            let mut decoder = FrameDecoder::new();
+            assert!(decoder.push(&wire).is_empty(), "{expected}");
+            assert!(decoder.desynced(), "{expected}");
+            let violations = decoder.take_violations();
+            assert_eq!(violations.len(), 1, "{expected}");
+            assert_eq!(violations[0].code, expected);
+            assert!(violations[0].fatal);
+            assert_eq!(violations[0].action, "forwarding_untapped");
+        }
+    }
+
+    #[test]
+    fn end_of_stream_marks_partial_frames_and_fragmented_messages() {
+        let mut header_decoder = FrameDecoder::new();
+        assert!(header_decoder.push(&[0x81]).is_empty());
+        let violations = header_decoder.finish_stream();
+        assert_eq!(violations[0].code, "connection_ended_mid_frame_header");
+        assert!(!violations[0].fatal);
+        assert_eq!(violations[0].action, "observed_incomplete");
+
+        let mut complete = frame(true, false, 0x1, b"hello", None);
+        complete[0] |= 0x20; // preserve header findings even when payload is partial
+        let mut payload_decoder = FrameDecoder::new();
+        assert!(payload_decoder.push(&complete[..4]).is_empty());
+        let violations = payload_decoder.finish_stream();
+        assert_eq!(violations[0].code, "rsv2_set");
+        assert_eq!(violations[1].code, "connection_ended_mid_frame");
+        assert_eq!(violations[1].action, "observed_incomplete");
+        assert_eq!(violations[1].detail["payload_bytes_received"], 2);
+        assert_eq!(violations[1].detail["payload_bytes_missing"], 3);
+
+        let mut framer = ManagedFramer::new();
+        assert!(framer.push(&complete[..4]).is_empty());
+        let violations = framer.finish_stream();
+        assert_eq!(violations[0].code, "rsv2_set");
+        assert_eq!(violations[1].code, "connection_ended_mid_frame");
+        assert_eq!(violations[1].opcode.as_deref(), Some("text"));
+
+        let mut oversized_reserved = vec![0x83, 127];
+        oversized_reserved.extend_from_slice(&(MANAGED_FRAME_CAP + 1).to_be_bytes());
+        let mut framer = ManagedFramer::new();
+        let items = framer.push(&oversized_reserved);
+        assert_eq!(items.len(), 1);
+        assert!(matches!(&items[0], ManagedItem::Passthrough(_)));
+        assert_eq!(framer.take_violations()[0].code, "reserved_opcode");
+
+        let mut decoder = FrameDecoder::new();
+        let mut assembler =
+            MessageAssembler::new(Direction::ServerToClient, DeflateParams::default());
+        let frames = decoder.push(&frame(false, false, 0x1, b"unfinished", None));
+        assert_eq!(frames.len(), 1);
+        assert!(assembler.accept(frames[0].clone()).is_none());
+        let violations = assembler.finish_stream();
+        assert_eq!(
+            violations[0].code,
+            "connection_ended_mid_fragmented_message"
+        );
+        assert_eq!(violations[0].action, "observed_incomplete");
+        assert_eq!(violations[0].detail["frame_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn tap_coordinator_finalizes_partial_evidence_in_both_pumps() {
+        let ctx = pump_test_context();
+        let meta = Arc::new(WsSessionMeta {
+            id: "w-shutdown".to_string(),
+            capture_session_id: "n-test".to_string(),
+            host: "ws.example.com".to_string(),
+            started_ts: events_now(),
+            deflate: DeflateParams::default(),
+        });
+        let stats = Arc::new(WsStats::default());
+        let counter = Arc::new(AtomicU64::new(1));
+        let (observed_tx, mut observed_rx) = mpsc::channel(16);
+
+        let (mut c2s_input, c2s_reader) = tokio::io::duplex(128);
+        let (c2s_writer, mut c2s_output) = tokio::io::duplex(128);
+        let (c2s_inject_tx, c2s_inject_rx) = mpsc::channel(1);
+        let c2s = pump(
+            ctx.clone(),
+            meta.clone(),
+            Direction::ClientToServer,
+            c2s_reader,
+            c2s_writer,
+            MessageAssembler::new(Direction::ClientToServer, meta.deflate),
+            stats.clone(),
+            counter.clone(),
+            observed_tx.clone(),
+            c2s_inject_rx,
+        );
+
+        let (mut s2c_input, s2c_reader) = tokio::io::duplex(128);
+        let (s2c_writer, mut s2c_output) = tokio::io::duplex(128);
+        let (s2c_inject_tx, s2c_inject_rx) = mpsc::channel(1);
+        let s2c = pump(
+            ctx.clone(),
+            meta.clone(),
+            Direction::ServerToClient,
+            s2c_reader,
+            s2c_writer,
+            MessageAssembler::new(Direction::ServerToClient, meta.deflate),
+            stats,
+            counter,
+            observed_tx.clone(),
+            s2c_inject_rx,
+        );
+        // Exercise the same outer coordinator used by `tap`: it must keep both
+        // pump futures alive after shutdown until their final findings are sent.
+        let coordinator = tokio::spawn(coordinate_tap_pumps(c2s, s2c));
+
+        let c2s_wire = frame(true, false, 0x1, b"partial", Some([0x11, 0x22, 0x33, 0x44]));
+        let c2s_partial = &c2s_wire[..c2s_wire.len() - 1];
+        c2s_input.write_all(c2s_partial).await.unwrap();
+        let s2c_fragment = frame(false, false, 0x1, b"unfinished", None);
+        s2c_input.write_all(&s2c_fragment).await.unwrap();
+
+        let mut c2s_forwarded = vec![0; c2s_partial.len()];
+        c2s_output.read_exact(&mut c2s_forwarded).await.unwrap();
+        assert_eq!(c2s_forwarded, c2s_partial);
+        let mut s2c_forwarded = vec![0; s2c_fragment.len()];
+        s2c_output.read_exact(&mut s2c_forwarded).await.unwrap();
+        assert_eq!(s2c_forwarded, s2c_fragment);
+
+        ctx.shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), coordinator)
+            .await
+            .expect("tap coordinator waits for both pumps after cancellation")
+            .unwrap();
+        drop((observed_tx, c2s_inject_tx, s2c_inject_tx));
+
+        let mut findings = Vec::new();
+        while let Some(record) = observed_rx.recv().await {
+            if let WsObservedRecord::Violation(record) = record {
+                findings.push((record.dir, record.violation));
+            }
+        }
+        assert!(findings.contains(&("c2s".to_string(), "connection_ended_mid_frame".to_string())));
+        assert!(findings.contains(&(
+            "s2c".to_string(),
+            "connection_ended_mid_fragmented_message".to_string()
+        )));
+    }
+
+    #[test]
+    fn managed_and_injected_observation_overflow_marks_session_unreliable() {
+        let meta = WsSessionMeta {
+            id: "w-overflow".to_string(),
+            capture_session_id: "n-test".to_string(),
+            host: "ws.example.com".to_string(),
+            started_ts: 1.0,
+            deflate: DeflateParams::default(),
+        };
+        let stats = WsStats::default();
+        let (tx, _rx) = mpsc::channel(1);
+        let injected = InjectedFrame {
+            opcode: Opcode::Text,
+            payload: b"second".to_vec(),
+        };
+        let mut managed_record =
+            injected_record(&meta, Direction::ServerToClient, 1, &injected, None);
+        managed_record.injected = false;
+        managed_record.disposition = Some("forwarded".to_string());
+        queue_observed_record(&stats, &tx, WsObservedRecord::Message(managed_record));
+        queue_observed_record(
+            &stats,
+            &tx,
+            WsObservedRecord::Message(injected_record(
+                &meta,
+                Direction::ServerToClient,
+                2,
+                &injected,
+                None,
+            )),
+        );
+
+        assert_eq!(stats.dropped.load(Ordering::Relaxed), 1);
+        assert!(
+            !stats.evidence_reliable(),
+            "a missing managed/injected record must be reflected in ws_close"
+        );
+    }
+
+    #[test]
+    fn direction_extension_and_fragmentation_validation_table() {
+        let masked_server = frame(true, false, 0x1, b"x", Some([1, 2, 3, 4]));
+        let mut rsv1_control = frame(true, false, 0x9, b"x", None);
+        rsv1_control[0] |= 0x40;
+        let mut continuation_rsv1 = frame(false, false, 0x1, b"a", None);
+        continuation_rsv1.extend(frame(true, true, 0x0, b"b", None));
+        let mut replaced_fragment = frame(false, false, 0x1, b"a", None);
+        replaced_fragment.extend(frame(true, false, 0x2, b"b", None));
+
+        let cases = vec![
+            (
+                "unmasked client",
+                Direction::ClientToServer,
+                DeflateParams::default(),
+                frame(true, false, 0x1, b"x", None),
+                "incorrect_masking",
+            ),
+            (
+                "masked server",
+                Direction::ServerToClient,
+                DeflateParams::default(),
+                masked_server,
+                "incorrect_masking",
+            ),
+            (
+                "rsv1 without extension",
+                Direction::ServerToClient,
+                DeflateParams::default(),
+                frame(true, true, 0x1, b"x", None),
+                "rsv1_without_negotiated_extension",
+            ),
+            (
+                "rsv1 control",
+                Direction::ServerToClient,
+                DeflateParams {
+                    enabled: true,
+                    ..Default::default()
+                },
+                rsv1_control,
+                "rsv1_on_control_frame",
+            ),
+            (
+                "rsv1 continuation",
+                Direction::ServerToClient,
+                DeflateParams {
+                    enabled: true,
+                    ..Default::default()
+                },
+                continuation_rsv1,
+                "rsv1_on_continuation",
+            ),
+            (
+                "orphan continuation",
+                Direction::ServerToClient,
+                DeflateParams::default(),
+                frame(true, false, 0x0, b"x", None),
+                "continuation_without_message",
+            ),
+            (
+                "new data before final continuation",
+                Direction::ServerToClient,
+                DeflateParams::default(),
+                replaced_fragment,
+                "new_data_frame_before_final_continuation",
+            ),
+        ];
+        for (name, direction, deflate, wire, expected) in cases {
+            let codes = protocol_codes(direction, deflate, &wire);
+            assert!(
+                codes.iter().any(|code| code == expected),
+                "{name}: {codes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn close_code_and_utf8_validation_table() {
+        for code in [1000, 1001, 1002, 1003, 1007, 1014, 3000, 4999] {
+            assert!(valid_close_code(code), "valid {code}");
+        }
+        for code in [0, 999, 1004, 1005, 1006, 1015, 2000, 2999, 5000] {
+            assert!(!valid_close_code(code), "invalid {code}");
+            let codes = protocol_codes(
+                Direction::ServerToClient,
+                DeflateParams::default(),
+                &frame(true, false, 0x8, &code.to_be_bytes(), None),
+            );
+            assert!(codes.iter().any(|item| item == "invalid_close_code"));
+        }
+
+        let one_byte = protocol_codes(
+            Direction::ServerToClient,
+            DeflateParams::default(),
+            &frame(true, false, 0x8, &[0x03], None),
+        );
+        assert!(
+            one_byte
+                .iter()
+                .any(|code| code == "invalid_close_payload_length")
+        );
+
+        let mut bad_reason = 1000u16.to_be_bytes().to_vec();
+        bad_reason.extend_from_slice(&[0xF0, 0x28, 0x8C, 0x28]);
+        let codes = protocol_codes(
+            Direction::ServerToClient,
+            DeflateParams::default(),
+            &frame(true, false, 0x8, &bad_reason, None),
+        );
+        assert!(codes.iter().any(|code| code == "invalid_close_reason_utf8"));
+
+        let codes = protocol_codes(
+            Direction::ServerToClient,
+            DeflateParams::default(),
+            &frame(true, false, 0x8, &1010u16.to_be_bytes(), None),
+        );
+        assert!(
+            codes
+                .iter()
+                .any(|code| code == "invalid_close_code_direction")
+        );
+    }
+
+    #[test]
+    fn fragmented_text_utf8_is_validated_after_reassembly() {
+        let mut invalid = frame(false, false, 0x1, &[0xF0, 0x9F], None);
+        invalid.extend(frame(true, false, 0x0, &[0x28, 0x80], None));
+        let codes = protocol_codes(
+            Direction::ServerToClient,
+            DeflateParams::default(),
+            &invalid,
+        );
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|code| code.as_str() == "invalid_text_utf8")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn message_record_marks_protocol_evidence_unreliable() {
+        let records = pipeline(
+            Direction::ServerToClient,
+            DeflateParams::default(),
+            None,
+            &frame(true, false, 0x1, &[0xF0, 0x28, 0x8C, 0x28], None),
+        );
+        assert_eq!(records.len(), 1);
+        assert!(!records[0].evidence_reliable);
+        assert_eq!(records[0].protocol_violations, ["invalid_text_utf8"]);
+        let event =
+            serde_json::to_value(records[0].msg_event(&Serial::new("emulator-5554"))).unwrap();
+        assert_eq!(event["evidence_reliable"], false);
+        assert_eq!(event["protocol_violations"][0], "invalid_text_utf8");
+    }
+
+    #[test]
+    fn legacy_message_dirty_fields_override_the_default_reliable_flag() {
+        let base = serde_json::json!({
+            "type": "ws_msg",
+            "id": "w1.1",
+            "session_id": "w1",
+            "ts": 2.0,
+            "host": "example.com",
+            "dir": "s2c",
+            "seq": 1,
+            "opcode": "text",
+            "payload_len": 5,
+            "wire_len": 5,
+            "retained_len": 5,
+            "frame_count": 1
+        });
+        let cases = [
+            ("truncated", serde_json::json!(true)),
+            ("compressed", serde_json::json!(true)),
+            (
+                "protocol_violations",
+                serde_json::json!(["incorrect_masking"]),
+            ),
+            ("evidence_reliable", serde_json::json!(false)),
+        ];
+        for (field, dirty) in cases {
+            let mut value = base.clone();
+            value[field] = dirty;
+            let record: WsMessageRecord = serde_json::from_value(value).unwrap();
+            assert!(record.evidence_reliable || field == "evidence_reliable");
+            assert!(!record.effective_evidence_reliable(), "field={field}");
+            let event =
+                serde_json::to_value(record.msg_event(&Serial::new("emulator-5554"))).unwrap();
+            assert_eq!(event["evidence_reliable"], false, "field={field}");
+            assert_eq!(
+                record.detail(false)["evidence_reliable"],
+                false,
+                "field={field}"
+            );
+        }
+
+        let clean: WsMessageRecord = serde_json::from_value(base.clone()).unwrap();
+        assert!(clean.effective_evidence_reliable());
+        let mut decoded = base;
+        decoded["compressed"] = serde_json::json!(true);
+        decoded["decompressed"] = serde_json::json!(true);
+        let decoded: WsMessageRecord = serde_json::from_value(decoded).unwrap();
+        assert!(decoded.effective_evidence_reliable());
+    }
+
+    #[test]
+    fn violation_record_is_structured_redacted_and_payload_free() {
+        let mut record = WsProtocolViolationRecord {
+            kind: "ws_protocol_violation".to_string(),
+            id: "w1.v1".to_string(),
+            session_id: "w1".to_string(),
+            flow_sequence: 9,
+            capture_session_id: "n-test".to_string(),
+            ts: 2.0,
+            host: "10.2.3.4".to_string(),
+            host_redacted: false,
+            dir: "s2c".to_string(),
+            violation: "invalid_close_reason_utf8".to_string(),
+            scope: "message".to_string(),
+            action: "forwarded_unmodified".to_string(),
+            fatal: false,
+            opcode: Some("close".to_string()),
+            detail: serde_json::json!({"reason_len": 4}),
+            redaction_policy: None,
+            redaction_policy_version: None,
+        };
+        record.redact(&crate::redaction::Policy::builtin());
+        let persisted = serde_json::to_value(&record).unwrap();
+        let event =
+            serde_json::to_value(record.violation_event(&Serial::new("emulator-5554"))).unwrap();
+        assert_eq!(persisted["type"], "ws_protocol_violation");
+        assert_eq!(event["type"], "ws_protocol_violation");
+        assert_eq!(event["violation"], "invalid_close_reason_utf8");
+        assert_eq!(event["action"], "forwarded_unmodified");
+        assert_eq!(event["detail"]["reason_len"], 4);
+        assert!(record.host_redacted);
+        assert!(
+            !serde_json::to_string(&persisted)
+                .unwrap()
+                .contains("10.2.3.4")
+        );
+        assert!(persisted.get("payload").is_none());
+        assert!(persisted.get("close_reason").is_none());
+    }
+
+    #[test]
+    fn legacy_close_record_defaults_to_reliable_evidence() {
+        let record: WsCloseRecord = serde_json::from_value(serde_json::json!({
+            "type": "ws_close",
+            "id": "w1",
+            "session_id": "w1",
+            "ts": 2.0,
+            "started_ts": 1.0,
+            "dur_ms": 1000,
+            "host": "example.com",
+            "c2s_msgs": 1,
+            "s2c_msgs": 1,
+            "c2s_bytes": 2,
+            "s2c_bytes": 2
+        }))
+        .unwrap();
+        assert!(record.evidence_reliable);
+        assert_eq!(record.unreliable_messages, 0);
+        assert_eq!(record.c2s_protocol_violations, 0);
+        assert_eq!(record.s2c_protocol_violations, 0);
+        assert!(!record.c2s_decode_desynced);
+        assert!(!record.s2c_decode_desynced);
+        assert!(record.effective_evidence_reliable());
+        assert_eq!(record.detail()["evidence_reliable"], true);
+    }
+
+    #[test]
+    fn legacy_close_dirty_fields_override_the_default_reliable_flag() {
+        let base = serde_json::json!({
+            "type": "ws_close",
+            "id": "w1",
+            "session_id": "w1",
+            "ts": 2.0,
+            "started_ts": 1.0,
+            "dur_ms": 1000,
+            "host": "example.com",
+            "c2s_msgs": 1,
+            "s2c_msgs": 1,
+            "c2s_bytes": 2,
+            "s2c_bytes": 2
+        });
+        let cases = [
+            ("dropped", serde_json::json!(1)),
+            ("unreliable_messages", serde_json::json!(1)),
+            ("c2s_protocol_violations", serde_json::json!(1)),
+            ("s2c_protocol_violations", serde_json::json!(1)),
+            ("c2s_decode_desynced", serde_json::json!(true)),
+            ("s2c_decode_desynced", serde_json::json!(true)),
+            ("evidence_reliable", serde_json::json!(false)),
+        ];
+        for (field, dirty) in cases {
+            let mut value = base.clone();
+            value[field] = dirty;
+            let record: WsCloseRecord = serde_json::from_value(value).unwrap();
+            assert!(record.evidence_reliable || field == "evidence_reliable");
+            assert!(!record.effective_evidence_reliable(), "field={field}");
+            let event =
+                serde_json::to_value(record.close_event(&Serial::new("emulator-5554"))).unwrap();
+            assert_eq!(event["evidence_reliable"], false, "field={field}");
+            assert_eq!(record.detail()["evidence_reliable"], false, "field={field}");
+        }
     }
 
     #[test]
@@ -3060,6 +4624,13 @@ mod tests {
 
         assert!(records[0].decompressed);
         assert_eq!(records[0].text.as_deref(), Some("hello"));
+        assert!(!records[0].evidence_reliable);
+        assert!(
+            records[0]
+                .protocol_violations
+                .iter()
+                .any(|code| code == "permessage_deflate_final_block")
+        );
 
         let second = &records[1];
         assert!(!second.decompressed, "must not report a fake clean decode");
@@ -3070,6 +4641,13 @@ mod tests {
             "raw bytes preserved, not shown as empty"
         );
         assert!(second.text.is_none());
+        assert!(!second.evidence_reliable);
+        assert!(
+            second
+                .protocol_violations
+                .iter()
+                .any(|code| code == "permessage_deflate_context_desynced")
+        );
     }
 
     #[test]
@@ -3110,8 +4688,17 @@ mod tests {
             assert_eq!(records.len(), 2, "{direction:?}");
             assert!(!records[0].decompressed, "{direction:?}");
             assert!(records[0].truncated, "{direction:?}");
+            assert!(!records[0].evidence_reliable, "{direction:?}");
+            assert!(
+                records[0]
+                    .protocol_violations
+                    .iter()
+                    .any(|code| code == "permessage_deflate_invalid_payload"),
+                "{direction:?}"
+            );
             assert!(records[1].decompressed, "{direction:?}");
             assert!(!records[1].truncated, "{direction:?}");
+            assert!(records[1].evidence_reliable, "{direction:?}");
             assert_eq!(
                 records[1].text.as_deref(),
                 Some("after error"),
@@ -3141,11 +4728,54 @@ mod tests {
         assert!(record.compressed);
         assert!(!record.decompressed);
         assert!(record.truncated);
+        assert!(!record.evidence_reliable);
         assert!(
             record.text.is_none(),
             "raw DEFLATE must not be shown as text"
         );
         assert!(record.data_b64.is_some(), "kept as a binary-safe artifact");
+        assert!(
+            record
+                .protocol_violations
+                .iter()
+                .any(|code| code == "permessage_deflate_input_incomplete")
+        );
+    }
+
+    #[test]
+    fn decompression_limit_is_a_machine_readable_unreliable_violation() {
+        use flate2::{Compress, Compression};
+
+        let plain = vec![b'z'; MAX_DECOMPRESS + 64 * 1024];
+        let mut compressor = Compress::new(Compression::best(), false);
+        let compressed = deflate_message(&mut compressor, &plain);
+        assert!(
+            compressed.len() < COMPRESSED_ACCUM_CAP,
+            "fixture must exercise output limit, not compressed-input cap"
+        );
+        let params = DeflateParams {
+            enabled: true,
+            server_no_context_takeover: true,
+            ..Default::default()
+        };
+        let records = pipeline(
+            Direction::ServerToClient,
+            params,
+            None,
+            &frame(true, true, 0x2, &compressed, None),
+        );
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert!(record.compressed);
+        assert!(!record.decompressed);
+        assert!(record.truncated);
+        assert!(!record.evidence_reliable);
+        assert!(
+            record
+                .protocol_violations
+                .iter()
+                .any(|code| { code == "permessage_deflate_decompression_limit_exceeded" })
+        );
     }
 
     #[test]
@@ -3285,6 +4915,12 @@ mod tests {
             c2s_bytes: 20,
             s2c_bytes: 20,
             dropped: 0,
+            unreliable_messages: 0,
+            c2s_protocol_violations: 0,
+            s2c_protocol_violations: 0,
+            c2s_decode_desynced: false,
+            s2c_decode_desynced: false,
+            evidence_reliable: true,
             redaction_policy: None,
             redaction_policy_version: None,
         };
@@ -3343,6 +4979,8 @@ mod tests {
             wire_len: 10,
             retained_len: 10,
             frame_count: 1,
+            protocol_violations: Vec::new(),
+            evidence_reliable: true,
             frames: Vec::new(),
             truncated: false,
             compressed: false,
@@ -3578,7 +5216,9 @@ mod tests {
                 assert_eq!(frame.payload, b"hello");
                 assert_eq!(frame.raw, masked, "raw bytes preserved verbatim");
             }
-            ManagedItem::Passthrough(_) => panic!("expected a frame"),
+            ManagedItem::Passthrough(_) | ManagedItem::ObservedFrame(_) => {
+                panic!("expected a managed frame")
+            }
         }
         // Split across reads still reassembles.
         let unmasked = encode_frame(Opcode::Binary, b"data", false);
@@ -3588,6 +5228,90 @@ mod tests {
             got.extend(framer.push(&[*byte]));
         }
         assert_eq!(got.len(), 1);
+    }
+
+    #[test]
+    fn managed_oversized_frame_streams_exactly_and_preserves_fragmentation_evidence() {
+        let payload_len = MANAGED_FRAME_CAP + 1;
+        let payload = (0..payload_len as usize)
+            .map(|index| ((index.wrapping_mul(31) + index / 251) & 0xFF) as u8)
+            .collect::<Vec<_>>();
+        let oversized_wire = frame(false, false, 0x1, &payload, None);
+        let header_len = oversized_wire.len() - payload.len();
+
+        let mut framer = ManagedFramer::new();
+        let mut assembler =
+            MessageAssembler::new(Direction::ServerToClient, DeflateParams::default());
+        let mut forwarded = Vec::with_capacity(oversized_wire.len());
+        for item in framer.push(&oversized_wire[..header_len]) {
+            match item {
+                ManagedItem::Passthrough(bytes) => forwarded.extend_from_slice(&bytes),
+                ManagedItem::Frame(_) | ManagedItem::ObservedFrame(_) => {
+                    panic!("the payload has not arrived")
+                }
+            }
+        }
+        assert!(!framer.at_boundary());
+
+        let mut observed = None;
+        for chunk in oversized_wire[header_len..].chunks(16 * 1024) {
+            for item in framer.push(chunk) {
+                match item {
+                    ManagedItem::Passthrough(bytes) => forwarded.extend_from_slice(&bytes),
+                    ManagedItem::ObservedFrame(frame) => observed = Some(frame),
+                    ManagedItem::Frame(_) => panic!("oversized frame must stay unmanaged"),
+                }
+            }
+        }
+
+        assert_eq!(
+            forwarded, oversized_wire,
+            "every nonuniform oversized wire byte must pass through unchanged and in order"
+        );
+        assert!(framer.at_boundary());
+        let oversized = observed.expect("boundary metadata emitted after raw passthrough");
+        assert_eq!(oversized.payload_len, payload_len);
+        assert!(oversized.payload.is_empty());
+        assert!(oversized.truncated);
+        assert!(
+            oversized
+                .violations
+                .iter()
+                .any(|violation| { violation.code == "managed_frame_exceeds_observation_cap" })
+        );
+        assert!(assembler.accept(oversized).is_none());
+        assert!(
+            !assembler.at_message_boundary(),
+            "oversized non-final data still starts a fragmented message"
+        );
+
+        let continuation = frame(true, false, 0x0, b"!", None);
+        let mut message = None;
+        for item in framer.push(&continuation) {
+            match item {
+                ManagedItem::Frame(frame) => {
+                    forwarded.extend_from_slice(&frame.raw);
+                    message = assembler.accept(managed_to_raw(&frame));
+                }
+                ManagedItem::Passthrough(_) | ManagedItem::ObservedFrame(_) => {
+                    panic!("expected a bounded continuation")
+                }
+            }
+        }
+        let message = message.expect("final continuation completes the message");
+        let mut original_wire = oversized_wire;
+        original_wire.extend_from_slice(&continuation);
+        assert_eq!(forwarded, original_wire);
+        assert_eq!(message.frame_count, 2);
+        assert_eq!(message.payload_len, payload_len + 1);
+        assert!(message.truncated);
+        assert!(!message_evidence_reliable(&message));
+        assert!(
+            message
+                .protocol_violations
+                .iter()
+                .any(|code| { code == "managed_frame_exceeds_observation_cap" })
+        );
     }
 
     #[test]
@@ -3660,6 +5384,7 @@ mod tests {
             compressed: false,
             decompressed: false,
             frames: Vec::new(),
+            protocol_violations: Vec::new(),
         };
         let (t, b, _, _) = encode_payload(&text);
         assert_eq!(t.as_deref(), Some("{\"a\":1}"));
@@ -3675,6 +5400,7 @@ mod tests {
             compressed: false,
             decompressed: false,
             frames: Vec::new(),
+            protocol_violations: Vec::new(),
         };
         let (t, b, _, _) = encode_payload(&binary);
         assert!(t.is_none());

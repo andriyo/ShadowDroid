@@ -929,7 +929,8 @@ fn event_matches(ev: &Event, m: &Matcher) -> bool {
         // filter excludes them.
         Event::WsMsg { host, .. }
         | Event::WsClose { host, .. }
-        | Event::WsIntercept { host, .. } => {
+        | Event::WsIntercept { host, .. }
+        | Event::WsProtocolViolation { host, .. } => {
             m.method.is_none()
                 && m.status.is_none()
                 && m.path.is_none()
