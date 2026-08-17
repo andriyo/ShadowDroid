@@ -14,8 +14,10 @@ use std::sync::LazyLock;
 use crate::cli::Cli;
 
 mod agent_metadata;
+mod effects;
 mod guides;
 use agent_metadata::agent_metadata;
+use effects::{command_effect_contract, effect_model_json};
 
 static CLI_COMMAND_TEMPLATE: LazyLock<Command> = LazyLock::new(Cli::command);
 
@@ -69,6 +71,7 @@ fn catalog_with_depth(root: &Command, depth: Option<usize>) -> serde_json::Value
         "name": root.get_name(),
         "version": root.get_version().unwrap_or(""),
         "about": root.get_about().map(|s| s.to_string()),
+        "effect_model": effect_model_json(),
         "global_args": args(root).into_iter().filter(|arg| arg["global"] == true).collect::<Vec<_>>(),
         "commands": subcommands(root, &[], depth),
         "next_actions": next_actions_for_path("commands"),
@@ -92,6 +95,7 @@ fn describe_catalog(root: &Command, raw_path: &str) -> Option<serde_json::Value>
     Some(serde_json::json!({
         "schema_version": 3,
         "path": names.join(" "),
+        "effect_model": effect_model_json(),
         "global_args": args(root).into_iter().filter(|arg| arg["global"] == true).collect::<Vec<_>>(),
         // Include one level of child names/contracts for namespace queries such
         // as `commands net`; leaf queries remain a single bounded command.
@@ -333,14 +337,15 @@ fn command_json(
     if let Some(agent) = catalog_agent_metadata(&path) {
         o.insert("agent".into(), agent);
     }
-    o.insert(
-        "contract".into(),
-        serde_json::json!({
-            "output_mode": output_mode(&path),
-            "success_condition": "process exit code 0; action envelopes also contain ok=true",
-            "next_actions": "every terminal JSON success/error contains a non-empty next_actions array; streaming events omit it until their terminal summary",
-        }),
-    );
+    let mut contract = serde_json::json!({
+        "output_mode": output_mode(&path),
+        "success_condition": "process exit code 0; action envelopes also contain ok=true",
+        "next_actions": "every terminal JSON success/error contains a non-empty next_actions array; streaming events omit it until their terminal summary",
+    });
+    if let Some(effects) = command_effect_contract(cmd, &path) {
+        contract["effect_contract"] = effects;
+    }
+    o.insert("contract".into(), contract);
     let command_args = args(cmd);
     if !command_args.is_empty() {
         o.insert("args".into(), serde_json::json!(command_args));

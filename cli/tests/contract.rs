@@ -306,6 +306,170 @@ fn config_schema_describes_stable_device_targets() {
 }
 
 #[test]
+fn catalog_exposes_typed_effect_contracts_and_their_vocabulary() {
+    let (out, code) = run(&["commands", "--json", "--depth", "1"]);
+    let catalog = one_json_line(&out);
+    assert_eq!(code, 0, "{catalog}");
+    assert_eq!(catalog["effect_model"]["schema_version"], 1);
+    assert_eq!(catalog["effect_model"]["mode"], "conservative_upper_bound");
+    assert_eq!(
+        catalog["effect_model"]["wildcard_semantics"]["effect"],
+        "unbounded_external_command"
+    );
+    assert_eq!(
+        catalog["effect_model"]["wildcard_semantics"]["scope"],
+        "transitive_external_subprocess_effects"
+    );
+    let vocabulary = catalog["effect_model"]["effects"]
+        .as_array()
+        .expect("effect vocabulary");
+    for required in [
+        "host_read",
+        "host_write",
+        "device_read",
+        "device_mutate",
+        "package_install",
+        "process_start",
+        "port_mapping_mutate",
+        "network_download",
+    ] {
+        assert!(
+            vocabulary.iter().any(|effect| effect["name"] == required),
+            "missing {required}: {vocabulary:?}"
+        );
+    }
+    let wildcard = vocabulary
+        .iter()
+        .find(|effect| effect["name"] == "unbounded_external_command")
+        .expect("external-command wildcard");
+    assert_eq!(wildcard["wildcard"], true);
+    assert!(
+        catalog["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|command| {
+                let contract = &command["contract"]["effect_contract"];
+                contract["effects"].is_array()
+                    && contract["effect_coverage"]["kind"].is_string()
+                    && contract["effect_coverage"]["wildcard_effects"].is_array()
+                    && contract["conditional_effects"]
+                        .as_array()
+                        .is_some_and(|effects| {
+                            effects.iter().any(|effect| {
+                                effect["effect"] == "host_write"
+                                    && effect["when"]
+                                        .as_str()
+                                        .is_some_and(|when| when.contains("usage logging"))
+                            })
+                        })
+            })
+    );
+}
+
+#[test]
+fn external_subprocess_effect_wildcard_is_explicit_per_command() {
+    for path in ["aar install", "device shell", "test", "update"] {
+        let (out, code) = run(&["commands", "--json", "--describe", path]);
+        let described = one_json_line(&out);
+        assert_eq!(code, 0, "{described}");
+        let contract = &described["command"]["contract"]["effect_contract"];
+        assert_eq!(
+            contract["effect_coverage"]["kind"], "enumerated_plus_unbounded_external_subprocess",
+            "{path}: {contract}"
+        );
+        assert_eq!(
+            contract["effect_coverage"]["wildcard_effects"],
+            serde_json::json!(["unbounded_external_command"]),
+            "{path}: {contract}"
+        );
+    }
+
+    let (out, code) = run(&["commands", "--json", "--describe", "commands"]);
+    let described = one_json_line(&out);
+    assert_eq!(code, 0, "{described}");
+    let contract = &described["command"]["contract"]["effect_contract"];
+    assert!(
+        contract["effects"]
+            .as_array()
+            .is_some_and(|effects| effects.iter().any(|effect| effect == "host_read")),
+        "commands must declare the usage-config read: {contract}"
+    );
+    assert_eq!(contract["effect_coverage"]["kind"], "enumerated");
+    assert_eq!(
+        contract["effect_coverage"]["wildcard_effects"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn collect_effect_contract_is_passive_and_server_reads_advertise_bring_up() {
+    let (out, code) = run(&["commands", "--json", "--describe", "collect"]);
+    let collect = one_json_line(&out);
+    assert_eq!(code, 0, "{collect}");
+    let effect_contract = &collect["command"]["contract"]["effect_contract"];
+    assert_eq!(effect_contract["scope"], "invocation");
+    assert_eq!(
+        effect_contract["effects"],
+        serde_json::json!(["host_read", "host_write", "device_read"])
+    );
+    assert!(
+        effect_contract["conditional_effects"]
+            .as_array()
+            .is_some_and(|effects| effects
+                .iter()
+                .any(|effect| effect["effect"] == "host_write")),
+        "usage-log exception must be explicit on collect: {effect_contract}"
+    );
+    let dependencies = effect_contract["effectful_dependencies"]
+        .as_array()
+        .unwrap();
+    assert!(
+        dependencies
+            .iter()
+            .any(|value| value == "existing_server_probe")
+    );
+    assert!(
+        dependencies
+            .iter()
+            .any(|value| value == "target_resolve_online"),
+        "collect must reject offline targets without booting them: {effect_contract}"
+    );
+    for forbidden in [
+        "server_ensure_ready",
+        "release_asset_download",
+        "package_installer",
+        "managed_process_start",
+        "port_mapping_mutation",
+        "target_resolve_may_start",
+        "target_resolve_existing",
+    ] {
+        assert!(
+            dependencies.iter().all(|value| value != forbidden),
+            "collect gained {forbidden}: {effect_contract}"
+        );
+    }
+
+    let (out, code) = run(&["commands", "--json", "--describe", "ui dump"]);
+    let ui_dump = one_json_line(&out);
+    assert_eq!(code, 0, "{ui_dump}");
+    let effects = ui_dump["command"]["contract"]["effect_contract"]["effects"]
+        .as_array()
+        .unwrap();
+    for lifecycle_effect in [
+        "package_install",
+        "process_start",
+        "port_mapping_mutate",
+        "network_download",
+    ] {
+        assert!(
+            effects.iter().any(|effect| effect == lifecycle_effect),
+            "ui dump must advertise ensure-ready's {lifecycle_effect}: {effects:?}"
+        );
+    }
+}
+
+#[test]
 fn commands_json_is_one_valid_json_object() {
     let (out, code) = run(&["commands", "--json"]);
     let v: serde_json::Value =
