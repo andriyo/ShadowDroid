@@ -9,9 +9,33 @@ permissions:
   contents: write
 
 jobs:
+  verify-release-source:
+    name: Verify tag and version contract
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # The release tag must be proven reachable from the public main
+          # branch. Full history avoids shallow-clone false negatives when
+          # main advances while this tag-triggered workflow is queued.
+          fetch-depth: 0
+
+      - name: Prove the tag commit has synchronized runtime versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git describe --tags --exact-match)" = "$GITHUB_REF_NAME"
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
+          ./scripts/check-release-versions.sh "$version"
+
   build-apks:
     name: Build Android server APKs
+    needs: verify-release-source
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     outputs:
       main_sha256: ${{ steps.checksums.outputs.main_sha256 }}
       test_sha256: ${{ steps.checksums.outputs.test_sha256 }}
@@ -32,13 +56,37 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v6
 
-      - name: Build APK pair
+      - name: Check, test, and build APK pair
         working-directory: server
         # -Pversion stamps the APK's versionName from the tag (build.gradle.kts
         # reads it; the running server reports the same value as server_version).
         # Without this the APK ships build.gradle.kts's fallback versionName, which
         # is how v0.4.0 APKs went out labeled 0.3.1 and looped the CLI version gate.
-        run: ./gradlew --no-daemon -Pversion="${GITHUB_REF_NAME#v}" :app:assembleDebug :app:assembleDebugAndroidTest
+        run: |
+          ./gradlew --no-daemon -Pversion="${GITHUB_REF_NAME#v}" \
+            ktlintCheck \
+            :app:lintDebug \
+            :app:testDebugUnitTest \
+            :app:assembleDebug \
+            :app:assembleDebugAndroidTest
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Test the tag-built APK pair on Android
+        uses: reactivecircus/android-emulator-runner@v2.37.0
+        with:
+          api-level: 36
+          target: google_apis
+          arch: x86_64
+          working-directory: server
+          script: >-
+            ./gradlew --no-daemon -Pversion="${GITHUB_REF_NAME#v}"
+            :app:connectedDebugAndroidTest
 
       - name: Stage APK assets
         id: checksums
@@ -60,6 +108,7 @@ jobs:
 
   build-studio-plugin:
     name: Build Android Studio plugin
+    needs: verify-release-source
     runs-on: ubuntu-24.04
     outputs:
       plugin_sha256: ${{ steps.checksums.outputs.plugin_sha256 }}
@@ -77,7 +126,7 @@ jobs:
         working-directory: shadowdroid-plugin
         shell: bash
         run: |
-          ./gradlew --no-daemon -Pversion="${GITHUB_REF_NAME#v}" buildPlugin verifyPluginStructure
+          ./gradlew --no-daemon -Pversion="${GITHUB_REF_NAME#v}" test buildPlugin verifyPluginStructure
 
       - name: Stage plugin asset
         id: checksums
@@ -98,6 +147,7 @@ jobs:
 
   build-agent-aar:
     name: Build in-app debug agent AAR
+    needs: verify-release-source
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
@@ -116,12 +166,30 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v6
 
-      - name: Build agent AARs
+      - name: Check, test, and build agent AARs
         working-directory: agent
         run: |
           ./gradlew --no-daemon \
+            :shadowdroid-agent:lintDebug \
+            :shadowdroid-agent:testDebugUnitTest \
             :shadowdroid-agent:assembleRelease \
+            :shadowdroid-agent-okhttp:lintDebug \
+            :shadowdroid-agent-okhttp:testDebugUnitTest \
             :shadowdroid-agent-okhttp:assembleRelease
+
+      - name: Test the tag-built AARs in their real app consumer
+        run: |
+          mkdir -p samples/shadowdroid-test-app/shadowdroid
+          cp agent/shadowdroid-agent/build/outputs/aar/shadowdroid-agent-release.aar \
+            samples/shadowdroid-test-app/shadowdroid/shadowdroid-agent.aar
+          cp agent/shadowdroid-agent-okhttp/build/outputs/aar/shadowdroid-agent-okhttp-release.aar \
+            samples/shadowdroid-test-app/shadowdroid/shadowdroid-agent-okhttp.aar
+          ./samples/shadowdroid-test-app/gradlew --no-daemon \
+            -p samples/shadowdroid-test-app \
+            :app:lintDebug \
+            :app:testDebugUnitTest \
+            :app:assembleDebug \
+            :app:assembleRelease
 
       - name: Stage AAR asset
         shell: bash
@@ -141,6 +209,7 @@ jobs:
   build-cli:
     name: Build ${{ matrix.target }}
     needs:
+      - verify-release-source
       - build-apks
       - build-studio-plugin
     strategy:
@@ -218,11 +287,26 @@ jobs:
       - name: Stage release assets
         shell: bash
         run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git describe --tags --exact-match)" = "$GITHUB_REF_NAME"
           mkdir -p dist
           find downloaded -maxdepth 3 -type f -exec cp {} dist/ \;
           cp scripts/install.sh dist/shadowdroid-installer.sh
           cp scripts/install.ps1 dist/shadowdroid-installer.ps1
           chmod +x dist/shadowdroid-installer.sh
+          jq -n \
+            --arg tag "$GITHUB_REF_NAME" \
+            --arg commit "$GITHUB_SHA" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg workflow_run "$GITHUB_RUN_ID" \
+            '{
+              artifact_type: "shadowdroid_release_provenance",
+              format_version: 1,
+              tag: $tag,
+              commit: $commit,
+              repository: $repository,
+              workflow_run: $workflow_run
+            }' > dist/RELEASE_PROVENANCE.json
           (
             cd dist
             rm -f SHA256SUMS

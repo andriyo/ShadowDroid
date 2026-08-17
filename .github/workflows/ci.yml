@@ -41,6 +41,16 @@ jobs:
         working-directory: cli
         run: cargo +1.97.0 test --locked --all-targets
 
+      - name: Build CLI for Android journeys
+        working-directory: cli
+        run: cargo +1.97.0 build --locked
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci-linux-cli
+          path: cli/target/debug/shadowdroid
+          if-no-files-found: error
+
   rust-msrv:
     name: Rust CLI (MSRV 1.91)
     runs-on: ubuntu-24.04
@@ -122,6 +132,20 @@ jobs:
             :app:assembleDebug \
             :app:assembleDebugAndroidTest
 
+      - name: Stage server APK pair for Android journeys
+        run: |
+          mkdir -p ci-artifacts/server
+          cp server/app/build/outputs/apk/debug/app-debug.apk \
+            ci-artifacts/server/app-debug.apk
+          cp server/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk \
+            ci-artifacts/server/app-debug-androidTest.apk
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci-server-apks
+          path: ci-artifacts/server/*.apk
+          if-no-files-found: error
+
   server-instrumented:
     name: Android server instrumentation
     runs-on: ubuntu-24.04
@@ -143,16 +167,14 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
-      - name: Run atomic file-route tests on an emulator
+      - name: Run every server instrumentation test on an emulator
         uses: reactivecircus/android-emulator-runner@v2.37.0
         with:
           api-level: 36
           target: google_apis
           arch: x86_64
           working-directory: server
-          script: >-
-            ./gradlew --no-daemon :app:connectedDebugAndroidTest
-            -Pandroid.testInstrumentationRunnerArguments.class=io.github.andriyo.shadowdroid.routes.FileRoutesAtomicWriteTest
+          script: ./gradlew --no-daemon :app:connectedDebugAndroidTest
 
   agent-and-sample:
     name: In-app agent and sample app
@@ -202,6 +224,86 @@ jobs:
             :app:testDebugUnitTest \
             :app:assembleDebug \
             :app:assembleRelease
+
+      - name: Stage sample APK for Android journeys
+        run: |
+          mkdir -p ci-artifacts/sample
+          cp samples/shadowdroid-test-app/app/build/outputs/apk/debug/app-debug.apk \
+            ci-artifacts/sample/app-debug.apk
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci-field-lab-apk
+          path: ci-artifacts/sample/app-debug.apk
+          if-no-files-found: error
+
+  android-surfaces:
+    name: Android agent surfaces (${{ matrix.name }})
+    needs:
+      - rust
+      - server
+      - agent-and-sample
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: phone-api-36
+            api-level: 36
+            target: google_apis
+            form-factor: phone
+          - name: tv-api-36
+            api-level: 36
+            target: android-tv
+            form-factor: tv
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: ci-linux-cli
+          path: ci-artifacts/cli
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: ci-server-apks
+          path: ci-artifacts/server
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: ci-field-lab-apk
+          path: ci-artifacts/sample
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Exercise the real CLI, APK pair, and Field Lab
+        uses: reactivecircus/android-emulator-runner@v2.37.0
+        with:
+          api-level: ${{ matrix.api-level }}
+          target: ${{ matrix.target }}
+          arch: x86_64
+          script: |
+            chmod +x ci-artifacts/cli/shadowdroid
+            SHADOWDROID_CLI_BIN="$PWD/ci-artifacts/cli/shadowdroid" \
+              SHADOWDROID_SERVER_TEST_APK="$PWD/ci-artifacts/server/app-debug-androidTest.apk" \
+              SHADOWDROID_SAMPLE_APK="$PWD/ci-artifacts/sample/app-debug.apk" \
+              SHADOWDROID_DEVICE=emulator-5554 \
+              SHADOWDROID_EXPECT_FORM_FACTOR=${{ matrix.form-factor }} \
+              SHADOWDROID_E2E_EVIDENCE="$RUNNER_TEMP/android-surfaces-${{ matrix.name }}" \
+              ./scripts/e2e-android-surfaces.sh
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: android-surfaces-${{ matrix.name }}
+          path: ${{ runner.temp }}/android-surfaces-${{ matrix.name }}
+          if-no-files-found: warn
 
   studio-plugin:
     name: Android Studio plugin

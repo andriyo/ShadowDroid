@@ -69,7 +69,7 @@ block() { if [ "$dry_run" = 1 ]; then echo "warning (blocks a real run): $*" >&2
 
 branch="$(git rev-parse --abbrev-ref HEAD)"
 [ "$branch" != "HEAD" ] || die "detached HEAD; check out a branch first"
-[ "$branch" = "main" ] || echo "warning: on '$branch', not 'main'" >&2
+[ "$branch" = "main" ] || die "release must be cut from main, not '$branch'"
 
 git rev-parse -q --verify "refs/tags/$tag" >/dev/null && block "tag $tag already exists locally"
 git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1 && block "tag $tag already exists on origin"
@@ -99,15 +99,16 @@ awk -v new="$version" '!done && /^version = "/ { sub(/"[^"]*"/, "\"" new "\""); 
 # The release workflow stamps the APK versionName from the tag via -Pversion, so
 # server literals are only the fallback for local/dev builds. The agent AAR
 # reports its BuildInfo marker directly at runtime, so stale source here ships a
-# mislabeled artifact. Each substitution is anchored; a miss warns rather than
-# blocks the release.
+# mislabeled artifact. Each substitution is anchored; a miss blocks the
+# release because silently shipping a stale runtime marker is unrecoverable at
+# the tag commit.
 sync_version_literal() {  # <file> <anchored-ERE-with-group-1-prefix>
   local file="$1" pattern="$2"
-  if [ ! -f "$file" ]; then echo "warning: $file missing; version sync skipped" >&2; return; fi
+  [ -f "$file" ] || die "$file missing; cannot synchronize release version"
   if grep -Eq "$pattern" "$file"; then
     sed -E -i.bak "s/$pattern/\\1\"$version\"/" "$file" && rm -f "$file.bak"
   else
-    echo "warning: no version literal matched in $file; left unchanged" >&2
+    die "no release version literal matched in $file"
   fi
 }
 # build.gradle.kts elvis fallback:  ?: "X.Y.Z"
@@ -120,6 +121,10 @@ sync_version_literal \
 sync_version_literal \
   "agent/shadowdroid-agent/src/main/kotlin/io/github/andriyo/shadowdroid/agent/BuildInfo.kt" \
   '(const val VERSION = )"[^"]*"'
+
+# Refuse to create a tag unless the lockfile and every source-controlled
+# runtime marker agree with the Cargo package version.
+scripts/check-release-versions.sh "$version"
 
 # --- 3. commit ----------------------------------------------------------
 git add cli/Cargo.toml cli/Cargo.lock \

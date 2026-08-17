@@ -35,6 +35,22 @@ The package is:
 io.github.andriyo.shadowdroid.sample
 ```
 
+## Real Android Surface Contract
+
+The repository-level journey drives the exact CLI, server APK pair, and sample
+APK built from the checkout across Compose, native View, WebView, D-pad focus,
+and delayed lifecycle convergence. CI runs it on phone and Android TV images;
+from the repository root, it can also be run against a local emulator:
+
+```bash
+SHADOWDROID_DEVICE=emulator-5554 \
+  SHADOWDROID_EXPECT_FORM_FACTOR=phone \
+  ./scripts/e2e-android-surfaces.sh
+```
+
+Every command response is retained in a temporary evidence directory printed by
+the final JSON object.
+
 ## Run The WebSocket Chat Server
 
 The `chat-server` module is a real Ktor server with a shared chat room, a

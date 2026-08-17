@@ -20,6 +20,11 @@
         android:usesCleartextTraffic="true">
 
         <activity
+            android:name=".FocusFixtureActivity"
+            android:exported="true"
+            android:label="Focus Contract Fixture" />
+
+        <activity
             android:name=".DeepLinkActivity"
             android:exported="true"
             android:label="@string/deep_link_activity_name">

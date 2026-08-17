@@ -1,4 +1,8 @@
 <resources>
+    <item name="focus_fixture_root" type="id" />
+    <item name="focus_origin_button" type="id" />
+    <item name="focus_status" type="id" />
+    <item name="focus_target_button" type="id" />
     <item name="sample_root" type="id" />
     <item name="status_text" type="id" />
     <item name="name_input" type="id" />

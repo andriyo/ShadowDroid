@@ -868,14 +868,14 @@ private fun MissionScreen(
                 Button(
                     onClick = {
                         codeAttempted = true
-                        when {
-                            operatorName.isBlank() -> actions.setStatus("Operator callsign is required")
-                            missionCode != MISSION_CODE -> actions.setStatus("Run code rejected")
-                            else -> {
-                                onMissionStageChanged(maxOf(missionStage, 1))
-                                actions.setStatus("Incident claimed by $operatorName")
-                            }
-                        }
+                        val transition =
+                            MissionModel.claimIncident(
+                                currentStage = missionStage,
+                                operatorName = operatorName,
+                                runCode = missionCode,
+                            )
+                        onMissionStageChanged(transition.stage)
+                        actions.setStatus(transition.status)
                     },
                     modifier =
                         Modifier
@@ -943,10 +943,16 @@ private fun MissionScreen(
                 Spacer(Modifier.height(12.dp))
                 Button(
                     onClick = {
-                        onMissionStageChanged(maxOf(missionStage, 2))
-                        actions.setStatus("Relay calibrated at ${signal.roundToInt()}%")
+                        val transition =
+                            MissionModel.armRelay(
+                                currentStage = missionStage,
+                                signal = signal,
+                                telemetryEnabled = telemetryEnabled,
+                            )
+                        onMissionStageChanged(transition.stage)
+                        actions.setStatus(transition.status)
                     },
-                    enabled = missionStage >= 1 && signal in 68f..74f && telemetryEnabled,
+                    enabled = MissionModel.canArmRelay(missionStage, signal, telemetryEnabled),
                     modifier =
                         Modifier
                             .fillMaxWidth()
@@ -997,12 +1003,17 @@ private fun MissionScreen(
                 }
                 Spacer(Modifier.height(14.dp))
                 HoldToAcknowledge(
-                    enabled = missionStage >= 2 && selectedRelay != null,
+                    enabled = MissionModel.canAcknowledgeRecovery(missionStage, selectedRelay),
                     onClick = { actions.setStatus("Hold acknowledgement; a tap is not enough") },
                     onLongClick = {
-                        onMissionStageChanged(3)
-                        actions.setStatus("Recovery acknowledged for Relay ${selectedRelay.orEmpty()}")
-                        showCompleteDialog = true
+                        val transition =
+                            MissionModel.acknowledgeRecovery(
+                                currentStage = missionStage,
+                                selectedRelay = selectedRelay,
+                            )
+                        onMissionStageChanged(transition.stage)
+                        actions.setStatus(transition.status)
+                        showCompleteDialog = transition.accepted
                     },
                 )
             }
@@ -2142,4 +2153,3 @@ const val DEFAULT_HTTPS_URL = "https://httpbin.org/anything/shadowdroid"
 const val DEFAULT_HTTP_URL = "http://httpbin.org/anything/shadowdroid-cleartext"
 const val DEFAULT_GRAPHQL_BODY =
     """{"operationName":"ShadowDroidSampleQuery","query":"query ShadowDroidSampleQuery { sample: __typename }","variables":{"source":"shadowdroid-test-app"}}"""
-private const val MISSION_CODE = "NIGHT-42"
