@@ -29,6 +29,7 @@ pub mod flow;
 pub mod paths;
 pub mod proxy;
 pub mod replay;
+pub mod rule;
 pub mod store;
 pub mod trust;
 pub mod ws;
@@ -162,7 +163,7 @@ impl Mutation {
 
 /// A declarative rule (P3). `kind` selects the transform; `args` are
 /// kind-specific positionals (e.g. map-local → `[path]`, set-status → `[code]`).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SyntheticResponseSpec {
     pub status: u16,
     #[serde(default)]
@@ -171,26 +172,11 @@ pub struct SyntheticResponseSpec {
     pub body: Vec<u8>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct RuleSpec {
-    pub kind: String,
-    #[serde(default)]
-    pub matcher: Matcher,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_type: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub operation_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub response: Option<SyntheticResponseSpec>,
-    /// `ws-*` rules: restrict to a direction (`c2s`/`s2c`); `None` = both.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ws_dir: Option<String>,
-    /// `ws-*` rules: restrict to a frame opcode; `None` = all.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ws_opcode: Option<String>,
-    #[serde(default)]
-    pub args: Vec<String>,
-}
+#[allow(unused_imports)]
+pub use rule::{
+    CompiledRule, MatchContext, RuleAction, RuleMatchOn, RuleMatcher, RulePhase, RuleSpec,
+    RuleTerminal, RuleTransform, WsDirection, WsOpcode,
+};
 
 /// Config handed to the daemon process at spawn.
 ///

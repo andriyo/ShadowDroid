@@ -1146,6 +1146,9 @@ mod tests {
         assert!(net_impl.contains(
             "fnallows_target_start(&self)->bool{matches!(self,Self::Check{..}|Self::Trust{..}|Self::Start{..})}"
         ));
+        assert!(net_impl.contains(
+            "fnis_local_rule_analysis(&self)->bool{matches!(self,Self::Rule(NetRuleCmd::Lint{..}|NetRuleCmd::Explain(_)))}"
+        ));
         assert!(!net_impl.contains("Self::Ws"));
 
         let net_dispatch = compact_source(source_region(
@@ -1156,6 +1159,19 @@ mod tests {
         assert!(net_dispatch.contains(
             "letserial=ifc.allows_target_start(){selection.resolve(&config).await?}else{selection.resolve_existing(&config).await?};"
         ));
+        assert!(net_dispatch.contains(
+            "ifc.is_local_rule_analysis(){returndispatch_net(c,&Serial::new(\"\"),&config).await;}"
+        ));
+        let local_analysis = net_dispatch
+            .find("ifc.is_local_rule_analysis(){")
+            .expect("local rule analysis must bypass device resolution");
+        let device_resolution = net_dispatch
+            .find("letserial=ifc.allows_target_start(){")
+            .expect("device-backed net commands must resolve a target");
+        assert!(
+            local_analysis < device_resolution,
+            "local rule analysis must return before any device resolution"
+        );
         assert!(net_dispatch.contains("ifmatches!(c,NetCmd::Ca(_)){"));
         assert!(net_dispatch.contains(
             "letserial=resolve_serial(direct).await.unwrap_or_else(|_|Serial::new(\"\"));"

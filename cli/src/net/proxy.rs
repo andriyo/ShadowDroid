@@ -48,7 +48,10 @@ use tokio_util::task::TaskTracker;
 use crate::events::{self, Event};
 use crate::net::ca::CertAuthority;
 use crate::net::flow::{self, FlowRecord};
-use crate::net::{Matcher, Mutation, RuleSpec, store, ws};
+use crate::net::{
+    CompiledRule, MatchContext, Matcher, Mutation, RuleAction, RuleMatchOn, RulePhase,
+    RuleTerminal, RuleTransform, store, ws,
+};
 
 /// The response body we hand the device: either a buffered `Full` (the common
 /// case) or a live `StreamBody` for streamed responses — unified as one boxed
@@ -116,8 +119,9 @@ pub struct SharedState {
     pub terminal_holds: Mutex<TerminalHoldHistory>,
     /// Live event fan-out (shared with the daemon) — carries `http_intercept`.
     pub events: broadcast::Sender<Arc<Event>>,
-    /// Declarative rules (`net rule`), applied in order: `(id, spec)`.
-    pub rules: RwLock<Vec<(String, RuleSpec)>>,
+    /// Declarative rules (`net rule`), applied in order. Every entry is fully
+    /// validated/compiled before the vector is atomically published.
+    pub rules: RwLock<Vec<(String, CompiledRule)>>,
     /// Fully validated immutable response set (`net replay`), or `None`.
     pub replay: RwLock<Option<Arc<ActiveReplay>>>,
     /// Hosts we've already reported a `tls_error` for, so a client that keeps
@@ -1433,6 +1437,7 @@ async fn proxy_request(
                     method.as_str(),
                     &host,
                     &path,
+                    &url,
                     &mut streamed_status,
                     &mut resp_headers,
                     &mut no_body,
@@ -1559,6 +1564,7 @@ async fn proxy_request(
             method.as_str(),
             &host,
             &path,
+            &url,
             &mut status,
             &mut resp_headers,
             &mut resp_bytes,
@@ -2614,70 +2620,22 @@ fn extend_rule_ids(target: &mut Vec<String>, incoming: Vec<String>) {
     }
 }
 
-fn rule_matches(
-    spec: &RuleSpec,
-    method: &str,
-    host: &str,
-    path: &str,
-    ct: Option<&str>,
-    status: Option<u16>,
-) -> bool {
-    let m = &spec.matcher;
-    let sub = |hay: &str, n: &Option<String>| {
-        n.as_deref()
-            .map(|x| hay.to_lowercase().contains(&x.to_lowercase()))
-            .unwrap_or(true)
-    };
-    sub(host, &m.host)
-        && sub(path, &m.path)
-        && sub(method, &m.method)
-        && m.status
-            .map(|wanted| status == Some(wanted))
-            .unwrap_or(true)
-        && spec
-            .content_type
-            .as_deref()
-            .map(|want| ct.map(|c| c.contains(want)).unwrap_or(false))
-            .unwrap_or(true)
-}
-
-fn graphql_operation_matches(wanted: &str, path: &str, body: &[u8]) -> bool {
-    let path = if path.starts_with('/') {
-        path.to_string()
-    } else {
-        format!("/{path}")
-    };
-    if reqwest::Url::parse(&format!("http://shadowdroid.invalid{path}"))
+fn effective_url_parts(url: &str, fallback_host: &str, fallback_path: &str) -> (String, String) {
+    reqwest::Url::parse(url)
         .ok()
-        .into_iter()
-        .flat_map(|url| {
-            url.query_pairs()
-                .map(|(key, value)| (key.into_owned(), value.into_owned()))
-                .collect::<Vec<_>>()
+        .map(|parsed| {
+            let host = parsed
+                .host_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| fallback_host.to_string());
+            let mut path = parsed.path().to_string();
+            if let Some(query) = parsed.query() {
+                path.push('?');
+                path.push_str(query);
+            }
+            (host, path)
         })
-        .any(|(key, value)| key == "operationName" && value == wanted)
-    {
-        return true;
-    }
-
-    fn json_matches(value: &serde_json::Value, wanted: &str) -> bool {
-        match value {
-            serde_json::Value::Object(object) => {
-                object
-                    .get("operationName")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(wanted)
-            }
-            serde_json::Value::Array(values) => {
-                values.iter().any(|value| json_matches(value, wanted))
-            }
-            _ => false,
-        }
-    }
-
-    serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .is_some_and(|value| json_matches(&value, wanted))
+        .unwrap_or_else(|| (fallback_host.to_string(), fallback_path.to_string()))
 }
 
 fn apply_request_rules(
@@ -2696,72 +2654,77 @@ fn apply_request_rules(
         modified: false,
         rule_ids: Vec::new(),
     };
-    for (id, spec) in rules.iter() {
-        if !rule_matches(spec, method, host, path, None, None)
-            || spec
-                .operation_name
-                .as_deref()
-                .is_some_and(|wanted| !graphql_operation_matches(wanted, path, body))
-        {
+    for (id, rule) in rules.iter() {
+        let spec = &rule.spec;
+        if spec.phase() != RulePhase::Request {
             continue;
         }
-        match spec.kind.as_str() {
-            "respond" => {
-                if let Some(response) = &spec.response {
-                    out.short_circuit = Some((
-                        response.status,
-                        response.headers.clone(),
-                        Bytes::copy_from_slice(&response.body),
-                    ));
-                    out.modified = true;
-                    out.rule_ids.push(id.clone());
-                    return out;
-                }
-            }
-            "block" => {
-                let status = spec
-                    .args
-                    .first()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(444);
-                out.short_circuit = Some((status, Vec::new(), Bytes::new()));
+        let (effective_host, effective_path) = effective_url_parts(url, host, path);
+        let (match_host, match_path) = match spec.match_on {
+            RuleMatchOn::Original => (host, path),
+            RuleMatchOn::Transformed => (effective_host.as_str(), effective_path.as_str()),
+        };
+        if !spec.matcher.matches(&MatchContext {
+            host: match_host,
+            path: match_path,
+            method,
+            status: None,
+            content_type: None,
+            body,
+            direction: None,
+            opcode: None,
+        }) {
+            continue;
+        }
+        match &spec.action {
+            RuleAction::Terminal {
+                terminal: RuleTerminal::Respond { response },
+            } => {
+                out.short_circuit = Some((
+                    response.status,
+                    response.headers.clone(),
+                    Bytes::copy_from_slice(&response.body),
+                ));
                 out.modified = true;
                 out.rule_ids.push(id.clone());
                 return out;
             }
-            "map-local" => {
-                if let Some(p) = spec.args.first()
-                    && let Ok(bytes) = std::fs::read(p)
-                {
-                    out.short_circuit = Some((
-                        200,
-                        vec![("content-type".into(), guess_content_type(p))],
-                        Bytes::from(bytes),
-                    ));
+            RuleAction::Terminal {
+                terminal: RuleTerminal::Block { status },
+            } => {
+                out.short_circuit = Some((*status, Vec::new(), Bytes::new()));
+                out.modified = true;
+                out.rule_ids.push(id.clone());
+                return out;
+            }
+            RuleAction::Terminal {
+                terminal: RuleTerminal::MapLocal { .. },
+            } => {
+                if let Some(local) = &rule.local_response {
+                    out.short_circuit =
+                        Some((local.status, local.headers.clone(), local.body.clone()));
                     out.modified = true;
                     out.rule_ids.push(id.clone());
                     return out;
                 }
             }
-            "map-remote" => {
-                if let Some(repl) = spec.args.first() {
-                    rewrite_url(url, repl);
-                    out.modified = true;
-                    out.rule_ids.push(id.clone());
-                }
+            RuleAction::Transform {
+                transform: RuleTransform::MapRemote { target },
+            } => {
+                rewrite_url(url, target);
+                out.modified = true;
+                out.rule_ids.push(id.clone());
             }
-            "set-request-header" => {
-                if let (Some(n), Some(v)) = (spec.args.first(), spec.args.get(1)) {
-                    set_header_vec(headers, n, v);
-                    out.modified = true;
-                    out.rule_ids.push(id.clone());
-                }
+            RuleAction::Transform {
+                transform: RuleTransform::SetRequestHeader { name, value },
+            } => {
+                set_header_vec(headers, name, value);
+                out.modified = true;
+                out.rule_ids.push(id.clone());
             }
-            "delay" => {
-                if let Some(ms) = spec.args.first().and_then(|s| s.parse::<u32>().ok()) {
-                    out.delay_ms = out.delay_ms.max(ms);
-                    out.rule_ids.push(id.clone());
-                }
+            RuleAction::Delay { milliseconds } => {
+                out.delay_ms = out.delay_ms.max(*milliseconds);
+                out.rule_ids.push(id.clone());
             }
             _ => {}
         }
@@ -2775,47 +2738,77 @@ fn apply_response_rules(
     method: &str,
     host: &str,
     path: &str,
+    effective_url: &str,
     status: &mut Option<u16>,
     headers: &mut Vec<(String, String)>,
     body: &mut Bytes,
     allow_body: bool,
 ) -> Vec<String> {
     let rules = shared.rules.read().unwrap();
-    let ct = flow::content_type(headers);
+    let original_status = *status;
+    let original_content_type = flow::content_type(headers);
+    let (effective_host, effective_path) = effective_url_parts(effective_url, host, path);
     let mut rule_ids = Vec::new();
-    for (id, spec) in rules.iter() {
-        if !rule_matches(spec, method, host, path, ct.as_deref(), *status) {
+    for (id, rule) in rules.iter() {
+        let spec = &rule.spec;
+        if spec.phase() != RulePhase::Response {
+            continue;
+        }
+        let current_content_type = flow::content_type(headers);
+        let (match_host, match_path, match_status, match_content_type) = match spec.match_on {
+            RuleMatchOn::Original => (
+                host,
+                path,
+                original_status,
+                original_content_type.as_deref(),
+            ),
+            RuleMatchOn::Transformed => (
+                effective_host.as_str(),
+                effective_path.as_str(),
+                *status,
+                current_content_type.as_deref(),
+            ),
+        };
+        if !spec.matcher.matches(&MatchContext {
+            host: match_host,
+            path: match_path,
+            method,
+            status: match_status,
+            content_type: match_content_type,
+            body,
+            direction: None,
+            opcode: None,
+        }) {
             continue;
         }
         let mut applied = false;
-        match spec.kind.as_str() {
-            "set-status" => {
-                if let Some(c) = spec.args.first().and_then(|s| s.parse().ok()) {
-                    *status = Some(c);
+        match &spec.action {
+            RuleAction::Transform {
+                transform: RuleTransform::SetStatus { status: new_status },
+            } => {
+                *status = Some(*new_status);
+                applied = true;
+            }
+            RuleAction::Transform {
+                transform: RuleTransform::SetResponseHeader { name, value },
+            } => {
+                if !is_response_framing_header(name) {
+                    set_header_vec(headers, name, value);
                     applied = true;
                 }
             }
-            "set-response-header" => {
-                if let (Some(n), Some(v)) = (spec.args.first(), spec.args.get(1))
-                    && !is_response_framing_header(n)
+            RuleAction::Transform {
+                transform: RuleTransform::ReplaceBody { replacement, .. },
+            } if allow_body => {
+                if let Some(regex) = &rule.replace_regex
+                    && let Ok(text) = std::str::from_utf8(body)
+                    && regex.is_match(text)
                 {
-                    set_header_vec(headers, n, v);
-                    applied = true;
-                }
-            }
-            "replace" if allow_body => {
-                if let (Some(re), Some(rp)) = (spec.args.first(), spec.args.get(1)) {
-                    let regex = regex::Regex::new(re);
-                    if let Ok(rx) = regex
-                        && let Ok(text) = std::str::from_utf8(body)
-                        && rx.is_match(text)
-                    {
-                        let new = rx.replace_all(text, rp.as_str()).into_owned();
-                        if new.as_bytes() != body.as_ref() {
-                            *body = Bytes::from(new.into_bytes());
-                            strip_body_validators(headers);
-                            applied = true;
-                        }
+                    let new = regex.replace_all(text, replacement.as_str()).into_owned();
+                    if new.as_bytes() != body.as_ref() {
+                        *body = Bytes::from(new.into_bytes());
+                        strip_body_validators(headers);
+                        applied = true;
                     }
                 }
             }
@@ -2895,24 +2888,6 @@ fn rewrite_url(url: &mut String, repl: &str) {
     } else {
         *url = format!("{}{}{}", &url[..scheme_end], repl, path);
     }
-}
-
-fn guess_content_type(path: &str) -> String {
-    let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
-    match ext.as_str() {
-        "json" => "application/json",
-        "html" | "htm" => "text/html",
-        "js" => "application/javascript",
-        "css" => "text/css",
-        "xml" => "application/xml",
-        "txt" => "text/plain",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "svg" => "image/svg+xml",
-        _ => "application/octet-stream",
-    }
-    .to_string()
 }
 
 fn set_header_vec(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
@@ -3185,23 +3160,47 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Rewind<T> {
 mod tests {
     use super::{
         ContentEncoding, DecodeFailure, DecodeOutcome, EncodingDisposition, HeldFlow, HoldDecision,
-        ReleaseHeldResult, TerminalHoldHistory, apply_request_mutation, decode_capped,
-        decompress_bounded_with_cap, encoding_disposition, frame_stream_body,
-        graphql_operation_matches, host_glob_match, persisted_tls_error_fields, release_held,
-        resolve_held, tls_failure_reason, upstream_headers, ws_tls_connector,
+        ReleaseHeldResult, SharedState, TerminalHoldHistory, apply_request_mutation,
+        apply_request_rules, apply_response_rules, decode_capped, decompress_bounded_with_cap,
+        encoding_disposition, frame_stream_body, host_glob_match, persisted_tls_error_fields,
+        release_held, resolve_held, tls_failure_reason, upstream_headers, ws_tls_connector,
     };
-    use crate::net::Mutation;
     use crate::net::flow::FlowRecord;
+    use crate::net::{Mutation, RuleAction, RuleMatchOn, RuleMatcher, RuleSpec, RuleTransform};
     use bytes::Bytes;
     use http_body_util::BodyExt;
     use hyper::body::Frame;
     use std::collections::HashMap;
     use std::io;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::Poll;
     use std::time::Duration;
     use tokio::sync::oneshot;
+
+    fn shared_with_rules(rules: Vec<(String, crate::net::CompiledRule)>) -> SharedState {
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        SharedState {
+            anticache: false,
+            anticomp: false,
+            redaction: None,
+            host_filters: vec![],
+            intercept: std::sync::RwLock::new(None),
+            held: Mutex::new(HashMap::new()),
+            terminal_holds: Mutex::new(TerminalHoldHistory::default()),
+            events,
+            rules: std::sync::RwLock::new(rules),
+            replay: std::sync::RwLock::new(None),
+            tls_errors_seen: Mutex::new(std::collections::HashSet::new()),
+            dropped_flows: AtomicU64::new(0),
+            persistence_errors: AtomicU64::new(0),
+            held_bytes: Arc::new(AtomicU64::new(0)),
+            rejected_holds: AtomicU64::new(0),
+            ws_control: Mutex::new(HashMap::new()),
+            ws_intercept: std::sync::RwLock::new(None),
+            ws_held: Mutex::new(HashMap::new()),
+        }
+    }
 
     async fn self_signed_tls_handshake(verify_upstream: bool) -> bool {
         let rcgen::CertifiedKey { cert, signing_key } =
@@ -3245,27 +3244,42 @@ mod tests {
 
     #[test]
     fn graphql_operation_matches_url_json_and_batch_bodies() {
-        assert!(graphql_operation_matches(
+        let matches = |wanted: &str, path: &str, body: &[u8]| {
+            crate::net::RuleMatcher::GraphqlOperation {
+                equals: wanted.into(),
+            }
+            .matches(&crate::net::MatchContext {
+                host: "api.example",
+                path,
+                method: "POST",
+                status: None,
+                content_type: None,
+                body,
+                direction: None,
+                opcode: None,
+            })
+        };
+        assert!(matches(
             "currentSession",
             "/graphql?operationName=currentSession",
             b""
         ));
-        assert!(graphql_operation_matches(
+        assert!(matches(
             "current Session",
             "/graphql?operationName=current%20Session",
             b""
         ));
-        assert!(graphql_operation_matches(
+        assert!(matches(
             "currentSession",
             "/graphql",
             br#"{"operationName":"currentSession","variables":{}}"#
         ));
-        assert!(graphql_operation_matches(
+        assert!(matches(
             "currentSession",
             "/graphql",
             br#"[{"operationName":"other"},{"operationName":"currentSession"}]"#
         ));
-        assert!(!graphql_operation_matches(
+        assert!(!matches(
             "currentSession",
             "/graphql?operationName=other",
             br#"{"operationName":"alsoOther"}"#
@@ -4098,34 +4112,147 @@ mod tests {
 
     #[test]
     fn response_rule_status_matcher_is_enforced() {
-        let spec = crate::net::RuleSpec {
-            kind: "set-status".into(),
-            matcher: crate::net::Matcher {
-                status: Some(200),
-                ..Default::default()
-            },
+        let matcher = crate::net::RuleMatcher::Status { equals: 200 };
+        let matching = crate::net::MatchContext {
+            host: "api.example",
+            path: "/",
+            method: "GET",
+            status: Some(200),
             content_type: None,
-            operation_name: None,
-            response: None,
-            ws_dir: None,
-            ws_opcode: None,
-            args: vec!["201".into()],
+            body: &[],
+            direction: None,
+            opcode: None,
         };
-        assert!(super::rule_matches(
-            &spec,
+        assert!(matcher.matches(&matching));
+        assert!(!matcher.matches(&crate::net::MatchContext {
+            status: Some(404),
+            ..matching
+        }));
+    }
+
+    #[test]
+    fn request_rules_distinguish_original_from_transformed_url() {
+        let compile = |id: &str, spec: RuleSpec| {
+            (
+                id.to_string(),
+                crate::net::rule::compile_rule(spec).unwrap(),
+            )
+        };
+        let rules = vec![
+            compile(
+                "map",
+                RuleSpec {
+                    match_on: RuleMatchOn::Original,
+                    matcher: RuleMatcher::Host {
+                        contains: "api.example".into(),
+                    },
+                    action: RuleAction::Transform {
+                        transform: RuleTransform::MapRemote {
+                            target: "mirror.test".into(),
+                        },
+                    },
+                },
+            ),
+            compile(
+                "transformed-delay",
+                RuleSpec {
+                    match_on: RuleMatchOn::Transformed,
+                    matcher: RuleMatcher::Host {
+                        contains: "mirror.test".into(),
+                    },
+                    action: RuleAction::Delay { milliseconds: 20 },
+                },
+            ),
+            compile(
+                "original-delay",
+                RuleSpec {
+                    match_on: RuleMatchOn::Original,
+                    matcher: RuleMatcher::Host {
+                        contains: "mirror.test".into(),
+                    },
+                    action: RuleAction::Delay { milliseconds: 99 },
+                },
+            ),
+        ];
+        let shared = shared_with_rules(rules);
+        let mut url = "https://api.example/v1/users".to_string();
+        let mut headers = Vec::new();
+        let result = apply_request_rules(
+            &shared,
             "GET",
             "api.example",
-            "/",
-            None,
-            Some(200),
-        ));
-        assert!(!super::rule_matches(
-            &spec,
+            "/v1/users",
+            &[],
+            &mut url,
+            &mut headers,
+        );
+        assert_eq!(url, "https://mirror.test/v1/users");
+        assert_eq!(result.delay_ms, 20);
+        assert_eq!(result.rule_ids, ["map", "transformed-delay"]);
+    }
+
+    #[test]
+    fn response_rules_match_original_or_current_status_explicitly() {
+        let compile = |id: &str, spec: RuleSpec| {
+            (
+                id.to_string(),
+                crate::net::rule::compile_rule(spec).unwrap(),
+            )
+        };
+        let rules = vec![
+            compile(
+                "status",
+                RuleSpec {
+                    match_on: RuleMatchOn::Original,
+                    matcher: RuleMatcher::Status { equals: 200 },
+                    action: RuleAction::Transform {
+                        transform: RuleTransform::SetStatus { status: 503 },
+                    },
+                },
+            ),
+            compile(
+                "after-status",
+                RuleSpec {
+                    match_on: RuleMatchOn::Transformed,
+                    matcher: RuleMatcher::Status { equals: 503 },
+                    action: RuleAction::Transform {
+                        transform: RuleTransform::SetResponseHeader {
+                            name: "x-shadowdroid-rule".into(),
+                            value: "matched".into(),
+                        },
+                    },
+                },
+            ),
+            compile(
+                "wrong-view",
+                RuleSpec {
+                    match_on: RuleMatchOn::Original,
+                    matcher: RuleMatcher::Status { equals: 503 },
+                    action: RuleAction::Transform {
+                        transform: RuleTransform::SetStatus { status: 418 },
+                    },
+                },
+            ),
+        ];
+        let shared = shared_with_rules(rules);
+        let mut status = Some(200);
+        let mut headers = vec![("content-type".into(), "application/json".into())];
+        let mut body = Bytes::from_static(b"{}");
+        let ids = apply_response_rules(
+            &shared,
             "GET",
             "api.example",
-            "/",
-            None,
-            Some(404),
-        ));
+            "/v1/users",
+            "https://api.example/v1/users",
+            &mut status,
+            &mut headers,
+            &mut body,
+            true,
+        );
+        assert_eq!(status, Some(503));
+        assert!(headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-shadowdroid-rule") && value == "matched"
+        }));
+        assert_eq!(ids, ["status", "after-status"]);
     }
 }

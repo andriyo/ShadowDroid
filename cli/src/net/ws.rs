@@ -1696,44 +1696,53 @@ fn ws_rule_matches(
     direction: Direction,
     opcode: &str,
 ) -> bool {
-    let host_ok = spec
-        .matcher
-        .host
-        .as_deref()
-        .is_none_or(|needle| host.to_lowercase().contains(&needle.to_lowercase()));
-    let dir_ok = spec
-        .ws_dir
-        .as_deref()
-        .is_none_or(|want| want == direction.as_str());
-    let opcode_ok = spec.ws_opcode.as_deref().is_none_or(|want| want == opcode);
-    host_ok && dir_ok && opcode_ok
+    let direction = match direction {
+        Direction::ClientToServer => crate::net::WsDirection::C2s,
+        Direction::ServerToClient => crate::net::WsDirection::S2c,
+    };
+    spec.matcher.matches(&crate::net::MatchContext {
+        host,
+        path: "",
+        method: "",
+        status: None,
+        content_type: None,
+        body: &[],
+        direction: Some(direction),
+        opcode: Some(opcode),
+    })
 }
 
-/// Apply `ws-drop` / `ws-set-text` rules matching (host, direction, opcode). The
-/// first matching rule wins.
+/// Apply `ws-drop` / `ws-set-text` rules matching (host, direction, opcode).
+/// Transform rules continue in order; a terminal drop stops evaluation. The
+/// returned id is the rule that decided the final payload/disposition.
 pub fn apply_ws_rules(
-    rules: &[(String, crate::net::RuleSpec)],
+    rules: &[(String, crate::net::CompiledRule)],
     host: &str,
     direction: Direction,
     opcode: &str,
 ) -> WsRuleAction {
-    for (id, spec) in rules {
-        if !matches!(spec.kind.as_str(), "ws-drop" | "ws-set-text") {
+    let mut modification = None;
+    for (id, rule) in rules {
+        let spec = &rule.spec;
+        if spec.phase() != crate::net::RulePhase::Websocket {
             continue;
         }
         if !ws_rule_matches(spec, host, direction, opcode) {
             continue;
         }
-        return match spec.kind.as_str() {
-            "ws-drop" => WsRuleAction::Drop(id.clone()),
-            "ws-set-text" => WsRuleAction::Modify(
-                id.clone(),
-                spec.args.first().cloned().unwrap_or_default().into_bytes(),
-            ),
-            _ => WsRuleAction::Forward,
-        };
+        match &spec.action {
+            crate::net::RuleAction::Terminal {
+                terminal: crate::net::RuleTerminal::DropWebsocket,
+            } => return WsRuleAction::Drop(id.clone()),
+            crate::net::RuleAction::Transform {
+                transform: crate::net::RuleTransform::SetWebsocketText { text },
+            } => modification = Some((id.clone(), text.as_bytes().to_vec())),
+            _ => {}
+        }
     }
-    WsRuleAction::Forward
+    modification.map_or(WsRuleAction::Forward, |(id, payload)| {
+        WsRuleAction::Modify(id, payload)
+    })
 }
 
 /// Whether re-encoding a frame in `direction` is window-safe. Under
@@ -1893,13 +1902,16 @@ fn direction_managed(ctx: &ProxyContext, meta: &WsSessionMeta, direction: Direct
     {
         return true;
     }
-    ctx.shared.rules.read().unwrap().iter().any(|(_, spec)| {
-        matches!(spec.kind.as_str(), "ws-drop" | "ws-set-text")
-            && host_match(spec.matcher.host.as_deref())
-            && spec
-                .ws_dir
-                .as_deref()
-                .is_none_or(|want| want == direction.as_str())
+    let typed_direction = match direction {
+        Direction::ClientToServer => crate::net::WsDirection::C2s,
+        Direction::ServerToClient => crate::net::WsDirection::S2c,
+    };
+    ctx.shared.rules.read().unwrap().iter().any(|(_, rule)| {
+        rule.spec.phase() == crate::net::RulePhase::Websocket
+            && rule
+                .spec
+                .matcher
+                .could_match_websocket_direction(&meta.host, typed_direction)
     })
 }
 
@@ -3363,23 +3375,24 @@ mod tests {
 
     #[test]
     fn ws_rules_match_by_host_dir_opcode() {
-        use crate::net::RuleSpec;
         let rule = |kind: &str, dir: Option<&str>, opcode: Option<&str>, args: &[&str]| {
+            let spec = crate::net::RuleSpec::from_legacy_parts(
+                kind.to_string(),
+                crate::net::Matcher {
+                    host: Some("chat".to_string()),
+                    ..Default::default()
+                },
+                None,
+                None,
+                None,
+                dir.map(str::to_string),
+                opcode.map(str::to_string),
+                args.iter().map(|s| s.to_string()).collect(),
+            )
+            .unwrap();
             (
                 "r1".to_string(),
-                RuleSpec {
-                    kind: kind.to_string(),
-                    matcher: crate::net::Matcher {
-                        host: Some("chat".to_string()),
-                        ..Default::default()
-                    },
-                    content_type: None,
-                    operation_name: None,
-                    response: None,
-                    ws_dir: dir.map(str::to_string),
-                    ws_opcode: opcode.map(str::to_string),
-                    args: args.iter().map(|s| s.to_string()).collect(),
-                },
+                crate::net::rule::compile_rule(spec).unwrap(),
             )
         };
         // ws-drop matching s2c text.
@@ -3423,6 +3436,76 @@ mod tests {
         ) {
             WsRuleAction::Modify(_, payload) => assert_eq!(payload, b"rewritten"),
             _ => panic!("expected modify"),
+        }
+    }
+
+    #[test]
+    fn websocket_text_transforms_continue_and_last_transform_is_attributed() {
+        let rule = |id: &str, text: &str| {
+            let spec = crate::net::RuleSpec {
+                match_on: crate::net::RuleMatchOn::Original,
+                matcher: crate::net::RuleMatcher::default(),
+                action: crate::net::RuleAction::Transform {
+                    transform: crate::net::RuleTransform::SetWebsocketText {
+                        text: text.to_string(),
+                    },
+                },
+            };
+            (
+                id.to_string(),
+                crate::net::rule::compile_rule(spec).unwrap(),
+            )
+        };
+        let rules = vec![rule("first", "one"), rule("second", "two")];
+
+        match apply_ws_rules(
+            &rules,
+            "chat.example.com",
+            Direction::ClientToServer,
+            "text",
+        ) {
+            WsRuleAction::Modify(id, payload) => {
+                assert_eq!(id, "second");
+                assert_eq!(payload, b"two");
+            }
+            _ => panic!("expected the last sequential transform"),
+        }
+    }
+
+    #[test]
+    fn websocket_terminal_drop_stops_after_transform_and_is_attributed() {
+        let transform = crate::net::RuleSpec {
+            match_on: crate::net::RuleMatchOn::Original,
+            matcher: crate::net::RuleMatcher::default(),
+            action: crate::net::RuleAction::Transform {
+                transform: crate::net::RuleTransform::SetWebsocketText {
+                    text: "rewritten".into(),
+                },
+            },
+        };
+        let drop = crate::net::RuleSpec {
+            match_on: crate::net::RuleMatchOn::Transformed,
+            matcher: crate::net::RuleMatcher::default(),
+            action: crate::net::RuleAction::Terminal {
+                terminal: crate::net::RuleTerminal::DropWebsocket,
+            },
+        };
+        let rules = vec![
+            (
+                "transform".into(),
+                crate::net::rule::compile_rule(transform).unwrap(),
+            ),
+            ("drop".into(), crate::net::rule::compile_rule(drop).unwrap()),
+        ];
+
+        match apply_ws_rules(
+            &rules,
+            "chat.example.com",
+            Direction::ServerToClient,
+            "text",
+        ) {
+            WsRuleAction::Drop(id) => assert_eq!(id, "drop"),
+            _ => panic!("expected the terminal drop to stop evaluation"),
         }
     }
 

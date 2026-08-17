@@ -1187,7 +1187,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "use_when": ["Need declarative request/response mutation rules for repeated network scenarios."],
             "output": "rule management JSON",
             "side_effects": ["add/rm/clear mutate active proxy rules"],
-            "next_actions": ["net rule add", "net rule list", "watch"]
+            "next_actions": ["net rule lint", "net rule explain", "net rule add", "net rule list", "watch"]
         })),
         "net rule add" => Some(serde_json::json!({
             "use_when": ["Need to add one explicit request- or response-phase mutation rule.", "Need one atomic synthetic response matched by GraphQL operation without contacting upstream. Use kind respond."],
@@ -1228,6 +1228,18 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "output": "rule clear JSON",
             "side_effects": ["removes all active proxy rules"],
             "next_actions": ["net rule list", "watch"]
+        })),
+        "net rule lint" => Some(serde_json::json!({
+            "use_when": ["Need to validate a typed or legacy rule file and prove impossible, duplicate, shadowed, or order-sensitive rules before installation."],
+            "output": "local lint JSON with stable issue codes and rule indexes; validation errors fail non-zero",
+            "side_effects": ["none; reads only the supplied host file and does not require a device or proxy"],
+            "next_actions": ["net rule explain <file> --host <host>", "net rules <file>"]
+        })),
+        "net rule explain" => Some(serde_json::json!({
+            "use_when": ["Need a mechanical trace of which rules match one concrete request, response, or WebSocket frame, including original-vs-transformed semantics."],
+            "output": "local ordered evaluation trace with matcher evidence, applied action categories, transformed state, and terminal rule",
+            "side_effects": ["none; reads only the supplied host file and does not require a device or proxy"],
+            "next_actions": ["net rule lint <file>", "net rules <file>"]
         })),
         "net rules" => Some(serde_json::json!({
             "use_when": ["Need to apply a bulk JSON rule file for a repeatable network scenario."],

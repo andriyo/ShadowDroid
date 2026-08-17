@@ -11,7 +11,10 @@ use std::time::Duration;
 
 use crate::device::{adb, installer};
 use crate::events;
-use crate::net::{DaemonConfig, Matcher, Mutation, RuleSpec, control, daemon, flow, paths, store};
+use crate::net::{
+    DaemonConfig, MatchContext, Matcher, Mutation, RuleAction, RuleMatchOn, RulePhase, RuleSpec,
+    RuleTransform, WsDirection, control, daemon, flow, paths, store,
+};
 
 /// Emit a `{"type":"action","cmd":<cmd>, …}` line — thin adapter over the shared
 /// [`crate::events::emit_action`].
@@ -2880,7 +2883,8 @@ pub async fn respond(
     Ok(())
 }
 
-pub async fn rule_add(serial: &Serial, spec: RuleSpec) -> Result<()> {
+pub async fn rule_add(serial: &Serial, mut spec: RuleSpec) -> Result<()> {
+    absolutize_map_local_path(&mut spec)?;
     let warning = map_remote_path_warning(&spec);
     let mut reply = checked_control_reply(
         "rule_add",
@@ -2903,16 +2907,18 @@ pub async fn override_local(serial: &Serial, url_glob: &str, file: &Path) -> Res
         );
     }
     let matcher = matcher_from_url_glob(url_glob);
-    let spec = RuleSpec {
-        kind: "map-local".into(),
-        matcher: matcher.clone(),
-        content_type: None,
-        operation_name: None,
-        response: None,
-        ws_dir: None,
-        ws_opcode: None,
-        args: vec![file.display().to_string()],
-    };
+    let mut spec = RuleSpec::from_legacy_parts(
+        "map-local".into(),
+        matcher.clone(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        vec![file.display().to_string()],
+    )
+    .map_err(anyhow::Error::msg)?;
+    absolutize_map_local_path(&mut spec)?;
     let reply = checked_control_reply(
         "rule_add",
         control::request(serial, json!({"op": "rule_add", "spec": spec})).await?,
@@ -2958,10 +2964,12 @@ fn matcher_from_url_glob(url_glob: &str) -> Matcher {
 /// matched request path (→ duplicated segments like `/api/v2/api/v2/...`), which
 /// is almost never intended. Warn so callers pass host+port only.
 fn map_remote_path_warning(spec: &RuleSpec) -> Option<String> {
-    if spec.kind != "map-remote" {
+    let crate::net::RuleAction::Transform {
+        transform: crate::net::RuleTransform::MapRemote { target: repl },
+    } = &spec.action
+    else {
         return None;
-    }
-    let repl = spec.args.first()?;
+    };
     let after_scheme = repl.split_once("://").map(|(_, r)| r).unwrap_or(repl);
     let (_authority, path) = after_scheme.split_once('/')?;
     let path = path.trim_end_matches('/');
@@ -2998,6 +3006,254 @@ pub async fn rule_clear(serial: &Serial) -> Result<()> {
     )?;
     emit("net_rule_clear", reply);
     Ok(())
+}
+
+fn load_rule_specs(file: &Path) -> Result<Vec<RuleSpec>> {
+    let text = std::fs::read_to_string(file)
+        .with_context(|| format!("read rules file {}", file.display()))?;
+    let mut specs = if text.trim_start().starts_with('[') {
+        serde_json::from_str(&text).context("parse rules JSON array")?
+    } else {
+        text.lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim().is_empty())
+            .map(|(index, line)| {
+                serde_json::from_str(line)
+                    .with_context(|| format!("parse rule on JSONL line {}", index + 1))
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    for spec in &mut specs {
+        absolutize_map_local_path(spec)?;
+    }
+    Ok(specs)
+}
+
+fn absolutize_map_local_path(spec: &mut RuleSpec) -> Result<()> {
+    let RuleAction::Terminal {
+        terminal: crate::net::RuleTerminal::MapLocal { path },
+    } = &mut spec.action
+    else {
+        return Ok(());
+    };
+    if path.is_relative() {
+        *path = std::env::current_dir()
+            .context("resolve current directory for map-local rule")?
+            .join(&*path);
+    }
+    Ok(())
+}
+
+pub fn rule_lint(file: &Path) -> Result<()> {
+    let specs = load_rule_specs(file)?;
+    let issues = crate::net::rule::lint_rules(&specs);
+    let errors = issues
+        .iter()
+        .filter(|issue| issue.severity == "error")
+        .count();
+    let warnings = issues.len() - errors;
+    if errors > 0 {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "net_rule_lint_failed",
+            "input",
+            format!("{errors} invalid or impossible network rule(s)"),
+        )
+        .detail(json!({
+            "file": file.display().to_string(),
+            "rules": specs.len(),
+            "errors": errors,
+            "warnings": warnings,
+            "issues": issues,
+        }))
+        .next_actions([
+            "fix every error in detail.issues and rerun `net rule lint`",
+            "use `net rule explain` with a representative flow before installing the set",
+        ])
+        .into());
+    }
+    emit(
+        "net_rule_lint",
+        json!({
+            "file": file.display().to_string(),
+            "rules": specs.len(),
+            "valid": true,
+            "warnings": warnings,
+            "issues": issues,
+        }),
+    );
+    Ok(())
+}
+
+pub fn rule_explain(args: &crate::cli::NetRuleExplainArgs) -> Result<()> {
+    let specs = load_rule_specs(&args.file)?;
+    let issues = crate::net::rule::lint_rules(&specs);
+    if issues.iter().any(|issue| issue.severity == "error") {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "net_rule_explain_invalid_rules",
+            "input",
+            "cannot explain a rule set that fails validation",
+        )
+        .detail(json!({"file": args.file.display().to_string(), "issues": issues}))
+        .next_actions(["run `net rule lint <file>` and fix every error first"])
+        .into());
+    }
+
+    let direction = match args.dir.as_deref() {
+        Some("c2s") => Some(WsDirection::C2s),
+        Some("s2c") => Some(WsDirection::S2c),
+        _ => None,
+    };
+    let phase = if direction.is_some() {
+        RulePhase::Websocket
+    } else if args.status.is_some() || args.content_type.is_some() {
+        RulePhase::Response
+    } else {
+        RulePhase::Request
+    };
+
+    let original_host = args.host.clone();
+    let original_path = args.path.clone();
+    let original_status = args.status;
+    let original_content_type = args.content_type.clone();
+    let mut transformed_host = original_host.clone();
+    let mut transformed_path = original_path.clone();
+    let mut transformed_status = original_status;
+    let mut transformed_content_type = original_content_type.clone();
+    let mut effective_delay_ms = 0;
+    let mut terminal_rule = None;
+    let mut steps = Vec::new();
+
+    for (index, spec) in specs.iter().enumerate() {
+        if spec.phase() != phase {
+            steps.push(json!({
+                "rule_index": index,
+                "phase": spec.phase(),
+                "evaluated": false,
+                "reason": "different_phase",
+            }));
+            continue;
+        }
+        if let Some(stopped_by) = terminal_rule {
+            steps.push(json!({
+                "rule_index": index,
+                "phase": spec.phase(),
+                "evaluated": false,
+                "reason": "earlier_terminal_action",
+                "stopped_by": stopped_by,
+            }));
+            continue;
+        }
+        let (host, path, status, content_type) = match spec.match_on {
+            RuleMatchOn::Original => (
+                original_host.as_str(),
+                original_path.as_str(),
+                original_status,
+                original_content_type.as_deref(),
+            ),
+            RuleMatchOn::Transformed => (
+                transformed_host.as_str(),
+                transformed_path.as_str(),
+                transformed_status,
+                transformed_content_type.as_deref(),
+            ),
+        };
+        let context = MatchContext {
+            host,
+            path,
+            method: &args.method,
+            status,
+            content_type,
+            body: args.body.as_bytes(),
+            direction,
+            opcode: args.opcode.as_deref(),
+        };
+        let trace = spec.matcher.explain(&context);
+        let matched = trace["matched"] == true;
+        steps.push(json!({
+            "rule_index": index,
+            "phase": spec.phase(),
+            "evaluated": true,
+            "matched": matched,
+            "match_on": spec.match_on,
+            "matcher": trace,
+            "action_category": match &spec.action {
+                RuleAction::Delay { .. } => "delay",
+                RuleAction::Transform { .. } => "transform",
+                RuleAction::Terminal { .. } => "terminal",
+            },
+            "action_kind": spec.action_kind(),
+            "action": crate::net::rule::action_summary(&spec.action),
+        }));
+        if !matched {
+            continue;
+        }
+        if let RuleAction::Delay { milliseconds } = &spec.action {
+            effective_delay_ms = effective_delay_ms.max(*milliseconds);
+        }
+        if let RuleAction::Transform { transform } = &spec.action {
+            match transform {
+                RuleTransform::MapRemote { target } => {
+                    explain_map_remote(&mut transformed_host, &mut transformed_path, target)
+                }
+                RuleTransform::SetStatus { status } => transformed_status = Some(*status),
+                RuleTransform::SetResponseHeader { name, value }
+                    if name.eq_ignore_ascii_case("content-type") =>
+                {
+                    transformed_content_type = Some(value.clone());
+                }
+                _ => {}
+            }
+        }
+        if spec.is_terminal() {
+            terminal_rule = Some(index);
+        }
+    }
+
+    emit(
+        "net_rule_explain",
+        json!({
+            "file": args.file.display().to_string(),
+            "phase": phase,
+            "original": {
+                "host": original_host,
+                "path": original_path,
+                "method": args.method,
+                "status": original_status,
+                "content_type": original_content_type,
+                "dir": args.dir,
+                "opcode": args.opcode,
+            },
+            "steps": steps,
+            "final_transformed": {
+                "host": transformed_host,
+                "path": transformed_path,
+                "status": transformed_status,
+                "content_type": transformed_content_type,
+            },
+            "effective_delay_ms": effective_delay_ms,
+            "terminal_rule": terminal_rule,
+            "lint_warnings": issues,
+        }),
+    );
+    Ok(())
+}
+
+fn explain_map_remote(host: &mut String, path: &mut String, target: &str) {
+    let candidate = if target.contains("://") {
+        target.to_string()
+    } else {
+        format!("http://{target}")
+    };
+    let Ok(parsed) = reqwest::Url::parse(&candidate) else {
+        return;
+    };
+    if let Some(new_host) = parsed.host_str() {
+        *host = new_host.to_string();
+    }
+    let prefix = parsed.path().trim_end_matches('/');
+    if !prefix.is_empty() {
+        *path = format!("{prefix}{}", path.as_str());
+    }
 }
 
 pub async fn rules_apply(serial: &Serial, file: &Path) -> Result<()> {
@@ -3505,16 +3761,17 @@ mod tests {
     }
 
     fn spec(kind: &str, arg: &str) -> RuleSpec {
-        RuleSpec {
-            kind: kind.into(),
-            matcher: Matcher::default(),
-            content_type: None,
-            operation_name: None,
-            response: None,
-            ws_dir: None,
-            ws_opcode: None,
-            args: vec![arg.into()],
-        }
+        RuleSpec::from_legacy_parts(
+            kind.into(),
+            Matcher::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec![arg.into()],
+        )
+        .unwrap()
     }
 
     #[test]
@@ -3533,7 +3790,7 @@ mod tests {
         assert!(w.contains("/device-ips/screens/v2"));
 
         // Other rule kinds never warn.
-        assert!(map_remote_path_warning(&spec("set-request-header", "x-debug")).is_none());
+        assert!(map_remote_path_warning(&spec("delay", "1")).is_none());
     }
 
     #[test]

@@ -133,6 +133,46 @@ upstream is bypassed. `--body-file` is the binary-safe alternative to `--body`.
 The rule summary reports body length without echoing its contents; captured
 flows include the rule id and `upstream_bypassed:true`.
 
+Rule files use typed Boolean matchers and explicit delay/transform/terminal
+actions. Legacy `kind` + `args` files are still accepted, but list/export output
+uses the canonical shape:
+
+```json
+[
+  {
+    "match_on": "original",
+    "matcher": {
+      "type": "all",
+      "matchers": [
+        {"type": "host", "contains": "api.example.com"},
+        {"type": "method", "equals": "POST"},
+        {"type": "not", "matcher": {"type": "path", "contains": "/health"}}
+      ]
+    },
+    "action": {"category": "delay", "milliseconds": 250}
+  },
+  {
+    "match_on": "transformed",
+    "matcher": {"type": "status", "equals": 200},
+    "action": {
+      "category": "transform",
+      "transform": {"type": "set_status", "status": 503}
+    }
+  }
+]
+```
+
+`original` always means the immutable flow observed before this phase;
+`transformed` means the result of earlier rules. Check a file locally before it
+touches a proxy:
+
+```bash
+shadowdroid net rule lint rules.json
+shadowdroid net rule explain rules.json --host api.example.com --path /v1/users --method POST
+shadowdroid net rule explain rules.json --host api.example.com --status 200
+```
+
+
 ## Optional in-app AAR
 
 The core debug-only AAR auto-starts its control provider and enables agent

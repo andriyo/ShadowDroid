@@ -26,6 +26,7 @@ use crate::net::flow::FlowRecord;
 use crate::net::proxy::{
     ActiveReplay, HoldDecision, InterceptCfg, ReleaseHeldResult, SharedState, TerminalHold,
 };
+use crate::net::rule::compile_rule;
 use crate::net::{Matcher, Mutation, RuleSpec, flow, paths, store};
 
 /// In-daemon state the control handlers read/mutate.
@@ -55,59 +56,15 @@ pub struct DaemonState {
 }
 
 fn public_rule(id: &str, spec: &RuleSpec) -> Value {
-    let phase = match spec.kind.as_str() {
-        "block" | "delay" | "map-local" | "map-remote" | "respond" | "set-request-header" => {
-            "request"
-        }
-        "set-status" | "set-response-header" | "replace" => "response",
-        "ws-drop" | "ws-set-text" => "websocket",
-        _ => "unknown",
-    };
-    let mut matcher = serde_json::to_value(&spec.matcher).unwrap_or_else(|_| json!({}));
-    if let Value::Object(fields) = &mut matcher {
-        fields.retain(|_, value| !value.is_null());
-        if let Some(operation_name) = &spec.operation_name {
-            fields.insert("graphql_operation".into(), json!(operation_name));
-        }
-    }
-    let mut value = json!({
+    let action = crate::net::rule::action_summary(&spec.action);
+    let value = json!({
         "id": id,
-        "kind": spec.kind,
-        "phase": phase,
-        "matcher": matcher,
+        "kind": spec.action_kind(),
+        "phase": spec.phase(),
+        "match_on": spec.match_on,
+        "matcher": spec.matcher,
+        "action": action,
     });
-    let Value::Object(fields) = &mut value else {
-        return value;
-    };
-    if let Some(content_type) = &spec.content_type {
-        fields.insert("content_type".into(), json!(content_type));
-    }
-    if let Some(ws_dir) = &spec.ws_dir {
-        fields.insert("ws_dir".into(), json!(ws_dir));
-    }
-    if let Some(ws_opcode) = &spec.ws_opcode {
-        fields.insert("ws_opcode".into(), json!(ws_opcode));
-    }
-    if !spec.args.is_empty() {
-        fields.insert("args".into(), json!(spec.args));
-    }
-    if let Some(response) = &spec.response {
-        let content_type = response
-            .headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-            .map(|(_, value)| value);
-        fields.insert(
-            "response".into(),
-            json!({
-                "status": response.status,
-                "headers": response.headers,
-                "content_type": content_type,
-                "body_bytes": response.body.len(),
-                "upstream_bypassed": true,
-            }),
-        );
-    }
     value
 }
 
@@ -643,24 +600,29 @@ pub async fn serve_client(
             }
         }
         "rule_add" => {
-            let spec: Option<RuleSpec> = req
+            let spec = req
                 .get("spec")
                 .cloned()
-                .and_then(|v| serde_json::from_value(v).ok());
+                .ok_or_else(|| "missing rule spec".to_string())
+                .and_then(|value| {
+                    serde_json::from_value::<RuleSpec>(value).map_err(|e| e.to_string())
+                });
             match spec {
-                None => {
+                Err(error) => {
                     write_json(
                         &mut wr,
-                        &json!({"ok": false, "error": "missing/invalid rule spec"}),
+                        &json!({"ok": false, "error": format!("invalid rule spec: {error}")}),
                     )
                     .await?
                 }
-                Some(spec) => match validate_rule(&spec) {
-                    Err(e) => write_json(&mut wr, &json!({"ok": false, "error": e})).await?,
-                    Ok(()) => {
+                Ok(spec) => match compile_rule(spec) {
+                    Err(error) => {
+                        write_json(&mut wr, &json!({"ok": false, "error": error})).await?
+                    }
+                    Ok(rule) => {
                         let id = next_rule_id();
-                        let mut reply = public_rule(&id, &spec);
-                        shared.rules.write().unwrap().push((id.clone(), spec));
+                        let mut reply = public_rule(&id, &rule.spec);
+                        shared.rules.write().unwrap().push((id.clone(), rule));
                         if let Value::Object(fields) = &mut reply {
                             fields.insert("ok".into(), json!(true));
                         }
@@ -675,7 +637,7 @@ pub async fn serve_client(
                 .read()
                 .unwrap()
                 .iter()
-                .map(|(id, spec)| public_rule(id, spec))
+                .map(|(id, rule)| public_rule(id, &rule.spec))
                 .collect();
             write_json(&mut wr, &json!({"ok": true, "rules": rules})).await?;
         }
@@ -942,93 +904,6 @@ fn is_managed_request_header(name: &str) -> bool {
     )
 }
 
-fn validate_request_rule_filters(spec: &RuleSpec) -> Result<(), String> {
-    if spec.content_type.is_some() {
-        return Err(format!(
-            "request-phase rule `{}` cannot match response content-type",
-            spec.kind
-        ));
-    }
-    if spec.matcher.status.is_some() {
-        return Err(format!(
-            "request-phase rule `{}` cannot match response status",
-            spec.kind
-        ));
-    }
-    Ok(())
-}
-
-/// WebSocket frame rules match only on host + `ws_dir` + `ws_opcode`; the HTTP
-/// matchers (path/method/status/content-type) don't apply and would silently do
-/// nothing, so reject them rather than mislead. Also validate the WS selectors.
-fn validate_ws_rule_filters(spec: &RuleSpec) -> Result<(), String> {
-    if spec.matcher.path.is_some() {
-        return Err(format!(
-            "WebSocket rule `{}` cannot match `--path` (WS rules match on host + --dir + --opcode)",
-            spec.kind
-        ));
-    }
-    if spec.matcher.method.is_some() {
-        return Err(format!(
-            "WebSocket rule `{}` cannot match `--method` (a WebSocket handshake is always GET)",
-            spec.kind
-        ));
-    }
-    if spec.matcher.status.is_some() {
-        return Err(format!(
-            "WebSocket rule `{}` cannot match `--status`",
-            spec.kind
-        ));
-    }
-    if spec.content_type.is_some() {
-        return Err(format!(
-            "WebSocket rule `{}` cannot match `--content-type`",
-            spec.kind
-        ));
-    }
-    if let Some(dir) = spec.ws_dir.as_deref()
-        && !matches!(dir, "c2s" | "s2c")
-    {
-        return Err(format!(
-            "invalid WebSocket direction {dir:?}; expected `c2s` or `s2c`"
-        ));
-    }
-    if let Some(opcode) = spec.ws_opcode.as_deref()
-        && !matches!(opcode, "text" | "binary" | "ping" | "pong" | "close")
-    {
-        return Err(format!(
-            "invalid WebSocket opcode {opcode:?}; expected text|binary|ping|pong|close"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_map_remote_target(target: &str) -> Result<(), String> {
-    let target = target.trim();
-    if target.is_empty() {
-        return Err("map-remote target must not be empty".into());
-    }
-    let candidate = if target.contains("://") {
-        target.to_string()
-    } else {
-        format!("http://{target}")
-    };
-    let parsed = reqwest::Url::parse(&candidate)
-        .map_err(|error| format!("invalid map-remote target {target:?}: {error}"))?;
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() {
-        return Err(format!(
-            "map-remote target must contain an http(s) host: {target:?}"
-        ));
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err("map-remote target must not embed credentials".into());
-    }
-    if parsed.query().is_some() || parsed.fragment().is_some() {
-        return Err("map-remote target must not contain a query or fragment".into());
-    }
-    Ok(())
-}
-
 fn validate_held_decision(
     shared: &SharedState,
     id: &str,
@@ -1110,157 +985,9 @@ fn validate_held_decision(
     Ok(())
 }
 
-/// Validate a rule completely before storing it. Rule application runs on the
-/// proxy hot path and must not turn bad user input into a silent no-op (or an
-/// invalid HTTP response) after the control call already reported success.
+#[cfg(test)]
 fn validate_rule(spec: &RuleSpec) -> Result<(), String> {
-    let n = spec.args.len();
-    let exact = |k: usize| {
-        if n == k {
-            Ok(())
-        } else {
-            Err(format!(
-                "rule `{}` needs exactly {k} arg(s), got {n}",
-                spec.kind
-            ))
-        }
-    };
-    let status = |value: &str| {
-        let parsed = value
-            .parse::<u16>()
-            .map_err(|_| format!("invalid final HTTP status {value:?}; expected 200..=599"))?;
-        validate_final_status(parsed)
-    };
-    if let Some(status) = spec.matcher.status
-        && !(100..=599).contains(&status)
-    {
-        return Err(format!(
-            "invalid status matcher {status}; expected 100..=599"
-        ));
-    }
-    if spec.kind != "respond" && (spec.operation_name.is_some() || spec.response.is_some()) {
-        return Err(format!(
-            "rule `{}` cannot use a GraphQL operation or synthetic response; use kind `respond`",
-            spec.kind
-        ));
-    }
-    match spec.kind.as_str() {
-        "respond" => {
-            validate_request_rule_filters(spec)?;
-            exact(0)?;
-            if spec
-                .operation_name
-                .as_deref()
-                .is_some_and(|operation| operation.trim().is_empty())
-            {
-                return Err("respond rule GraphQL operation name must not be empty".into());
-            }
-            let response = spec
-                .response
-                .as_ref()
-                .ok_or_else(|| "respond rule is missing its synthetic response".to_string())?;
-            validate_final_status(response.status)?;
-            if response.body.len() > 8 * 1024 * 1024 {
-                return Err(format!(
-                    "respond rule body is {} bytes; maximum is 8388608",
-                    response.body.len()
-                ));
-            }
-            for (name, value) in &response.headers {
-                validate_header(name, value)?;
-                if is_managed_response_header(name) {
-                    return Err(format!(
-                        "response framing header {name:?} is managed by the proxy and cannot be set by a rule"
-                    ));
-                }
-            }
-            Ok(())
-        }
-        "block" => {
-            validate_request_rule_filters(spec)?;
-            match spec.args.as_slice() {
-                [] => Ok(()),
-                [value] => status(value),
-                _ => Err(format!("rule `block` needs zero or one arg, got {n}")),
-            }
-        }
-        "delay" => {
-            validate_request_rule_filters(spec)?;
-            exact(1)?;
-            spec.args[0].parse::<u32>().map(|_| ()).map_err(|_| {
-                format!(
-                    "invalid delay {:?}; expected milliseconds as a u32",
-                    spec.args[0]
-                )
-            })
-        }
-        "map-local" => {
-            validate_request_rule_filters(spec)?;
-            exact(1)?;
-            let path = std::path::Path::new(&spec.args[0]);
-            let metadata = std::fs::metadata(path).map_err(|error| {
-                format!("cannot read map-local file {}: {error}", path.display())
-            })?;
-            if !metadata.is_file() {
-                return Err(format!(
-                    "map-local path is not a regular file: {}",
-                    path.display()
-                ));
-            }
-            std::fs::File::open(path)
-                .map(|_| ())
-                .map_err(|error| format!("cannot open map-local file {}: {error}", path.display()))
-        }
-        "map-remote" => {
-            validate_request_rule_filters(spec)?;
-            exact(1)?;
-            validate_map_remote_target(&spec.args[0])
-        }
-        "set-status" => {
-            exact(1)?;
-            status(&spec.args[0])
-        }
-        "set-request-header" | "set-response-header" => {
-            exact(2)?;
-            validate_header(&spec.args[0], &spec.args[1])?;
-            if spec.kind == "set-request-header" {
-                validate_request_rule_filters(spec)?;
-                if is_managed_request_header(&spec.args[0]) {
-                    return Err(format!(
-                        "request header {:?} is managed by the proxy and cannot be set by a rule",
-                        spec.args[0]
-                    ));
-                }
-            }
-            if spec.kind == "set-response-header" && is_managed_response_header(&spec.args[0]) {
-                return Err(format!(
-                    "response framing header {:?} is managed by the proxy and cannot be set by a rule",
-                    spec.args[0]
-                ));
-            }
-            Ok(())
-        }
-        "replace" => {
-            exact(2)?;
-            regex::Regex::new(&spec.args[0])
-                .map(|_| ())
-                .map_err(|error| format!("invalid replacement regex {:?}: {error}", spec.args[0]))
-        }
-        // WebSocket frame rules — matched by host + optional dir/opcode, applied
-        // per-frame in the live tap (only for sessions without permessage-deflate
-        // context takeover; see `net inject` for the always-safe path).
-        "ws-drop" => {
-            validate_ws_rule_filters(spec)?;
-            exact(0)
-        }
-        "ws-set-text" => {
-            validate_ws_rule_filters(spec)?;
-            exact(1)
-        }
-        other => Err(format!(
-            "unknown rule kind {other:?} (block|delay|map-local|map-remote|respond|set-status|set-request-header|set-response-header|replace|ws-drop|ws-set-text)"
-        )),
-    }
+    compile_rule(spec.clone()).map(|_| ())
 }
 
 /// Hand a held flow its decision (fires the proxy's oneshot). Shares the atomic
@@ -1511,19 +1238,35 @@ async fn write_request(wr: &mut OwnedWriteHalf, req: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::net::{Matcher, RuleSpec, SyntheticResponseSpec};
+    use crate::net::{
+        Matcher, RuleAction, RuleMatchOn, RuleMatcher, RuleSpec, RuleTerminal, RuleTransform,
+        SyntheticResponseSpec,
+    };
 
     fn spec(kind: &str, args: &[&str]) -> RuleSpec {
-        RuleSpec {
-            kind: kind.into(),
-            matcher: Matcher::default(),
-            content_type: None,
-            operation_name: None,
-            response: None,
-            ws_dir: None,
-            ws_opcode: None,
-            args: args.iter().map(|s| s.to_string()).collect(),
-        }
+        legacy_spec(kind, Matcher::default(), None, None, None, None, args).unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn legacy_spec(
+        kind: &str,
+        matcher: Matcher,
+        content_type: Option<&str>,
+        operation_name: Option<&str>,
+        dir: Option<&str>,
+        opcode: Option<&str>,
+        args: &[&str],
+    ) -> Result<RuleSpec, String> {
+        RuleSpec::from_legacy_parts(
+            kind.into(),
+            matcher,
+            content_type.map(str::to_string),
+            operation_name.map(str::to_string),
+            None,
+            dir.map(str::to_string),
+            opcode.map(str::to_string),
+            args.iter().map(|s| s.to_string()).collect(),
+        )
     }
 
     #[test]
@@ -1533,11 +1276,33 @@ mod tests {
         assert!(
             validate_rule(&spec("set-response-header", &["cache-control", "no-store"])).is_ok()
         );
-        assert!(validate_rule(&spec("set-request-header", &["x-debug"])).is_err());
+        assert!(
+            legacy_spec(
+                "set-request-header",
+                Matcher::default(),
+                None,
+                None,
+                None,
+                None,
+                &["x-debug"]
+            )
+            .is_err()
+        );
 
         // The old umbrella `set-header` is gone — it now reads as unknown so a
         // stale rule fails loudly instead of silently applying to the wrong phase.
-        assert!(validate_rule(&spec("set-header", &["a", "b"])).is_err());
+        assert!(
+            legacy_spec(
+                "set-header",
+                Matcher::default(),
+                None,
+                None,
+                None,
+                None,
+                &["a", "b"]
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1613,46 +1378,64 @@ mod tests {
 
     #[test]
     fn respond_rule_is_atomic_validated_and_publicly_summarized() {
-        let spec = RuleSpec {
-            kind: "respond".into(),
-            matcher: Matcher {
+        let response = SyntheticResponseSpec {
+            status: 401,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: br#"{"error":"unauthorized"}"#.to_vec(),
+        };
+        let spec = RuleSpec::from_legacy_parts(
+            "respond".into(),
+            Matcher {
                 host: Some("api.example.com".into()),
                 method: Some("POST".into()),
                 ..Default::default()
             },
-            content_type: None,
-            operation_name: Some("currentSession".into()),
-            response: Some(SyntheticResponseSpec {
-                status: 401,
-                headers: vec![("content-type".into(), "application/json".into())],
-                body: br#"{"error":"unauthorized"}"#.to_vec(),
-            }),
-            ws_dir: None,
-            ws_opcode: None,
-            args: vec![],
-        };
+            None,
+            Some("currentSession".into()),
+            Some(response),
+            None,
+            None,
+            vec![],
+        )
+        .unwrap();
         assert!(validate_rule(&spec).is_ok());
 
         let public = public_rule("r12", &spec);
         assert_eq!(public["phase"], "request");
-        assert_eq!(public["matcher"]["graphql_operation"], "currentSession");
-        assert_eq!(public["response"]["status"], 401);
-        assert_eq!(public["response"]["content_type"], "application/json");
-        assert_eq!(public["response"]["upstream_bypassed"], true);
-        assert_eq!(public["response"]["body_bytes"], 24);
-        assert!(public["response"].get("body").is_none());
+        assert_eq!(public["kind"], "respond");
+        assert_eq!(public["match_on"], "original");
+        assert_eq!(public["action"]["category"], "terminal");
+        assert_eq!(public["action"]["terminal"]["type"], "respond");
+        assert_eq!(public["action"]["terminal"]["response"]["status"], 401);
+        assert_eq!(public["action"]["terminal"]["response"]["body_bytes"], 24);
+        assert!(
+            public["action"]["terminal"]["response"]
+                .get("body")
+                .is_none()
+        );
 
         let mut invalid = spec;
-        invalid.response.as_mut().unwrap().headers = vec![("content-length".into(), "1".into())];
+        let RuleAction::Terminal {
+            terminal: RuleTerminal::Respond { response },
+        } = &mut invalid.action
+        else {
+            panic!("expected respond action")
+        };
+        response.headers = vec![("content-length".into(), "1".into())];
         assert!(validate_rule(&invalid).is_err());
     }
 
     #[test]
     fn validate_rule_rejects_values_that_would_be_silent_noops() {
+        for (kind, args) in [
+            ("delay", &["forever"][..]),
+            ("set-status", &["199"][..]),
+            ("set-status", &["700"][..]),
+        ] {
+            let decoded = legacy_spec(kind, Matcher::default(), None, None, None, None, args);
+            assert!(decoded.is_err() || validate_rule(&decoded.unwrap()).is_err());
+        }
         for invalid in [
-            spec("delay", &["forever"]),
-            spec("set-status", &["199"]),
-            spec("set-status", &["700"]),
             spec("set-request-header", &["bad header", "value"]),
             spec("set-request-header", &["Host", "example.test"]),
             spec("set-request-header", &["Transfer-Encoding", "chunked"]),
@@ -1668,63 +1451,146 @@ mod tests {
         }
         assert!(validate_rule(&spec("map-remote", &["localhost:8080/api"])).is_ok());
 
-        let mut request_filtered_by_response = spec("delay", &["1"]);
-        request_filtered_by_response.content_type = Some("application/json".into());
-        assert!(validate_rule(&request_filtered_by_response).is_err());
-        request_filtered_by_response.content_type = None;
-        request_filtered_by_response.matcher.status = Some(200);
+        let request_filtered_by_response = RuleSpec {
+            match_on: RuleMatchOn::Original,
+            matcher: RuleMatcher::ContentType {
+                contains: "application/json".into(),
+            },
+            action: RuleAction::Delay { milliseconds: 1 },
+        };
         assert!(validate_rule(&request_filtered_by_response).is_err());
 
-        let mut response_with_status = spec("replace", &["old", "new"]);
-        response_with_status.matcher.status = Some(200);
+        let request_filtered_by_response = RuleSpec {
+            matcher: RuleMatcher::Status { equals: 200 },
+            ..request_filtered_by_response
+        };
+        assert!(validate_rule(&request_filtered_by_response).is_err());
+
+        let response_with_status = RuleSpec {
+            match_on: RuleMatchOn::Original,
+            matcher: RuleMatcher::Status { equals: 200 },
+            action: RuleAction::Transform {
+                transform: RuleTransform::ReplaceBody {
+                    pattern: "old".into(),
+                    replacement: "new".into(),
+                },
+            },
+        };
         assert!(validate_rule(&response_with_status).is_ok());
-        response_with_status.matcher.status = Some(99);
+        let response_with_status = RuleSpec {
+            matcher: RuleMatcher::Status { equals: 99 },
+            ..response_with_status
+        };
         assert!(validate_rule(&response_with_status).is_err());
     }
 
     #[test]
     fn ws_rules_reject_http_matchers_and_bad_selectors() {
         // A well-formed ws rule with valid selectors is accepted…
-        let mut ok = spec("ws-set-text", &["{\"forced\":true}"]);
-        ok.matcher.host = Some("chat.app".into());
-        ok.ws_dir = Some("s2c".into());
-        ok.ws_opcode = Some("text".into());
+        let ok = legacy_spec(
+            "ws-set-text",
+            Matcher {
+                host: Some("chat.app".into()),
+                ..Default::default()
+            },
+            None,
+            None,
+            Some("s2c"),
+            Some("text"),
+            &["{\"forced\":true}"],
+        )
+        .unwrap();
         assert!(validate_rule(&ok).is_ok());
         assert!(validate_rule(&spec("ws-drop", &[])).is_ok());
 
         // …and public_rule surfaces the WS selectors, not HTTP fields.
         let public = public_rule("r1", &ok);
         assert_eq!(public["phase"], "websocket");
-        assert_eq!(public["ws_dir"], "s2c");
-        assert_eq!(public["ws_opcode"], "text");
-        assert!(public["matcher"].get("path").is_none());
-        assert!(public["matcher"].get("method").is_none());
+        assert!(public["matcher"].to_string().contains("s2c"));
+        assert!(public["matcher"].to_string().contains("text"));
 
         // HTTP matchers don't apply to WS frame rules — reject, don't ignore.
-        let mut with_path = spec("ws-drop", &[]);
-        with_path.matcher.path = Some("/ws".into());
+        let with_path = RuleSpec {
+            match_on: RuleMatchOn::Original,
+            matcher: RuleMatcher::Path {
+                contains: "/ws".into(),
+            },
+            action: RuleAction::Terminal {
+                terminal: RuleTerminal::DropWebsocket,
+            },
+        };
         assert!(validate_rule(&with_path).is_err());
-        let mut with_method = spec("ws-drop", &[]);
-        with_method.matcher.method = Some("GET".into());
+        let with_method = RuleSpec {
+            matcher: RuleMatcher::Method {
+                equals: "GET".into(),
+            },
+            ..with_path.clone()
+        };
         assert!(validate_rule(&with_method).is_err());
-        let mut with_status = spec("ws-drop", &[]);
-        with_status.matcher.status = Some(101);
+        let with_status = RuleSpec {
+            matcher: RuleMatcher::Status { equals: 101 },
+            ..with_path.clone()
+        };
         assert!(validate_rule(&with_status).is_err());
-        let mut with_ct = spec("ws-drop", &[]);
-        with_ct.content_type = Some("application/json".into());
+        let with_ct = RuleSpec {
+            matcher: RuleMatcher::ContentType {
+                contains: "application/json".into(),
+            },
+            ..with_path
+        };
         assert!(validate_rule(&with_ct).is_err());
 
         // Bad direction / opcode selectors are rejected.
-        let mut bad_dir = spec("ws-drop", &[]);
-        bad_dir.ws_dir = Some("up".into());
-        assert!(validate_rule(&bad_dir).is_err());
-        let mut bad_opcode = spec("ws-drop", &[]);
-        bad_opcode.ws_opcode = Some("frame".into());
-        assert!(validate_rule(&bad_opcode).is_err());
+        assert!(
+            legacy_spec(
+                "ws-drop",
+                Matcher::default(),
+                None,
+                None,
+                Some("up"),
+                None,
+                &[]
+            )
+            .is_err()
+        );
+        assert!(
+            legacy_spec(
+                "ws-drop",
+                Matcher::default(),
+                None,
+                None,
+                None,
+                Some("frame"),
+                &[]
+            )
+            .is_err()
+        );
 
         // Arg arity still enforced alongside the WS filters.
-        assert!(validate_rule(&spec("ws-set-text", &[])).is_err());
-        assert!(validate_rule(&spec("ws-drop", &["x"])).is_err());
+        assert!(
+            legacy_spec(
+                "ws-set-text",
+                Matcher::default(),
+                None,
+                None,
+                None,
+                None,
+                &[]
+            )
+            .is_err()
+        );
+        assert!(
+            legacy_spec(
+                "ws-drop",
+                Matcher::default(),
+                None,
+                None,
+                None,
+                None,
+                &["x"]
+            )
+            .is_err()
+        );
     }
 
     #[test]

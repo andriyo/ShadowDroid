@@ -1336,6 +1336,13 @@ impl NetCmd {
             Self::Check { .. } | Self::Trust { .. } | Self::Start { .. }
         )
     }
+
+    fn is_local_rule_analysis(&self) -> bool {
+        matches!(
+            self,
+            Self::Rule(NetRuleCmd::Lint { .. } | NetRuleCmd::Explain(_))
+        )
+    }
 }
 
 #[derive(Subcommand)]
@@ -1395,6 +1402,40 @@ pub enum NetRuleCmd {
     Rm { id: String },
     /// Remove all rules.
     Clear,
+    /// Validate a rules file without requiring a device or running proxy.
+    Lint { file: PathBuf },
+    /// Explain which rules match one concrete flow and why.
+    Explain(Box<NetRuleExplainArgs>),
+}
+
+#[derive(clap::Args)]
+pub struct NetRuleExplainArgs {
+    /// JSON array or legacy JSONL rules file.
+    pub file: PathBuf,
+    /// Observed request/WebSocket host.
+    #[arg(long)]
+    pub host: String,
+    /// Observed request path and query.
+    #[arg(long, default_value = "/")]
+    pub path: String,
+    /// Observed HTTP method.
+    #[arg(long, default_value = "GET")]
+    pub method: String,
+    /// Response status; selects response-phase explanation.
+    #[arg(long, conflicts_with_all = ["dir", "opcode"])]
+    pub status: Option<u16>,
+    /// Response content type; selects response-phase explanation.
+    #[arg(long, conflicts_with_all = ["dir", "opcode"])]
+    pub content_type: Option<String>,
+    /// Request body used by GraphQL operation matchers.
+    #[arg(long, default_value = "")]
+    pub body: String,
+    /// WebSocket direction; selects WebSocket-phase explanation.
+    #[arg(long, value_parser = ["c2s", "s2c"], requires = "opcode")]
+    pub dir: Option<String>,
+    /// WebSocket opcode; selects WebSocket-phase explanation.
+    #[arg(long, value_parser = ["text", "binary", "ping", "pong", "close"], requires = "dir")]
+    pub opcode: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -2010,6 +2051,9 @@ async fn run_inner() -> Result<()> {
             if matches!(c, NetCmd::Daemon(_)) {
                 // The daemon ignores this arg (it reads its serial from the
                 // deserialized DaemonConfig); pass an empty sentinel.
+                return dispatch_net(c, &Serial::new(""), &config).await;
+            }
+            if c.is_local_rule_analysis() {
                 return dispatch_net(c, &Serial::new(""), &config).await;
             }
             // `net ca` manages host-side CA files and needs no device attached;
@@ -3356,26 +3400,29 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
                 } else {
                     None
                 };
-                let spec = RuleSpec {
-                    kind: a.kind.clone(),
-                    matcher: Matcher {
+                let spec = RuleSpec::from_legacy_parts(
+                    a.kind.clone(),
+                    Matcher {
                         host: a.host.clone(),
                         path: a.path.clone(),
                         method: a.method.clone(),
                         status: None,
                     },
-                    content_type: a.content_type.clone(),
-                    operation_name: a.operation_name.clone(),
+                    a.content_type.clone(),
+                    a.operation_name.clone(),
                     response,
-                    ws_dir: a.dir.clone(),
-                    ws_opcode: a.opcode.clone(),
-                    args: a.args.clone(),
-                };
+                    a.dir.clone(),
+                    a.opcode.clone(),
+                    a.args.clone(),
+                )
+                .map_err(anyhow::Error::msg)?;
                 nc::rule_add(serial, spec).await
             }
             NetRuleCmd::List => nc::rule_list(serial).await,
             NetRuleCmd::Rm { id } => nc::rule_rm(serial, id).await,
             NetRuleCmd::Clear => nc::rule_clear(serial).await,
+            NetRuleCmd::Lint { file } => nc::rule_lint(file),
+            NetRuleCmd::Explain(args) => nc::rule_explain(args),
         },
         NetCmd::Override { url, file } => nc::override_local(serial, url, file).await,
         NetCmd::Rules { file } => nc::rules_apply(serial, file).await,
@@ -6409,6 +6456,47 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn net_rule_explain_rejects_mixed_response_and_websocket_selectors() {
+        for response_selector in [["--status", "200"], ["--content-type", "text/plain"]] {
+            let parsed = Cli::try_parse_from([
+                "shadowdroid",
+                "net",
+                "rule",
+                "explain",
+                "rules.json",
+                "--host",
+                "chat.example.com",
+                "--dir",
+                "c2s",
+                "--opcode",
+                "text",
+                response_selector[0],
+                response_selector[1],
+            ]);
+            let error = match parsed {
+                Err(error) => error,
+                Ok(_) => panic!("mixed response/WebSocket selectors unexpectedly parsed"),
+            };
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+
+        Cli::try_parse_from([
+            "shadowdroid",
+            "net",
+            "rule",
+            "explain",
+            "rules.json",
+            "--host",
+            "chat.example.com",
+            "--dir",
+            "c2s",
+            "--opcode",
+            "text",
+        ])
+        .expect("a pure WebSocket explanation should parse");
     }
 
     #[test]
