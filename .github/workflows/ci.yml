@@ -289,19 +289,20 @@ jobs:
 
       - name: Exercise the real CLI, APK pair, and Field Lab
         uses: reactivecircus/android-emulator-runner@v2.37.0
+        env:
+          SHADOWDROID_CLI_BIN: ${{ github.workspace }}/ci-artifacts/cli/shadowdroid
+          SHADOWDROID_SERVER_TEST_APK: ${{ github.workspace }}/ci-artifacts/server/app-debug-androidTest.apk
+          SHADOWDROID_SAMPLE_APK: ${{ github.workspace }}/ci-artifacts/sample/app-debug.apk
+          SHADOWDROID_DEVICE: emulator-5554
+          SHADOWDROID_EXPECT_FORM_FACTOR: ${{ matrix.form-factor }}
+          SHADOWDROID_E2E_EVIDENCE: ${{ runner.temp }}/android-surfaces-${{ matrix.name }}
         with:
           api-level: ${{ matrix.api-level }}
           target: ${{ matrix.target }}
           arch: x86_64
           script: |
             chmod +x ci-artifacts/cli/shadowdroid
-            SHADOWDROID_CLI_BIN="$PWD/ci-artifacts/cli/shadowdroid" \
-              SHADOWDROID_SERVER_TEST_APK="$PWD/ci-artifacts/server/app-debug-androidTest.apk" \
-              SHADOWDROID_SAMPLE_APK="$PWD/ci-artifacts/sample/app-debug.apk" \
-              SHADOWDROID_DEVICE=emulator-5554 \
-              SHADOWDROID_EXPECT_FORM_FACTOR=${{ matrix.form-factor }} \
-              SHADOWDROID_E2E_EVIDENCE="$RUNNER_TEMP/android-surfaces-${{ matrix.name }}" \
-              ./scripts/e2e-android-surfaces.sh
+            ./scripts/e2e-android-surfaces.sh
 
       - uses: actions/upload-artifact@v7
         if: always()
