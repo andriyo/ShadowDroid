@@ -1,247 +1,79 @@
 # ShadowDroid
 
-**An agent-first Android control plane** for UI automation, app/device control,
-log and crash triage, layout inspection, debugger access, diagnostics, and
-HTTP(S) interception.
+**Give your coding agent eyes, hands, and a debugger for Android.**
+
+ShadowDroid is an open-source Android automation and debugging CLI for AI
+coding agents. It lets any shell-capable agent — Claude Code, Codex, Cursor,
+Gemini, Antigravity — drive, inspect, and debug real Android apps, emulators,
+and devices through structured JSON: no test DSL, no client SDK, no Appium
+server. One native binary plus `adb`.
 
 [![Latest release](https://img.shields.io/github/v/release/andriyo/ShadowDroid?sort=semver&display_name=tag&label=release&color=blue)](https://github.com/andriyo/ShadowDroid/releases/latest)
 [![CI](https://github.com/andriyo/ShadowDroid/actions/workflows/ci.yml/badge.svg)](https://github.com/andriyo/ShadowDroid/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/github/license/andriyo/ShadowDroid?color=blue)](LICENSE)
 [![Platform: Android](https://img.shields.io/badge/platform-Android-3DDC84?logo=android&logoColor=white)](#install)
-[![Built with Rust](https://img.shields.io/badge/built%20with-Rust-CE422B?logo=rust&logoColor=white)](#how-it-works)
 
-ShadowDroid is an open-source **Android automation and debugging CLI for AI
-agents**. It lets coding agents such as Claude Code, Cursor, Codex, Gemini, and
-Antigravity drive, inspect, and debug real Android apps and emulators through a
-fast, JSON-first command line — no test DSL, no client library, no Appium
-server. If your agent can run a shell command and parse JSON, it can drive
-Android.
+[Install](#install) · [Quickstart](#quickstart) ·
+[Why ShadowDroid](#why-shadowdroid) · [Docs](#documentation) ·
+[Field Lab](#the-field-lab-sample)
 
-It pairs a single Rust binary on your laptop with a Kotlin instrumentation
-service on the device, then exposes UI state, app lifecycle, structured logcat,
-crash/ANR events, device controls, permissions, files, display profiles,
-toasts, HTTP(S) traffic, Android Studio debugger state, Layout Inspector data,
-and an optional in-app debug AAR through one CLI. Warm UI reads normally complete
-in tens of milliseconds, so an agent can observe after every meaningful action.
+## The loop, in three commands
 
-## Sixty seconds in the loop
+Captured verbatim against the bundled [Field Lab sample](#the-field-lab-sample)
+on an API 36 emulator, trimmed to the interesting fields (`…` marks elisions).
 
-A real session — read the screen, act by selector, and notice how the tool
-answers the agent's next question *before it's asked*:
+**1. The agent reads the screen** — parsed elements with stable selectors, not
+a screenshot to squint at:
 
 ```jsonc
 $ shadowdroid ui dump
-{"screen_hash":"154e97ff111d4b1e","screen_hash_version":3,
- "content_hash":"c:154e97ff111d4b1e",
- "interaction_hash":"i:6b4f20feab9812c3","interaction_hash_version":1,
- "snapshot_state":"consistent","captured_at_ms":1760000000123,
- "viewport":{"w":1080,"h":2424},
- "current_app":{"package":"com.example.app","activity":".MainActivity","pid":5170,
-                "sampled_at_ms":1760000000118},
- "ui_tree":{"package":"com.example.app","window_id":42,
-            "sampled_at_ms":1760000000121,"age_ms":2},
- "element_count":39,"ime":{"keyboard_visible":false},
- "elements":[{"id":7,"handle":"i:6b4f20feab9812c3/e:2","text":"Sign in",
-              "rid":"btn_sign_in","tap":[540,1200],"clickable":true}, …]}
+{"screen_hash":"c50fd462de4304be","interaction_hash":"i:178f2b73ce0e1447",
+ "snapshot_state":"consistent","viewport":{"w":1080,"h":2424},
+ "current_app":{"package":"io.github.andriyo.shadowdroid.sample",
+                "activity":"io.github.andriyo.shadowdroid.sample.MainActivity"},
+ "element_count":39,
+ "elements":[…,
+   {"id":3,"text":"Recover the\nsilent relay.","tap":[336,777]},
+   {"id":30,"rid":"nav_mission","tap":[403,2256],"clickable":true,
+    "handle":"i:178f2b73ce0e1447/e:3"}, …]}
+```
 
-// Act + wait for a quiet accessibility state in ONE call. A destination
-// postcondition makes the observation transactional and implies --observe.
-$ shadowdroid ui tap --text "Sign in" --expect-text "Welcome" --timeout-ms 3000
-{"type":"action","cmd":"tap","ok":true,"via":"selector","matched":true,
- "selector_matched":true,"actionable_resolved":true,"input_delivered":true,
- "matched_element":{"id":7,"text":"Sign in","tap":[540,1200]},
- "activated_element":{"id":7,"text":"Sign in","clickable":true},
- "action":"accessibility_click","action_delivered":true,"stable":true,
- "settle_ms":684,"quiet_period_ms":500,"screen_changed":true,
- "postcondition":{"kind":"text","expected":"Welcome","matched":true},
+**2. It acts by selector and proves the destination in the same call** — tap,
+wait for the screen to settle, check the postcondition, and return the new
+screen, one round-trip:
+
+```jsonc
+$ shadowdroid ui tap --rid nav_mission --expect-text "Night Shift: Signal Recovery"
+{"type":"action","cmd":"tap","ok":true,
+ "matched_element":{"id":30,"rid":"nav_mission","tap":[403,2256], …},
+ "action":"accessibility_click","action_delivered":true,
+ "settle_ms":1878,"screen_changed":true,
+ "postcondition":{"kind":"text","expected":"Night Shift: Signal Recovery",
+                  "matched":true, …},
  "postcondition_satisfied":true,
- "screen":{"screen_hash":"9c01d2aa87b3e544","screen_hash_version":3,
-           "content_hash":"c:9c01d2aa87b3e544",
-           "interaction_hash":"i:72f4e31cb098a6d5","interaction_hash_version":1,
-           "snapshot_state":"consistent","captured_at_ms":1760000000440,
-           "element_count":24,"elements":[…]}}
+ "screen":{"screen_hash":"87332662a59bfb79","element_count":45,"elements":[…]}}
+```
 
-// Strict guard: any content change, including telemetry, refuses the action.
-$ shadowdroid ui tap --text "Buy" --if-screen 154e97ff111d4b1e
-{"type":"error","ok":false,"stage":"run","code":"screen_changed",
- "msg":"screen changed since your last read (expected hash 154e97ff…, now 9c01d2aa…) — not acting; re-plan from detail.screen",
- "retryable":false,
- "next_actions":["re-plan from detail.screen instead of issuing another dump"],
- "detail":{"expected":"154e97ff111d4b1e","actual":"9c01d2aa87b3e544","screen":{…fresh compact dump…}}}
+**3. When the app breaks, the error is the diagnosis.** After tapping the
+Field Lab's deliberate crash fixture, one bounded read returns the verdict —
+no logcat spelunking:
 
-// Interaction guard: display-only telemetry/video may change, but controls,
-// their hierarchy, bounds, selectors, enabled state, and actions must match.
-$ shadowdroid ui tap --rid btn_sign_in --exact --if-interaction i:6b4f20feab9812c3
-
-// A handle is bound to that same interaction snapshot and resolves its current
-// numeric id atomically. Navigation/recomposition makes an old handle fail with
-// code=stale_element and returns the fresh screen without acting.
-$ shadowdroid ui tap --handle i:6b4f20feab9812c3/e:2 --observe
-
-// If the app crashed since your previous command, your NEXT response says so —
-// success or error, no watcher required:
-$ shadowdroid ui wait --text "Welcome" --timeout-ms 6000
-{"type":"error","ok":false,"stage":"ui","code":"wait_timeout",
- "retryable":true,
- "detail":{"timeout_ms":6000,"gone":false,
-           "screen_hash":"9c01d2aa87b3e544","screen_hash_version":3,
-           "current_app":{"package":"com.example.app","activity":".MainActivity"},
-           "top_texts":["Example App keeps stopping","App info","Close app"]},
- "next_actions":["inspect detail.top_texts and current_app, then correct the selector or expected screen",
-                 "run `shadowdroid why` if the app reached an unexpected state"],
- "events":[{"type":"crash","kind":"java","package":"com.example.app",
-            "exception":"java.lang.IllegalStateException","message":"boom",
-            "stack":["com.example.CartRepo.checkout(CartRepo.kt:42)", …],
-            "hint":"app process died; `shadowdroid why` or `shadowdroid log --last 2m` for detail"}]}
-
-// One bounded read answers "what just went wrong?" — verdict, evidence, next steps:
+```jsonc
 $ shadowdroid why
 {"type":"action","cmd":"why","ok":true,"verdict":"app_crashed",
  "explanation":"the app process crashed — see evidence.crash (project_frames point into your code)",
- "evidence":{"crash":{"exception":"java.lang.IllegalStateException",
-   "project_frames":[{"frame":"com.example.CartRepo.checkout(CartRepo.kt:42)",
-                      "path":"app/src/main/java/com/example/CartRepo.kt","line":42}], …}},
- "hints":["shadowdroid log --last 5m   # full crash context", …]}
+ "evidence":{"crash":{"kind":"java","exception":"java.lang.RuntimeException",
+   "message":"Deliberate ShadowDroid sample crash",
+   "stack":["io.github.andriyo.shadowdroid.sample.MainActivity.crashNow(MainActivity.kt:240)", …]}},
+ "hints":["shadowdroid log --last 5m   # full crash context",
+          "shadowdroid app start       # relaunch after the fix"]}
 ```
 
-> Android-only by design, and not a test framework — ShadowDroid is the fast,
-> observable layer an agent drives directly against a running app.
-
-## Key benefits
-
-- **A fast warm path** — a persistent on-device service answers core UI reads
-  in tens of milliseconds instead of starting a fresh UI dump process each time.
-- **Fewer round-trips** — `--observe` fuses act + accessibility-idle re-read
-  into one call, while `--expect-text`/`--expect-rid`/`--expect-desc`/
-  `--expect-package`/`--expect-activity` prove the stable destination;
-  `--if-screen` strictly guards all content, while `--if-interaction` and
-  screen-bound element handles tolerate display-only telemetry/video changes
-  but refuse changed controls. Both hand back the fresh screen on failure.
-  Every round-trip an agent saves is an LLM inference saved.
-- **Failures explain themselves** — a missed selector returns what *is* on
-  screen (`top_texts`) and the closest candidates ranked; a timeout reports what
-  the screen became; a crash since your last command rides the next response as
-  an `events` array. The error is the diagnosis.
-- **Structured logs and one-verb triage** — `log` turns logcat into bounded,
-  app-scoped JSON with crash/ANR blocks parsed out and stack frames mapped to
-  your source files; `why` fuses crash + logs + screen + network failures into
-  a single verdict with evidence.
-- **No test DSL, client SDK, or Appium server** — one binary plus `adb`.
-- **Robust, selector-based actions** — tap / type / swipe / scroll by `--rid`,
-  `--text`, `--desc`, or `--xpath`, so flows survive layout changes instead of
-  breaking on hard-coded coordinates. Strict ambiguity handling: several
-  matches and no exact hit is a structured error listing candidates, never a
-  guess.
-- **Full Android operator surface** — app install/start/stop/clear/info, runtime
-  permissions, app-ops, device power/orientation/clipboard/notifications,
-  display profiles, and on-device file push/pull live in the same CLI.
-- **First-class Jetpack Compose support** — a semantics-aware element tree
-  (AndroidX UI Automator 2.3.0+), enriched with Compose source locations and
-  recomposition counts when Android Studio's Layout Inspector is live.
-- **Sees _why_, not just _what_** — a bounded Android Studio debugger exposed
-  as JSON: debugger control and breakpoints, call stack, threads, variables,
-  watches, expression eval, first-class non-suspending logpoints, native/
-  tombstone readiness, and coroutine insight.
-- **One live event stream** — `watch` emits screen diffs, crashes, toasts,
-  popup-watcher actions, structured logpoint hits, and decrypted HTTP(S) on a
-  single timeline.
-- **Crash-safe screen video** — `video record` captures segmented Android
-  screen video into a protected evidence bundle; detached
-  `start` / `mark` / `status` / `stop` verbs cover longer interactive runs.
-- **Built-in HTTP(S) interception** — a host-side MITM proxy built into the
-  binary; an optional debug-only in-app agent adds process/coroutine diagnostics
-  and explicit above-TLS OkHttp capture, including pinned OkHttp calls.
-- **Self-describing and agent-ready** — `commands --json --depth 1` gives a
-  compact map and `commands --json --describe '<path>'` gives precise command
-  construction data; one command installs skills for Claude Code, Cursor,
-  Codex, Gemini, and Antigravity.
-- **Trivial to install, safe to run** — a single native binary plus a tiny,
-  SHA-256-verified APK; macOS / Linux / Windows hosts; real devices, emulators,
-  and Android TV / leanback.
-
-## Contents
-
-- [Why it exists](#why-it-exists)
-- [How it works](#how-it-works)
-- [Install](#install)
-- [Connect](#connect)
-- [Field Lab sample](#field-lab-sample)
-- [The agent loop](#the-agent-loop)
-- [The output contract](#the-output-contract)
-- [When something goes wrong](#when-something-goes-wrong)
-- [What you can drive](#what-you-can-drive)
-- [Screen video evidence](#screen-video-evidence)
-- [Agent debugging](#agent-debugging)
-- [Agent integration](#agent-integration)
-- [FAQ](#faq)
-- [License](#license)
-
-## Why it exists
-
-To drive a *running* app in a tight agent loop, the tools you'd otherwise reach
-for each fall short:
-
-| Tool                              | Gap for a live agent loop                                                          |
-| --------------------------------- | ---------------------------------------------------------------------------------- |
-| `adb shell uiautomator dump`      | ~500ms–1s per dump — the loop stalls between every step.                           |
-| `adb shell input tap`             | Stateless: no idea what's on screen, fragile to any layout change.                 |
-| `adb logcat`                      | An unscoped text firehose — no app scoping, no structure, crash blocks buried in noise. |
-| `android` CLI (`layout`/`screen`) | Built for project create / build / run / SDK — and great at it. But for live UI, each `layout` call runs a fresh `ui-dump` (the slow path): no persistent service, no streaming loop, no interaction-by-selector, no crash/popup events, no agent debugger. |
-
-ShadowDroid is the **complement, not a replacement**. Keep using the `android`
-CLI to scaffold, build, deploy, and manage the SDK — then hand the *running* app
-to ShadowDroid. A persistent on-device service keeps warm dumps in the
-tens-of-milliseconds range, a streaming JSON event model lets the agent follow
-the app live, and it ships with
-**first-class Jetpack Compose support** (AndroidX UI Automator 2.3.0+),
-**built-in crash detection**, **declarative popup watchers**, and — uniquely — an
-**agent-facing Android Studio debugger** (see [Agent debugging](#agent-debugging)).
-It even follows the `android` CLI's own conventions (`init`, `skill`, `layout`,
-`studio`), so it slots in right beside it.
-
-## How it works
-
-```
-        Laptop                         adb forward                Android device
-  ┌───────────────────────┐         tcp:7912 ⇆ 7912         ┌───────────────────────────┐
-  │  shadowdroid (Rust)   │  ── HTTP + JSON (loopback) ──▶  │  instrumentation APK      │
-  │  • clap CLI           │                                 │  • Ktor 3 / CIO server    │
-  │  • XML → element JSON │ ◀────────  adb logcat  ──────── │  • UiDevice (AndroidX     │
-  │  • watch/crash/why    │                                 │    UI Automator 2.3.0+)   │
-  └───────────────────────┘                                 └───────────────────────────┘
-```
-
-The on-device APK exposes low-latency UI tree reads and UI/device actions over
-HTTP. The host CLI owns orchestration: the watch diff loop, logcat parsing for
-the `log`/`why`/crash-event paths, watcher policy, act+observe fusion, source
-mapping, and recovery. This split means host/adb evidence in `log`, `why`,
-`doctor`, and `collect` remains useful when the on-device server is down.
-`collect` is passive with respect to device lifecycle: the selected device/AVD
-must already be online, and it only reads server-backed evidence through an
-already-established session. It never starts an AVD, server, or adb forward.
-
-Optional integrations extend the same command surface:
-
-- The Android Studio plugin exposes debugger state and Layout Inspector models to
-  `shadowdroid debug ...` and `shadowdroid layout ...`.
-- The built-in host-side MITM proxy wires through `adb reverse` and device proxy
-  settings so `shadowdroid net ...` can inspect, intercept, mutate, and replay
-  HTTP(S) traffic.
-- The debug-only core AAR auto-starts through a merged `ContentProvider` in apps
-  you can build and supplies process/coroutine diagnostics. HTTP capture is
-  separate: `aar install --okhttp` adds an optional companion, and the app must
-  explicitly add `ShadowDroidCaptureInterceptor()` to each debug OkHttp client.
-  That sees pinned OkHttp traffic above TLS; it does not instrument Cronet,
-  QUIC, or other clients.
-
-On the first `connect`, the CLI auto-installs a **version-matched APK pair**
-(downloaded from the matching GitHub Release, SHA-256 verified, cached under
-`~/.shadowdroid/`), runs `adb forward`, and starts the instrumentation. Later
-calls just probe `GET /v1/state` and reuse the live server, so steady-state
-latency stays low.
-
-At the wire level the server is a loopback HTTP/JSON API, but the supported
-public interface for agents is the CLI surface and `shadowdroid commands --json`.
+Every response ends with machine-readable `next_actions`, and if the app
+crashed since your previous command, the next response — success or error —
+carries the parsed crash as an `events` array. The crash finds the agent, not
+the other way around. Full details: [the output
+contract](docs/output-contract.md).
 
 ## Install
 
@@ -251,978 +83,228 @@ Homebrew:
 brew install andriyo/tap/shadowdroid
 ```
 
-macOS / Linux:
+Shell installer (macOS / Linux):
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/andriyo/ShadowDroid/releases/latest/download/shadowdroid-installer.sh | sh
 ```
 
-Scoop:
+Windows (Scoop, or the PowerShell installer):
 
 ```powershell
 scoop bucket add andriyo https://github.com/andriyo/scoop-bucket
 scoop install shadowdroid
 ```
 
-Windows PowerShell:
-
 ```powershell
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/andriyo/ShadowDroid/releases/latest/download/shadowdroid-installer.ps1 | iex"
 ```
 
-ShadowDroid also requires Android Platform Tools (`adb`) on PATH — the
-installers print a hint if it's missing. On macOS:
-`brew install --cask android-platform-tools`; on Windows: `scoop install adb`.
-The direct shell/PowerShell installers also seed global agent skills; for
-package-manager installs, run `shadowdroid init` once.
+You also need Android Platform Tools (`adb`) on PATH — the installers print a
+hint if it's missing (macOS: `brew install --cask android-platform-tools`;
+Windows: `scoop install adb`). Manual binaries are attached to each [GitHub
+Release](https://github.com/andriyo/ShadowDroid/releases/latest).
 
-For manual installs, use the assets attached to the latest GitHub Release.
-
-## Connect
+## Quickstart
 
 Start an emulator or plug in a device with USB debugging, then:
 
 ```bash
-shadowdroid devices        # list attached devices / emulators
-shadowdroid connect        # install the on-device server, forward, and verify
+shadowdroid devices     # list attached devices and emulators
+shadowdroid connect     # install the on-device service, forward, verify
+shadowdroid ui dump     # read the current screen as JSON
 ```
 
-On first `connect`, the CLI downloads the matching instrumentation APKs from the
-GitHub Release, verifies them with SHA-256, caches them under
-`~/.shadowdroid/apks/<version>/`, and installs them on the device. When working
-inside this repo it auto-discovers local Gradle build outputs before falling
-back to cached or release APKs.
+On first `connect`, the CLI installs a version-matched, SHA-256-verified APK
+pair on the device (downloaded from the matching GitHub Release and cached
+under `~/.shadowdroid/`). Later calls reuse the live server. If anything is
+off, `shadowdroid doctor` diagnoses the pipe and `doctor --fix` repairs it.
 
-Keep the CLI current and diagnose a flaky pipe:
+Now act by selector and verify the outcome in one call — selectors here are
+illustrative; use your app's:
 
 ```bash
-shadowdroid update --check  # compare against the latest GitHub Release
-shadowdroid doctor          # diagnose device state, APK version, forward, server
-shadowdroid doctor --fix    # attempt repairs (reinstall, re-forward, restart)
-shadowdroid collect         # bundle a self-contained diagnostic snapshot
+shadowdroid ui tap --text "Sign in" --expect-text "Welcome"
 ```
 
-> **Running instrumentation tests?** While connected, ShadowDroid holds the
-> device's single `UiAutomation` slot, so Espresso / UI Automator tests
-> (`AndroidJUnitRunner`) fail with `UiAutomationService ... already registered!`.
-> Prefer `shadowdroid test -- ./gradlew connectedDebugAndroidTest`, which
-> disconnects before the wrapped command and reconnects afterward. Or run
-> `disconnect`/`connect` explicitly. `connect` reports the slot advisory and
-> `doctor` shows the current owner.
-
-Initialize host integrations (Android Studio plugin for debugger + layout, plus
-agent skills):
+And when something surprises you:
 
 ```bash
-shadowdroid init                    # install/update Studio plugin + agent skills
-shadowdroid init --no-studio-plugin # only inspect Studio and install skills
+shadowdroid why
 ```
 
-Put repeated values in config instead of spending prompt/context on every
-command. Config lives in a folder: the global `~/.shadowdroid/config.json` is
-loaded first, then a project `.shadowdroid/config.json` from each of the current
-directory's ancestors, with the nearest project file winning.
+### Point your agent at it
+
+One command installs the agent skill and the Android Studio plugin (skip the
+plugin with `--no-studio-plugin`):
 
 ```bash
-shadowdroid config schema --json
-shadowdroid config init --project --app Livd --package com.livd --app-target mobile \
-  --default-target mobile --target-name mobile --target-avd Livd_Pixel_9_API_36 \
-  --target-start if-needed --target-form-factor mobile \
-  --project-path /Users/you/Work/Livd --json
-shadowdroid config validate --json
+shadowdroid init
 ```
 
-```json
-{
-  "default_target": "mobile",
-  "app": "Livd",
-  "project": "/Users/you/Work/Livd",
-  "redaction": {
-    "enabled": true,
-    "json_keys": ["customerId"],
-    "patterns": ["ORDER-[0-9]+"]
-  },
-  "proxy": {
-    "ca_trusted": true,
-    "hosts": ["*.livd.app"],
-    "trust_store": "user"
-  },
-  "apps": {
-    "Livd": {
-      "package": "com.livd",
-      "run_configuration": "app",
-      "debugger": "Android Debugger",
-      "target": "mobile"
-    }
-  },
-  "targets": {
-    "mobile": {
-      "avd": "Livd_Pixel_9_API_36",
-      "start": "if-needed",
-      "form_factor": "mobile"
-    },
-    "tv": {
-      "avd": "Livd_TV_API_35",
-      "start": "if-needed",
-      "form_factor": "tv"
-    }
-  }
-}
-```
+Then ask your agent to drive: the skill teaches it the loop, and
+`shadowdroid commands --json --depth 1` gives any agent the full,
+self-describing command catalog — canonical paths, argument construction data,
+output contracts, and decision hints. The operating contract agents follow is
+written down in [the agent loop](docs/agent-loop.md).
 
-Named targets make multi-project and mobile/TV work deterministic. ShadowDroid
-matches a running emulator by its stable AVD name, discovers its current adb
-serial, and reuses it. If none is running, `start: "if-needed"` opts into
-starting that existing AVD and waiting for Android to finish booting; the
-default policy is `never`. ShadowDroid never silently creates an AVD. Physical
-devices use a target entry with `"serial": "..."` and are never auto-started.
+> **Running Espresso / UI Automator tests?** While connected, ShadowDroid holds
+> the device's single `UiAutomation` slot, so instrumentation tests fail with
+> `UiAutomationService ... already registered!`. Wrap them in
+> `shadowdroid test -- ./gradlew connectedDebugAndroidTest`, which disconnects
+> first and reconnects after — or run `disconnect`/`connect` yourself.
 
-Use `shadowdroid --target tv connect` to override `default_target`; explicit
-`-d/--device` has highest precedence. `shadowdroid devices` stays passive and
-includes the AVD name when Android exposes it. AVD claims under
-`~/.shadowdroid/targets/claims/` prevent two projects from silently sharing one
-emulator—and therefore its accounts, proxy, and single UiAutomation slot. Use
-`--takeover` only for an intentional reassignment. Startup uses the Android SDK
-emulator found via `ANDROID_SDK_ROOT` / `ANDROID_HOME` / PATH; set
-`SHADOWDROID_EMULATOR` for an explicit executable.
+## Why ShadowDroid
 
-AVD names are host configuration. Commit target bindings only when the team
-standardizes those names; otherwise define `targets` in the user config and
-keep only the project's `default_target` / app `target` roles in project config.
+The tools you'd otherwise reach for each fall short in a live agent loop:
 
-The `project` path matters for debugging: `why` and `log` use it to map crash
-stack frames back to files in your source tree (`project_frames`), so the agent
-gets `app/src/main/java/.../CartRepo.kt:42` instead of a bare class name.
-
-`config init` changes only explicitly supplied fields, deep-merges an existing
-app alias, validates Android identifier fields, and atomically replaces the
-target file. Treat a committed project config as repository input, never as a
-place for shell fragments. If a malformed config prevents an ordinary command
-from loading, recovery commands still work because they run before normal
-config loading:
-
-```bash
-shadowdroid config paths --json
-shadowdroid config validate --json  # non-zero config_invalid with report in detail
-shadowdroid config schema --json
-shadowdroid commands --json --depth 1
-```
-
-Repository config cannot supply executable device-shell fragments: app
-packages are validated while the config is deserialized, permission/app-op
-tokens are validated at their command boundary, and accepted values are quoted
-before entering an Android shell command. Values containing `;`, newlines,
-`$()`, quotes, or whitespace fail with a typed `invalid_*` error.
-
-### Per-project proxy CA
-
-The `net` MITM proxy signs with a CA that ShadowDroid resolves per invocation:
-an explicit `proxy.ca_cert`/`proxy.ca_key` in config (absolute or `~/` paths),
-else a per-project convention CA at `<project>/.shadowdroid/ca.{crt,key}`, else
-the global `~/.shadowdroid/net/ca.{crt,key}`. Mint a project CA with
-`shadowdroid net ca reset --project` (or import your own with `net ca import
---project --cert …`); `config init --project` and the project-scoped `net ca`
-verbs write a `.shadowdroid/.gitignore` so the CA cert, key, and `.bak` backups
-are never committed.
-
-Set `proxy.ca_trusted: true` to tell ShadowDroid the CA is already trusted on
-the device (e.g. baked into a custom emulator image) — `net trust`/`net check`
-then skip the adb install and trust-store readback and report the basis as
-`asserted`. Even without it, a successful `net trust`/`net check` is cached per
-device (keyed by CA fingerprint), so repeat runs skip the probe; pass `--fresh`
-to force a real check.
-
-## Field Lab sample
-
-[`samples/shadowdroid-test-app`](samples/shadowdroid-test-app) is a polished,
-stateful Android showcase for driving ShadowDroid against a real package. Its
-four destinations turn the fixture surface into an operator workflow:
-
-| Destination | Experience |
+| Tool | Gap for a live agent loop |
 | --- | --- |
-| **Overview** | Mission progress, live posture, workspace shortcuts, and a recent-event trail |
-| **Mission** | A three-gate “Night Shift: Signal Recovery” run with validation, semantic range control, gated state, relay selection, and a long press |
-| **Signals** | An HTTP request composer, live WS/WSS field channel, and platform WebView |
-| **Lab** | Searchable deterministic fixtures for selectors, native/Compose ranges, windows, permissions, lifecycle, storage, coroutines, logs, crash, and ANR paths |
+| `adb shell uiautomator dump` | A fresh dump process per read, writing raw XML to `/sdcard` for you to pull and parse. No selectors, no actions, no events. |
+| `adb shell input tap` | Stateless coordinate injection: no idea what's on screen, fragile to any layout change. |
+| `adb logcat` | An unscoped text firehose — no app scoping, no structure, crash blocks buried in noise. |
+| Appium / Maestro / Espresso | Built for authored test suites running in CI, with a server, DSL, or compiled tests between the agent and the device. |
 
-Build and install it from the repository root:
+ShadowDroid keeps a **persistent service on the device**, so reads are warm:
+on our reference setup (Apple-silicon macOS host, arm64 API 36 emulator,
+August 2026), a warm `ui dump` returns parsed JSON in **~60–70 ms end-to-end**
+including CLI process start, while a single raw `uiautomator dump` takes
+~130–190 ms before you've pulled or parsed anything. Cold paths (first
+connect, APK install) are slower. Fast reads matter because the agent observes
+after every action — and every round-trip saved is an LLM inference saved.
+
+Speed is the smallest part. The persistent service is what makes the rest
+possible:
+
+- **Act + observe fused**: postconditions, stale-screen guards, and the
+  resulting screen in the same response.
+- **Failures that explain themselves**: what *is* on screen, ranked
+  near-matches, crash events riding the next response.
+- **A debugger an agent can read**: Android Studio breakpoints, stacks,
+  variables, and Layout Inspector data as JSON.
+
+ShadowDroid is a **complement, not a replacement**: keep `adb`, Android
+Studio, and the `android` CLI for scaffold/build/deploy/SDK work, and keep
+Espresso for regression suites. ShadowDroid takes over once the app is
+running — it is the live runtime control plane for an AI development and
+debugging loop. It even follows the `android` CLI's conventions (`init`,
+`skill`, `layout`, `studio`), so it slots in beside it.
+
+## What your agent gets
+
+**Robust selector actions with guards.** Tap / type / swipe / scroll /
+long-press by `--rid`, `--text`, `--desc`, or `--xpath` — never brittle
+coordinates. Ambiguity is a structured error listing candidates, never a
+guess. `--observe` fuses act + settle + re-read into one call; `--expect-*`
+proves the destination; `--if-screen`/`--if-interaction` refuse to act on a
+screen that changed since you read it; screen-bound handles catch stale
+elements before input is delivered. First-class Jetpack Compose and Android
+TV (D-pad focus) support. → [docs/agent-loop.md](docs/agent-loop.md)
+
+**Failures that explain themselves.** A missed selector returns `top_texts`
+(what the screen actually shows) and `closest` (ranked near-matches); a
+timeout reports what the screen became; a crash since your last command rides
+the next response as an `events` array:
+
+```jsonc
+$ shadowdroid ui tap --text "Sign in"
+{"type":"error","ok":false,"code":"element_not_found","retryable":true,
+ "detail":{"top_texts":["DETERMINISTIC FIXTURES","Challenge catalog", …],
+           "closest":[{"id":43,"text":"Signals","score":0.5, …}, …], …},
+ "next_actions":["inspect detail.top_texts and detail.closest when present", …]}
+```
+
+→ [docs/output-contract.md](docs/output-contract.md)
+
+**Structured logs and one-verb triage.** `log` turns logcat into bounded,
+app-scoped, deduplicated JSON with crash/ANR blocks parsed out and stack
+frames mapped to your source files. `why` fuses crash + logs + screen +
+network failures into a single verdict with evidence and next steps.
+`collect` bundles everything for a hand-off. →
+[docs/debugging.md](docs/debugging.md)
+
+**The debugger, as JSON.** Through the optional Android Studio plugin, the
+agent gets a live debugger it can read: breakpoints (line, exception, method,
+field; conditional and temporary), call stacks, threads, variables, watches,
+expression evaluation, non-suspending logpoints with structured hit streams,
+coroutine insight, and Layout Inspector data — Compose source locations and
+recomposition counts. UI polling tells an agent *what* happened; this tells it
+*why*. → [docs/debugging.md](docs/debugging.md)
+
+**The network, observed and shaped.** A host-side MITM proxy built into the
+binary captures decrypted HTTP(S) — HTTP/2, SSE, streaming bodies,
+`gzip`/`deflate`/`br`/`zstd` — and WebSocket frames. The agent can intercept
+and mutate flows in-flight, declare rewrite rules, inject or rewrite WS
+frames, export HAR/curl/fixtures, and replay recorded backends. An optional
+debug-only in-app companion captures certificate-pinned OkHttp traffic above
+TLS. → [docs/network.md](docs/network.md)
+
+**A full operator console.** App lifecycle and state snapshot/restore, runtime
+permissions and app-ops, files (including private app dirs via `--run-as`),
+display profiles, device controls, crash-safe segmented screen video with
+timeline markers, and a live `watch` stream of screen diffs, crashes, toasts,
+and HTTP events. Mutations verify their postconditions instead of trusting a
+silent shell. → [docs/device-state.md](docs/device-state.md)
+
+## How it works
+
+```
+        Laptop                          adb forward                Android device
+  ┌───────────────────────┐    (per-device host port → 7912)   ┌───────────────────────────┐
+  │  shadowdroid (Rust)   │  ──── HTTP + JSON (loopback) ───▶  │  instrumentation APK      │
+  │  • clap CLI           │                                    │  • Ktor server            │
+  │  • watch/log/why      │  ◀────────  adb logcat  ─────────  │  • UiDevice (AndroidX     │
+  │  • net MITM proxy     │                                    │    UI Automator 2.3.0+)   │
+  └───────────────────────┘                                    └───────────────────────────┘
+```
+
+The on-device APK answers low-latency UI reads and performs UI/device actions.
+The host CLI owns orchestration: watch diffing, logcat parsing for
+`log`/`why`/crash events, act+observe fusion, source mapping, and recovery —
+so host-side evidence keeps working even when the on-device server is down.
+The wire protocol is loopback HTTP/JSON, but the supported public interface
+for agents is the CLI and `shadowdroid commands --json`.
+
+Three optional integrations extend the same command surface, and everything
+degrades gracefully without them:
+
+- **Android Studio plugin** — exposes the debugger and Layout Inspector to
+  `shadowdroid debug ...` and `shadowdroid layout ...` (installed by
+  `shadowdroid init` or `studio install`).
+- **Built-in MITM proxy** — `shadowdroid net ...` wires the device through
+  `adb reverse` and restores the previous proxy state on stop.
+- **Debug-only in-app AAR** — `shadowdroid aar ...` adds process/coroutine
+  diagnostics and explicit above-TLS OkHttp capture to apps you build.
+
+## The Field Lab sample
+
+[`samples/shadowdroid-test-app`](samples/shadowdroid-test-app) is a stateful
+showcase app for driving ShadowDroid against a real package — the same app the
+transcripts above ran against:
+
+| Destination | What it exercises |
+| --- | --- |
+| **Overview** | Mission progress, live posture, workspace shortcuts, event trail |
+| **Mission** | A three-gate "Night Shift: Signal Recovery" run: validation, semantic sliders, gated state, a long press |
+| **Signals** | HTTP request composer, live WS/WSS channel, WebView |
+| **Lab** | Deterministic fixtures: selectors, ranges, windows, permissions, lifecycle, storage, coroutines, logs, crash and ANR paths |
 
 ```bash
 ./server/gradlew -p samples/shadowdroid-test-app :app:assembleDebug
 shadowdroid app reinstall \
   samples/shadowdroid-test-app/app/build/outputs/apk/debug/app-debug.apk \
   --grant-all --wait-front
-shadowdroid app start io.github.andriyo.shadowdroid.sample \
-  --activity .MainActivity
+shadowdroid app start io.github.andriyo.shadowdroid.sample --activity .MainActivity
 ```
 
-Three concise showcase journeys:
+Command-by-command walkthroughs — the Night Shift mission, a selector
+gauntlet with deliberate ambiguity, and a live WebSocket channel — are in
+[`samples/README.md`](samples/README.md).
 
-- **Night Shift mission:** open **Mission**, enter any non-empty callsign and
-  run code `NIGHT-42`, set `mission_signal_slider` to `71`, enable
-  `mission_telemetry_switch`, arm the relay, select `mission_relay_east`, then
-  resolve `mission_hold_acknowledge` with `ui find` and long-press its
-  `element.tap` coordinates. The terminal postcondition is the **Signal
-  recovered** dialog.
-- **Selector gauntlet:** open **Lab** and use the initially expanded
-  **Interaction gauntlet**. An exact text tap on `Duplicate action` should be
-  ambiguous; the stable IDs disambiguate both buttons. The same section keeps
-  nested clickable ancestors, disabled targets, a true no-op, and controlled
-  unstable accessibility updates.
-- **Network channel:** run the sample Ktor server, trust the ShadowDroid CA on
-  the target as appropriate, then start
-  `shadowdroid net start --host shadowdroid.localhost`. Open **Signals → Open
-  live channel**, establish WSS, transmit text, then exercise the binary and
-  4KB frame actions before a normal close. Inspect the result with
-  `shadowdroid net ws`.
+## Agent integrations
 
-The visual shell adds realistic navigation and state without hiding the test
-contract: the raw deterministic fixtures and their stable resource IDs,
-Compose test tags, and content descriptions remain directly available in
-**Lab**. See [`samples/README.md`](samples/README.md) for command-oriented
-walkthroughs.
-
-## The agent loop
-
-This section is the canonical operating contract for LLMs and coding agents.
-The loop is **read → act → confirm**, and ShadowDroid is built so each step
-costs as few round-trips as possible.
-
-1. **Discover the surface once.** Start with `shadowdroid commands --json
-   --depth 1`; use `commands --json --describe 'ui tap'` for one command,
-   `commands --guide net|debugger|state` for a domain driving guide, or
-   omit `--depth` for the full tree. Schema version 3 contains canonical paths,
-   complete argument construction data (aliases, conflicts, requirements,
-   groups, arity, and trailing/hyphen-value behavior), output contracts, and
-   agent decision hints. Do not invent command names from memory or scrape
-   `--help` prose.
-2. **Put repeated context in config.** `shadowdroid config init ...` then
-   `config validate --json`. Use an app alias instead of spending tokens on
-   `--package`/`--project`/`--debugger` every call.
-3. **Connect.** `shadowdroid connect`; if it fails, `shadowdroid doctor --json`,
-   then `doctor --fix` only when repair side effects are acceptable.
-4. **Read by dumping.** `shadowdroid ui dump` returns the actionable tree as a
-   compact element list plus strict content identity, actionable interaction
-   identity, screen-bound handles, and freshness metadata. Act only
-   from `snapshot_state: "consistent"`; a lifecycle race is retried within a
-   bounded window, then returned as `transitioning` with a warning. Cache the
-   hash/version pairs; invalidate a cached hash if its version changes.
-5. **Act by selector, not coordinates.** Prefer `--rid`, then `--desc`/exact
-   `--text`. Add `--observe` to wait for an accessibility quiet period and get
-   the post-action screen in the same response. Prefer one `--expect-*`
-   destination condition when the outcome is known; it implies observation.
-   Add `--if-interaction <hash>` to stable selectors on dynamic screens, or use
-   a returned `--handle` when no stable selector exists. Use `--if-screen
-   <hash>` when even display-only content must remain identical. A mismatch
-   returns the fresh screen — that *is* your re-read.
-6. **Confirm.** `ui wait --text/--rid/--pkg` blocks until the expected state and
-   echoes the matched element; a timeout returns `top_texts` so you see what the
-   screen became instead of guessing.
-7. **Watch when timing matters.** `shadowdroid watch` streams screen diffs,
-   crashes, ANRs, toasts, watcher actions, Android Studio logpoint hits, and
-   (with `net` running) HTTP events on one JSONL timeline.
-8. **Triage failures with one read.** After any surprise, `shadowdroid why`
-   returns a verdict + evidence; `shadowdroid log --last 5m` gives the structured
-   logcat behind it. You rarely need both plus a screenshot — start with `why`.
-9. **Go deeper only when needed.** `shadowdroid debug ...` (Android Studio
-   debugger as JSON) and `shadowdroid layout ...` (Compose semantics/source/
-   recompositions) when UI polling can't answer *why*.
-10. **Free the slot for instrumentation.** `shadowdroid test -- <cmd>` (or
-    `disconnect` first) before Espresso / UI Automator runs — Android allows one
-    `UiAutomation` owner at a time.
-
-## The output contract
-
-Treat the process exit code as authoritative. Most one-shot commands print one
-JSON object on stdout: action success as
-`{"type":"action","ok":true,"cmd":…,…}`, a raw read such as `ui dump` as its
-payload, and failure as `{"type":"error","ok":false,"stage":…,"code":…,
-"msg":…}`. Every terminal JSON success and failure includes a non-empty,
-command-specific `next_actions` array; failures also include `retryable` and
-structured `detail`. Use those fields instead of parsing `msg`. Raw reads can
-omit `ok`, so exit code zero is their success signal.
-
-Streaming commands are explicit JSONL exceptions (`watch`, `log`, `net log`,
-`debug logpoint follow`, and `debug replay`); `test` passes through the wrapped
-command and adds a ShadowDroid trailer. Stream errors have the same `code`,
-`retryable`, `detail`, and non-empty `next_actions` recovery fields, while
-terminal stream summaries carry follow-up actions. Human, source, and
-wrapped-command pass-through output cannot embed the JSON field; their exact
-follow-ups remain available from
-`commands --json --describe '<path>'`. Interop exports such as HAR, curl, and
-fixtures write an artifact and emit a small terminal action naming its path and
-byte count. Some setup/report commands default to human output and offer
-`--json`. Unknown-argument and missing-command errors are JSON and exit 2; a
-spelling suggestion is included when one is available. Explicit `--help`
-remains human-readable.
-
-Runtime actions preserve the selected `-d <serial>` and shell-quote identifiers
-copied from device/app output. If a required value is not yet known, the CLI
-emits an exact `commands --json --describe '<path>'` discovery action rather
-than a command that would immediately fail.
-
-Inside a running `watch` stream, `{"type":"error","stage":…,"code":…,"msg":…,
-"input":…,"retryable":…,"detail":…,"next_actions":[…],"ts":…}` is a
-timeline event, not the terminal one-shot error envelope above. Keep consuming
-unless the stream ends or the task says to stop.
-
-- **`events` rides any response.** When the app crashed or ANRed since your
-  previous command, the next result (action *or* error) carries an `events`
-  array of parsed `{"type":"crash",…}` objects. No `watch` required, no separate
-  poll — the crash finds you. (`SHADOWDROID_NO_EVENTS=1` opts out.)
-- **Failures are self-describing.** `element_not_found` carries `top_texts`
-  (what *is* on screen) and `closest` (ranked near-matches to your selector);
-  `ambiguous_match` lists the candidate nodes; `screen_changed` carries the
-  fresh compact screen; `ui wait` timeouts are non-zero `wait_timeout` errors
-  carrying `top_texts`, `current_app`, and recovery commands. Read `detail`
-  before re-dumping.
-- **Logs go to stderr.** ShadowDroid's own operational logging is on **stderr**,
-  so `… | jq` already sees clean JSON. Add `--quiet`/`-q` (or
-  `SHADOWDROID_QUIET=1`) to silence it entirely — handy when you merge with
-  `2>&1`.
-- **Selector actions are strict.** Several matches and no exact hit is an
-  `ambiguous_match` error listing candidates, never a silent guess.
-
-## When something goes wrong
-
-Three verbs, in the order you'll usually reach for them:
-
-```bash
-shadowdroid why                       # verdict + evidence + next steps, in one read
-shadowdroid log --last 5m --level e   # structured, app-scoped logcat behind it
-shadowdroid collect                   # full offline bundle to hand off
-```
-
-**`why`** fuses the last crash/ANR (with stack frames mapped into your source
-tree), recent error logs, the current screen, and network failures (when the
-`net` proxy is up) into a single `verdict` — `app_crashed`,
-`app_not_responding`, `tls_rejected`, `backend_errors`, `app_not_foreground`,
-`log_errors_only`, or `no_obvious_cause` — with `evidence` and `hints`. It is
-non-mutating: it reads the server only if that server is already reachable and
-does not install/start it, create an adb forward, or change device state to get
-a screen. Without a reachable server it marks screen evidence unavailable and
-continues with adb/host evidence.
-
-**`log`** is logcat shaped for an agent: scoped to the configured app by default
-(`--all` for everything), windowed (`--last 60s`), filtered (`--level e`,
-`--grep`, `--tag`), deduplicated (repeats collapse with a count), and with
-crash/ANR blocks lifted out as parsed `{"type":"crash",…}` events — one JSON
-object per line, then an action summary.
-
-**`collect`** is the "I give up, here's everything" bundle: `doctor` output,
-device info, logcat + crash buffer, screenshot, screen dump, and app state, all
-in one directory. It degrades gracefully — the host-side diagnostics are
-captured even if no already-established on-device server session is reachable,
-without installing, starting, repairing, or forwarding one. With global
-`--redact` (or
-`redaction.enabled` in config), every JSON/text artifact is filtered and the
-manifest records privacy status per file. Screenshot pixels are never silently
-treated as safe: they remain marked potentially sensitive; add
-`--redact-screenshots` to explicitly black out accessibility bounds matching
-the active policy.
-
-## Redacting secrets and PII
-
-Pass global `--redact` before or after any subcommand to filter JSON and text at
-the shared output boundary:
-
-```bash
-shadowdroid --redact ui dump
-shadowdroid log --last 2m --redact
-shadowdroid --redact collect --app com.example.app --redact-screenshots
-shadowdroid net start --redact
-```
-
-Built-ins cover password/secret/token/cookie fields, JWTs, bearer values,
-emails, IPv4/IPv6 addresses, usernames/phone values, and common session,
-device, transaction, and serial identifiers. JSON embedded in log or GraphQL
-body strings is parsed and retains its structure. Each emitted record carries
-the policy version and replacement count. Config can enable the policy for all
-commands and add key names or Rust-regex patterns; user and project additions
-are merged, with the nearest `enabled` value winning.
-
-`net start --redact` also applies the same policy to completed capture copies
-before they reach the session log, including URL path/query values, hosts,
-connection errors, WebSocket metadata, and TLS failures. In-app OkHttp flows
-drained by `aar capture` cross the same policy boundary before stdout, JSONL,
-fixtures, or the shared store. A live daemon reports its capture-policy
-fingerprint; requesting `--redact` refuses to reuse an unredacted or differently
-configured daemon and asks for an explicit stop/start. Request/response bytes
-forwarded to the app or upstream are never changed. `ui screenshot` reports raw
-pixels as potentially sensitive. Explicit `--redact-pixels` (PNG only) blacks
-out matching accessibility bounds, but still reports that Android may not
-expose every rendered glyph.
-
-Video is a stricter boundary: global `--redact` does not alter MP4 pixels.
-Every `video` bundle is marked as containing sensitive, unencrypted data; review
-its clips before sharing it. For video bundles, `--redact` filters marker labels;
-device/session identity and recovery paths remain in the protected manifest, so
-the JSON timeline is still marked potentially sensitive. Screen recording is
-video-only — it does not capture device, app, or microphone audio.
-
-Optionally, opt in to a **local usage log**. Schema version 2 records only the
-command path, duration, CLI version, outcome, and typed error code/stage/retry
-posture — never argument values — and never uploads anything:
-
-```bash
-shadowdroid usage enable
-shadowdroid usage report --days 30 | jq \
-  '{verbs, error_codes, error_stages, versions, recommendations, feedback_loop}'
-```
-
-Recommendations require repeated evidence: high error rates, slow p95s, or
-recurring error codes. The report suggests the next engineering action but does
-not edit code. Reproduce the evidence, add a regression, implement the change,
-then compare error rate and p95 by version.
-
-## What you can drive
-
-Automation commands are JSON-first, and selectors are consistent across
-commands: `--text`, `--rid` (resource id), `--desc` (content description), and
-`--xpath`. A typical agent reads `ui dump` once, acts by `--rid`/`--text`, and
-caches strict `content_hash` and actionable `interaction_hash` together with
-their versions. Legacy `screen_hash` remains the unprefixed strict identity for
-backward compatibility. A hash is comparable only within the same version;
-invalidate it when the version changes. `content_hash` changes for any visible
-or actionable snapshot detail. `interaction_hash` ignores display-only content
-(telemetry, timers, video surfaces) and a slider's current value, but includes
-actionable hierarchy, bounds, stable selectors, enabled/selected/checked state,
-range shape, and supported actions. Text participates when it is the control's
-only selector.
-`snapshot_state`, `captured_at_ms`, `current_app.sampled_at_ms`, and `ui_tree`
-make lifecycle freshness explicit. Do not derive an action from a
-`transitioning` snapshot; retry or wait for the expected package/activity.
-
-Text/desc selectors match as a **normalized, case-insensitive substring** by
-default: before comparing, surrounding whitespace is collapsed, curly
-quotes/apostrophes/ellipsis are folded to ASCII, and zero-width characters are
-stripped — so `--text "sign in"` matches a `SIGN IN` button and `--text "Don't
-allow"` matches text rendered with a typographic apostrophe. Add `--exact` (on
-`ui find`/`tap`/`text`/`wait`/`focus`) to require a full match (so `--text
-Allow` won't hit a label reading "Allow Disney+…"), and `--clickable` to skip
-non-clickable matches instead of resolving their clickable ancestor. `--rid` is
-the most reliable target when a stable resource id exists. Matching is
-**literal** — `*`, `.`, `?` and other symbols match
-themselves, with no wildcards or regex (a value starting with `-` needs the
-`--text=-50%` equals form so it isn't read as a flag).
-
-Each actionable element also has a screen-bound `handle` such as
-`i:6b4f20feab9812c3/e:2`. Prefer a stable `--rid` or `--desc` plus
-`--if-interaction`; use `--handle` when no stable selector exists. Handles are
-accepted by `ui tap`, `ui set-progress`, and `ui text`. They are resolved to the
-fresh numeric element id only after validating their embedded interaction hash,
-so stale navigation/recomposition or reused numeric ids fail as `stale_element`
-without delivering input. Agent-facing `next_actions` follow the same order:
-stable selector first, handle second, and numeric ids only as a strictly
-`--if-screen`-guarded compatibility fallback.
-
-Every `ui dump` also reports `accessibility_completeness`. UIAutomator cannot
-prove that custom-drawn or unexported Compose controls are represented, so the
-normal tree is explicitly marked `unverified` instead of looking deceptively
-complete. With Android Studio Layout Inspector attached, ask for the deeper
-comparison:
-
-```bash
-shadowdroid ui dump --deep
-shadowdroid ui tap --fallback-id cs:12345 --if-screen <screen-hash>
-```
-
-Missing Compose nodes are returned under `fallback.elements` with an id,
-bounds/tap point, `source` (`compose_semantics` or `compose_layout`), confidence,
-and `stable_selector:false`. High-confidence `cs:` semantics results can be
-targeted directly by fallback id. Layout-only `cl:` results (including custom
-drawing without exported semantics) require both `--coordinate-fallback` and a
-same-snapshot `--if-screen` guard. OCR is not run automatically; direct `X Y`
-taps remain an explicit coordinate target and support the same screen guard.
-
-Platform and Compose sliders expose their accessibility `range` (`type`,
-`min`, `max`, `current`, and nullable `step`) plus stable `actions` in the
-normal `ui dump` shape. Android's range API does not expose a declared discrete
-step, so ShadowDroid leaves `step:null` unless a future platform surface can
-prove it. Set a slider semantically and verify the resulting range readback:
-
-```bash
-shadowdroid ui set-progress --desc "Follow stand-off slider" --value 0.45 --observe
-shadowdroid ui set-progress --rid distance_slider --percent 80 --if-interaction <interaction-hash>
-shadowdroid ui set-progress --handle <handle> --percent 50 --observe
-```
-
-Out-of-range values fail unless `--clamp` is explicit. Missing range semantics
-or `ACTION_SET_PROGRESS` is a typed error; `--coordinate-fallback` opts into an
-approximate track click and reports when readback could not verify it.
-
-Selector **actions** are **strict**: if `ui tap`/`text`/`focus` matches several
-elements and none is an exact match, they fail with a structured
-`ambiguous_match` error listing the candidates rather than guessing — narrow
-with `--exact`, `--rid`, or `--clickable`. On a hit, `ui tap`/`wait`/`focus`
-echo back the matched element so you can confirm the right node was targeted.
-
-Selector taps are semantic by default. A non-clickable match resolves to its
-nearest enabled clickable ancestor and reports both `matched_element` and
-`activated_element`; a disabled target fails with `element_disabled`, and a
-label with no safe ancestor fails with `element_not_clickable`. Raw center
-injection requires explicit `--coordinate-fallback` (or direct `X Y`
-coordinates). Tap results separate `selector_matched`, `actionable_resolved`,
-`input_delivered`, `screen_changed` (with `--observe`), and
-`postcondition_satisfied`, so a valid no-op action is not confused with an
-undelivered input.
-
-Numeric system keypads can be driven without returning the secret in action
-JSON: `shadowdroid ui pin "$DEVICE_PIN" --if-interaction <interaction-hash>`.
-The command preflights every required digit before entering anything, activates
-each label through its clickable ancestor, and presses Enter by default;
-`--no-submit` leaves the digits entered for controlled validation. Its output
-contains only a digit count and delivery/submission state. Unlike ordinary
-loop-fusion actions, `ui pin` intentionally exposes only the pre-action
-`--if-screen` / `--if-interaction` guards—not `--observe` or postconditions,
-whose returned screen could reveal an unmasked keypad value. The PIN is still
-present in the local process invocation, so use the host's normal shell-history
-and process-visibility protections. When either guard is present, every digit
-and the optional Enter revalidate the original interaction identity inside the
-on-device action request; partial-entry failures remain PIN-redacted.
-
-Loop-fusion action verbs (`ui tap`, `ui set-progress`, coordinate gestures, `ui pinch`, `ui text`,
-`ui key`, `ui back`, and `ui home`) accept `--observe` (wait for a 500 ms
-accessibility-event quiet period, then return the stable compact screen) and
-`--if-screen <hash>` (strict optimistic concurrency) and `--if-interaction
-<hash>` (ignore display-only volatility while guarding actionable structure).
-The device server re-captures and validates that state in the same guarded
-request that resolves the target and injects input. A server too old to support
-this contract fails the distinct guarded route before injecting anything.
-Both refuse changed state and return the fresh screen. A single `--expect-text`, `--expect-desc`,
-`--expect-rid`, `--expect-package`, or `--expect-activity` postcondition implies
-observation; `--expect-exact`, `--observe-delay-ms`, and `--timeout-ms` refine
-matching and timing. An unmet condition fails with `postcondition_timeout`; a
-screen that never settles fails with `observation_unstable`. Both preserve the
-freshest screen under `detail.screen` as diagnostic evidence only, so start a
-new interaction cycle instead of reusing its element ids.
-`ui wait` also syncs on the foreground app, not just elements: `--pkg <package>`
-blocks until that app reaches the foreground (e.g. a Custom Tab or share sheet
-opened), and `--pkg-not <package>` blocks until the screen leaves it.
-
-**Android TV / leanback** is focus + D-pad driven, not touch driven:
-`/v1/state` reports `is_television: true`, each element carries a `focused`
-flag, and `ui focus --text/--rid/--desc [--center]` walks the D-pad to a
-selector (then optionally activates it) — the TV analog of `ui tap` /
-`ui scroll-to`. Prefer it (and `ui key dpad_*`) over coordinate taps there.
-
-| Group | Commands |
-| --- | --- |
-| **Discovery/setup** | `commands --json --depth 1`, `commands --json --describe '<path>'`, `commands --guide '<topic>'`, `config paths` / `schema` / `explain` / `init` / `validate`, `skill`, `studio status` / `install`, `init`, `update`, `usage` |
-| **Session/diagnostics** | `devices`, `connect`, `disconnect`, `test`, `doctor`, `collect`, `why`, `log` |
-| **UI automation** | `ui dump`, `ui audit`, `ui gen`, `ui screenshot`, `ui find`, `ui tap`, `ui set-progress`, `ui double-tap`, `ui long-tap`, `ui swipe`, `ui drag`, `ui swipe-ext`, `ui pinch`, `ui scroll-to`, `ui focus`, `ui text`, `ui pin`, `ui key`, `ui hide-keyboard`, `ui back`, `ui home`, `ui wait`, `ui toast` (action verbs take `--observe`, `--if-screen`, and `--if-interaction`; tap/progress/text also accept `--handle`) |
-| **Triage** | `why` (one-read verdict + evidence), `log` (structured app-scoped logcat + parsed crashes) |
-| **Live timeline** | `watch` (screen changes, crashes, ANRs, toasts, watcher actions, Android Studio logpoint hits, and HTTP events when network capture is active) |
-| **Screen video** | `video record -o DIR [--duration 30s]`; detached `video start -o DIR`, `video status`, `video mark LABEL`, `video stop` |
-| **Layout / Compose** | `layout snapshot`, `layout diff`, `layout source`, `layout recompositions` |
-| **Debugger** | `debug auto`, `snapshot`, `record`, `replay`, `status`, `sessions`, `clients`, `attach`, `break`, `breakpoints`, `logpoint add` / `list` / `events` / `follow` / `remove` / `clear`, `pause`, `resume`, `step-in`, `step-over`, `step-out`, `stop`, `stack`, `threads`, `variables`, `eval`, `inspect`, `coroutines`, `continue-until`, `watch`, `step-until-screen-change`, `step-until-log`, `run-until-crash`, `native`, `tombstones` |
-| **App lifecycle/state** | `app start`, `stop`, `install`, `reinstall`, `clear`, `info`, `wait`, `current`; `app state snapshot`, `restore`, `recover`, `cleanup` |
-| **Permissions/app-ops** | `perm grant`, `revoke`, `list`, `reset`; `appops get`, `set` |
-| **Device/system** | `device info`, `shell`, `wake`, `sleep`, `unlock`, `orientation`, `clipboard`, `notifications`, `quick-settings`, `open-url` |
-| **Display profile** | `profile snapshot`, `apply`, `reset` (animations, font, density, size, rotation) |
-| **Files** | `files ls`, `push`, `pull` (add `--run-as --app <pkg>` for private debuggable-app paths) |
-| **Network MITM** | `net check`, `trust`, `ca import/info/reset`, `start`, `stop`, `status`, `log`, `checkpoint`, `show`, `export`, `intercept`, `resume`, `drop`, `respond`, `rule`, `rules`, `replay` |
-| **In-app AAR agent** | `aar install` (`--okhttp`, `--coroutine-probes`, `--build`), `status`, `remove`, `capture`, `intercept`, `resume`, `drop`, `agent`, `coroutines` |
-| **Authoring/testing helpers** | `ui audit` (selector gaps), `ui gen` (Screen Object scaffold), `net export fixtures` (replayable response set + `manifest.json`, GraphQL keyed by operationName), `test` (instrumentation command with the slot freed), `debug replay --repeat --diff` (flake hunting) |
-
-Mutation commands verify the requested postcondition instead of trusting an
-empty Android shell response. Permission/app-op changes, profile apply/reset,
-explicit file modes, app clear/stop, install steps, and goal-directed
-scroll/focus operations exit non-zero when readback disagrees, with requested
-and observed state in `detail`.
-
-`appops get <package> [op]` reports `uid_mode` and `package_mode` separately,
-plus the `governing_scope` and `effective_mode`; UID policy takes precedence
-when Android returns both. `appops set` requires `--scope uid` or
-`--scope package` and verifies that exact layer, preventing an apparently
-successful package change from hiding an unchanged governing UID mode.
-
-`profile apply --file` accepts the JSON shape written by `profile snapshot` and
-rejects unknown, empty, or unsafe values. Values remain JSON strings:
-animation scales must be finite and non-negative, `font_scale` finite and
-positive, density a positive integer, size positive `WxH`, auto-rotation and
-stylus flags `0`/`1`, and user rotation `0`–`3`. A file conflicts with CLI
-setting overlays so no supplied value is silently ignored. For shared/FUSE
-storage, omit `files push --mode`; when `--mode` is explicit, failure to apply
-it is a typed error even if the bytes were transferred.
-
-Private debuggable-app files are available without raw shell redirection:
-
-```bash
-shadowdroid files pull --run-as --app com.example.app files/state.json local.json
-shadowdroid files push --run-as --app com.example.app --mode 600 local.json files/state.json
-```
-
-Contents are byte-preserving and never printed. For cross-version regression
-state, snapshot selected files or whole directories while the app is
-force-stopped, then restore them under the app UID:
-
-```bash
-shadowdroid app state snapshot --app com.example.app \
-  --out /tmp/example-state \
-  --include shared_prefs \
-  --include files/session-state.json \
-  --include databases/app.db
-
-shadowdroid app state restore --from /tmp/example-state
-shadowdroid app state cleanup --from /tmp/example-state
-```
-
-The protected snapshot directory is `0700`; files and `manifest.json` are
-`0600`. The manifest records package/version, a stable Android signing identity
-digest, every relative path, bytes, SHA-256, mode, selected roots, automatically
-included SQLite `-wal`/`-shm`/`-journal` sidecars, and
-`contains_sensitive_data:true`. It is deliberately marked unencrypted.
-`cleanup` overwrites before deletion but warns that SSD/COW/journaled storage
-cannot guarantee physical erasure.
-
-Restore refuses a package/signature mismatch unless `--allow-incompatible` is
-explicit. It stages all data privately, atomically claims a recovery marker,
-swaps each selected root, and records `verified` only after every hash/mode
-check passes. The pending-marker rename is the commit point; rollback data is
-garbage-collected only afterward. If a restore is interrupted while
-`prepared`, `app state recover --app <pkg>` rolls it back. If it is interrupted
-after `verified`, recovery finishes the commit instead. Recovery is idempotent,
-and a no-pending recovery does not stop a running app. Snapshot and restore
-leave the app force-stopped; recovery does so only for an active transaction.
-This protects against fail-stop CLI/ADB interruptions, not sudden device
-storage loss without filesystem durability guarantees.
-
-### Screen video evidence
-
-Use `video record` for a bounded foreground capture:
-
-```bash
-shadowdroid video record -o /tmp/checkout-repro --duration 30s
-```
-
-For an interactive run, start a detached recorder and add human-readable
-timeline boundaries while driving the app:
-
-```bash
-shadowdroid video start -o /tmp/checkout-repro
-shadowdroid video mark "before checkout"
-shadowdroid video status
-shadowdroid video mark "payment failed"
-shadowdroid video stop
-```
-
-Both capture paths write a private-mode bundle on Unix (`0700` directories and
-`0600` files; other platforms are labelled `platform_default`) containing
-`manifest.json`, `events.jsonl`, and numbered MP4 files under `segments/`. When compatible
-segments can be assembled losslessly, the bundle also contains `video.mp4`;
-the segments remain the authoritative capture if assembly is unavailable.
-Recording is segmented before Android's `screenrecord` time limit so a long run
-does not silently end, and `stop` finalizes the active segment before returning.
-
-`record` and `start` accept `--backend auto|screenrecord`, plus `--size`,
-`--bit-rate`, `--display-id`, `--bugreport`, and `--segment-seconds`.
-`auto` selects the available built-in path; explicit `screenrecord` is useful
-when reproducibility matters. Device support for size, display selection, and
-bugreport overlays varies, so unsupported combinations fail rather than being
-silently ignored. The built-in backend captures screen video only, with no app,
-device, or microphone audio.
-
-MP4 pixels are never redacted, including when global `--redact` is enabled.
-The flag does filter marker labels, but structural device/session identifiers
-needed for crash recovery remain in the manifest and timeline. The manifest
-therefore labels every bundle sensitive and unencrypted. Treat the whole
-directory as private evidence and inspect every clip before sharing it.
-
-Per-segment `sample_count` and `media_duration_ms` report encoded coverage.
-Marker offsets and rollover gaps are host-observed approximations, explicitly
-labelled as such in the manifest; use them to navigate evidence, not as
-frame-accurate media timestamps. A static or very short capture can contain only
-one frame: ShadowDroid preserves that segment, reports `playable: false`, marks
-the session `partial`, and does not publish a misleading `video.mp4`.
-
-`watch` is the streaming workhorse — it emits debounced, hash-diffed `screen`
-events plus `crash`, `toast`, `watcher_fired`, structured Android Studio
-`logpoint` hits, and `http` events when a `net` proxy is running (plus a
-`tls_error` when an app rejects the proxy CA, so a failed interception is
-visible instead of just missing). A missing Studio bridge or proxy produces a
-structured warning while the other producers continue; use `--no-logpoints` or
-`--no-net` when that source is intentionally absent.
-
-`net` is a host-side MITM proxy built into the single binary — no Python, no
-external mitmproxy. `net start` spawns the proxy, wires the device through
-`adb reverse` and proxy settings, and decrypted HTTP(S) transactions then stream
-as `http` events on the same timeline as `screen` when `watch` is running.
-The pre-existing device proxy setting is persisted before wiring; a repeated
-`net start` repairs wiring to an already-running daemon, while `net stop`
-restores that exact setting and reports separate raw-IP and DNS connectivity
-checks (`--canary-host` selects the neutral DNS probe).
-Each new proxy run returns a stable `capture_session_id`, and every captured
-flow records both that session and any matching rule ids. Isolate a phase with
-`net log --session`, `--since 2m`, `--after-id`, `--rule-id`, or create a
-durable boundary with `net checkpoint` and query it using
-`net log --after-checkpoint`. `net log clear` clears only queryable history
-while preserving an active proxy and its rules; restarting the proxy creates a
-new session.
-Beyond observing, the agent can **intercept** a flow — `net intercept` pauses
-matching requests/responses and emits them as `http_intercept` events on
-`watch`; each held event includes device-scoped `net show`, `resume`, `drop`,
-and `respond` actions so the agent can decide before the hold deadline. The
-same flow ID remains actionable across `net status`, `net show`, and the release
-verbs while held. Status includes its phase, held/expiry timestamps, and client
-connection state; a raced action reports `already_released`, `deadline_expired`,
-`client_canceled`, or `unknown_id` with the available lifecycle timestamps. The
-agent inspects with `net show`, then releases with
-`net resume --set-status/--body/…`, `net drop`, or `net respond` (a canned
-reply). Repeated edits can be promoted to declarative `net rule`s (map-local /
-map-remote / set-status / set-request-header / set-response-header / replace /
-block / delay). A `respond` rule atomically returns a synthetic status, headers,
-and literal or file-backed body without contacting upstream; it can match a
-GraphQL `operationName` from either the URL query or JSON POST body. Captured
-flows name the rule and report `upstream_bypassed:true`. `net export fixtures`
-writes the versioned, content-addressed bundle consumed directly by `net
-replay --from`: the loader validates its schema, paths, sizes, hashes, statuses,
-and headers before atomically replacing the active set. Replay keys include
-method, scheme, canonical host, effective port, case-sensitive path, normalized
-query pairs, GraphQL operation, and canonical JSON (or raw body) hash, so
-same-route requests cannot silently collide. Redacted, truncated, streamed,
-errored, or otherwise incomplete captures are refused rather than producing
-misleading fixtures. `net check <app>` labels its
-debuggable/targetSdk result as a static heuristic and leaves the app-specific
-verdict unverified. With the proxy running, `net check --probe <app>` launches a
-package-scoped HTTPS canary; it reports verified/interceptable only when the app
-handles that intent, requests its unique URL, and the exact decrypted flow is
-captured. `net export har|curl|fixtures` hands flows to other tools by writing a
-durable artifact and returning an actionable summary;
-HAR defaults to `shadowdroid-network.har`, curl to
-`shadowdroid-network.curl.sh`, and fixtures to `shadowdroid-fixtures` unless
-`--out` selects another path. A corrupt or incompatible replay candidate leaves
-the prior active generation untouched; an older running daemon is detected by
-capability preflight and must be restarted before loading the bundle.
-
-Header rules deliberately name their phase: use `set-request-header` before
-upstream or `set-response-header` before returning to the app. The ambiguous
-`set-header` kind is rejected instead of guessing.
-
-The decrypted leg negotiates **HTTP/2 or HTTP/1.1** (h2 apps aren't
-downgraded), streams **SSE / large bodies** through instead of buffering them —
-both response and request (a big upload streams chunked; marked
-`streamed`/`req_streamed` in the flow) — decodes `gzip`/`deflate`/`br`/`zstd`,
-and **captures WebSocket (WS/WSS) frames**. `net start --verify-upstream`
-validates the real server certificate for both HTTPS and WSS (off by default for
-self-signed dev backends);
-
-Once an in-scope connection upgrades, the proxy forwards every byte unchanged
-and decodes a copy of the frame stream. Inspect it hierarchically so an agent
-spends tokens only on the frames it needs: `net ws` lists sessions (id, url,
-per-direction message/byte counts), `net ws <id>` lists that session's messages
-(compact `dir`/`opcode`/`preview`, filterable by `--dir`/`--opcode`/`--grep`/
-`--since`), and `net show <message-id> --body` reveals a full reassembled
-payload (`--body-file` writes it binary-safe; bare `net show` returns metadata +
-`preview`). Fragmented messages are reassembled and `permessage-deflate`
-payloads inflated (marked `compressed`/`decompressed`, with `wire_len` vs
-`payload_len`). `net log` shows `ws_open`/`ws_close` lifecycle inline with HTTP
-by default; `--protocol websocket|all` adds per-message `ws_msg` events, which
-also stream live on `watch`. `net ws <id> --stats` summarizes a chatty socket
-(opcode histogram, per-direction bytes, compression ratio, rate) in one call;
-`net show <msg> --format hex|json|protobuf` decodes a payload and `--frames`
-shows a fragmented message's per-frame breakdown; `net export jsonl` and
-`net export har` (with devtools `_webSocketMessages`) write durable dumps.
-Payload retention is bounded (`truncated`), `--redact` scrubs text frames,
-handshake headers, and close reasons, and an engine that bypasses the proxy or
-pins its certificate is reported (`tls_error`) rather than silently dropped.
-
-Beyond observing, an agent can **drive** a live session in the same
-agent-in-the-loop model as HTTP: `net inject <id> --dir s2c --text …` splices a
-frame in (simulate a server push, or send to the server as the app; always safe,
-even under compression); `net rule add ws-drop`/`ws-set-text` declaratively drop
-or rewrite matching frames; and `net intercept --dir …` pauses matching frames
-(surfaced on `watch` and in `net status`) for `net resume [--text …]`/`net drop`.
-Drop/modify re-encode a frame, which is unsafe under `permessage-deflate`
-context takeover — those are forwarded unchanged and marked `refused_deflate`;
-`net start --anticomp` negotiates an uncompressed session where they fully apply.
-Global `--redact` on `net start` applies the built-in/configured policy to
-authorization/cookie headers, nested JSON/GraphQL body fields, JWTs, email/IP
-values, URL path/query values (including percent-encoded names and values),
-hosts, errors, and configured patterns before completed captures are persisted
-(the session log is written `0600` either way). Records flag redacted routing
-or error fields and carry policy version 2. Forwarded traffic is unchanged.
-
-Completed flows enter a bounded in-memory queue; `net status` exposes
-`dropped_flows` if sustained traffic outruns storage. The session JSONL keeps
-one 64 MiB current generation plus one rotated generation, bounding disk use to
-roughly 128 MiB per device session.
-
-By default the proxy signs with a CA it generates on first use. To reuse a CA
-the device already trusts — an existing mitmproxy/Charles/corporate CA — run
-`net ca import --cert <pem>` (the key can be a separate `--key`, or bundled in a
-combined PEM like mitmproxy's `mitmproxy-ca.pem`); every downstream step then
-signs and installs *your* CA. `net ca info` shows the active CA and
-`net ca reset` returns to a generated one.
-
-For in-process diagnostics in an app you can build, install the debug-only core
-AAR with `shadowdroid aar install --build`. Add `--coroutine-probes` for
-`aar coroutines`. HTTP capture is opt-in and OkHttp-specific:
-
-```bash
-shadowdroid aar install --okhttp --build
-```
-
-Then add `ShadowDroidCaptureInterceptor()` as an application interceptor to
-each target debug `OkHttpClient`. `aar agent` reports whether that provider is
-actually registered before `aar capture`/`aar intercept` are used. The core AAR
-alone does not capture HTTP, and the companion does not instrument Cronet,
-QUIC, or other stacks.
-
-`aar intercept` holds at most 32 matching calls and gives each one an absolute
-monotonic deadline. Unresolved, interrupted, or over-capacity calls fail open.
-At or after the deadline, `aar resume`/`aar drop` returns a non-zero typed
-`aar_intercept_deadline_expired` error instead of claiming that a late action
-was delivered while that record remains in the bounded terminal history;
-concurrent resolvers likewise have exactly one winner. `aar agent` exposes live
-holds plus that history so an automation can distinguish expiration,
-interruption, an earlier release, and an unknown or evicted id.
-
-Run `shadowdroid commands --json --depth 1` for a compact catalog,
-`commands --json --describe '<path>'` for one command, or `--help` for a human
-view.
-
-## Agent debugging
-
-**This is the part nothing else gives an agent.** Driving a UI tells an agent
-*what* happened on screen; debugging tells it *why*. ShadowDroid hands a coding
-agent a live Android Studio debugger as plain JSON — so when a tap doesn't do
-what the agent expected, it can set a breakpoint and read the actual program
-state instead of guessing from screenshots. Reads are bounded, while attach,
-pause/resume/step, breakpoint/watch changes, and evaluation have normal
-debugger side effects. It is a debugger control surface, not a remote shell.
-
-Backed by an optional Android Studio plugin:
-
-- **`debug auto [app]`** — low-effort path: resolve an app alias/name/package,
-  launch it, attach the Studio debugger when available, then return a full
-  snapshot with setup guidance if the bridge is missing.
-- **`debug`** — attach to the running app; set breakpoints (line, exception,
-  method, field watchpoint; conditional and temporary) and owner-scoped,
-  non-suspending logpoints; read the call stack, local variables, and watches;
-  evaluate/inspect expressions (`this`,
-  locals, fields, array indexes) and follow object handles while the session
-  remains suspended. Treat evaluation as real debugger evaluation rather than
-  assuming arbitrary expressions are side-effect-free. Requests are bounded —
-  they return structured failure instead of blocking without a suspended frame.
-- **`debug snapshot`** — one shot: device + build, foreground app, screen tree,
-  screenshot, recent logcat, the live debugger stack / variables / breakpoints,
-  and a bounded page of recent logpoint events in a single JSON object.
-- **`debug record` / `debug replay`** — JSONL timelines of screen changes,
-  lifecycle, logcat, structured logpoint hits, and replayable actions (taps,
-  text, keys, swipes, drags).
-- **`debug run-until-crash` / `step-until-screen-change` / `step-until-log`** —
-  let the app run until something interesting happens, then return a full
-  snapshot; crash waits emit parsed Java/native/ANR events and can write local
-  bundles.
-- **`debug native` / `debug tombstones` / `debug coroutines`** — native/mixed
-  readiness, tombstone artifacts, and conservative suspended-state coroutine
-  insight without arbitrary code execution. (For whole-process coroutine dumps
-  from a *running* app with no debugger attached, see `aar coroutines`.)
-- **`layout`** — UI-tree snapshots and diffs, enriched (when Studio's Layout
-  Inspector is live) with Compose source locations, semantics, and recomposition
-  counters.
-
-### Non-suspending logpoints
-
-Logpoints observe a source line without leaving the app paused on successful
-hits. They require the ShadowDroid Android Studio plugin, the matching Android
-project open in Studio, and a debuggable app attached to the Studio debugger.
-The source must match the installed build. Conditions and expressions run in
-the app's debugger context and can call code, mutate state, block, or throw;
-stack rendering and high-frequency hits add more overhead. “Non-suspending” is
-not the same as free or side-effect-free.
-
-| Command | Purpose |
-| --- | --- |
-| `debug logpoint add` | Transactionally add or update a line logpoint with `--expression`, `--log-message`, and/or `--log-stack`; optional `--condition`, `--pass-count`, `--temporary`, ownership, rate, and message-size bounds apply in the same operation. |
-| `debug logpoint list` | List configured logpoints, optionally filtered by project, id, or owner. |
-| `debug logpoint events` | Read one bounded page of structured hit events, optionally strictly after a paired `--after <cursor> --stream-id <stream_id>`. |
-| `debug logpoint follow` | Follow new hits as JSONL; it starts at the live tail unless paired `--after` / `--stream-id` values or `--replay-existing` are supplied, and can stop by duration or event count. |
-| `debug logpoint remove` | Remove one ShadowDroid-owned logpoint when its id and owner match. |
-| `debug logpoint clear` | Remove only ShadowDroid-owned logpoints in the requested project/owner scope. |
-
-`debug logpoint add` immediately disables a newly registered breakpoint,
-validates the condition and expression, applies every logging option plus
-suspend policy `none`, then enables it in one Studio operation. A validation or
-configuration failure rolls back a newly created logpoint and leaves an existing
-one unchanged, so no partially configured breakpoint survives the request. The
-public JetBrains API does not expose create-disabled registration; on an already
-attached, extremely hot line there is therefore a theoretical interval before
-the same IDE task applies the initial disable. Prefer adding instrumentation
-before attach when even that narrow platform-level race is unacceptable. At
-least one of `--expression`,
-`--log-message`, or `--log-stack` is required. `--force` skips set-time
-expression validation; a bad expression can then fail at runtime, where the
-failure is recorded and a non-suspending logpoint resumes without an IDE-blocking
-dialog. Use it deliberately because evaluation can still have side effects.
-`--temporary` retains the first structured hit, then asynchronously removes the
-still-owned logpoint because Studio does not auto-remove non-suspending actions.
-
-Each hit is a structured event with a monotonic cursor plus logpoint, source,
-project, debugger-session/device, and ownership context. The payload contains
-JetBrains' composite rendered message: expression output, the optional default
-hit message, and an optional rendered stack can share that one string and are
-not promised as separately parsed fields. `debug snapshot` includes a bounded
-recent page; `debug record` and `watch` interleave hits as ordered timeline
-records; the dedicated `events` and `follow` commands support narrower project/
-session/id/owner filters.
-
-The Studio-side history is bounded. Pages report a `stream_id` and
-`oldest_cursor`, `latest_cursor`, and `next_cursor`; `--after` means strictly
-newer than that cursor. Cursors belong to one stream, so resuming requires both
-`--after <cursor>` and the page's `--stream-id <stream_id>`. A one-shot read
-rejects a mismatched stream instead of returning ambiguous events; a follower
-discards the mismatched page and resets to the new live tail with a warning.
-Studio restart changes the stream id. If a consumer
-falls behind the retained history, `overflowed:true`, `evicted_total`, and a
-cursor-gap warning make the loss explicit. Bound hot sites with `--condition`,
-`--pass-count`, or `--max-events-per-second`; page-level `rate_limited_total`
-reports suppressed hits instead of allowing memory to grow without limit.
-`--max-message-chars` marks oversized events with `message_truncated:true` and
-retains `original_message_chars`; its supported range is 256 through 65,536.
-Global `--redact` scrubs supported JSON/JSONL
-output, including snapshots and recordings, but it cannot stop the expression
-from being evaluated or the unredacted value from reaching Android Studio first.
-
-Ownership is the cleanup boundary. The default is `shadowdroid`; concurrent
-agents should use distinct `--owner` labels and pass the same label to `remove`
-or `clear`. These lifecycle commands neither repurpose nor delete ordinary
-human-created Studio breakpoints or logpoints owned by somebody else. Prefer
-them over generic `debug break remove` for temporary agent instrumentation. If
-a human edits an owned logpoint in Studio, ShadowDroid relinquishes ownership.
-Ownership is also intentionally process-local: after Studio restarts, a
-persisted logpoint becomes unowned/manual rather than eligible for a later
-owner-wide deletion.
-
-Multiple devices debugged in one Studio are addressable: `debug sessions`
-reports each session's device, stable `id` (for that Studio debug-session
-lifetime), and current numeric index. Prefer `--session <id>`; the index remains
-available for convenience but can change as sessions start/stop. Global `-d
-<serial>` selects that device's session when no explicit session is supplied.
-
-Everything degrades gracefully: with no Studio plugin running, the device and UI
-commands still work and the debugger section just reports `available:false`.
-Run `shadowdroid debug --help` and `shadowdroid layout --help` for the live
-command surface.
-
-## Agent integration
-
-ShadowDroid is self-describing. `shadowdroid commands --json --depth 1` emits a
-low-context top-level catalog; `commands --json --describe '<path>'` returns one
-command with complete construction data; `commands --guide <topic>` returns the
-driving guide for a whole domain (`net`, `debugger`, or `state` — covered
-command groups alias to their guide); omitting `--depth` emits the full tree.
-Schema version 3 carries canonical paths, global/command args, constraints,
-output contracts, and agent decision hints straight from the CLI definition.
-
-`shadowdroid init` installs/updates user-scoped agent skills automatically.
-Project installs remain explicit so initialization never writes into an
-arbitrary repository. `shadowdroid skill <agent>` prints a standard
-`SKILL.md`; add `--install` and choose `--scope user|project` to put it in the
-agent's discovery path. `AGENTS.md` is a separate always-on instruction
-mechanism, not a skill. Supported agents: `claude-code`, `cursor`, `codex`,
-`gemini`, `antigravity`.
+Skills ship for five agents; `shadowdroid init` installs/updates user-scoped
+skills automatically, or install one explicitly:
 
 ```bash
 shadowdroid skill claude-code --install # → ~/.claude/skills/shadowdroid/SKILL.md
@@ -1232,119 +314,140 @@ shadowdroid skill gemini      --install # → ~/.gemini/skills/shadowdroid/SKILL
 shadowdroid skill antigravity --install # → ~/.gemini/config/skills/shadowdroid/SKILL.md
 ```
 
-User scope is the default. For project scope, Claude Code uses
-`.claude/skills/shadowdroid/SKILL.md`; Codex, Cursor, Gemini CLI, and
-Antigravity share the interoperable `.agents/skills/shadowdroid/SKILL.md`:
+Add `--scope project` for per-repository installs (Claude Code uses
+`.claude/skills/`; the others share `.agents/skills/`). Installed skills are
+version-stamped: `shadowdroid skill --sync` refreshes pristine installs after
+an upgrade (`connect` does this automatically for user scope), while
+customized files are preserved and reported — `--force` is required to
+replace them. Any other agent that can run a shell command can bootstrap from
+`shadowdroid commands --json`.
 
-```bash
-shadowdroid skill codex       --install --scope project
-shadowdroid skill claude-code --install --scope project
-```
+## Documentation
 
-Installed skills are version-stamped. After upgrading the CLI, refresh them in
-one shot. Pristine older files are rewritten; customized or markerless files
-are preserved and reported. Explicit `--install` writes use the same safety
-check. Pass `--force` only after reviewing the destination and intentionally
-choosing to replace it:
+- [The agent loop](docs/agent-loop.md) — the canonical read → act → confirm
+  contract: selectors, hashes, guards, handles, fusion flags, TV, and the full
+  command surface.
+- [The output contract](docs/output-contract.md) — envelopes, exit codes,
+  `next_actions`, `events`, streaming JSONL, self-describing failures.
+- [Configuration](docs/configuration.md) — folder config, app aliases, named
+  device targets, AVD claims, source mapping, per-project proxy CAs.
+- [Network](docs/network.md) — HTTP(S)/WebSocket capture, interception,
+  rules, fixtures and replay, CA management, the OkHttp AAR companion.
+- [Triage and debugging](docs/debugging.md) — `why`/`log`/`collect`, the
+  Android Studio debugger surface, logpoints, layout/Compose inspection.
+- [Device and state controls](docs/device-state.md) — app state
+  snapshot/restore, permissions/app-ops, files, display profiles, screen
+  video evidence.
+- [Security and redaction](docs/security-and-redaction.md) — the redaction
+  policy, pixel boundaries, trust model, and what stays local.
+- [Field Lab walkthroughs](samples/README.md) — scripted journeys against the
+  sample app.
 
-```bash
-shadowdroid skill --sync                 # refresh user-scoped installs
-shadowdroid skill --sync --scope project # refresh installs in the current project
-```
+## Security and limitations
 
-`connect` refreshes user-scoped installs automatically (pristine skills only),
-so an upgraded CLI keeps personal skills current with no extra step.
+Honest boundaries, up front:
+
+- **Android-only, by design.** macOS/Linux/Windows hosts; the target is
+  always Android (real devices, emulators, Android TV / leanback).
+- **Not a test framework.** No assertion DSL, no runner. It drives and
+  observes a *running* app; keep Espresso/JUnit for regression suites
+  (`shadowdroid test -- <cmd>` frees the device slot for them).
+- **One `UiAutomation` owner per device.** While connected, ShadowDroid holds
+  it; instrumentation tests need `shadowdroid test` or an explicit
+  `disconnect`.
+- **The MITM proxy has real limits.** `net trust` installs the CA into the
+  **user** trust store; apps that pin certificates, opt out via network
+  security config, or use non-standard stacks (Cronet/QUIC) are *not*
+  magically captured — rejections surface as `tls_error` events. The optional
+  OkHttp companion sees pinned OkHttp traffic, is debug-only, and requires
+  the app to register the interceptor explicitly.
+- **Sensitive data stays your problem — with help.** Global `--redact`
+  filters secrets/PII from JSON output, and `net start --redact` scrubs
+  captures before they're persisted; but screenshot pixels are only redacted
+  on explicit request, and **video pixels are never redacted**. Bundles that
+  can contain secrets are written `0700`/`0600` and marked sensitive.
+- **Diagnostics are passive.** `why` and `collect` never install, start, or
+  forward anything to gather evidence.
+- **The supported agent interface is the CLI** and `shadowdroid commands
+  --json` — the loopback HTTP API underneath is not a stable surface.
+
+Details: [docs/security-and-redaction.md](docs/security-and-redaction.md).
+
+## Contributing
+
+If ShadowDroid improves your Android agent loop, starring the repository
+helps other Android developers find it.
+
+Three concrete ways to help:
+
+- **Report a compatibility gap.** Ran it against a device, OS version, or app
+  where something misbehaved? [Open an
+  issue](https://github.com/andriyo/ShadowDroid/issues) — `shadowdroid
+  collect` produces the diagnostic bundle worth attaching (review it for
+  private data first).
+- **Extend the Field Lab.** Add a fixture or journey to
+  [`samples/shadowdroid-test-app`](samples/shadowdroid-test-app) that breaks
+  selectors, capture, or recovery in an interesting way.
+- **Improve an agent integration.** The skill templates and install targets
+  live in the CLI (`shadowdroid skill`); a new agent or a sharper skill is a
+  contained contribution.
+
+Developing the CLI needs stable Rust (`cargo test --locked --all-targets` in
+[`cli/`](cli/)); the on-device server, sample app, and Android Studio plugin
+are Gradle projects (`server/`, `samples/`, `shadowdroid-plugin/`).
 
 ## FAQ
 
-**What is ShadowDroid?**
-An open-source command-line tool that turns a real Android device or emulator
-into a structured surface an AI agent can read, drive, debug, configure, and
-instrument. It covers UI automation, app/device control, structured logcat and
-crash triage, permissions, files, display profile, network interception, Android
-Studio debugger state, Layout Inspector data, Compose recompositions, and an
-optional in-app AAR for process/coroutine diagnostics plus explicit OkHttp
-capture through its companion interceptor.
-
-**Who is it for?**
-Anyone pointing an AI or coding agent at a *running* Android app: building
-agentic QA, reproducing bugs, automating end-to-end flows, or letting an agent
-self-verify a UI change. It's equally handy by hand for quick scripted
-automation.
-
 **Is ShadowDroid a test framework?**
-No. There's no assertion DSL or test runner to babysit — it's a fast, observable
-control surface an agent drives live. It *can* launch your existing
-instrumentation tests (`shadowdroid test`, which frees the `UiAutomation` slot
-first), but it isn't a replacement for Espresso or JUnit.
+No. There's no assertion DSL or test runner — it's a fast, observable control
+surface an agent drives live. It *can* launch your existing instrumentation
+tests (`shadowdroid test`, which frees the `UiAutomation` slot first), but it
+isn't a replacement for Espresso or JUnit.
 
 **How is it different from Appium, Maestro, or Espresso?**
 Those are built for authored test suites — WebDriver scripts, YAML flows,
-compiled JUnit — running in CI. ShadowDroid is built for a *live agent loop*: a
-persistent on-device service answers warm UI reads in tens of milliseconds, actions can fuse
-their re-read (`--observe`), failures explain themselves, and the agent can
-stream crash / toast / HTTP events or attach an Android Studio debugger. Use
-those frameworks for regression suites; use ShadowDroid when an agent needs to
-drive and reason about a running app right now.
+compiled JUnit — running in CI. ShadowDroid is built for a *live agent loop*:
+a persistent on-device service answers warm UI reads fast, actions fuse their
+re-read (`--observe`), failures explain themselves, and the agent can stream
+crash/toast/HTTP events or attach a debugger. Use those frameworks for
+regression suites; use ShadowDroid when an agent needs to drive and reason
+about a running app right now.
 
 **How is it different from `adb` and the `android` CLI?**
-It complements them. Keep `adb` and the `android` CLI for scaffold, build,
-deploy, and SDK management, then hand the *running* app to ShadowDroid. Raw
-`adb shell uiautomator dump` is ~500 ms–1 s and stateless; `adb logcat` is an
-unscoped firehose. ShadowDroid keeps a warm service, acts by selector,
-turns logcat into structured `log`/`why` output, and streams events. See
-[Why it exists](#why-it-exists).
-
-**How do `why` and `log` differ from `adb logcat`?**
-`adb logcat` is an unscoped text stream you have to grep and eyeball.
-`shadowdroid log` scopes to the app, windows by time, dedups, and lifts crash
-blocks out as parsed events with source-mapped frames — as JSON. `shadowdroid
-why` goes one step further: instead of *lines*, it returns a *verdict* (was it a
-crash, an ANR, a network failure, or just a different screen?) with the evidence
-and next steps attached. Reach for `why` first, `log` for the detail behind it.
+It complements them. Keep them for scaffold, build, deploy, and SDK
+management, then hand the *running* app to ShadowDroid: warm structured reads
+instead of one-shot XML dumps, selector actions instead of raw coordinates,
+scoped structured `log`/`why` instead of an unscoped logcat firehose. See
+[Why ShadowDroid](#why-shadowdroid).
 
 **Does it support Jetpack Compose?**
-Yes — first-class, via AndroidX UI Automator 2.3.0+. Compose nodes appear in the
-same element tree. When Android Studio's Layout Inspector is running,
-`layout snapshot --compose --semantics --source-map` adds Compose semantics and
-source locations, and `layout recompositions` reports recomposition counters.
-If visible Compose cards/custom drawing are absent from the normal tree, use
-`ui dump --deep`; fallback nodes carry source/confidence/stability metadata and
-can be targeted with `ui tap --fallback-id` under the safeguards described
-above.
-
-**When should I use `net` versus `aar`?**
-Use `net` first for proxy-aware HTTP(S): it is built into the host CLI, requires
-no app code changes, and supports capture, intercept, mutation, rules, fixtures,
-HAR/curl export, and replay. Use `aar` for apps you can build when you need the
-debug-only in-app agent for process/coroutine diagnostics. For above-TLS HTTP,
-install its optional OkHttp companion and explicitly add
-`ShadowDroidCaptureInterceptor()` to the target debug clients; it handles
-certificate-pinned OkHttp traffic but not Cronet, QUIC, or other HTTP stacks.
+Yes — first-class, via AndroidX UI Automator 2.3.0+. Compose nodes appear in
+the same element tree. With Android Studio's Layout Inspector running,
+`layout` adds Compose semantics, source locations, and recomposition
+counters; `ui dump --deep` cross-checks the accessibility tree against
+Compose data and can target nodes the normal tree misses.
 
 **Do I need Android Studio?**
-Not for the core. The CLI plus `adb` cover UI automation, app lifecycle, network
-capture, structured logs, and event streaming. Android Studio (via the optional
-plugin) only adds the live debugger and Layout Inspector enrichment; without it
+Not for the core. The CLI plus `adb` cover UI automation, app/device control,
+network capture, structured logs, and event streaming. The optional Studio
+plugin adds the live debugger and Layout Inspector enrichment; without it
 those sections report `available:false` and everything else keeps working.
 
-**Which devices work? Emulators? Android TV?**
-Real devices and emulators with USB debugging, plus Android TV / leanback, which
-is focus + D-pad driven via `ui focus` and `ui key dpad_*`. Projects can bind
-stable AVD/physical devices to named targets such as `mobile` and `tv`; opted-in
-AVD targets are automatically reused or started for device-backed commands.
+**Which devices work?**
+Real devices and emulators with USB debugging, plus Android TV / leanback
+(focus + D-pad driven via `ui focus` and `ui key dpad_*`). Projects can bind
+named targets (e.g. `mobile`, `tv`) to stable AVDs or serials — see
+[configuration](docs/configuration.md).
 
 **Which agents can use it?**
-Any agent that can run a shell command and read JSON. One-command skill install
-ships for Claude Code, Cursor, Codex, Gemini, and Antigravity, and
-`shadowdroid commands --json` emits the live catalog for anything else.
+Any agent that can run a shell command and read JSON. Skills ship for Claude
+Code, Cursor, Codex, Gemini, and Antigravity; `shadowdroid commands --json`
+is the live catalog for everything else.
 
-**What host platforms are supported?**
-macOS, Linux, and Windows hosts (Homebrew, Scoop, or a one-line installer). The
-target is always Android.
-
-**Is it open source?**
-Yes — licensed under Apache-2.0.
+**When do I use `net` versus `aar` for HTTP?**
+`net` first — no app changes needed. `aar` when the app pins its certificates
+(OkHttp only) or you want in-process diagnostics. See
+[docs/network.md](docs/network.md).
 
 ## License
 

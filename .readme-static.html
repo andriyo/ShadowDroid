@@ -1,0 +1,181 @@
+<!doctype html><meta charset="utf-8"><style>
+body{max-width:880px;margin:2rem auto;font-family:-apple-system,Segoe UI,sans-serif;line-height:1.55;padding:0 1rem;color:#1f2328}
+pre{background:#f6f8fa;padding:12px;border-radius:6px;overflow-x:auto;font-size:12.5px;line-height:1.45}
+code{font-family:ui-monospace,SFMono-Regular,monospace;background:#f6f8fa;padding:1px 4px;border-radius:4px;font-size:0.9em}
+pre code{background:none;padding:0}
+h1{border-bottom:1px solid #d8dee4;padding-bottom:6px} h2{border-bottom:1px solid #d8dee4;padding-bottom:4px;margin-top:2rem}
+table{border-collapse:collapse;margin:1rem 0}td,th{border:1px solid #d0d7de;padding:6px 10px;font-size:14px;text-align:left}
+blockquote{border-left:4px solid #d0d7de;margin-left:0;padding:0.2rem 1rem;color:#57606a}
+a{color:#0969da;text-decoration:none} img{max-width:100%}</style>
+<h1>ShadowDroid</h1>
+<p><strong>Give your coding agent eyes, hands, and a debugger for Android.</strong></p>
+<p>ShadowDroid is an open-source Android automation and debugging CLI for AI coding agents. It lets any shell-capable agent — Claude Code, Codex, Cursor, Gemini, Antigravity — drive, inspect, and debug real Android apps, emulators, and devices through structured JSON: no test DSL, no client SDK, no Appium server. One native binary plus <code>adb</code>.</p>
+<p><a href="https://github.com/andriyo/ShadowDroid/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/andriyo/ShadowDroid?sort=semver&amp;display_name=tag&amp;label=release&amp;color=blue"></a> <a href="https://github.com/andriyo/ShadowDroid/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/andriyo/ShadowDroid/actions/workflows/ci.yml/badge.svg"></a> <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/github/license/andriyo/ShadowDroid?color=blue"></a> <a href="#install"><img alt="Platform: Android" src="https://img.shields.io/badge/platform-Android-3DDC84?logo=android&amp;logoColor=white"></a></p>
+<p><a href="#install">Install</a> · <a href="#quickstart">Quickstart</a> · <a href="#why-shadowdroid">Why ShadowDroid</a> · <a href="#documentation">Docs</a> · <a href="#the-field-lab-sample">Field Lab</a></p>
+<h2>The loop, in three commands</h2>
+<p>Captured verbatim against the bundled <a href="#the-field-lab-sample">Field Lab sample</a> on an API 36 emulator, trimmed to the interesting fields (<code>…</code> marks elisions).</p>
+<p><strong>1. The agent reads the screen</strong> — parsed elements with stable selectors, not a screenshot to squint at:</p>
+<pre><code class="lang-jsonc">$ shadowdroid ui dump
+{&quot;screen_hash&quot;:&quot;c50fd462de4304be&quot;,&quot;interaction_hash&quot;:&quot;i:178f2b73ce0e1447&quot;,
+ &quot;snapshot_state&quot;:&quot;consistent&quot;,&quot;viewport&quot;:{&quot;w&quot;:1080,&quot;h&quot;:2424},
+ &quot;current_app&quot;:{&quot;package&quot;:&quot;io.github.andriyo.shadowdroid.sample&quot;,
+                &quot;activity&quot;:&quot;io.github.andriyo.shadowdroid.sample.MainActivity&quot;},
+ &quot;element_count&quot;:39,
+ &quot;elements&quot;:[…,
+   {&quot;id&quot;:3,&quot;text&quot;:&quot;Recover the\nsilent relay.&quot;,&quot;tap&quot;:[336,777]},
+   {&quot;id&quot;:30,&quot;rid&quot;:&quot;nav_mission&quot;,&quot;tap&quot;:[403,2256],&quot;clickable&quot;:true,
+    &quot;handle&quot;:&quot;i:178f2b73ce0e1447/e:3&quot;}, …]}</code></pre>
+<p><strong>2. It acts by selector and proves the destination in the same call</strong> — tap, wait for the screen to settle, check the postcondition, and return the new screen, one round-trip:</p>
+<pre><code class="lang-jsonc">$ shadowdroid ui tap --rid nav_mission --expect-text &quot;Night Shift: Signal Recovery&quot;
+{&quot;type&quot;:&quot;action&quot;,&quot;cmd&quot;:&quot;tap&quot;,&quot;ok&quot;:true,
+ &quot;matched_element&quot;:{&quot;id&quot;:30,&quot;rid&quot;:&quot;nav_mission&quot;,&quot;tap&quot;:[403,2256], …},
+ &quot;action&quot;:&quot;accessibility_click&quot;,&quot;action_delivered&quot;:true,
+ &quot;settle_ms&quot;:1878,&quot;screen_changed&quot;:true,
+ &quot;postcondition&quot;:{&quot;kind&quot;:&quot;text&quot;,&quot;expected&quot;:&quot;Night Shift: Signal Recovery&quot;,
+                  &quot;matched&quot;:true, …},
+ &quot;postcondition_satisfied&quot;:true,
+ &quot;screen&quot;:{&quot;screen_hash&quot;:&quot;87332662a59bfb79&quot;,&quot;element_count&quot;:45,&quot;elements&quot;:[…]}}</code></pre>
+<p><strong>3. When the app breaks, the error is the diagnosis.</strong> After tapping the Field Lab's deliberate crash fixture, one bounded read returns the verdict — no logcat spelunking:</p>
+<pre><code class="lang-jsonc">$ shadowdroid why
+{&quot;type&quot;:&quot;action&quot;,&quot;cmd&quot;:&quot;why&quot;,&quot;ok&quot;:true,&quot;verdict&quot;:&quot;app_crashed&quot;,
+ &quot;explanation&quot;:&quot;the app process crashed — see evidence.crash (project_frames point into your code)&quot;,
+ &quot;evidence&quot;:{&quot;crash&quot;:{&quot;kind&quot;:&quot;java&quot;,&quot;exception&quot;:&quot;java.lang.RuntimeException&quot;,
+   &quot;message&quot;:&quot;Deliberate ShadowDroid sample crash&quot;,
+   &quot;stack&quot;:[&quot;io.github.andriyo.shadowdroid.sample.MainActivity.crashNow(MainActivity.kt:240)&quot;, …]}},
+ &quot;hints&quot;:[&quot;shadowdroid log --last 5m   # full crash context&quot;,
+          &quot;shadowdroid app start       # relaunch after the fix&quot;]}</code></pre>
+<p>Every response ends with machine-readable <code>next_actions</code>, and if the app crashed since your previous command, the next response — success or error — carries the parsed crash as an <code>events</code> array. The crash finds the agent, not the other way around. Full details: <a href="docs/output-contract.md">the output contract</a>.</p>
+<h2>Install</h2>
+<p>Homebrew:</p>
+<pre><code class="lang-bash">brew install andriyo/tap/shadowdroid</code></pre>
+<p>Shell installer (macOS / Linux):</p>
+<pre><code class="lang-bash">curl --proto &#x27;=https&#x27; --tlsv1.2 -LsSf https://github.com/andriyo/ShadowDroid/releases/latest/download/shadowdroid-installer.sh | sh</code></pre>
+<p>Windows (Scoop, or the PowerShell installer):</p>
+<pre><code class="lang-powershell">scoop bucket add andriyo https://github.com/andriyo/scoop-bucket
+scoop install shadowdroid</code></pre>
+<pre><code class="lang-powershell">powershell -ExecutionPolicy Bypass -c &quot;irm https://github.com/andriyo/ShadowDroid/releases/latest/download/shadowdroid-installer.ps1 | iex&quot;</code></pre>
+<p>You also need Android Platform Tools (<code>adb</code>) on PATH — the installers print a hint if it's missing (macOS: <code>brew install --cask android-platform-tools</code>; Windows: <code>scoop install adb</code>). Manual binaries are attached to each <a href="https://github.com/andriyo/ShadowDroid/releases/latest">GitHub Release</a>.</p>
+<h2>Quickstart</h2>
+<p>Start an emulator or plug in a device with USB debugging, then:</p>
+<pre><code class="lang-bash">shadowdroid devices     # list attached devices and emulators
+shadowdroid connect     # install the on-device service, forward, verify
+shadowdroid ui dump     # read the current screen as JSON</code></pre>
+<p>On first <code>connect</code>, the CLI installs a version-matched, SHA-256-verified APK pair on the device (downloaded from the matching GitHub Release and cached under <code>~/.shadowdroid/</code>). Later calls reuse the live server. If anything is off, <code>shadowdroid doctor</code> diagnoses the pipe and <code>doctor --fix</code> repairs it.</p>
+<p>Now act by selector and verify the outcome in one call — selectors here are illustrative; use your app's:</p>
+<pre><code class="lang-bash">shadowdroid ui tap --text &quot;Sign in&quot; --expect-text &quot;Welcome&quot;</code></pre>
+<p>And when something surprises you:</p>
+<pre><code class="lang-bash">shadowdroid why</code></pre>
+<h3>Point your agent at it</h3>
+<p>One command installs the agent skill and the Android Studio plugin (skip the plugin with <code>--no-studio-plugin</code>):</p>
+<pre><code class="lang-bash">shadowdroid init</code></pre>
+<p>Then ask your agent to drive: the skill teaches it the loop, and <code>shadowdroid commands --json --depth 1</code> gives any agent the full, self-describing command catalog — canonical paths, argument construction data, output contracts, and decision hints. The operating contract agents follow is written down in <a href="docs/agent-loop.md">the agent loop</a>.</p>
+<blockquote><p><strong>Running Espresso / UI Automator tests?</strong> While connected, ShadowDroid holds the device's single <code>UiAutomation</code> slot, so instrumentation tests fail with <code>UiAutomationService ... already registered!</code>. Wrap them in <code>shadowdroid test -- ./gradlew connectedDebugAndroidTest</code>, which disconnects first and reconnects after — or run <code>disconnect</code>/<code>connect</code> yourself.</p></blockquote>
+<h2>Why ShadowDroid</h2>
+<p>The tools you'd otherwise reach for each fall short in a live agent loop:</p>
+<table><tr><th>Tool</th><th>Gap for a live agent loop</th></tr>
+<tr><td><code>adb shell uiautomator dump</code></td><td>A fresh dump process per read, writing raw XML to <code>/sdcard</code> for you to pull and parse. No selectors, no actions, no events.</td></tr>
+<tr><td><code>adb shell input tap</code></td><td>Stateless coordinate injection: no idea what's on screen, fragile to any layout change.</td></tr>
+<tr><td><code>adb logcat</code></td><td>An unscoped text firehose — no app scoping, no structure, crash blocks buried in noise.</td></tr>
+<tr><td>Appium / Maestro / Espresso</td><td>Built for authored test suites running in CI, with a server, DSL, or compiled tests between the agent and the device.</td></tr>
+</table>
+<p>ShadowDroid keeps a <strong>persistent service on the device</strong>, so reads are warm: on our reference setup (Apple-silicon macOS host, arm64 API 36 emulator, August 2026), a warm <code>ui dump</code> returns parsed JSON in <strong>~60–70 ms end-to-end</strong> including CLI process start, while a single raw <code>uiautomator dump</code> takes ~130–190 ms before you've pulled or parsed anything. Cold paths (first connect, APK install) are slower. Fast reads matter because the agent observes after every action — and every round-trip saved is an LLM inference saved.</p>
+<p>Speed is the smallest part. The persistent service is what makes the rest possible:</p>
+<ul>
+<li><strong>Act + observe fused</strong>: postconditions, stale-screen guards, and the resulting screen in the same response.</li>
+<li><strong>Failures that explain themselves</strong>: what <em>is</em> on screen, ranked near-matches, crash events riding the next response.</li>
+<li><strong>A debugger an agent can read</strong>: Android Studio breakpoints, stacks, variables, and Layout Inspector data as JSON.</li>
+</ul>
+<p>ShadowDroid is a <strong>complement, not a replacement</strong>: keep <code>adb</code>, Android Studio, and the <code>android</code> CLI for scaffold/build/deploy/SDK work, and keep Espresso for regression suites. ShadowDroid takes over once the app is running — it is the live runtime control plane for an AI development and debugging loop. It even follows the <code>android</code> CLI's conventions (<code>init</code>, <code>skill</code>, <code>layout</code>, <code>studio</code>), so it slots in beside it.</p>
+<h2>What your agent gets</h2>
+<p><strong>Robust selector actions with guards.</strong> Tap / type / swipe / scroll / long-press by <code>--rid</code>, <code>--text</code>, <code>--desc</code>, or <code>--xpath</code> — never brittle coordinates. Ambiguity is a structured error listing candidates, never a guess. <code>--observe</code> fuses act + settle + re-read into one call; <code>--expect-*</code> proves the destination; <code>--if-screen</code>/<code>--if-interaction</code> refuse to act on a screen that changed since you read it; screen-bound handles catch stale elements before input is delivered. First-class Jetpack Compose and Android TV (D-pad focus) support. → <a href="docs/agent-loop.md">docs/agent-loop.md</a></p>
+<p><strong>Failures that explain themselves.</strong> A missed selector returns <code>top_texts</code> (what the screen actually shows) and <code>closest</code> (ranked near-matches); a timeout reports what the screen became; a crash since your last command rides the next response as an <code>events</code> array:</p>
+<pre><code class="lang-jsonc">$ shadowdroid ui tap --text &quot;Sign in&quot;
+{&quot;type&quot;:&quot;error&quot;,&quot;ok&quot;:false,&quot;code&quot;:&quot;element_not_found&quot;,&quot;retryable&quot;:true,
+ &quot;detail&quot;:{&quot;top_texts&quot;:[&quot;DETERMINISTIC FIXTURES&quot;,&quot;Challenge catalog&quot;, …],
+           &quot;closest&quot;:[{&quot;id&quot;:43,&quot;text&quot;:&quot;Signals&quot;,&quot;score&quot;:0.5, …}, …], …},
+ &quot;next_actions&quot;:[&quot;inspect detail.top_texts and detail.closest when present&quot;, …]}</code></pre>
+<p>→ <a href="docs/output-contract.md">docs/output-contract.md</a></p>
+<p><strong>Structured logs and one-verb triage.</strong> <code>log</code> turns logcat into bounded, app-scoped, deduplicated JSON with crash/ANR blocks parsed out and stack frames mapped to your source files. <code>why</code> fuses crash + logs + screen + network failures into a single verdict with evidence and next steps. <code>collect</code> bundles everything for a hand-off. → <a href="docs/debugging.md">docs/debugging.md</a></p>
+<p><strong>The debugger, as JSON.</strong> Through the optional Android Studio plugin, the agent gets a live debugger it can read: breakpoints (line, exception, method, field; conditional and temporary), call stacks, threads, variables, watches, expression evaluation, non-suspending logpoints with structured hit streams, coroutine insight, and Layout Inspector data — Compose source locations and recomposition counts. UI polling tells an agent <em>what</em> happened; this tells it <em>why</em>. → <a href="docs/debugging.md">docs/debugging.md</a></p>
+<p><strong>The network, observed and shaped.</strong> A host-side MITM proxy built into the binary captures decrypted HTTP(S) — HTTP/2, SSE, streaming bodies, <code>gzip</code>/<code>deflate</code>/<code>br</code>/<code>zstd</code> — and WebSocket frames. The agent can intercept and mutate flows in-flight, declare rewrite rules, inject or rewrite WS frames, export HAR/curl/fixtures, and replay recorded backends. An optional debug-only in-app companion captures certificate-pinned OkHttp traffic above TLS. → <a href="docs/network.md">docs/network.md</a></p>
+<p><strong>A full operator console.</strong> App lifecycle and state snapshot/restore, runtime permissions and app-ops, files (including private app dirs via <code>--run-as</code>), display profiles, device controls, crash-safe segmented screen video with timeline markers, and a live <code>watch</code> stream of screen diffs, crashes, toasts, and HTTP events. Mutations verify their postconditions instead of trusting a silent shell. → <a href="docs/device-state.md">docs/device-state.md</a></p>
+<h2>How it works</h2>
+<pre><code class="lang-">        Laptop                          adb forward                Android device
+  ┌───────────────────────┐    (per-device host port → 7912)   ┌───────────────────────────┐
+  │  shadowdroid (Rust)   │  ──── HTTP + JSON (loopback) ───▶  │  instrumentation APK      │
+  │  • clap CLI           │                                    │  • Ktor server            │
+  │  • watch/log/why      │  ◀────────  adb logcat  ─────────  │  • UiDevice (AndroidX     │
+  │  • net MITM proxy     │                                    │    UI Automator 2.3.0+)   │
+  └───────────────────────┘                                    └───────────────────────────┘</code></pre>
+<p>The on-device APK answers low-latency UI reads and performs UI/device actions. The host CLI owns orchestration: watch diffing, logcat parsing for <code>log</code>/<code>why</code>/crash events, act+observe fusion, source mapping, and recovery — so host-side evidence keeps working even when the on-device server is down. The wire protocol is loopback HTTP/JSON, but the supported public interface for agents is the CLI and <code>shadowdroid commands --json</code>.</p>
+<p>Three optional integrations extend the same command surface, and everything degrades gracefully without them:</p>
+<ul>
+<li><strong>Android Studio plugin</strong> — exposes the debugger and Layout Inspector to <code>shadowdroid debug ...</code> and <code>shadowdroid layout ...</code> (installed by <code>shadowdroid init</code> or <code>studio install</code>).</li>
+<li><strong>Built-in MITM proxy</strong> — <code>shadowdroid net ...</code> wires the device through <code>adb reverse</code> and restores the previous proxy state on stop.</li>
+<li><strong>Debug-only in-app AAR</strong> — <code>shadowdroid aar ...</code> adds process/coroutine diagnostics and explicit above-TLS OkHttp capture to apps you build.</li>
+</ul>
+<h2>The Field Lab sample</h2>
+<p><a href="samples/shadowdroid-test-app"><code>samples/shadowdroid-test-app</code></a> is a stateful showcase app for driving ShadowDroid against a real package — the same app the transcripts above ran against:</p>
+<table><tr><th>Destination</th><th>What it exercises</th></tr>
+<tr><td><strong>Overview</strong></td><td>Mission progress, live posture, workspace shortcuts, event trail</td></tr>
+<tr><td><strong>Mission</strong></td><td>A three-gate "Night Shift: Signal Recovery" run: validation, semantic sliders, gated state, a long press</td></tr>
+<tr><td><strong>Signals</strong></td><td>HTTP request composer, live WS/WSS channel, WebView</td></tr>
+<tr><td><strong>Lab</strong></td><td>Deterministic fixtures: selectors, ranges, windows, permissions, lifecycle, storage, coroutines, logs, crash and ANR paths</td></tr>
+</table>
+<pre><code class="lang-bash">./server/gradlew -p samples/shadowdroid-test-app :app:assembleDebug
+shadowdroid app reinstall \
+  samples/shadowdroid-test-app/app/build/outputs/apk/debug/app-debug.apk \
+  --grant-all --wait-front
+shadowdroid app start io.github.andriyo.shadowdroid.sample --activity .MainActivity</code></pre>
+<p>Command-by-command walkthroughs — the Night Shift mission, a selector gauntlet with deliberate ambiguity, and a live WebSocket channel — are in <a href="samples/README.md"><code>samples/README.md</code></a>.</p>
+<h2>Agent integrations</h2>
+<p>Skills ship for five agents; <code>shadowdroid init</code> installs/updates user-scoped skills automatically, or install one explicitly:</p>
+<pre><code class="lang-bash">shadowdroid skill claude-code --install # → ~/.claude/skills/shadowdroid/SKILL.md
+shadowdroid skill cursor      --install # → ~/.cursor/skills/shadowdroid/SKILL.md
+shadowdroid skill codex       --install # → ~/.agents/skills/shadowdroid/SKILL.md
+shadowdroid skill gemini      --install # → ~/.gemini/skills/shadowdroid/SKILL.md
+shadowdroid skill antigravity --install # → ~/.gemini/config/skills/shadowdroid/SKILL.md</code></pre>
+<p>Add <code>--scope project</code> for per-repository installs (Claude Code uses <code>.claude/skills/</code>; the others share <code>.agents/skills/</code>). Installed skills are version-stamped: <code>shadowdroid skill --sync</code> refreshes pristine installs after an upgrade (<code>connect</code> does this automatically for user scope), while customized files are preserved and reported — <code>--force</code> is required to replace them. Any other agent that can run a shell command can bootstrap from <code>shadowdroid commands --json</code>.</p>
+<h2>Documentation</h2>
+<ul>
+<li><a href="docs/agent-loop.md">The agent loop</a> — the canonical read → act → confirm contract: selectors, hashes, guards, handles, fusion flags, TV, and the full command surface.</li>
+<li><a href="docs/output-contract.md">The output contract</a> — envelopes, exit codes, <code>next_actions</code>, <code>events</code>, streaming JSONL, self-describing failures.</li>
+<li><a href="docs/configuration.md">Configuration</a> — folder config, app aliases, named device targets, AVD claims, source mapping, per-project proxy CAs.</li>
+<li><a href="docs/network.md">Network</a> — HTTP(S)/WebSocket capture, interception, rules, fixtures and replay, CA management, the OkHttp AAR companion.</li>
+<li><a href="docs/debugging.md">Triage and debugging</a> — <code>why</code>/<code>log</code>/<code>collect</code>, the Android Studio debugger surface, logpoints, layout/Compose inspection.</li>
+<li><a href="docs/device-state.md">Device and state controls</a> — app state snapshot/restore, permissions/app-ops, files, display profiles, screen video evidence.</li>
+<li><a href="docs/security-and-redaction.md">Security and redaction</a> — the redaction policy, pixel boundaries, trust model, and what stays local.</li>
+<li><a href="samples/README.md">Field Lab walkthroughs</a> — scripted journeys against the sample app.</li>
+</ul>
+<h2>Security and limitations</h2>
+<p>Honest boundaries, up front:</p>
+<ul>
+<li><strong>Android-only, by design.</strong> macOS/Linux/Windows hosts; the target is always Android (real devices, emulators, Android TV / leanback).</li>
+<li><strong>Not a test framework.</strong> No assertion DSL, no runner. It drives and observes a <em>running</em> app; keep Espresso/JUnit for regression suites (<code>shadowdroid test -- &lt;cmd&gt;</code> frees the device slot for them).</li>
+<li><strong>One <code>UiAutomation</code> owner per device.</strong> While connected, ShadowDroid holds it; instrumentation tests need <code>shadowdroid test</code> or an explicit <code>disconnect</code>.</li>
+<li><strong>The MITM proxy has real limits.</strong> <code>net trust</code> installs the CA into the <strong>user</strong> trust store; apps that pin certificates, opt out via network security config, or use non-standard stacks (Cronet/QUIC) are <em>not</em> magically captured — rejections surface as <code>tls_error</code> events. The optional OkHttp companion sees pinned OkHttp traffic, is debug-only, and requires the app to register the interceptor explicitly.</li>
+<li><strong>Sensitive data stays your problem — with help.</strong> Global <code>--redact</code> filters secrets/PII from JSON output, and <code>net start --redact</code> scrubs captures before they're persisted; but screenshot pixels are only redacted on explicit request, and <strong>video pixels are never redacted</strong>. Bundles that can contain secrets are written <code>0700</code>/<code>0600</code> and marked sensitive.</li>
+<li><strong>Diagnostics are passive.</strong> <code>why</code> and <code>collect</code> never install, start, or forward anything to gather evidence.</li>
+<li><strong>The supported agent interface is the CLI</strong> and <code>shadowdroid commands --json</code> — the loopback HTTP API underneath is not a stable surface.</li>
+</ul>
+<p>Details: <a href="docs/security-and-redaction.md">docs/security-and-redaction.md</a>.</p>
+<h2>Contributing</h2>
+<p>If ShadowDroid improves your Android agent loop, starring the repository helps other Android developers find it.</p>
+<p>Three concrete ways to help:</p>
+<ul>
+<li><strong>Report a compatibility gap.</strong> Ran it against a device, OS version, or app where something misbehaved? <a href="https://github.com/andriyo/ShadowDroid/issues">Open an issue</a> — <code>shadowdroid collect</code> produces the diagnostic bundle worth attaching (review it for private data first).</li>
+<li><strong>Extend the Field Lab.</strong> Add a fixture or journey to <a href="samples/shadowdroid-test-app"><code>samples/shadowdroid-test-app</code></a> that breaks selectors, capture, or recovery in an interesting way.</li>
+<li><strong>Improve an agent integration.</strong> The skill templates and install targets live in the CLI (<code>shadowdroid skill</code>); a new agent or a sharper skill is a contained contribution.</li>
+</ul>
+<p>Developing the CLI needs stable Rust (<code>cargo test --locked --all-targets</code> in <a href="cli/"><code>cli/</code></a>); the on-device server, sample app, and Android Studio plugin are Gradle projects (<code>server/</code>, <code>samples/</code>, <code>shadowdroid-plugin/</code>).</p>
+<h2>FAQ</h2>
+<p><strong>Is ShadowDroid a test framework?</strong> No. There's no assertion DSL or test runner — it's a fast, observable control surface an agent drives live. It <em>can</em> launch your existing instrumentation tests (<code>shadowdroid test</code>, which frees the <code>UiAutomation</code> slot first), but it isn't a replacement for Espresso or JUnit.</p>
+<p><strong>How is it different from Appium, Maestro, or Espresso?</strong> Those are built for authored test suites — WebDriver scripts, YAML flows, compiled JUnit — running in CI. ShadowDroid is built for a <em>live agent loop</em>: a persistent on-device service answers warm UI reads fast, actions fuse their re-read (<code>--observe</code>), failures explain themselves, and the agent can stream crash/toast/HTTP events or attach a debugger. Use those frameworks for regression suites; use ShadowDroid when an agent needs to drive and reason about a running app right now.</p>
+<p><strong>How is it different from <code>adb</code> and the <code>android</code> CLI?</strong> It complements them. Keep them for scaffold, build, deploy, and SDK management, then hand the <em>running</em> app to ShadowDroid: warm structured reads instead of one-shot XML dumps, selector actions instead of raw coordinates, scoped structured <code>log</code>/<code>why</code> instead of an unscoped logcat firehose. See <a href="#why-shadowdroid">Why ShadowDroid</a>.</p>
+<p><strong>Does it support Jetpack Compose?</strong> Yes — first-class, via AndroidX UI Automator 2.3.0+. Compose nodes appear in the same element tree. With Android Studio's Layout Inspector running, <code>layout</code> adds Compose semantics, source locations, and recomposition counters; <code>ui dump --deep</code> cross-checks the accessibility tree against Compose data and can target nodes the normal tree misses.</p>
+<p><strong>Do I need Android Studio?</strong> Not for the core. The CLI plus <code>adb</code> cover UI automation, app/device control, network capture, structured logs, and event streaming. The optional Studio plugin adds the live debugger and Layout Inspector enrichment; without it those sections report <code>available:false</code> and everything else keeps working.</p>
+<p><strong>Which devices work?</strong> Real devices and emulators with USB debugging, plus Android TV / leanback (focus + D-pad driven via <code>ui focus</code> and <code>ui key dpad_*</code>). Projects can bind named targets (e.g. <code>mobile</code>, <code>tv</code>) to stable AVDs or serials — see <a href="docs/configuration.md">configuration</a>.</p>
+<p><strong>Which agents can use it?</strong> Any agent that can run a shell command and read JSON. Skills ship for Claude Code, Cursor, Codex, Gemini, and Antigravity; <code>shadowdroid commands --json</code> is the live catalog for everything else.</p>
+<p><strong>When do I use <code>net</code> versus <code>aar</code> for HTTP?</strong> <code>net</code> first — no app changes needed. <code>aar</code> when the app pins its certificates (OkHttp only) or you want in-process diagnostics. See <a href="docs/network.md">docs/network.md</a>.</p>
+<h2>License</h2>
+<p>Apache-2.0. See <a href="LICENSE">LICENSE</a>.</p>
