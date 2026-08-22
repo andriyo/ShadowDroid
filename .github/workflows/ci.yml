@@ -257,10 +257,12 @@ jobs:
           - name: phone-api-36
             api-level: 36
             target: google_apis
+            profile: ""
             form-factor: phone
           - name: tv-api-36
             api-level: 36
             target: android-tv
+            profile: tv_1080p
             form-factor: tv
     steps:
       - uses: actions/checkout@v6
@@ -299,6 +301,7 @@ jobs:
         with:
           api-level: ${{ matrix.api-level }}
           target: ${{ matrix.target }}
+          profile: ${{ matrix.profile }}
           arch: x86_64
           script: |
             chmod +x ci-artifacts/cli/shadowdroid
