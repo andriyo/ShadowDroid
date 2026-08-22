@@ -7,8 +7,10 @@ import androidx.test.platform.app.InstrumentationRegistry
 import io.ktor.utils.io.ByteChannel
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.writeFully
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -42,14 +44,21 @@ class FileRoutesAtomicWriteTest {
             val dir = testDirectory("interrupted")
             val destination = File(dir, "payload.bin").apply { writeText("old") }
             val source = ByteChannel(autoFlush = true)
-            val producer =
-                launch {
-                    source.writeFully(ByteArray(4096) { 7 })
-                    source.cancel(IOException("injected transfer failure"))
-                }
+            val write = async { runCatching { writeFileAtomically(source, destination, null) } }
 
-            val result = runCatching { writeFileAtomically(source, destination, null) }
-            producer.join()
+            source.writeFully(ByteArray(4096) { 7 })
+            withTimeout(5_000) {
+                while (
+                    dir.listFiles().orEmpty().none {
+                        it.name.contains(".shadowdroid-") && it.length() >= 4096
+                    }
+                ) {
+                    delay(10)
+                }
+            }
+            source.cancel(IOException("injected transfer failure"))
+
+            val result = write.await()
 
             assertTrue(result.isFailure)
             assertEquals("old", destination.readText())
