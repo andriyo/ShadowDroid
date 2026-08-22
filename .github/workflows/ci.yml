@@ -37,6 +37,11 @@ jobs:
         working-directory: cli
         run: cargo +1.97.0 clippy --locked --all-targets --all-features
 
+      - name: Start ADB server for CLI integration tests
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platform-tools"
+          "$ANDROID_HOME/platform-tools/adb" start-server
+
       - name: Test
         working-directory: cli
         run: cargo +1.97.0 test --locked --all-targets
