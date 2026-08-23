@@ -2,11 +2,22 @@
 
 **Give your coding agent eyes, hands, and a debugger for Android.**
 
-ShadowDroid is an open-source Android automation and debugging CLI for AI
-coding agents. It lets any shell-capable agent — Claude Code, Codex, Cursor,
-Gemini, Antigravity — drive, inspect, and debug real Android apps, emulators,
-and devices through structured JSON: no test DSL, no client SDK, no Appium
-server. One native binary plus `adb`.
+ShadowDroid is an open-source Android automation and debugging CLI for AI coding agents. It lets any shell-capable
+agent — Claude Code, Codex, Cursor, Gemini, Antigravity etc — drive, inspect, and debug real Android apps, emulators,
+and devices through structured JSON. While it's possible for AI agents to achieve this with just commonly available CLIs
+like adb and android, it’s the only CLI that is optimized for speed and has an expertise layer built-in into it.
+ShadowDroid doesn’t replace adb completely (only the slowest parts). It also has a built-in network proxy
+specifically designed for AI agents. It also has a built-in debugger so agents can debug your code without inserting log
+statements and recompiling. ShadowDroid can analyze app layouts, Compose recomposition counts etc. And all of that
+information is available as a stream of JSON lines that are easy and inexpensive (token cost wise) for an agent to parse.
+
+Most importantly, each output line has recommended next steps for the agent to do so the agent is informed contextually
+about possible and suggested commands to run. ShadowDroid is an Android development expert system wrapped into a CLI
+tool.
+
+ShadowDroid is also optimized to run multiple debug automations at the same time. So your AI agents can work in parallel
+on different devices/emulators on different projects.
+
 
 [![Latest release](https://img.shields.io/github/v/release/andriyo/ShadowDroid?sort=semver&display_name=tag&label=release&color=blue)](https://github.com/andriyo/ShadowDroid/releases/latest)
 [![CI](https://github.com/andriyo/ShadowDroid/actions/workflows/ci.yml/badge.svg)](https://github.com/andriyo/ShadowDroid/actions/workflows/ci.yml)
@@ -19,8 +30,6 @@ server. One native binary plus `adb`.
 
 ## The loop, in three commands
 
-Captured verbatim against the bundled [Field Lab sample](#the-field-lab-sample)
-on an API 36 emulator, trimmed to the interesting fields (`…` marks elisions).
 
 **1. The agent reads the screen** — parsed elements with stable selectors, not
 a screenshot to squint at:
@@ -343,35 +352,6 @@ replace them. Any other agent that can run a shell command can bootstrap from
 - [Field Lab walkthroughs](samples/README.md) — scripted journeys against the
   sample app.
 
-## Security and limitations
-
-Honest boundaries, up front:
-
-- **Android-only, by design.** macOS/Linux/Windows hosts; the target is
-  always Android (real devices, emulators, Android TV / leanback).
-- **Not a test framework.** No assertion DSL, no runner. It drives and
-  observes a *running* app; keep Espresso/JUnit for regression suites
-  (`shadowdroid test -- <cmd>` frees the device slot for them).
-- **One `UiAutomation` owner per device.** While connected, ShadowDroid holds
-  it; instrumentation tests need `shadowdroid test` or an explicit
-  `disconnect`.
-- **The MITM proxy has real limits.** `net trust` installs the CA into the
-  **user** trust store; apps that pin certificates, opt out via network
-  security config, or use non-standard stacks (Cronet/QUIC) are *not*
-  magically captured — rejections surface as `tls_error` events. The optional
-  OkHttp companion sees pinned OkHttp traffic, is debug-only, and requires
-  the app to register the interceptor explicitly.
-- **Sensitive data stays your problem — with help.** Global `--redact`
-  filters secrets/PII from JSON output, and `net start --redact` scrubs
-  captures before they're persisted; but screenshot pixels are only redacted
-  on explicit request, and **video pixels are never redacted**. Bundles that
-  can contain secrets are written `0700`/`0600` and marked sensitive.
-- **Diagnostics are passive.** `why` and `collect` never install, start, or
-  forward anything to gather evidence.
-- **The supported agent interface is the CLI** and `shadowdroid commands
-  --json` — the loopback HTTP API underneath is not a stable surface.
-
-Details: [docs/security-and-redaction.md](docs/security-and-redaction.md).
 
 ## Contributing
 
