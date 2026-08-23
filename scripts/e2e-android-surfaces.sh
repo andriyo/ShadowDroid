@@ -128,8 +128,12 @@ record load-webview ui tap --rid webview_button
 record webview-ready ui wait --klass WebView --timeout-ms 10000
 record webview-dump ui dump --full
 jq -e '
-    .snapshot_state == "consistent" and
-    any(.elements[]; .klass | endswith("WebView"))
+    .ok == true and
+    .matched == true and
+    (.element.klass | endswith("WebView"))
+' "$evidence_dir/webview-ready.json" >/dev/null
+jq -e '
+    .snapshot_state == "consistent"
 ' "$evidence_dir/webview-dump.json" >/dev/null
 
 jq -n \
