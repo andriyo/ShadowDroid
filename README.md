@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/shadowdroid-hero.png" alt="A Shadow Droid — a glossy black Imperial droid starfighter with a red sensor slash and segmented weapon booms" width="720">
+</p>
+
 # ShadowDroid
 
 **Give your coding agent eyes, hands, and a debugger for Android.**
@@ -428,6 +432,22 @@ is the live catalog for everything else.
 `net` first — no app changes needed. `aar` when the app pins its certificates
 (OkHttp only) or you want in-process diagnostics. See
 [docs/network.md](docs/network.md).
+
+## Credits
+
+The name — and the banner above — come from the **Shadow Droid**, the Imperial
+droid starfighter piloted by a surgically implanted brain in the *Star Wars*
+expanded universe ([Wookieepedia](https://starwars.fandom.com/wiki/Shadow_Droid)).
+
+The banner is a render of
+[*-Star Wars- Dark Empire Shadow Droid*](https://sketchfab.com/3d-models/star-wars-dark-empire-shadow-droid-290d87db98d24fc199243031cfb4df04)
+by **ARKON MAREK**, used and modified under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). The model is his;
+the materials, lighting, and camera are this project's.
+
+ShadowDroid is an independent project, not affiliated with or endorsed by
+Lucasfilm Ltd. or The Walt Disney Company. *Star Wars* and related marks are
+trademarks of Lucasfilm Ltd.
 
 ## License
 
