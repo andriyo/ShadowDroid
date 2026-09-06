@@ -206,6 +206,12 @@ alone does not capture HTTP, and the companion does not instrument Cronet,
 QUIC, or other stacks. Because it sits above TLS, it sees certificate-pinned
 OkHttp traffic that the MITM proxy cannot.
 
+If an OkHttp call fails before returning a response (for example DNS, TLS,
+connection, timeout or cancellation failure), the companion records request
+metadata, elapsed time and the error with no response status or body. The
+original `IOException` still reaches the app. Failures while the app later
+consumes a returned response body are outside this interceptor's capture window.
+
 `aar intercept` holds at most 32 matching calls and gives each one an absolute
 monotonic deadline. Unresolved, interrupted, or over-capacity calls fail open.
 At or after the deadline, `aar resume`/`aar drop` returns a non-zero typed

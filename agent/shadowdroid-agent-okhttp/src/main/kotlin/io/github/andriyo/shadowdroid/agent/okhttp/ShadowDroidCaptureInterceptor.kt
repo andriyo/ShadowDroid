@@ -49,7 +49,29 @@ class ShadowDroidCaptureInterceptor : Interceptor {
         val reqHeaders = captureHeaders(request.headers)
         val operationName = operationName(reqBody.text)
 
-        val response = chain.proceed(request)
+        val response = try {
+            chain.proceed(request)
+        } catch (failure: IOException) {
+            // A failed attempt still belongs in the capture. Limit this catch
+            // to proceed so deliberate drops below are not recorded twice, and
+            // preserve the original exception seen by the host application.
+            recordFlow(
+                id,
+                request,
+                request.url,
+                (System.nanoTime() - startNs) / 1_000_000,
+                reqType,
+                null,
+                reqHeaders,
+                emptyList(),
+                reqBody,
+                metadataOnly(0),
+                null,
+                false,
+                failure.toString(),
+            )
+            throw failure
+        }
         val durMs = (System.nanoTime() - startNs) / 1_000_000
 
         val url = request.url
