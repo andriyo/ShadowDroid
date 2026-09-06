@@ -111,6 +111,9 @@ pub fn run(args: &SkillArgs) -> Result<()> {
             if let Some(note) = install_note(agent, args.scope, args.install) {
                 payload["note"] = Value::String(note.to_string());
             }
+            if args.install {
+                payload["legacy_skills"] = retire_legacy_skills(args.scope)?;
+            }
             crate::events::emit_action("skill", &payload);
         }
         None => print!("{content}"),
@@ -139,7 +142,12 @@ pub fn install_default_skills() -> Value {
         }
     }
 
+    let legacy = retire_legacy_skills(SkillScope::User).unwrap_or_else(|error| {
+        failed.push(json!({"agent":"codex","error":error.to_string()}));
+        json!([])
+    });
     json!({
+        "legacy_skills": legacy,
         "type": "action",
         "ok": failed.is_empty(),
         "cmd": "skill_install_defaults",
@@ -392,6 +400,50 @@ fn skill_targets(scope: SkillScope) -> Vec<(&'static str, PathBuf)> {
         .collect()
 }
 
+/// Older Codex releases installed here. Keeping both SKILL.md files active
+/// exposes contradictory guidance even after the canonical skill is updated.
+fn retire_legacy_skills(scope: SkillScope) -> Result<Value> {
+    let root = match scope {
+        SkillScope::User => home_dir()?,
+        SkillScope::Project => std::env::current_dir()?,
+    };
+    retire_legacy_codex(
+        &root.join(".codex/skills/shadowdroid/SKILL.md"),
+        &root.join(".agents/skills/shadowdroid/SKILL.md"),
+    )
+}
+
+fn retire_legacy_codex(legacy: &Path, canonical: &Path) -> Result<Value> {
+    if !legacy.exists() || legacy.canonicalize().ok() == canonical.canonicalize().ok() {
+        return Ok(json!([]));
+    }
+    let (decision, expected) = inspect("codex", legacy)?;
+    let backup = legacy.with_file_name("SKILL.md.retired");
+    let reason = if matches!(decision, Decision::Customized | Decision::Untracked) {
+        Some("legacy skill has custom or untracked content; review and migrate it manually")
+    } else if backup.exists() {
+        Some("legacy backup already exists; review both copies before retiring this one")
+    } else if canonical.exists()
+        && matches!(
+            inspect("codex", canonical)?.0,
+            Decision::Customized | Decision::Untracked
+        )
+    {
+        Some("canonical skill has custom content; review the legacy copy before retiring it")
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
+        return Ok(
+            json!([{"path":legacy,"canonical":canonical,"status":"needs_review","reason":reason}]),
+        );
+    }
+    write_skill_checked("codex", canonical, &expected, false)?;
+    // Preserve the old bytes, but remove the discoverable SKILL.md name.
+    std::fs::rename(legacy, &backup).context("retire duplicate managed Codex skill")?;
+    Ok(json!([{"path":legacy,"canonical":canonical,"backup":backup,"status":"retired"}]))
+}
+
 enum Decision {
     /// Already byte-identical to current output.
     UpToDate,
@@ -477,6 +529,7 @@ fn sync_skills(scope: SkillScope, force: bool) -> Result<()> {
         "version": version,
         "scope": scope.as_str(),
         "refreshed": refreshed, "up_to_date": up_to_date,
+        "legacy_skills": retire_legacy_skills(scope)?,
     });
     if !skipped_customized.is_empty() {
         payload["skipped_customized"] = json!(skipped_customized);
@@ -526,10 +579,13 @@ pub fn refresh_for_connect() -> Option<Value> {
         }
     }
 
-    if refreshed.is_empty() && need_sync.is_empty() {
+    let legacy = retire_legacy_skills(SkillScope::User)
+        .unwrap_or_else(|error| json!([{"status":"needs_review","reason":error.to_string()}]));
+    if refreshed.is_empty() && need_sync.is_empty() && legacy.as_array().is_none_or(Vec::is_empty) {
         return None;
     }
     let mut o = json!({});
+    o["legacy_skills"] = legacy;
     if !refreshed.is_empty() {
         o["refreshed"] = json!(refreshed);
     }
@@ -720,6 +776,41 @@ mod tests {
                 "{agent}"
             );
         }
+    }
+
+    #[test]
+    fn legacy_managed_skill_is_backed_up_and_only_canonical_remains_discoverable() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("old/SKILL.md");
+        let canonical = dir.path().join("new/SKILL.md");
+        let old = append_marker("older generated guidance\n");
+        write_skill(&legacy, &old).unwrap();
+        let report = retire_legacy_codex(&legacy, &canonical).unwrap();
+        assert_eq!(report[0]["status"], "retired");
+        assert!(!legacy.exists());
+        assert_eq!(
+            std::fs::read_to_string(legacy.with_file_name("SKILL.md.retired")).unwrap(),
+            old
+        );
+        assert_eq!(
+            std::fs::read_to_string(canonical).unwrap(),
+            generated_content("codex").unwrap()
+        );
+    }
+
+    #[test]
+    fn customized_duplicate_skills_are_reported_and_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("old/SKILL.md");
+        let canonical = dir.path().join("new/SKILL.md");
+        write_skill(&legacy, "my custom guidance").unwrap();
+        let report = retire_legacy_codex(&legacy, &canonical).unwrap();
+        assert_eq!(report[0]["status"], "needs_review");
+        assert_eq!(
+            std::fs::read_to_string(&legacy).unwrap(),
+            "my custom guidance"
+        );
+        assert!(!canonical.exists());
     }
 
     #[test]

@@ -1,11 +1,9 @@
-`shadowdroid` controls and debugs a running Android app: deployment, app/device
-state, UI, logs/crashes, debugger/layout, and network. Gradle or `android`
-builds; ShadowDroid verifies on a device or emulator.
+`shadowdroid` deploys, controls, and debugs Android apps. Gradle or `android`
+builds; ShadowDroid verifies on devices.
 
 ## Discover before constructing a command
 
-The live CLI is the source of truth — prefer its machine catalog to remembered
-syntax or scraped help:
+Use the live machine catalog to discover syntax:
 
 ```bash
 shadowdroid commands --json --depth 1
@@ -13,9 +11,8 @@ shadowdroid commands --json --describe 'ui tap'
 shadowdroid commands --guide net
 ```
 
-The catalog carries canonical paths, argument constraints, output modes, and
-hand-authored agent hints. Domain depth is served on demand — before first use
-of a domain, read its driving guide: `--guide net` (proxy, TLS trust, capture
+The catalog gives paths, constraints, output modes, and hints. Before using a
+domain, read its guide: `--guide net` (proxy, TLS trust, capture
 sessions, rules, in-app OkHttp AAR), `--guide debugger` (Studio plugin, debug
 sessions, Layout Inspector fallbacks, recompositions), or `--guide state` (app
 state snapshot/restore, appops scoping, profile files, private files).
@@ -53,6 +50,9 @@ Treat stdout as data and the process exit code as authoritative:
 - `watch`, `log`, `net log`, and `debug replay` stream JSONL; large exports
   (HAR, curl, fixtures) write an artifact and return a small JSON summary; a
   few setup/report commands default to human output — request `--json`.
+
+Check each child’s exit status in batches. Serialize device lifecycle changes;
+retry `device_lifecycle_busy` within a deadline. Never delete an active lock.
 
 Branch on `ok`/`code`, inspect `detail`, follow the most relevant
 `next_actions` entry; never parse `msg` to recover state. Inside a `watch`
@@ -104,7 +104,7 @@ Check-act-observe (full flag semantics: `commands --describe 'ui tap'`):
 - `ui wait` timeouts are typed non-zero `wait_timeout` failures; never treat
   one as successful polling.
 
-Use global `--redact` for UI/log/network/watch/collect output; screenshots
+Use `--redact` for output; screenshots
 are pixel-masked only when explicitly requested (`--redact-pixels`,
 `--redact-screenshots`) and stay labeled potentially sensitive. On
 TV/leanback prefer `ui focus` and `ui key dpad_*`.
@@ -160,5 +160,6 @@ before `net` or `aar` work.
 ## Maintenance and self-improvement
 
 `skill --sync` refreshes pristine installed skills after upgrades (hand-edits
-preserved). Opt-in `usage enable` + `usage report` builds a local friction
+preserved). Pristine legacy duplicates are backed up and retired; customized copies are
+reported. Opt-in `usage enable` + `usage report` builds a local friction
 backlog — local-only, no argument values recorded.
