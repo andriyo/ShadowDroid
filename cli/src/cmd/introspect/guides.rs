@@ -19,11 +19,7 @@ pub(super) const GUIDES: &[Guide] = &[
     Guide {
         topic: "evidence",
         covers: &["evidence", "video"],
-        content: concat!(
-            include_str!("../../../../docs/evidence.md"),
-            "\n",
-            include_str!("../../../../docs/recording-coverage.md")
-        ),
+        content: include_str!("guides/evidence.md"),
     },
     Guide {
         topic: "net",
