@@ -57,7 +57,11 @@ agent inspects with `net show`, then releases with
 reply).
 
 HTTP `net drop <id>` returns 502 by default; `--set-status` returns an explicit
-HTTP status. Use `net drop <id> --transport` to abort the downstream connection
+HTTP status. These drops, including fail-closed hold timeouts, persist one final
+flow with the synthetic response sent to the app, `matched:intercept:drop`, and
+an error. `upstream_bypassed` identifies request-phase drops; response-phase drops
+replace the captured upstream response with the synthetic result.
+Use `net drop <id> --transport` to abort the downstream connection
 or HTTP/2 stream without sending a response status/body. For a lost successful
 refresh response, first intercept the response with `--at response --status 200`
 and inspect it before the transport abort. Capture retains the upstream 200 and

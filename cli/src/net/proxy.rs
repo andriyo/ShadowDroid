@@ -1304,7 +1304,7 @@ async fn proxy_request(
             rule_ids: &rule_ids,
         });
         stamp_capture_context(&ctx, &mut snap);
-        if let Some(decision) = hold(&ctx, snap, "request").await {
+        if let Some(decision) = hold(&ctx, snap, "request", &method).await {
             match decision {
                 HoldDecision::Drop(s) => return Ok(drop_response(&method, s)),
                 HoldDecision::AbortTransport => return Err(TransportAborted.into()),
@@ -1629,7 +1629,7 @@ async fn proxy_request(
             snap.resp_body = None;
             snap.resp_len = u64::try_from(resp_bytes.len()).unwrap_or(u64::MAX);
         }
-        if let Some(decision) = hold(&ctx, snap, "response").await {
+        if let Some(decision) = hold(&ctx, snap, "response", &method).await {
             match decision {
                 HoldDecision::Drop(s) => return Ok(drop_response(&method, s)),
                 HoldDecision::AbortTransport => return Err(TransportAborted.into()),
@@ -2295,7 +2295,12 @@ fn held_flow_charge(flow: &FlowRecord) -> u64 {
 /// If interception is active and `snap` matches at this `phase`, register the
 /// flow as held, emit an `http_intercept` event, and await the agent's decision
 /// (fail-open / fail-closed on the hold deadline). Returns `None` when not held.
-async fn hold(ctx: &ProxyContext, snap: FlowRecord, phase: &'static str) -> Option<HoldDecision> {
+async fn hold(
+    ctx: &ProxyContext,
+    snap: FlowRecord,
+    phase: &'static str,
+    method: &Method,
+) -> Option<HoldDecision> {
     let cfg = ctx.shared.intercept.read().unwrap().clone()?;
     let want = if phase == "request" {
         cfg.at_request
@@ -2375,7 +2380,29 @@ async fn hold(ctx: &ProxyContext, snap: FlowRecord, phase: &'static str) -> Opti
         },
     )
     .await;
-    if matches!(decision, HoldDecision::AbortTransport) {
+    if let HoldDecision::Drop(status) = decision {
+        // Record the synthetic response delivered to the app, including drops
+        // chosen by the hold deadline. Do not present an upstream 200/body as
+        // the result of an HTTP drop. Transport aborts retain that evidence below.
+        let (status, headers, mut body) = drop_response_parts(status);
+        let response = build_client_response_for(method, status, &headers, body.clone());
+        let mut dropped = snap;
+        dropped.status = Some(status);
+        dropped.resp_headers = header_pairs(response.headers());
+        dropped.resp_type = flow::content_type(&dropped.resp_headers);
+        if !response_allows_body(method, status) {
+            body = Bytes::new();
+        }
+        dropped.resp_len = body.len() as u64;
+        (dropped.resp_body, dropped.resp_truncated) =
+            flow::body_to_text(dropped.resp_type.as_deref(), &body, flow::BODY_CAP);
+        dropped.streamed = false;
+        dropped.error = Some("dropped by net intercept".into());
+        dropped.matched = Some("intercept:drop".into());
+        dropped.modified = true;
+        dropped.upstream_bypassed = phase == "request";
+        finish_capture(ctx, dropped);
+    } else if matches!(decision, HoldDecision::AbortTransport) {
         // Persist the upstream result even though the app receives no response.
         // The status remains the observed upstream status; error/matched identify
         // the downstream failure instead of manufacturing an HTTP 502.
@@ -2625,9 +2652,18 @@ fn apply_body_mutation(body: &mut Bytes, m: &Mutation) {
 }
 
 fn drop_response(method: &Method, status: Option<u16>) -> Response<ProxyBody> {
+    let (status, headers, body) = drop_response_parts(status);
+    build_client_response_for(method, status, &headers, body)
+}
+
+fn drop_response_parts(status: Option<u16>) -> SyntheticResponse {
     match status {
-        Some(s) => build_client_response_for(method, s, &[], Bytes::new()),
-        None => error_response_for(method, StatusCode::BAD_GATEWAY, "dropped by net intercept"),
+        Some(s) => (s, vec![], Bytes::new()),
+        None => (
+            StatusCode::BAD_GATEWAY.as_u16(),
+            vec![("content-type".into(), "text/plain; charset=utf-8".into())],
+            Bytes::from_static(b"shadowdroid proxy: dropped by net intercept"),
+        ),
     }
 }
 
@@ -4092,14 +4128,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transport_drop_sends_no_http_response_after_upstream_200() {
+    async fn intercept_drops_capture_the_terminal_result_once() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        for (phase, transport, explicit_status) in [
-            ("response", true, None),
-            ("request", true, None),
-            ("response", false, None),
-            ("response", false, Some(401)),
+        for (phase, transport, explicit_status, timed_out, method) in [
+            ("response", true, None, false, "POST"),
+            ("request", true, None, false, "POST"),
+            ("response", false, None, false, "POST"),
+            ("response", false, Some(401), false, "POST"),
+            ("request", false, None, false, "POST"),
+            ("request", false, Some(401), false, "POST"),
+            ("response", false, Some(204), false, "POST"),
+            ("request", false, None, false, "HEAD"),
+            ("response", false, None, true, "POST"),
+            ("request", false, None, true, "POST"),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let key = rcgen::KeyPair::generate().unwrap();
@@ -4117,8 +4159,8 @@ mod tests {
                 matcher: crate::net::Matcher::default(),
                 at_request: phase == "request",
                 at_response: phase == "response",
-                hold_ms: 5000,
-                on_timeout_drop: false,
+                hold_ms: if timed_out { 1000 } else { 5000 },
+                on_timeout_drop: timed_out,
             });
             let ctx = Arc::new(super::ProxyContext {
                 ca,
@@ -4154,7 +4196,7 @@ mod tests {
             let (stop_tx, stop_rx) = oneshot::channel();
             let proxy_task = tokio::spawn(super::serve(ctx.clone(), listener, stop_rx));
             let mut downstream = TcpStream::connect(proxy_addr).await.unwrap();
-            downstream.write_all(format!("POST http://{upstream_addr}/refresh HTTP/1.1\r\nHost: {upstream_addr}\r\nContent-Length: 3\r\nConnection: close\r\n\r\nold").as_bytes()).await.unwrap();
+            downstream.write_all(format!("{method} http://{upstream_addr}/refresh HTTP/1.1\r\nHost: {upstream_addr}\r\nContent-Length: 3\r\nConnection: close\r\n\r\nold").as_bytes()).await.unwrap();
             let held = tokio::time::timeout(Duration::from_secs(3), async {
                 loop {
                     let candidate = shared
@@ -4183,18 +4225,20 @@ mod tests {
                     Some("{\"refreshToken\":\"new\"}")
                 );
             }
-            let reply = interception_control_request(
-                shared.clone(),
-                serde_json::json!({
-                    "op": "drop", "id": held.id, "transport": transport, "status": explicit_status
-                }),
-            )
-            .await;
-            assert_eq!(reply["released"], true);
-            assert_eq!(
-                reply["action"],
-                if transport { "abort_transport" } else { "drop" }
-            );
+            if !timed_out {
+                let reply = interception_control_request(
+                    shared.clone(),
+                    serde_json::json!({
+                        "op": "drop", "id": held.id, "transport": transport, "status": explicit_status
+                    }),
+                )
+                .await;
+                assert_eq!(reply["released"], true);
+                assert_eq!(
+                    reply["action"],
+                    if transport { "abort_transport" } else { "drop" }
+                );
+            }
             let mut response = vec![];
             let read = tokio::time::timeout(
                 Duration::from_secs(3),
@@ -4202,6 +4246,17 @@ mod tests {
             )
             .await
             .unwrap();
+            let captured = tokio::time::timeout(Duration::from_secs(1), flow_rx.recv())
+                .await
+                .expect("every dropped request must produce a terminal capture")
+                .unwrap();
+            assert_eq!(captured.id, held.id);
+            assert_eq!(captured.capture_session_id, "transport-test");
+            assert_eq!(captured.upstream_bypassed, phase == "request");
+            assert!(captured.modified);
+            assert_eq!(captured.detail(false)["ok"], false);
+            let event = serde_json::to_value(captured.http_event(&ctx.serial)).unwrap();
+            assert_eq!(event["ok"], false);
             if transport {
                 assert!(
                     response.is_empty(),
@@ -4215,16 +4270,8 @@ mod tests {
                             | io::ErrorKind::UnexpectedEof
                     ));
                 }
-                let captured = tokio::time::timeout(Duration::from_secs(1), flow_rx.recv())
-                    .await
-                    .unwrap()
-                    .unwrap();
                 assert_eq!(captured.status, held.status);
                 assert_eq!(captured.resp_body, held.resp_body);
-                assert_eq!(captured.upstream_bypassed, phase == "request");
-                assert_eq!(captured.detail(false)["ok"], false);
-                let event = serde_json::to_value(captured.http_event(&ctx.serial)).unwrap();
-                assert_eq!(event["ok"], false);
                 assert_eq!(event["status"], serde_json::json!(held.status));
                 assert_eq!(
                     captured.matched.as_deref(),
@@ -4240,12 +4287,41 @@ mod tests {
                 read.unwrap();
                 let expected = format!("HTTP/1.1 {}", explicit_status.unwrap_or(502));
                 assert!(String::from_utf8_lossy(&response).starts_with(&expected));
+                assert_eq!(captured.status, Some(explicit_status.unwrap_or(502)));
+                assert_eq!(event["status"], explicit_status.unwrap_or(502));
+                assert_eq!(captured.matched.as_deref(), Some("intercept:drop"));
+                assert_eq!(captured.error.as_deref(), Some("dropped by net intercept"));
+                let actual_body = response
+                    .split_at(response.windows(4).position(|s| s == b"\r\n\r\n").unwrap() + 4)
+                    .1;
+                assert_eq!(captured.resp_len, actual_body.len() as u64);
+                assert_eq!(
+                    captured.resp_body.as_deref().unwrap_or("").as_bytes(),
+                    actual_body
+                );
+                assert!(
+                    !captured
+                        .resp_body
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("refreshToken")
+                );
+                assert!(!captured.resp_truncated);
+                assert!(!captured.streamed);
             }
             let _ = stop_tx.send(());
             ctx.shutdown.cancel();
             proxy_task.await.unwrap().unwrap();
             ctx.tasks.close();
             ctx.tasks.wait().await;
+            assert!(
+                flow_rx.try_recv().is_err(),
+                "a drop must be captured exactly once"
+            );
+            assert_eq!(
+                processed.load(Ordering::SeqCst),
+                usize::from(phase == "response")
+            );
             upstream_task.abort();
             let _ = upstream_task.await;
         }
