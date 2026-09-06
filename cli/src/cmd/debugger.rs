@@ -2094,12 +2094,16 @@ impl BridgeClient {
                 )
             })
             .collect();
-        // Session-scoped routes default to the session on this client's device
-        // when the caller didn't pin an explicit `session=` index. Harmless when
-        // a session index IS given — the plugin prefers the index.
+        // Session and Android-client operations inherit the selected target.
+        // Attach/clients include a DEVICE parameter even when their local flag
+        // is absent; only a populated override should suppress the fallback.
         if let Some(device) = &self.device {
-            let already = params.iter().any(|(key, _)| *key == query::DEVICE);
-            if route_is_session_scoped(path) && !already {
+            let already = params
+                .iter()
+                .any(|(key, value)| *key == query::DEVICE && value.is_some());
+            if (route_is_session_scoped(path) || matches!(path, route::ATTACH | route::CLIENTS))
+                && !already
+            {
                 pairs.push(format!(
                     "{}={}",
                     urlencoding::encode(query::DEVICE),
@@ -2232,6 +2236,25 @@ mod tests {
             "no duplicate device param: {u}"
         );
         assert!(u.contains("device=dev-B"));
+    }
+
+    #[test]
+    fn android_client_routes_inherit_target_unless_explicitly_overridden() {
+        let bridge = BridgeClient::with_device(Some(URL), Some("TV-default")).unwrap();
+        for route in [route::ATTACH, route::CLIENTS] {
+            let inherited = bridge.url(
+                route,
+                &[
+                    (query::PACKAGE, Some("com.example.app")),
+                    (query::DEVICE, None),
+                ],
+            );
+            assert!(inherited.contains("device=TV-default"), "{inherited}");
+            let overridden = bridge.url(route, &[(query::DEVICE, Some("emulator-5556"))]);
+            assert_eq!(overridden.matches("device=").count(), 1);
+            assert!(overridden.contains("device=emulator-5556"));
+            assert!(!overridden.contains("TV-default"));
+        }
     }
 
     #[test]
