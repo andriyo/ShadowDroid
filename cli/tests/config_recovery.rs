@@ -39,6 +39,36 @@ fn json(output: &Output) -> Value {
 }
 
 #[test]
+fn invalid_configured_capture_host_is_rejected_before_device_resolution() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(home.join(".shadowdroid")).unwrap();
+    std::fs::create_dir_all(project.join(".shadowdroid")).unwrap();
+    std::fs::write(
+        project.join(".shadowdroid/config.json"),
+        r#"{"proxy":{"hosts":["*bamgrid.com"]}}"#,
+    )
+    .unwrap();
+
+    let output = run(
+        &home,
+        &project,
+        &["--target", "not-configured", "net", "start"],
+    );
+    assert!(!output.status.success());
+    let value = json(&output);
+    assert_eq!(value["code"], "invalid_capture_host_filter", "{value}");
+    assert_eq!(value["detail"]["host_filter"], "*bamgrid.com");
+    assert!(
+        value["next_actions"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty())
+    );
+    assert!(!home.join(".shadowdroid/net").exists());
+}
+
+#[test]
 fn malformed_config_does_not_block_config_recovery_commands() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");

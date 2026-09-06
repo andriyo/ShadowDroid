@@ -68,6 +68,23 @@ fn invalid_subcommand_is_a_structured_error() {
 }
 
 #[test]
+fn unsupported_capture_host_wildcard_is_an_actionable_usage_error() {
+    let (out, code) = run(&["net", "start", "--host", "*bamgrid.com"]);
+    let value = one_json_line(&out);
+    assert_eq!(code, 2, "{value}");
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["code"], "usage");
+    assert_eq!(value["kind"], "ValueValidation");
+    assert_eq!(value["arg"], "--host <HOST>");
+    assert!(value["msg"].as_str().unwrap().contains("'*.example.com'"));
+    assert!(
+        value["next_actions"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty())
+    );
+}
+
+#[test]
 fn bare_invocation_is_a_structured_discovery_error() {
     let (out, code) = run(&[]);
     let value = one_json_line(&out);

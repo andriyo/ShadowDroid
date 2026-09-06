@@ -12,6 +12,21 @@ The pre-existing device proxy setting is persisted before wiring; a repeated
 restores that exact setting and reports separate raw-IP and DNS connectivity
 checks (`--canary-host` selects the neutral DNS probe).
 
+## Capture host scope
+
+`net start --host example.com` and `net start --host '*.example.com'` both
+capture the domain and its subdomains, ignoring case and matching at domain
+label boundaries. They do not match `otherexample.com` or
+`example.com.other.example`. Bare fragments such as `example` retain substring
+matching. Repeat `--host` for multiple scopes, or omit both `--host` and
+configured `proxy.hosts` to capture all hosts.
+
+Only the leading `*.` wildcard form is supported. Patterns such as
+`*example.com`, `api.*.com`, and `example.*` fail before proxy startup. These
+rules also apply to configured `proxy.hosts`. The `net log` and intercept/rule
+host filters use substring matching on captured flows and do not change which
+hosts the proxy captures.
+
 ## Sessions, checkpoints, and querying
 
 Each new proxy run returns a stable `capture_session_id`, and every captured

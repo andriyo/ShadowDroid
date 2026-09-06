@@ -3099,7 +3099,42 @@ fn connection_nominated_headers(headers: &[(String, String)]) -> HashSet<String>
         .collect()
 }
 
-/// Glob host match used to scope which hosts the proxy MITMs (`net start --host`).
+pub(crate) fn parse_capture_host_filter(pattern: &str) -> Result<String, String> {
+    let suffix = pattern.strip_prefix("*.").unwrap_or(pattern);
+    if pattern.is_empty()
+        || pattern.chars().any(char::is_whitespace)
+        || suffix.is_empty()
+        || suffix.starts_with('.')
+        || suffix.contains(['*', '?', '[', ']', '{', '}'])
+    {
+        return Err(
+            "use a domain such as example.com, a leading '*.' pattern such as '*.example.com', or a bare substring; other wildcard forms are unsupported; omit --host and proxy.hosts for all hosts"
+                .to_string(),
+        );
+    }
+    Ok(pattern.to_string())
+}
+
+pub(crate) fn validate_capture_host_filters(filters: &[String]) -> Result<()> {
+    for filter in filters {
+        if let Err(reason) = parse_capture_host_filter(filter) {
+            return Err(crate::diagnostic::DiagnosticError::new(
+                "invalid_capture_host_filter",
+                "net",
+                format!("invalid capture host filter {filter:?}: {reason}"),
+            )
+            .detail(serde_json::json!({"host_filter": filter}))
+            .next_actions([
+                "replace the host filter with a domain or a leading '*.' pattern",
+                "shadowdroid commands --json --describe 'net start'",
+            ])
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Host match used to scope which hosts the proxy MITMs (`net start --host`).
 /// `*.example.com` matches the apex + any subdomain. A **domain-shaped** pattern
 /// (contains a dot) matches that domain and its subdomains at a label boundary —
 /// so `example.com` matches `api.example.com` but NOT `example.com.evil.com`. A
@@ -3295,8 +3330,9 @@ mod tests {
         ContentEncoding, DecodeFailure, DecodeOutcome, EncodingDisposition, HeldFlow, HoldDecision,
         ReleaseHeldResult, TerminalHoldHistory, apply_request_mutation, apply_request_rules,
         apply_response_rules, decode_capped, decompress_bounded_with_cap, encoding_disposition,
-        frame_stream_body, host_glob_match, persisted_tls_error_fields, release_held, resolve_held,
-        shared_with_rules, tls_failure_reason, upstream_headers, ws_tls_connector,
+        frame_stream_body, host_glob_match, parse_capture_host_filter, persisted_tls_error_fields,
+        release_held, resolve_held, shared_with_rules, tls_failure_reason, upstream_headers,
+        ws_tls_connector,
     };
     use crate::net::flow::FlowRecord;
     use crate::net::{Mutation, RuleAction, RuleMatchOn, RuleMatcher, RuleSpec, RuleTransform};
@@ -4217,6 +4253,45 @@ mod tests {
         // …but NOT a longer domain that merely contains it (the over-capture bug).
         assert!(!host_glob_match("example.com", "example.com.evil.com"));
         assert!(!host_glob_match("livd.app", "notlivd.app"));
+    }
+
+    #[test]
+    fn capture_host_filters_reject_unsupported_wildcard_forms() {
+        for pattern in [
+            "*bamgrid.com",
+            "*",
+            "*.",
+            "*..example.com",
+            "**.example.com",
+            "api.*.com",
+            "example.*",
+            "?.example.com",
+            "[ab].example.com",
+            "{a,b}.example.com",
+            "",
+            " example.com",
+            "example.com ",
+        ] {
+            assert!(parse_capture_host_filter(pattern).is_err(), "{pattern:?}");
+        }
+    }
+
+    #[test]
+    fn capture_host_filters_preserve_supported_matching_scope() {
+        for pattern in ["bamgrid.com", "*.bamgrid.com", "BAMGRID.COM"] {
+            let parsed = parse_capture_host_filter(pattern).unwrap();
+            assert_eq!(parsed, pattern);
+            for host in ["bamgrid.com", "disney.api.edge.bamgrid.com"] {
+                assert!(host_glob_match(&parsed, host), "{pattern:?} / {host:?}");
+            }
+            for host in ["otherbamgrid.com", "bamgrid.com.other.example"] {
+                assert!(!host_glob_match(&parsed, host), "{pattern:?} / {host:?}");
+            }
+        }
+        for pattern in ["bamgrid", "localhost", "127.0.0.1"] {
+            assert_eq!(parse_capture_host_filter(pattern).unwrap(), pattern);
+        }
+        assert!(host_glob_match("bamgrid", "otherbamgrid.example"));
     }
 
     #[test]

@@ -4,6 +4,14 @@
 `adb reverse`, and changes the device proxy; `net stop` restores the prior
 device proxy value.
 
+Capture scope accepts `--host example.com` or `--host '*.example.com'`; both
+match that domain and its subdomains at a label boundary, ignoring case. A bare
+fragment such as `example` matches host substrings. Repeat `--host` to include
+multiple scopes. Other wildcard forms, such as `*example.com` or `api.*.com`,
+are rejected. Omit both `--host` and configured `proxy.hosts` for all hosts.
+`net log` and intercept/rule host filters use substring matching on captured
+flows; their filters do not expand the proxy's capture scope.
+
 ```bash
 shadowdroid net check com.example.app
 shadowdroid net trust --auto

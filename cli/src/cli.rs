@@ -1012,9 +1012,11 @@ pub enum NetCmd {
         /// Proxy listen port (wired to the device via `adb reverse`).
         #[arg(long, default_value_t = crate::net::DEFAULT_PROXY_PORT)]
         port: u16,
-        /// Limit capture/MITM to these host globs, e.g. '*.livd.app' (repeatable;
-        /// empty = all hosts). Same `--host` filter used by `net log`/`intercept`.
-        #[arg(long)]
+        /// Limit capture/MITM to domains or leading '*.' patterns (repeatable).
+        /// Both example.com and '*.example.com' include the apex and subdomains;
+        /// a bare fragment matches substrings. Other wildcards are rejected.
+        /// Omit --host and proxy.hosts to capture all hosts.
+        #[arg(long, value_parser = crate::net::proxy::parse_capture_host_filter)]
         host: Vec<String>,
         /// Run the proxy in the foreground instead of detaching a daemon.
         #[arg(long)]
@@ -1510,8 +1512,8 @@ pub struct NetDaemonArgs {
     /// Signing CA private key to load (resolved by the parent `net start`).
     #[arg(long)]
     pub ca_key: PathBuf,
-    /// Host globs to scope capture to (repeatable; empty = all).
-    #[arg(long)]
+    /// Domains or leading '*.' patterns to scope capture to (repeatable; empty = all).
+    #[arg(long, value_parser = crate::net::proxy::parse_capture_host_filter)]
     pub host: Vec<String>,
     /// Strip cache-validation request headers.
     #[arg(long)]
@@ -1885,6 +1887,9 @@ async fn run_inner() -> Result<()> {
             .unwrap_or_default();
     }
     apply_config_defaults(&mut cmd, &config);
+    if let Cmd::Net(NetCmd::Start { host, .. }) = &cmd {
+        crate::net::proxy::validate_capture_host_filters(host)?;
+    }
 
     // ── Phase 1: commands that do NOT need the on-device server ──
     // doctor diagnoses the very server `ensure_ready` would start; collect only
