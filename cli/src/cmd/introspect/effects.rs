@@ -471,6 +471,7 @@ fn leaf_contract(path: &str) -> Option<LeafEffectContract> {
                 D::NetworkListener,
             ],
         ),
+        "video coverage" => leaf(HOST_READ, CONFIG),
         "video status" => leaf(EXISTING_READ, EXISTING),
         "video mark" => leaf(
             &[E::HostRead, E::HostWrite, E::DeviceRead],
@@ -1050,7 +1051,8 @@ mod tests {
             | "net intercept" | "net resume" | "net drop" | "net respond" | "net rule add"
             | "net rule list" | "net rule rm" | "net rule clear" | "net override" | "net rules"
             | "net replay" => ResolverPolicy::Existing,
-            "devices"
+            "video coverage"
+            | "devices"
             | "update"
             | "init"
             | "commands"

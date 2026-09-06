@@ -61,6 +61,7 @@ impl Shared {
             "timeline": self.bundle.timeline_path.display().to_string(),
             "current_segment": current_segment,
             "segments_complete": self.manifest.segments.iter().filter(|segment| segment.state == "complete").count(),
+            "coverage": super::coverage::summary(&self.manifest),
             "warnings": self.manifest.warnings,
             "contains_sensitive_data": true,
             "encrypted": false,

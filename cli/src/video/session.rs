@@ -76,7 +76,7 @@ pub struct ArtifactInfo {
     pub potentially_sensitive: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Segment {
     pub index: u32,
     pub path: String,
@@ -112,7 +112,7 @@ pub struct Segment {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Marker {
     pub label: String,
     pub ts: f64,
@@ -232,7 +232,11 @@ impl Bundle {
     }
 
     pub fn write_manifest(&self, manifest: &Manifest) -> Result<()> {
-        write_json_private(&self.manifest_path, &serde_json::to_value(manifest)?)
+        write_json_private(&self.manifest_path, &serde_json::to_value(manifest)?)?;
+        write_json_private(
+            &self.root.join("coverage.json"),
+            &super::coverage::report(manifest),
+        )
     }
 
     pub fn append_event(&self, event: &Value) -> Result<()> {
@@ -943,6 +947,8 @@ pub fn artifact_summary(root: &Path, manifest: &Manifest) -> Value {
         "segments": manifest.segments.iter().filter(|segment| segment.state == "complete").count(),
         "playable_segments": manifest.segments.iter().filter(|segment| segment.state == "complete" && segment.playable).count(),
         "playable": video.is_some(),
+        "coverage": super::coverage::summary(manifest),
+        "coverage_file": root.join("coverage.json").is_file().then(|| root.join("coverage.json")),
         "bytes": bytes,
         "elapsed_ms": manifest.capture.elapsed_ms,
         "warnings": manifest.warnings,

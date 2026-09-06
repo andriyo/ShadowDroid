@@ -23,6 +23,12 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
                 "commands --guide net --json"
             ]
         })),
+        "video coverage" => Some(serde_json::json!({
+            "use_when":["Assess encoded coverage, missing segments and marker ranges in a saved recording."],
+            "output":"segment coverage and enclosing export ranges; no invented exact marker offsets",
+            "side_effects":["none"],
+            "next_actions":["video status","commands --json --describe 'video record'"]
+        })),
         "devices" => Some(serde_json::json!({
             "use_when": ["Need to inspect attached emulator/device state without triggering configured target startup."],
             "output": "device list JSON/action output including stable AVD name and build characteristics when available",

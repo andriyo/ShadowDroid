@@ -9,6 +9,7 @@
 mod backend;
 mod commands;
 mod control;
+mod coverage;
 mod daemon;
 mod paths;
 mod session;
@@ -50,6 +51,8 @@ pub enum VideoCmd {
     Start(StartArgs),
     /// Report the active recorder, or running:false when this device is idle.
     Status,
+    /// Read encoded coverage, gaps, and marker ranges from an existing bundle (no device required).
+    Coverage { bundle: PathBuf },
     /// Add a timestamped label to the active recording timeline.
     Mark {
         /// Searchable marker text, for example "before checkout".
@@ -161,6 +164,11 @@ pub async fn run(args: &VideoArgs, serial: &Serial) -> Result<()> {
             Ok(())
         }
         VideoCmd::Status => commands::status(serial).await,
+        VideoCmd::Coverage { bundle } => {
+            let manifest = session::manifest_from_bundle(bundle)?;
+            crate::events::emit_action("video_coverage", &coverage::report(&manifest));
+            Ok(())
+        }
         VideoCmd::Mark { label } => commands::mark(serial, label).await,
         VideoCmd::Stop => commands::stop(serial, "explicit").await,
         VideoCmd::Daemon(daemon_args) => daemon::run(daemon_args.clone()).await,

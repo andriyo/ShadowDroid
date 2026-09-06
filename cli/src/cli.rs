@@ -1990,7 +1990,7 @@ async fn run_inner() -> Result<()> {
         // Video is a host-side ADB daemon and does not need the UiAutomation
         // server. Detached daemon args carry their own exact serial.
         Cmd::Video(args) => {
-            if args.is_daemon() {
+            if args.is_daemon() || matches!(args.command, crate::video::VideoCmd::Coverage { .. }) {
                 return crate::video::run(args, &Serial::new("")).await;
             }
             let serial = if args.allows_target_start() {
