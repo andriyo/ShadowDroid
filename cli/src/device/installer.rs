@@ -66,6 +66,15 @@ impl Drop for DeviceLifecycleGuard {
     }
 }
 
+static LIFECYCLE_WAIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn set_lifecycle_wait_ms(milliseconds: u64) {
+    LIFECYCLE_WAIT_MS.store(
+        milliseconds.min(30_000),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 pub fn acquire_lifecycle_lock(serial: &Serial) -> Result<DeviceLifecycleGuard> {
     let dir = shadowdroid_home()?.join("locks");
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
@@ -74,6 +83,20 @@ pub fn acquire_lifecycle_lock(serial: &Serial) -> Result<DeviceLifecycleGuard> {
 }
 
 fn acquire_lifecycle_lock_at(serial: &Serial, path: &Path) -> Result<DeviceLifecycleGuard> {
+    acquire_lifecycle_lock_wait(
+        serial,
+        path,
+        std::time::Duration::from_millis(
+            LIFECYCLE_WAIT_MS.load(std::sync::atomic::Ordering::Relaxed),
+        ),
+    )
+}
+
+fn acquire_lifecycle_lock_wait(
+    serial: &Serial,
+    path: &Path,
+    timeout: std::time::Duration,
+) -> Result<DeviceLifecycleGuard> {
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -82,31 +105,41 @@ fn acquire_lifecycle_lock_at(serial: &Serial, path: &Path) -> Result<DeviceLifec
         .open(path)
         .with_context(|| format!("open {}", path.display()))?;
 
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => {
-            let owner = std::fs::read_to_string(path)
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty());
-            return Err(crate::diagnostic::DiagnosticError::new(
-                "device_lifecycle_busy",
-                "device",
-                format!("another ShadowDroid process is changing device {serial}"),
-            )
-            .retryable(true)
-            .detail(serde_json::json!({
-                "device": serial.as_str(),
-                "owner_pid": owner,
-                "lock": path.display().to_string(),
-            }))
-            .next_actions([
-                "wait for the active ShadowDroid lifecycle command to finish, then retry",
-            ])
-            .into());
-        }
-        Err(TryLockError::Error(error)) => {
-            return Err(error).with_context(|| format!("lock {}", path.display()));
+    let started = std::time::Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(TryLockError::WouldBlock) if started.elapsed() < timeout => {
+                std::thread::sleep(
+                    std::time::Duration::from_millis(20)
+                        .min(timeout.saturating_sub(started.elapsed())),
+                );
+            }
+            Err(TryLockError::WouldBlock) => {
+                let owner = std::fs::read_to_string(path)
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty());
+                return Err(crate::diagnostic::DiagnosticError::new(
+                    "device_lifecycle_busy",
+                    "device",
+                    format!("another ShadowDroid process is changing device {serial}"),
+                )
+                .retryable(true)
+                .detail(serde_json::json!({
+                    "device": serial.as_str(),
+                    "owner_pid": owner,
+                    "waited_ms": started.elapsed().as_millis(),
+                    "lock": path.display().to_string(),
+                }))
+                .next_actions([
+                    "wait for the active ShadowDroid lifecycle command to finish, then retry",
+                ])
+                .into());
+            }
+            Err(TryLockError::Error(error)) => {
+                return Err(error).with_context(|| format!("lock {}", path.display()));
+            }
         }
     }
 
@@ -1045,6 +1078,27 @@ mod tests {
         drop(first);
         assert!(path.exists(), "persistent lock inode must not be unlinked");
         acquire_lifecycle_lock_at(&serial, &path).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_wait_acquires_after_release_and_times_out_without_stealing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.lock");
+        let serial = Serial::new("test-device");
+        let first = acquire_lifecycle_lock_wait(&serial, &path, std::time::Duration::ZERO).unwrap();
+        let error =
+            acquire_lifecycle_lock_wait(&serial, &path, std::time::Duration::from_millis(20))
+                .unwrap_err();
+        assert_eq!(crate::cli::error_code_of(&error), "device_lifecycle_busy");
+        assert!(path.exists());
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                drop(first);
+            });
+            acquire_lifecycle_lock_wait(&serial, &path, std::time::Duration::from_secs(2)).unwrap();
+        });
+        assert!(path.exists());
     }
 
     #[test]

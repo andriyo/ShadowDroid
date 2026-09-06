@@ -90,6 +90,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub takeover: bool,
 
+    /// Wait up to this many milliseconds for a device lifecycle lock (default: fail immediately).
+    #[arg(long, global = true, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=30000))]
+    pub lock_timeout_ms: u32,
+
     /// Local APK to install instead of normal APK resolution. Can be either:
     ///   • a path to the test APK (e.g., app-debug-androidTest.apk); the
     ///     sibling main APK is auto-discovered in the same directory tree
@@ -1844,6 +1848,7 @@ async fn run_inner() -> Result<()> {
             .map(crate::config::RedactionConfig::policy_spec)
             .unwrap_or_default(),
     )?;
+    crate::device::installer::set_lifecycle_wait_ms(u64::from(cli.lock_timeout_ms));
     let selection = DeviceSelection {
         explicit_device: cli
             .device

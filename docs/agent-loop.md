@@ -244,3 +244,14 @@ view.
   rules, and replay.
 - [debugging.md](debugging.md) — `why`/`log`/`collect`, the Android Studio
   debugger surface, logpoints, and layout inspection.
+
+### Concurrent command batches
+
+Check every command's exit status; the last successful shell command does not
+make earlier failures successful. Serialize device lifecycle changes. For a
+short, expected contention window, `--lock-timeout-ms 2000` waits up to two
+seconds **per lifecycle lock acquisition** before returning retryable
+`device_lifecycle_busy` with `waited_ms`. The default remains zero, and the
+maximum is 30000. Waiting never removes a lock file or takes ownership from
+another process. Long-running command orchestration should still set its own
+overall deadline.

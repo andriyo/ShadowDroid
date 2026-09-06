@@ -52,7 +52,7 @@ Treat stdout as data and the process exit code as authoritative:
   few setup/report commands default to human output — request `--json`.
 
 Check each child’s exit status in batches. Serialize device lifecycle changes;
-retry `device_lifecycle_busy` within a deadline. Never delete an active lock.
+use `--lock-timeout-ms 2000` for bounded contention. Never delete an active lock.
 
 Branch on `ok`/`code`, inspect `detail`, follow the most relevant
 `next_actions` entry; never parse `msg` to recover state. Inside a `watch`
