@@ -34,6 +34,23 @@ On a `watch` stream, completed `http`, held `http_intercept`, and `tls_error`
 events carry exact device-scoped `next_actions`; act on a held flow before its
 `hold_deadline_ms` rather than waiting for the stream to finish.
 
+`net intercept --clear` disarms HTTP interception. It first checks daemon support;
+an older daemon returns `net_http_intercept_clear_unsupported` without changing
+its matcher. To disarm WebSocket frame
+interception, use `net intercept --dir c2s --clear` (either direction selects
+the single WebSocket matcher). Each command leaves the other protocol's
+matcher unchanged. Already-held flows/frames retain their deadlines and must
+still be released with `net resume`, `net drop`, or `net respond` (HTTP only).
+
+`net drop <http-id>` returns HTTP 502 by default; `--set-status` selects another
+HTTP status. Use `net drop <http-id> --transport` to abort the downstream HTTP
+connection/stream before sending any response status or body. Holding at
+`--at response --status 200` first proves the upstream completed successfully,
+so this models a lost successful response. Its persisted flow retains that
+upstream status/body and is marked `intercept:transport_abort` with an error;
+the app did not receive that status. `--transport` is HTTP-only and conflicts
+with `--set-status`; it does not drop a WebSocket frame.
+
 `net start` returns a stable `capture_session_id`; every flow and TLS failure
 carries it. Use `net log --session`, `--since 2m`, `--after-id`,
 `--after-checkpoint`, or `--rule-id` to isolate one test phase. `net checkpoint`

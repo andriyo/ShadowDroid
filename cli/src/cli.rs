@@ -1238,7 +1238,8 @@ pub enum NetCmd {
         /// With --dir: only intercept frames of this opcode.
         #[arg(long, value_parser = ["text", "binary", "ping", "pong", "close"], requires = "dir")]
         opcode: Option<String>,
-        /// Disarm interception (clears the armed matcher).
+        /// Disarm HTTP interception, or WebSocket interception with --dir.
+        /// Already-held flows/frames keep their existing release/deadline lifecycle.
         #[arg(long)]
         clear: bool,
         /// Hold at the request phase, response phase, or both (HTTP only).
@@ -1285,12 +1286,15 @@ pub enum NetCmd {
         #[arg(long)]
         set_url: Option<String>,
     },
-    /// Kill a held flow (device sees a connection error, or the given status).
+    /// Drop a held flow (HTTP 502 by default), or abort its transport explicitly.
     Drop {
         id: String,
-        /// Return this status to the device instead of a connection error.
+        /// Return this HTTP status instead of the default 502.
         #[arg(long)]
         set_status: Option<u16>,
+        /// Abort the HTTP connection/stream without sending a response status or body.
+        #[arg(long, conflicts_with = "set_status")]
+        transport: bool,
     },
     /// Short-circuit a held request with a canned response (never hits the server).
     Respond {
@@ -3310,7 +3314,7 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
             hold_ms,
             on_timeout,
         } => {
-            if dir.is_some() || *clear {
+            if dir.is_some() {
                 nc::ws_intercept(
                     serial,
                     nc::WsInterceptOpts {
@@ -3330,6 +3334,7 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
                     at.clone(),
                     *hold_ms,
                     on_timeout.clone(),
+                    *clear,
                 )
                 .await
             }
@@ -3387,7 +3392,11 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
             };
             nc::resume(serial, id, mutation, ws_payload).await
         }
-        NetCmd::Drop { id, set_status } => nc::drop_flow(serial, id, *set_status).await,
+        NetCmd::Drop {
+            id,
+            set_status,
+            transport,
+        } => nc::drop_flow(serial, id, *set_status, *transport).await,
         NetCmd::Respond {
             id,
             set_status,

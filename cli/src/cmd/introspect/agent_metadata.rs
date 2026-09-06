@@ -1178,7 +1178,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "next_actions": ["watch", "net log", "ui dump"]
         })),
         "net drop" => Some(serde_json::json!({
-            "use_when": ["Need the app to experience a held request as a connection failure or explicit status."],
+            "use_when": ["Need a held HTTP flow to return 502 or an explicit status, or use --transport to abort without sending HTTP response headers/body."],
             "output": "release result JSON with phase and lifecycle timestamps; terminal races name their exact state",
             "side_effects": ["unblocks a held HTTP flow with failure behavior"],
             "next_actions": ["watch", "ui dump"]

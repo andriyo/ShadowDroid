@@ -337,8 +337,10 @@ impl Drop for HeldFlow {
 pub enum HoldDecision {
     /// Continue (optionally mutated).
     Resume(Mutation),
-    /// Kill it; the device sees a connection error or this status.
+    /// Return the requested HTTP status (502 when omitted).
     Drop(Option<u16>),
+    /// Fail the downstream HTTP service before sending any response headers.
+    AbortTransport,
     /// Short-circuit with a canned response (request phase = never hits upstream).
     Respond {
         status: u16,
@@ -346,6 +348,17 @@ pub enum HoldDecision {
         headers: Vec<(String, String)>,
     },
 }
+
+#[derive(Debug)]
+struct TransportAborted;
+
+impl std::fmt::Display for TransportAborted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("downstream transport aborted by net intercept")
+    }
+}
+
+impl std::error::Error for TransportAborted {}
 
 /// Build the upstream reqwest client. Doesn't follow redirects (we pass them to
 /// the app). By default it accepts invalid upstream certs — this is a debugging
@@ -422,7 +435,7 @@ async fn handle(
     ctx: Arc<ProxyContext>,
     req: Request<Incoming>,
     tunnel: Option<(Scheme, Authority)>,
-) -> Result<Response<ProxyBody>, Infallible> {
+) -> Result<Response<ProxyBody>, std::io::Error> {
     if req.method() == Method::CONNECT {
         return Ok(process_connect(ctx, req));
     }
@@ -436,6 +449,10 @@ async fn handle(
     let method = req.method().clone();
     match proxy_request(ctx, req, tunnel).await {
         Ok(resp) => Ok(resp),
+        Err(e) if e.is::<TransportAborted>() => Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            TransportAborted,
+        )),
         Err(e) => {
             tracing::debug!("proxy_request error: {e}");
             Ok(error_response_for(
@@ -1290,6 +1307,7 @@ async fn proxy_request(
         if let Some(decision) = hold(&ctx, snap, "request").await {
             match decision {
                 HoldDecision::Drop(s) => return Ok(drop_response(&method, s)),
+                HoldDecision::AbortTransport => return Err(TransportAborted.into()),
                 HoldDecision::Respond {
                     status,
                     body,
@@ -1614,6 +1632,7 @@ async fn proxy_request(
         if let Some(decision) = hold(&ctx, snap, "response").await {
             match decision {
                 HoldDecision::Drop(s) => return Ok(drop_response(&method, s)),
+                HoldDecision::AbortTransport => return Err(TransportAborted.into()),
                 HoldDecision::Respond {
                     status: rs,
                     body,
@@ -2356,6 +2375,17 @@ async fn hold(ctx: &ProxyContext, snap: FlowRecord, phase: &'static str) -> Opti
         },
     )
     .await;
+    if matches!(decision, HoldDecision::AbortTransport) {
+        // Persist the upstream result even though the app receives no response.
+        // The status remains the observed upstream status; error/matched identify
+        // the downstream failure instead of manufacturing an HTTP 502.
+        let mut aborted = snap;
+        aborted.error = Some(TransportAborted.to_string());
+        aborted.matched = Some("intercept:transport_abort".into());
+        aborted.modified = true;
+        aborted.upstream_bypassed = phase == "request";
+        finish_capture(ctx, aborted);
+    }
     Some(decision)
 }
 
@@ -3341,10 +3371,11 @@ mod tests {
     use hyper::body::Frame;
     use std::collections::HashMap;
     use std::io;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::Poll;
     use std::time::Duration;
+    use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::oneshot;
 
     async fn self_signed_tls_handshake(verify_upstream: bool) -> bool {
@@ -4058,6 +4089,284 @@ mod tests {
 
     fn fail_open() -> HoldDecision {
         HoldDecision::Resume(Mutation::default())
+    }
+
+    #[tokio::test]
+    async fn transport_drop_sends_no_http_response_after_upstream_200() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for (phase, transport, explicit_status) in [
+            ("response", true, None),
+            ("request", true, None),
+            ("response", false, None),
+            ("response", false, Some(401)),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::default();
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            let cert = params.self_signed(&key).unwrap();
+            let cert_path = dir.path().join("root.crt");
+            let key_path = dir.path().join("root.key");
+            std::fs::write(&cert_path, cert.pem()).unwrap();
+            std::fs::write(&key_path, key.serialize_pem()).unwrap();
+            let ca = crate::net::ca::CertAuthority::load_from_files(&cert_path, &key_path).unwrap();
+            let (flow_tx, mut flow_rx) = tokio::sync::mpsc::channel(4);
+            let shared = Arc::new(shared_with_rules(vec![]));
+            *shared.intercept.write().unwrap() = Some(super::InterceptCfg {
+                matcher: crate::net::Matcher::default(),
+                at_request: phase == "request",
+                at_response: phase == "response",
+                hold_ms: 5000,
+                on_timeout_drop: false,
+            });
+            let ctx = Arc::new(super::ProxyContext {
+                ca,
+                client: super::build_upstream_client(false),
+                flow_tx,
+                shared: shared.clone(),
+                serial: "intercept-test".into(),
+                capture_session_id: "transport-test".into(),
+                verify_upstream: false,
+                tasks: tokio_util::task::TaskTracker::new(),
+                shutdown: tokio_util::sync::CancellationToken::new(),
+            });
+            let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let upstream_addr = upstream.local_addr().unwrap();
+            let processed = Arc::new(AtomicUsize::new(0));
+            let upstream_processed = processed.clone();
+            let upstream_task = tokio::spawn(async move {
+                let (mut socket, _) = upstream.accept().await.unwrap();
+                let mut request = vec![];
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") {
+                    socket.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                }
+                let mut body = [0; 3];
+                socket.read_exact(&mut body).await.unwrap();
+                assert_eq!(&body, b"old");
+                upstream_processed.fetch_add(1, Ordering::SeqCst);
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 22\r\nConnection: close\r\n\r\n{\"refreshToken\":\"new\"}").await.unwrap();
+            });
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let proxy_addr = listener.local_addr().unwrap();
+            let (stop_tx, stop_rx) = oneshot::channel();
+            let proxy_task = tokio::spawn(super::serve(ctx.clone(), listener, stop_rx));
+            let mut downstream = TcpStream::connect(proxy_addr).await.unwrap();
+            downstream.write_all(format!("POST http://{upstream_addr}/refresh HTTP/1.1\r\nHost: {upstream_addr}\r\nContent-Length: 3\r\nConnection: close\r\n\r\nold").as_bytes()).await.unwrap();
+            let held = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let candidate = shared
+                        .held
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .next()
+                        .map(|h| h.meta.clone());
+                    if let Some(candidate) = candidate {
+                        break candidate;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(held.status, (phase == "response").then_some(200));
+            assert_eq!(
+                processed.load(Ordering::SeqCst),
+                usize::from(phase == "response")
+            );
+            if phase == "response" {
+                assert_eq!(
+                    held.resp_body.as_deref(),
+                    Some("{\"refreshToken\":\"new\"}")
+                );
+            }
+            let reply = interception_control_request(
+                shared.clone(),
+                serde_json::json!({
+                    "op": "drop", "id": held.id, "transport": transport, "status": explicit_status
+                }),
+            )
+            .await;
+            assert_eq!(reply["released"], true);
+            assert_eq!(
+                reply["action"],
+                if transport { "abort_transport" } else { "drop" }
+            );
+            let mut response = vec![];
+            let read = tokio::time::timeout(
+                Duration::from_secs(3),
+                downstream.read_to_end(&mut response),
+            )
+            .await
+            .unwrap();
+            if transport {
+                assert!(
+                    response.is_empty(),
+                    "no HTTP headers or body may reach the app: {response:?}"
+                );
+                if let Err(error) = read {
+                    assert!(matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::UnexpectedEof
+                    ));
+                }
+                let captured = tokio::time::timeout(Duration::from_secs(1), flow_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(captured.status, held.status);
+                assert_eq!(captured.resp_body, held.resp_body);
+                assert_eq!(captured.upstream_bypassed, phase == "request");
+                assert_eq!(captured.detail(false)["ok"], false);
+                let event = serde_json::to_value(captured.http_event(&ctx.serial)).unwrap();
+                assert_eq!(event["ok"], false);
+                assert_eq!(event["status"], serde_json::json!(held.status));
+                assert_eq!(
+                    captured.matched.as_deref(),
+                    Some("intercept:transport_abort")
+                );
+                assert!(
+                    captured
+                        .error
+                        .unwrap()
+                        .contains("downstream transport aborted")
+                );
+            } else {
+                read.unwrap();
+                let expected = format!("HTTP/1.1 {}", explicit_status.unwrap_or(502));
+                assert!(String::from_utf8_lossy(&response).starts_with(&expected));
+            }
+            let _ = stop_tx.send(());
+            ctx.shutdown.cancel();
+            proxy_task.await.unwrap().unwrap();
+            ctx.tasks.close();
+            ctx.tasks.wait().await;
+            upstream_task.abort();
+            let _ = upstream_task.await;
+        }
+    }
+
+    async fn interception_control_request(
+        shared: Arc<super::SharedState>,
+        request: serde_json::Value,
+    ) -> serde_json::Value {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = Arc::new(crate::net::control::DaemonState {
+            serial: "intercept-test".into(),
+            port: addr.port(),
+            host_port: addr.port(),
+            startup_id: "test".into(),
+            pid: std::process::id(),
+            started: crate::events::now_ts(),
+            capture_session_id: "test".into(),
+            checkpoint_count: AtomicU64::new(0),
+            ca_fingerprint: "test".into(),
+            flow_count: AtomicU64::new(0),
+            events: shared.events.clone(),
+        });
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (stop_tx, _stop_rx) = tokio::sync::mpsc::channel(1);
+            crate::net::control::serve_client(stream, state, shared, stop_tx)
+                .await
+                .unwrap();
+        });
+        let reply = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut stream = BufReader::new(TcpStream::connect(addr).await.unwrap());
+            stream
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            serde_json::from_str(&line).unwrap()
+        })
+        .await
+        .unwrap();
+        server.await.unwrap();
+        reply
+    }
+
+    #[tokio::test]
+    async fn intercept_clear_disarms_only_selected_protocol_and_preserves_held_lifecycle() {
+        use serde_json::json;
+
+        let shared = Arc::new(shared_with_rules(vec![]));
+        let arm_http = json!({"op": "intercept", "matcher": {"host": "example.com"}});
+        assert_eq!(
+            interception_control_request(shared.clone(), arm_http.clone()).await["intercepting"],
+            true
+        );
+        interception_control_request(shared.clone(), json!({"op": "ws_intercept", "dir": "c2s"}))
+            .await;
+        let mut decision = insert_held(&shared.held, "f1");
+        shared.held_bytes.store(123, Ordering::Relaxed);
+        shared
+            .held
+            .lock()
+            .unwrap()
+            .get_mut("f1")
+            .unwrap()
+            .held_charge = Some((shared.held_bytes.clone(), 123));
+        let before = interception_control_request(shared.clone(), json!({"op": "status"})).await;
+        assert_eq!(before["intercepting"], true);
+        assert_eq!(before["ws_intercepting"], true);
+        assert_eq!(before["held"], 1);
+
+        // Repeated clear must stay disarmed, without altering a live hold or the WS matcher.
+        for _ in 0..2 {
+            let reply = interception_control_request(
+                shared.clone(),
+                json!({"op": "intercept", "clear": true}),
+            )
+            .await;
+            assert_eq!(reply, json!({"ok": true, "intercepting": false}));
+            let status =
+                interception_control_request(shared.clone(), json!({"op": "status"})).await;
+            assert_eq!(status["intercepting"], false);
+            assert_eq!(status["ws_intercepting"], true);
+            assert_eq!(status["held"], 1);
+            assert_eq!(status["held_flows"], before["held_flows"]);
+            assert_eq!(status["held_bytes"], 123);
+            assert!(matches!(
+                decision.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert!(shared.terminal_holds.lock().unwrap().get("f1").is_none());
+        }
+
+        // WS clear also leaves the HTTP matcher alone.
+        interception_control_request(shared.clone(), arm_http).await;
+        let reply = interception_control_request(
+            shared.clone(),
+            json!({"op": "ws_intercept", "clear": true}),
+        )
+        .await;
+        assert_eq!(reply["intercepting"], false);
+        assert!(shared.intercept.read().unwrap().is_some());
+        assert!(shared.ws_intercept.read().unwrap().is_none());
+
+        // The pre-existing hold remains explicitly releasable with its original timestamps.
+        let reply =
+            interception_control_request(shared.clone(), json!({"op": "resume", "id": "f1"})).await;
+        assert_eq!(reply["released"], true);
+        assert_eq!(reply["state"], "released");
+        assert!(matches!(decision.await.unwrap(), HoldDecision::Resume(_)));
+        assert!(shared.held.lock().unwrap().is_empty());
+        assert_eq!(shared.held_bytes.load(Ordering::Relaxed), 0);
+        let terminal = shared.terminal_holds.lock().unwrap().get("f1").unwrap();
+        assert_eq!(terminal.state, "released");
+        assert_eq!(terminal.action.as_deref(), Some("resume"));
+        assert_eq!(reply["held_at"], terminal.held_at);
+        assert_eq!(reply["expires_at"], terminal.expires_at);
     }
 
     #[test]

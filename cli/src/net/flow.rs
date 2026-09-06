@@ -108,7 +108,7 @@ pub struct FlowRecord {
 
 impl FlowRecord {
     pub fn ok(&self) -> bool {
-        matches!(self.status, Some(s) if (200..400).contains(&s))
+        self.error.is_none() && matches!(self.status, Some(s) if (200..400).contains(&s))
     }
 
     /// AND over the matcher's present fields (case-insensitive substring for

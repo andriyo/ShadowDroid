@@ -365,6 +365,8 @@ pub async fn serve_client(
                     "capabilities": {
                         "replay_bundle_format": crate::net::replay::REPLAY_FORMAT_VERSION,
                         "replay_atomic_replace": true,
+                        "http_transport_abort": true,
+                        "http_intercept_clear": true,
                     },
                     "capture_redaction": capture_redaction_status(shared.redaction.as_ref()),
                     "replay": replay_status(&shared.replay),
@@ -383,6 +385,11 @@ pub async fn serve_client(
             .await?;
         }
         "intercept" => {
+            if req.get("clear").and_then(Value::as_bool) == Some(true) {
+                *shared.intercept.write().unwrap() = None;
+                write_json(&mut wr, &json!({"ok": true, "intercepting": false})).await?;
+                return Ok(());
+            }
             let matcher: Matcher = req
                 .get("matcher")
                 .cloned()
@@ -469,17 +476,30 @@ pub async fn serve_client(
         }
         "drop" => {
             let id = req.get("id").and_then(Value::as_str).unwrap_or("");
+            let transport = req
+                .get("transport")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let status = request_status_field(&req, "status", None)?;
+            if transport && (status.is_some() || id.starts_with('w')) {
+                write_json(&mut wr, &json!({"ok": false, "error": "transport abort requires an HTTP flow and cannot specify an HTTP status"})).await?;
+                return Ok(());
+            }
             if let Some(reply) =
                 ws_release(&shared, id, crate::net::ws::WsHoldDecision::Drop, "drop")
             {
                 write_json(&mut wr, &reply).await?;
                 return Ok(());
             }
-            let status = request_status_field(&req, "status", None)?;
-            let decision = HoldDecision::Drop(status);
+            let decision = if transport {
+                HoldDecision::AbortTransport
+            } else {
+                HoldDecision::Drop(status)
+            };
             match validate_held_decision(&shared, id, &decision) {
                 Ok(()) => {
-                    let released = release(&shared, id, "drop", decision);
+                    let action = if transport { "abort_transport" } else { "drop" };
+                    let released = release(&shared, id, action, decision);
                     write_json(&mut wr, &released_reply(&shared, id, released)).await?;
                 }
                 Err(error) => {
@@ -1043,6 +1063,7 @@ fn validate_held_decision(
         return Ok(());
     };
     match decision {
+        HoldDecision::AbortTransport => {}
         HoldDecision::Drop(status) => {
             if let Some(status) = status {
                 validate_final_status(*status)?;

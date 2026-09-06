@@ -56,6 +56,23 @@ agent inspects with `net show`, then releases with
 `net resume --set-status/--body/…`, `net drop`, or `net respond` (a canned
 reply).
 
+HTTP `net drop <id>` returns 502 by default; `--set-status` returns an explicit
+HTTP status. Use `net drop <id> --transport` to abort the downstream connection
+or HTTP/2 stream without sending a response status/body. For a lost successful
+refresh response, first intercept the response with `--at response --status 200`
+and inspect it before the transport abort. Capture retains the upstream 200 and
+body, marked `intercept:transport_abort` and a downstream error. The app never
+received that 200. This mode requires a current daemon, is HTTP-only, and cannot
+be combined with `--set-status`.
+
+`net intercept --clear` disarms HTTP interception. It first checks daemon support;
+an older daemon returns `net_http_intercept_clear_unsupported` without changing
+its matcher. With `--dir c2s` or
+`--dir s2c`, it disarms the single WebSocket interception matcher instead.
+The other protocol's matcher is unchanged. Clearing does not release flows
+or frames already held: they keep their deadlines and remain actionable with
+the usual release commands.
+
 ## Declarative rules
 
 Repeated edits can be promoted to declarative `net rule`s (map-local /

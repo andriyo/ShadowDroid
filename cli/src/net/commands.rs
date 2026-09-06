@@ -2898,12 +2898,33 @@ pub async fn intercept(
     at: String,
     hold_ms: u32,
     on_timeout: String,
+    clear: bool,
 ) -> Result<()> {
-    let reply = checked_control_reply("intercept", control::request(
-        serial,
-        json!({"op": "intercept", "matcher": matcher, "at": at, "hold_ms": hold_ms, "on_timeout": on_timeout}),
-    )
-    .await?)?;
+    let request = if clear {
+        // Older daemons ignore `clear` and would arm an unrestricted matcher.
+        // Check support before sending a mutation to a long-running daemon.
+        let status = checked_control_reply(
+            "status",
+            control::request(serial, json!({"op": "status"})).await?,
+        )?;
+        if status
+            .pointer("/capabilities/http_intercept_clear")
+            .and_then(Value::as_bool)
+            != Some(true)
+        {
+            return Err(crate::diagnostic::DiagnosticError::new(
+                "net_http_intercept_clear_unsupported",
+                "net",
+                "running proxy daemon cannot clear HTTP interception; its matcher was left untouched",
+            )
+            .next_actions(["restart the proxy with this ShadowDroid binary before clearing HTTP interception"])
+            .into());
+        }
+        json!({"op": "intercept", "clear": true})
+    } else {
+        json!({"op": "intercept", "matcher": matcher, "at": at, "hold_ms": hold_ms, "on_timeout": on_timeout})
+    };
+    let reply = checked_control_reply("intercept", control::request(serial, request).await?)?;
     emit("net_intercept", reply);
     Ok(())
 }
@@ -2952,10 +2973,47 @@ pub async fn ws_intercept(serial: &Serial, opts: WsInterceptOpts) -> Result<()> 
     Ok(())
 }
 
-pub async fn drop_flow(serial: &Serial, id: &str, status: Option<u16>) -> Result<()> {
+pub async fn drop_flow(
+    serial: &Serial,
+    id: &str,
+    status: Option<u16>,
+    transport: bool,
+) -> Result<()> {
+    if transport && id.starts_with('w') {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "net_transport_http_only",
+            "net",
+            "--transport applies to held HTTP flows, not WebSocket messages",
+        )
+        .next_actions(["use `net drop <message-id>` to drop a held WebSocket frame"])
+        .into());
+    }
+    if transport {
+        let status = checked_control_reply(
+            "status",
+            control::request(serial, json!({"op": "status"})).await?,
+        )?;
+        if status
+            .pointer("/capabilities/http_transport_abort")
+            .and_then(Value::as_bool)
+            != Some(true)
+        {
+            return Err(crate::diagnostic::DiagnosticError::new(
+                "net_transport_abort_unsupported",
+                "net",
+                "running proxy daemon cannot abort HTTP transport; the held flow was left untouched",
+            )
+            .next_actions(["restart the proxy with this ShadowDroid binary, then re-arm the experiment"])
+            .into());
+        }
+    }
     let reply = checked_control_reply(
         "drop",
-        control::request(serial, json!({"op": "drop", "id": id, "status": status})).await?,
+        control::request(
+            serial,
+            json!({"op": "drop", "id": id, "status": status, "transport": transport}),
+        )
+        .await?,
     )?;
     emit("net_drop", reply);
     Ok(())
