@@ -1844,10 +1844,19 @@ async fn run_inner() -> Result<()> {
             .unwrap_or_default(),
     )?;
     let selection = DeviceSelection {
-        explicit_device: cli.device.clone(),
+        explicit_device: cli
+            .device
+            .as_deref()
+            .map(crate::device_ref::resolve)
+            .transpose()?,
         requested_target: cli.target.clone(),
         takeover: cli.takeover,
     };
+    if selection.explicit_device.is_none()
+        && let Some(target) = selection.target_name(&config)
+    {
+        crate::events::set_current_target(target.to_owned());
+    }
     let apk = cli.apk;
     let project = cli
         .project_root

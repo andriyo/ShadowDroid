@@ -175,7 +175,7 @@ const UPDATE_EFFECTS: &[E] = &[
     E::NetworkDownload,
     E::UnboundedExternalCommand,
 ];
-const DEVICE_INVENTORY: &[E] = &[E::HostRead, E::DeviceRead];
+const DEVICE_INVENTORY: &[E] = &[E::HostRead, E::HostWrite, E::DeviceRead];
 const TARGET_READ: &[E] = &[
     E::HostRead,
     E::HostWrite,
@@ -289,8 +289,8 @@ const NET_STOP_EFFECTS: &[E] = &[
     E::ProcessStop,
     E::PortMappingMutate,
 ];
-const DEBUGGER_READ: &[E] = &[E::HostRead, E::DeviceRead];
-const DEBUGGER_MUTATE: &[E] = &[E::HostRead, E::DeviceRead, E::DeviceMutate];
+const DEBUGGER_READ: &[E] = &[E::HostRead, E::HostWrite, E::DeviceRead];
+const DEBUGGER_MUTATE: &[E] = &[E::HostRead, E::HostWrite, E::DeviceRead, E::DeviceMutate];
 const DEBUGGER_PERSISTENT_MUTATE: &[E] =
     &[E::HostRead, E::HostWrite, E::DeviceRead, E::DeviceMutate];
 const APP_STATE_EFFECTS: &[E] = &[
@@ -408,11 +408,23 @@ fn leaf_contract(path: &str) -> Option<LeafEffectContract> {
         | "debug coroutines flow"
         | "debug watch list" => leaf(DEBUGGER_READ, CONFIG),
         "debug attach" => leaf(
-            &[E::HostRead, E::DeviceRead, E::DeviceMutate, E::ProcessStart],
+            &[
+                E::HostRead,
+                E::HostWrite,
+                E::DeviceRead,
+                E::DeviceMutate,
+                E::ProcessStart,
+            ],
             &[D::ConfigLoad, D::ManagedProcessStart],
         ),
         "debug stop" => leaf(
-            &[E::HostRead, E::DeviceRead, E::DeviceMutate, E::ProcessStop],
+            &[
+                E::HostRead,
+                E::HostWrite,
+                E::DeviceRead,
+                E::DeviceMutate,
+                E::ProcessStop,
+            ],
             &[D::ConfigLoad, D::ManagedProcessStop],
         ),
         "debug break line"

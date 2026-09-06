@@ -43,6 +43,7 @@ mod cmd;
 mod config;
 mod crashscan;
 mod device;
+mod device_ref;
 mod diagnostic;
 mod events;
 mod fusion;

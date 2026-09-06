@@ -17,6 +17,11 @@ const MAX_NEXT_ACTIONS: usize = 5;
 /// terminal emitter can attach the same catalog-backed decision guidance.
 static CURRENT_COMMAND_PATH: OnceLock<String> = OnceLock::new();
 static CURRENT_DEVICE: OnceLock<String> = OnceLock::new();
+static CURRENT_TARGET: OnceLock<String> = OnceLock::new();
+
+pub fn set_current_target(target: String) {
+    let _ = CURRENT_TARGET.set(target);
+}
 
 pub fn set_current_command_path(path: String) {
     let _ = CURRENT_COMMAND_PATH.set(path);
@@ -1457,10 +1462,62 @@ fn specialize_action(template: &str, map: &serde_json::Map<String, serde_json::V
         && let Some(command) = action.strip_prefix("shadowdroid ")
         && !command.starts_with("-d ")
         && !command.starts_with("--device ")
+        && !command.starts_with("--target ")
     {
-        action = format!("shadowdroid -d {} {command}", shell_token(&device));
+        if let Some(target) = CURRENT_TARGET.get() {
+            action = format!("shadowdroid --target {} {command}", shell_token(target));
+        } else if !device.starts_with("avd:") {
+            action = format!("shadowdroid -d {} {command}", shell_token(&device));
+        }
+    }
+    if crate::redaction::active_policy().is_some() {
+        action = redact_recovery_device(&action, crate::device_ref::register);
     }
     action
+}
+
+// Read the scope from the command itself: inventory actions may each select a
+// different device, with no top-level device in the surrounding envelope.
+fn redact_recovery_device(
+    action: &str,
+    register: impl Fn(&str) -> anyhow::Result<String>,
+) -> String {
+    let Some(mut words) = crate::cmd::introspect::split_shell_words(action) else {
+        return action.into();
+    };
+    if words.first().map(String::as_str) != Some("shadowdroid") {
+        return action.into();
+    }
+    let scope = if words.get(1).map(String::as_str) == Some("--redact") {
+        2
+    } else {
+        1
+    };
+    if matches!(
+        words.get(scope).map(String::as_str),
+        Some("-d" | "--device")
+    ) {
+        let Some(device) = words.get_mut(scope + 1) else {
+            return "shadowdroid --redact devices".into();
+        };
+        if device.starts_with("avd:") || device.contains('<') {
+            return "shadowdroid --redact devices".into();
+        }
+        if !device.starts_with("@sd-device-") {
+            match register(device) {
+                Ok(handle) => *device = handle,
+                Err(_) => return "shadowdroid --redact devices".into(),
+            }
+        }
+    }
+    if scope == 1 {
+        words.insert(1, "--redact".into());
+    }
+    words
+        .iter()
+        .map(|word| shell_token(word))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn executable_action(template: &str, map: &serde_json::Map<String, serde_json::Value>) -> String {
@@ -1492,9 +1549,10 @@ fn observed_value(map: &serde_json::Map<String, serde_json::Value>, key: &str) -
 }
 
 pub(crate) fn shell_token(value: &str) -> String {
-    if value
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || "._:/@+-=".contains(ch))
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || "._:/@+-=".contains(ch))
     {
         value.to_string()
     } else {
@@ -1685,6 +1743,16 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_lock_identity_is_not_an_adb_serial() {
+        let map = serde_json::json!({"detail":{"device":"avd:TV-default"}})
+            .as_object()
+            .unwrap()
+            .clone();
+        let action = specialize_action("shadowdroid commands --json --describe 'files pull'", &map);
+        assert!(!action.contains("-d avd:"), "{action}");
+    }
+
+    #[test]
     fn dynamic_values_are_shell_quoted_and_device_scoped() {
         let map = serde_json::json!({
             "device": "emulator-5554; unsafe",
@@ -1734,6 +1802,65 @@ mod tests {
         assert_eq!(
             dynamic_next_actions(Some("devices"), &map),
             ["shadowdroid -d emulator-5554 connect"]
+        );
+    }
+
+    #[test]
+    fn redacted_inventory_actions_keep_each_explicit_device_and_survive_policy() {
+        let map = serde_json::json!({"devices": [
+            {"serial":"emulator-5554", "state":"device"},
+            {"serial":"quoted serial's value", "state":"device"}
+        ]})
+        .as_object()
+        .unwrap()
+        .clone();
+        let actions = dynamic_next_actions(Some("devices"), &map);
+        let mut result = Vec::new();
+        for action in actions {
+            result.push(redact_recovery_device(&action, |serial| {
+                Ok(match serial {
+                    "emulator-5554" => "@sd-device-first",
+                    "quoted serial's value" => "@sd-device-second",
+                    _ => panic!("unexpected serial"),
+                }
+                .into())
+            }));
+        }
+        let output = crate::redaction::Policy::builtin().redact_output(serde_json::json!({
+            "devices":map["devices"], "next_actions":result
+        }));
+        assert_eq!(
+            output["next_actions"],
+            serde_json::json!([
+                "shadowdroid --redact -d @sd-device-first connect",
+                "shadowdroid --redact -d @sd-device-second connect"
+            ])
+        );
+    }
+
+    #[test]
+    fn redacted_recovery_preserves_handles_arguments_and_rejects_lock_identifiers() {
+        let untouched = |_: &str| -> anyhow::Result<String> { panic!("must not create a handle") };
+        assert_eq!(
+            redact_recovery_device(
+                "shadowdroid --redact --device @sd-device-existing ui type ''",
+                untouched
+            ),
+            "shadowdroid --redact --device @sd-device-existing ui type ''"
+        );
+        assert_eq!(
+            redact_recovery_device("shadowdroid -d avd:TV-default connect", untouched),
+            "shadowdroid --redact devices"
+        );
+        assert_eq!(
+            redact_recovery_device("shadowdroid --target tv video status", untouched),
+            "shadowdroid --redact --target tv video status"
+        );
+        assert_eq!(
+            redact_recovery_device("shadowdroid -d serial connect", |_| anyhow::bail!(
+                "unavailable"
+            )),
+            "shadowdroid --redact devices"
         );
     }
 

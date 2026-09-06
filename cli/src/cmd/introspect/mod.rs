@@ -548,11 +548,12 @@ fn materialize_action_template(command: &str) -> String {
     output
 }
 
-fn split_shell_words(command: &str) -> Option<Vec<String>> {
+pub(crate) fn split_shell_words(command: &str) -> Option<Vec<String>> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut quote = None;
     let mut escaped = false;
+    let mut started = false;
     for ch in command.chars() {
         if escaped {
             word.push(ch);
@@ -560,10 +561,12 @@ fn split_shell_words(command: &str) -> Option<Vec<String>> {
             continue;
         }
         if ch == '\\' && quote != Some('\'') {
+            started = true;
             escaped = true;
             continue;
         }
         if matches!(ch, '\'' | '"') {
+            started = true;
             if quote == Some(ch) {
                 quote = None;
             } else if quote.is_none() {
@@ -574,17 +577,19 @@ fn split_shell_words(command: &str) -> Option<Vec<String>> {
             continue;
         }
         if ch.is_whitespace() && quote.is_none() {
-            if !word.is_empty() {
+            if started {
                 words.push(std::mem::take(&mut word));
+                started = false;
             }
         } else {
+            started = true;
             word.push(ch);
         }
     }
     if escaped || quote.is_some() {
         return None;
     }
-    if !word.is_empty() {
+    if started {
         words.push(word);
     }
     (!words.is_empty()).then_some(words)

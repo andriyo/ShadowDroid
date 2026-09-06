@@ -120,3 +120,14 @@ reachable and never installs, starts, or forwards anything to get a screen.
 must already be online, it only reads server-backed evidence through an
 already-established session, and it never starts an AVD, server, or adb
 forward. Its manifest records privacy status per artifact.
+
+### Recovery without exposing device serials
+
+With `--redact`, device-scoped recovery commands use local `@sd-…` handles
+accepted by `--device`, or the selected project `--target`. Handle mappings
+live under `~/.shadowdroid/device-refs` (0600 files in a 0700 directory on
+Unix). They work only on that host; deleting a mapping invalidates its handle.
+They are not credentials. Device details and application session identifiers
+remain redacted, and suggested follow-ups retain `--redact`.
+Internal lifecycle identities such as `avd:TV-default` are never emitted as
+ADB serial arguments.
