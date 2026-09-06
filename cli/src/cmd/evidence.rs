@@ -247,7 +247,10 @@ fn preference_json(bytes: &[u8], key: &str) -> Result<Value> {
                     for attribute in e.attributes() {
                         let attribute = attribute?;
                         if attribute.key.as_ref() == b"name"
-                            && attribute.unescape_value()?.as_ref() == key
+                            && attribute
+                                .normalized_value(quick_xml::XmlVersion::Implicit1_0)?
+                                .as_ref()
+                                == key
                         {
                             if selected.is_some() {
                                 bail!("duplicate preference key");
