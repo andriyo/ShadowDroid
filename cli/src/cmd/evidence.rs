@@ -258,7 +258,12 @@ fn preference_json(bytes: &[u8], key: &str) -> Result<Value> {
                     }
                 }
             }
-            Event::Text(e) if collecting => text.push_str(&e.unescape()?),
+            Event::Text(e) if collecting => text.push_str(&e.decode()?),
+            // quick-xml emits references separately from text. Resolve the
+            // predefined/numeric entities and reject unknown names as before.
+            Event::GeneralRef(e) if collecting => {
+                text.push_str(&quick_xml::escape::unescape(&format!("&{};", e.decode()?))?);
+            }
             Event::CData(e) if collecting => text.push_str(std::str::from_utf8(e.as_ref())?),
             Event::End(_) => {
                 if collecting && depth == 2 {
@@ -713,6 +718,29 @@ mod tests {
             .is_err()
         );
         assert!(preference_json(br#"<!DOCTYPE map><map/>"#, "x").is_err());
+    }
+
+    #[test]
+    fn preference_xml_preserves_references_and_checks_duplicate_attributes() {
+        let xml = br#"<map><string name="a&amp;b">{"symbols":"&amp;&lt;&gt;&apos;","quote":"\&quot;","unicode":"&#65;&#x1F680;","mixed":"before<![CDATA[ & literal]]>after"}</string></map>"#;
+        assert_eq!(
+            preference_json(xml, "a&b").unwrap(),
+            json!({"symbols":"&<>'","quote":"\"","unicode":"A🚀","mixed":"before & literalafter"})
+        );
+        assert!(
+            preference_json(
+                br#"<map><string name="x">{"value":"&unknown;"}</string></map>"#,
+                "x"
+            )
+            .is_err()
+        );
+
+        // Cross the parser's small-attribute threshold and ensure a duplicate
+        // near the end is still rejected by its bounded-complexity check.
+        let attributes = (0..128).map(|i| format!(" a{i}=\"v\"")).collect::<String>();
+        let xml =
+            format!("<map><string name=\"x\"{attributes} a127=\"duplicate\">{{}}</string></map>");
+        assert!(preference_json(xml.as_bytes(), "x").is_err());
     }
     #[test]
     fn timeline_keeps_checkpoint_links_when_no_field_probes_were_requested() {

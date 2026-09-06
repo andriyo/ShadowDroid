@@ -40,7 +40,7 @@ serde_json = "1.0.151"
 
 # Evidence projections: JWT payload decoding and Android SharedPreferences XML.
 base64 = "0.22.1"
-quick-xml = "0.37.5"
+quick-xml = "0.41.0"
 
 # ── ADB protocol (no shell-out to adb binary) ───────────────────────────
 # 3.x is a breaking change from 2.x; touch points are in device/adb.rs.
