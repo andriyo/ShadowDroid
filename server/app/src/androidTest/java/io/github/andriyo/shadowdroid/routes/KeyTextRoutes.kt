@@ -1,7 +1,12 @@
 package io.github.andriyo.shadowdroid.routes
 
+import android.accessibilityservice.AccessibilityService
 import android.app.Instrumentation
 import android.os.Bundle
+import android.os.SystemClock
+import android.view.InputDevice
+import android.view.KeyCharacterMap
+import android.view.KeyEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import androidx.test.uiautomator.By
 import androidx.test.uiautomator.UiDevice
@@ -47,6 +52,7 @@ private suspend fun handleKey(
     val injected =
         withUiActionGuard(call, uiDevice, instr, guarded) {
             when {
+                guarded -> pressGuardedKey(instr, request)
                 request.code != null -> uiDevice.pressKeyCode(request.code)
                 request.name != null -> pressNamed(uiDevice, request.name)
                 else -> throw BadRequest("missing_key", "either 'name' or 'code' required")
@@ -56,6 +62,81 @@ private suspend fun handleKey(
     // even when the key event was delivered. Report the raw result rather than
     // re-pressing and potentially navigating twice.
     call.respond(OkResponse(ok = injected))
+}
+
+/** Inject immediately after validation; UiDevice's key helpers wait for idle before injection. */
+private fun pressGuardedKey(
+    instr: Instrumentation,
+    request: KeyReq,
+): Boolean {
+    val code =
+        request.code ?: when (val name = request.name?.lowercase()) {
+            null -> throw BadRequest("missing_key", "either 'name' or 'code' required")
+            "back" -> KeyEvent.KEYCODE_BACK
+            "home" -> KeyEvent.KEYCODE_HOME
+            "menu" -> KeyEvent.KEYCODE_MENU
+            "enter" -> KeyEvent.KEYCODE_ENTER
+            "search" -> KeyEvent.KEYCODE_SEARCH
+            "delete" -> KeyEvent.KEYCODE_DEL
+            "recent" -> return instr.uiAutomation.performGlobalAction(AccessibilityService.GLOBAL_ACTION_RECENTS)
+            "dpad_up" -> KeyEvent.KEYCODE_DPAD_UP
+            "dpad_down" -> KeyEvent.KEYCODE_DPAD_DOWN
+            "dpad_left" -> KeyEvent.KEYCODE_DPAD_LEFT
+            "dpad_right" -> KeyEvent.KEYCODE_DPAD_RIGHT
+            "dpad_center" -> KeyEvent.KEYCODE_DPAD_CENTER
+            "wakeup" -> KeyEvent.KEYCODE_WAKEUP
+            "power" -> KeyEvent.KEYCODE_POWER
+            "volume_up" -> KeyEvent.KEYCODE_VOLUME_UP
+            "volume_down" -> KeyEvent.KEYCODE_VOLUME_DOWN
+            "volume_mute" -> KeyEvent.KEYCODE_VOLUME_MUTE
+            "camera" -> KeyEvent.KEYCODE_CAMERA
+            "call" -> KeyEvent.KEYCODE_CALL
+            "endcall" -> KeyEvent.KEYCODE_ENDCALL
+            else -> throw BadRequest("unknown_key", "no mapping for '$name'; pass a numeric KeyEvent code as 'code' instead")
+        }
+    return injectKeyCodeWithoutIdleWait(code) { event -> instr.uiAutomation.injectInputEvent(event, true) }
+}
+
+/** Match UiAutomator's short-key event metadata and failure semantics without its pre-injection idle wait. */
+internal fun injectKeyCodeWithoutIdleWait(
+    keyCode: Int,
+    inject: (KeyEvent) -> Boolean,
+): Boolean {
+    val eventTime = SystemClock.uptimeMillis()
+    // Match InteractionController.sendKeys in UiAutomator 2.4.0, including
+    // standalone modifier keys supplied through the numeric-code API.
+    val metaState =
+        when (keyCode) {
+            KeyEvent.KEYCODE_SHIFT_LEFT -> KeyEvent.META_SHIFT_ON or KeyEvent.META_SHIFT_LEFT_ON
+            KeyEvent.KEYCODE_SHIFT_RIGHT -> KeyEvent.META_SHIFT_ON or KeyEvent.META_SHIFT_RIGHT_ON
+            KeyEvent.KEYCODE_ALT_LEFT -> KeyEvent.META_ALT_ON or KeyEvent.META_ALT_LEFT_ON
+            KeyEvent.KEYCODE_ALT_RIGHT -> KeyEvent.META_ALT_ON or KeyEvent.META_ALT_RIGHT_ON
+            KeyEvent.KEYCODE_SYM -> KeyEvent.META_SYM_ON
+            KeyEvent.KEYCODE_FUNCTION -> KeyEvent.META_FUNCTION_ON
+            KeyEvent.KEYCODE_CTRL_LEFT -> KeyEvent.META_CTRL_ON or KeyEvent.META_CTRL_LEFT_ON
+            KeyEvent.KEYCODE_CTRL_RIGHT -> KeyEvent.META_CTRL_ON or KeyEvent.META_CTRL_RIGHT_ON
+            KeyEvent.KEYCODE_META_LEFT -> KeyEvent.META_META_LEFT_ON
+            KeyEvent.KEYCODE_META_RIGHT -> KeyEvent.META_META_RIGHT_ON
+            KeyEvent.KEYCODE_CAPS_LOCK -> KeyEvent.META_CAPS_LOCK_ON
+            KeyEvent.KEYCODE_NUM_LOCK -> KeyEvent.META_NUM_LOCK_ON
+            KeyEvent.KEYCODE_SCROLL_LOCK -> KeyEvent.META_SCROLL_LOCK_ON
+            else -> 0
+        }
+
+    fun event(action: Int) =
+        KeyEvent(
+            eventTime,
+            eventTime,
+            action,
+            keyCode,
+            0,
+            metaState,
+            KeyCharacterMap.VIRTUAL_KEYBOARD,
+            0,
+            0,
+            InputDevice.SOURCE_KEYBOARD,
+        )
+    return inject(event(KeyEvent.ACTION_DOWN)) && inject(event(KeyEvent.ACTION_UP))
 }
 
 private suspend fun handleText(

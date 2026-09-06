@@ -76,7 +76,7 @@ object AppRoutes {
                         // Errors visibly in the shell output if the package isn't found.
                         val out =
                             uiDevice.executeShellCommand(
-                                "monkey -p ${quoteDeviceShellArg(pkg)} -c android.intent.category.LAUNCHER 1",
+                                "monkey -p $pkg -c android.intent.category.LAUNCHER 1",
                             )
                         if (out.contains("No activities found")) {
                             throw NotFound(
@@ -110,7 +110,9 @@ object AppRoutes {
                 runDeviceShell(
                     instr,
                     uiDevice,
-                    "am force-stop ${quoteDeviceShellArg(pkg)}",
+                    // Validated package names are shell-safe. The legacy executor
+                    // passes quotes literally instead of interpreting a shell script.
+                    "am force-stop $pkg",
                     timeoutMs = 20_000,
                 )
             val deadline = System.currentTimeMillis() + 2_000
@@ -143,7 +145,7 @@ object AppRoutes {
                 runDeviceShell(
                     instr,
                     uiDevice,
-                    "pm clear ${quoteDeviceShellArg(pkg)}",
+                    "pm clear $pkg",
                     timeoutMs = 20_000,
                 )
             if (exitCode?.let { it != 0 } == true || !pmClearSucceeded(output)) {
@@ -210,7 +212,7 @@ object AppRoutes {
                 return@get
             }
             // Fallback: parse dumpsys
-            val out = uiDevice.executeShellCommand("dumpsys package ${quoteDeviceShellArg(pkg)}")
+            val out = uiDevice.executeShellCommand("dumpsys package $pkg")
             val versionName =
                 Regex("""versionName=(.+)""")
                     .find(out)
@@ -257,7 +259,7 @@ private fun requireInstalledPackage(
             .isSuccess
     if (visibleToPackageManager) return
 
-    val output = uiDevice.executeShellCommand("pm path ${quoteDeviceShellArg(pkg)}")
+    val output = uiDevice.executeShellCommand("pm path $pkg")
     if (!packagePathExists(output)) {
         throw NotFound(
             "package_not_found",

@@ -79,10 +79,11 @@ object ScreenRoutes {
                     false
                 }
             val snapshot = captureScreen(uiDevice, instr, enrichmentCache)
+            val settleMs = (SystemClock.elapsedRealtime() - started).coerceAtLeast(0L)
             call.respond(
                 StableScreenResponse(
-                    stable = idle && snapshot.assessment.state == SnapshotState.CONSISTENT,
-                    settle_ms = (SystemClock.elapsedRealtime() - started).coerceAtLeast(0L),
+                    stable = idle && settleMs <= timeoutMs && snapshot.assessment.state == SnapshotState.CONSISTENT,
+                    settle_ms = settleMs,
                     quiet_period_ms = quietMs,
                     screen = snapshot.toResponse(),
                 ),
@@ -215,7 +216,7 @@ internal suspend fun captureScreen(
         val treeWindowId = root?.windowId
         val treeReady = elements.isNotEmpty() || (root?.childCount ?: 0) > 0
         val treeSampledAtMs = System.currentTimeMillis()
-        val foregroundPackage = uiDevice.currentPackageName
+        val foregroundPackage = activeWindowPackage(instr)
         val remaining = (deadline - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
         val enrichment =
             enrichmentCache.snapshot(
@@ -313,6 +314,19 @@ private const val DEFAULT_OBSERVE_TIMEOUT_MS = 3_000L
 private const val MIN_OBSERVE_TIMEOUT_MS = 1L
 private const val MAX_OBSERVE_TIMEOUT_MS = 10_000L
 
+// UiDevice.currentPackageName implicitly waits up to ten seconds for idle.
+// A fresh root read keeps the foreground sample separate from the walked tree;
+// assessSnapshot still checks it against independently sampled activity/PID data.
+@Suppress("DEPRECATION") // Accessibility nodes are pooled before Android 13.
+internal fun activeWindowPackage(instr: Instrumentation): String? {
+    val root = instr.uiAutomation.rootInActiveWindow ?: return null
+    return try {
+        root.packageName?.toString()?.takeIf { it.isNotBlank() }
+    } finally {
+        root.recycle()
+    }
+}
+
 private fun detectImeState(
     elements: List<Element>,
     enrichment: ScreenEnrichment,
@@ -384,7 +398,7 @@ internal class ScreenEnrichmentCache private constructor(
         )
 
     init {
-        requestRefresh(uiDevice.currentPackageName)
+        requestRefresh(activeWindowPackage(instr))
     }
 
     suspend fun snapshot(
@@ -432,7 +446,7 @@ internal class ScreenEnrichmentCache private constructor(
 
     fun invalidate() {
         value.updateAndGet { it.copy(refreshedAtElapsedMs = 0L) }
-        requestRefresh(uiDevice.currentPackageName)
+        requestRefresh(activeWindowPackage(instr))
     }
 
     private fun requestRefresh(currentPackage: String?) {
@@ -473,7 +487,7 @@ internal class ScreenEnrichmentCache private constructor(
                 // If the foreground package changed while the old package was
                 // being enriched, immediately schedule the new snapshot. Do
                 // not require a second client request to notice the transition.
-                val latestPackage = uiDevice.currentPackageName
+                val latestPackage = activeWindowPackage(instr)
                 if (latestPackage != currentPackage) {
                     requestRefresh(latestPackage)
                 }

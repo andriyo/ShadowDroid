@@ -57,7 +57,10 @@ internal fun pidForPackage(
             runDeviceShell(
                 instr,
                 ui,
-                "pidof ${quoteDeviceShellArg(packageName)}",
+                // The pre-Android 12 executor does not interpret shell quotes; they
+                // become part of pidof's process name. Validation above limits this
+                // argument to shell-safe package characters on both executor paths.
+                "pidof $packageName",
                 timeoutMs = 5_000,
             )
         }.getOrNull()

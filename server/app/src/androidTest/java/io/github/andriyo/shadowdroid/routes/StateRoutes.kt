@@ -52,7 +52,7 @@ object StateRoutes {
         }
 
         route.get("/state") {
-            val pkg = uiDevice.currentPackageName
+            val pkg = activeWindowPackage(instr)
             // Keep the lightweight state probe non-blocking. The screen route
             // applies the stricter bounded convergence policy when it also
             // returns a UI tree that must agree with this metadata.
