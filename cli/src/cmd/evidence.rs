@@ -155,7 +155,18 @@ fn fingerprint(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn project(document: &Value, fields: &BTreeMap<String, Projection>) -> Value {
+fn project(
+    document: &Value,
+    fields: &BTreeMap<String, Projection>,
+    policy: &crate::redaction::Policy,
+) -> Value {
+    // Value projections need the source keys (including sensitive ancestors)
+    // and known literals before fields become generic name/value rows. Keep
+    // fingerprint and explicit JWT-claim projections on the original input.
+    let redacted_document = fields
+        .values()
+        .any(|p| matches!(p.mode, ProjectionMode::Value))
+        .then(|| policy.redact_source_value(document));
     let mut result = Vec::new();
     for (name, projection) in fields {
         let Some(value) = document.pointer(&projection.pointer) else {
@@ -167,7 +178,15 @@ fn project(document: &Value, fields: &BTreeMap<String, Projection>) -> Value {
             json!({"present":true,"unavailable":"source_redacted"})
         } else {
             match projection.mode {
-                ProjectionMode::Value => json!({"present":true,"value":value}),
+                ProjectionMode::Value => match redacted_document
+                    .as_ref()
+                    .and_then(|source| source.pointer(&projection.pointer))
+                {
+                    Some(value) => json!({"present":true,"value":value}),
+                    // A sensitive ancestor may have become a placeholder,
+                    // hiding this path. The original field was still present.
+                    None => json!({"present":true,"unavailable":"source_redacted"}),
+                },
                 ProjectionMode::Sha256 => {
                     let bytes = value
                         .as_str()
@@ -373,7 +392,7 @@ pub async fn checkpoint(serial: &Serial, args: &EvidenceCmd) -> Result<()> {
                     Some(key) => preference_json(&bytes, key)?,
                     None => serde_json::from_slice(&bytes)?,
                 };
-                Ok(project(&document, &probe.fields))
+                Ok(project(&document, &probe.fields, &policy))
             }
             .await,
             &probe.name,
@@ -461,7 +480,7 @@ pub async fn checkpoint(serial: &Serial, args: &EvidenceCmd) -> Result<()> {
                     "checkpoint_id":id,"probe":probe.name,"flow_id":flow.id,"capture_ref":capture_ref,
                     "observed_at_ms":flow.ts*1000.0,"event_time_ms":event_time,"correlation_ref":correlation,
                     "source_body_redacted":redacted,"modified":flow.modified,"rule_ids":flow.rule_ids,
-                    "fields":project(event,&probe.fields)}));
+                    "fields":project(event,&probe.fields,&policy)}));
             }
         }
     }
@@ -578,7 +597,11 @@ mod tests {
             "e30.{}.signature",
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"subt":"registered"}"#)
         );
-        let projected_raw = project(&json!({"null":null,"access":token}), &fields);
+        let projected_raw = project(
+            &json!({"null":null,"access":token}),
+            &fields,
+            &crate::redaction::Policy::builtin(),
+        );
         let projected =
             named_fields(crate::redaction::Policy::builtin().redact_output(projected_raw));
         assert_eq!(projected["missing"]["present"], false);
@@ -588,10 +611,94 @@ mod tests {
         assert_eq!(projected["claim"]["signature_verified"], false);
         assert!(!projected.to_string().contains(&token));
         assert_eq!(
-            named_fields(project(&json!({"access":"<redacted:token>"}), &fields))["token"]["unavailable"],
+            named_fields(project(
+                &json!({"access":"<redacted:token>"}),
+                &fields,
+                &crate::redaction::Policy::builtin()
+            ))["token"]["unavailable"],
             "source_redacted"
         );
     }
+    #[test]
+    fn value_projections_redact_source_keys_ancestors_and_aliases_before_saving() {
+        let policy = crate::redaction::Policy::new(crate::redaction::PolicySpec {
+            json_keys: vec!["customerId".into(), "private/key".into()],
+            patterns: vec!["ORDER-[0-9]+".into()],
+        })
+        .unwrap();
+        let document = json!({
+            "password":"opaque-password", "accessToken":"opaque-token",
+            "customerId":"opaque-customer", "alias":"opaque-password",
+            "private/key":{"nested":"opaque-nested"},
+            "profile":{"password":"nested-password","display":"public"},
+            "order":"ORDER-1234", "null":null,
+            "redaction":{"classification":"public", "secret":"metadata-secret"}
+        });
+        let fields = serde_json::from_value(json!({
+            "p":{"pointer":"/password"}, "t":{"pointer":"/accessToken"},
+            "customer":{"pointer":"/customerId"}, "alias":{"pointer":"/alias"},
+            "nested":{"pointer":"/private~1key/nested"},
+            "profile":{"pointer":"/profile"}, "order":{"pointer":"/order"},
+            "null":{"pointer":"/null"}, "missing":{"pointer":"/missing"},
+            "metadata":{"pointer":"/redaction/classification"},
+            "metadata-value":{"pointer":"/redaction/secret"}
+        }))
+        .unwrap();
+        let saved = policy
+            .redact_output(json!({"records":[{"fields":project(&document,&fields,&policy)}]}));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint.json");
+        write_private(&path, &saved).unwrap();
+        let bytes = std::fs::read_to_string(path).unwrap();
+        for secret in [
+            "opaque-password",
+            "opaque-token",
+            "opaque-customer",
+            "opaque-nested",
+            "nested-password",
+            "metadata-secret",
+            "ORDER-1234",
+        ] {
+            assert!(
+                !bytes.contains(&format!("\"{secret}\"")),
+                "saved secret: {secret}"
+            );
+        }
+        let rows = named_fields(saved["records"][0]["fields"].clone());
+        assert_eq!(rows["p"]["value"], "<redacted:secret>");
+        assert_eq!(rows["t"]["value"], "<redacted:token>");
+        assert_eq!(rows["customer"]["value"], "<redacted:configured>");
+        assert_eq!(rows["nested"]["present"], true);
+        assert_eq!(rows["nested"]["unavailable"], "source_redacted");
+        assert_eq!(rows["profile"]["value"]["display"], "public");
+        assert_eq!(rows["metadata"]["value"], "public");
+        assert_eq!(rows["null"]["present"], true);
+        assert!(rows["null"]["value"].is_null());
+        assert_eq!(rows["missing"]["present"], false);
+    }
+
+    #[test]
+    fn value_redaction_does_not_change_fingerprints_or_explicit_jwt_claims() {
+        let policy = crate::redaction::Policy::builtin();
+        let token = format!(
+            "e30.{}.signature",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"subt":"registered"}"#)
+        );
+        let fields = serde_json::from_value(json!({
+            "value":{"pointer":"/accessToken"},
+            "digest":{"pointer":"/accessToken","mode":"sha256"},
+            "claim":{"pointer":"/accessToken","mode":"jwt_claim","claim":"subt"},
+            "root":{"pointer":""}
+        }))
+        .unwrap();
+        let rows = named_fields(project(&json!({"accessToken":token}), &fields, &policy));
+        assert_eq!(rows["value"]["value"], "<redacted:token>");
+        assert_eq!(rows["root"]["value"]["accessToken"], "<redacted:token>");
+        assert_eq!(rows["digest"]["fingerprint"], fingerprint(token.as_bytes()));
+        assert_eq!(rows["claim"]["value"], "registered");
+        assert_eq!(rows["claim"]["signature_verified"], false);
+    }
+
     #[test]
     fn preference_xml_decodes_entities_and_rejects_ambiguous_keys() {
         let xml =

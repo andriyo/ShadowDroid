@@ -267,6 +267,19 @@ impl Policy {
         self.redact_output(value.clone())
     }
 
+    /// Redact source data before selecting fields from it. Unlike an output
+    /// envelope, a source document has no reserved metadata keys: even a field
+    /// named `redaction` must retain its normal payload meaning. Keeping the
+    /// complete source context also redacts aliases of known sensitive values.
+    pub fn redact_source_value(&self, value: &Value) -> Value {
+        let mut redacted = value.clone();
+        let mut literals = BTreeMap::new();
+        self.collect_sensitive_literals(value, &mut literals);
+        self.redact_value(&mut redacted);
+        redact_known_literals(&mut redacted, &literals);
+        redacted
+    }
+
     pub fn redact_text(&self, text: &str) -> String {
         self.redact_string(text).0
     }

@@ -69,7 +69,11 @@ Fields are rows with `name`, `present`, and either `value`, `fingerprint`, or
 `present:true,value:null`. Fingerprinting already-redacted input reports
 `source_redacted` instead of hashing a shared placeholder. Select fingerprints
 for credentials; redaction is applied by default to retained values, but
-explicit field selection still determines what data enters the bundle.
+explicit field selection still determines what data enters the bundle. Value
+projections are redacted with their original source keys and ancestors before
+being converted to named rows; a field hidden by a redacted ancestor remains
+`present:true` with `unavailable:"source_redacted"`. Fingerprints and explicit
+JWT-claim projections continue to use the original input.
 
 Flow probes use host/path substrings and optional exact GraphQL operation
 names. `--since-seconds` defaults to 300; `--flow-limit` defaults to 100 recent
