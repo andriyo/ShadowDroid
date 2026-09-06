@@ -5,7 +5,7 @@
 use crate::ids::Serial;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -1748,11 +1748,15 @@ pub async fn log(serial: &Serial, opts: LogOpts) -> Result<()> {
     Ok(())
 }
 
-pub async fn checkpoint(serial: &Serial) -> Result<()> {
-    let reply = checked_control_reply(
+pub async fn checkpoint_value(serial: &Serial) -> Result<Value> {
+    checked_control_reply(
         "checkpoint",
         control::request(serial, json!({"op": "checkpoint"})).await?,
-    )?;
+    )
+}
+
+pub async fn checkpoint(serial: &Serial) -> Result<()> {
+    let reply = checkpoint_value(serial).await?;
     emit("net_checkpoint", reply);
     Ok(())
 }

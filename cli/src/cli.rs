@@ -152,6 +152,8 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Cmd {
+    /// Correlate UI, network, video and projected application state.
+    Evidence(crate::cmd::evidence::EvidenceArgs),
     // ── session / diagnostics (flat) ──────────────────────────
     /// List attached devices / emulators.
     Devices,
@@ -1891,6 +1893,13 @@ async fn run_inner() -> Result<()> {
     // are pure host-side `adb`.
     match &cmd {
         Cmd::Devices => return cmd_devices(&config).await,
+        Cmd::Evidence(args) => {
+            if let crate::cmd::evidence::EvidenceCmd::Timeline { bundle } = &args.command {
+                return crate::cmd::evidence::timeline(bundle);
+            }
+            let serial = selection.resolve_online(&config).await?;
+            return crate::cmd::evidence::checkpoint(&serial, &args.command).await;
+        }
         Cmd::Init(args) => return crate::cmd::studio::run_init(args).await,
         Cmd::Update { .. }
         | Cmd::Commands { .. }
@@ -2109,6 +2118,7 @@ async fn run_inner() -> Result<()> {
         | Cmd::Init(_)
         | Cmd::Doctor { .. }
         | Cmd::Collect { .. }
+        | Cmd::Evidence(_)
         | Cmd::Commands { .. }
         | Cmd::Log(_)
         | Cmd::Why(_)

@@ -370,7 +370,7 @@ fn leaf_contract(path: &str) -> Option<LeafEffectContract> {
             &[D::ConfigLoad, D::ArtifactWriter, D::ReleaseAssetDownload],
         ),
         "studio status" => leaf(HOST_READ, CONFIG),
-        "collect" => leaf(
+        "collect" | "evidence checkpoint" => leaf(
             COLLECT_EFFECTS,
             &[
                 D::ConfigLoad,
@@ -471,7 +471,7 @@ fn leaf_contract(path: &str) -> Option<LeafEffectContract> {
                 D::NetworkListener,
             ],
         ),
-        "video coverage" => leaf(HOST_READ, CONFIG),
+        "evidence timeline" | "video coverage" => leaf(HOST_READ, CONFIG),
         "video status" => leaf(EXISTING_READ, EXISTING),
         "video mark" => leaf(
             &[E::HostRead, E::HostWrite, E::DeviceRead],
@@ -1044,14 +1044,15 @@ mod tests {
     /// dispatch classifier without its effect dependency fails mechanically.
     fn expected_resolver_policy(path: &str) -> ResolverPolicy {
         match path {
-            "collect" => ResolverPolicy::Online,
+            "collect" | "evidence checkpoint" => ResolverPolicy::Online,
             "disconnect" | "video status" | "video mark" | "video stop" | "net ca import"
             | "net ca info" | "net ca reset" | "net stop" | "net status" | "net log"
             | "net checkpoint" | "net show" | "net export" | "net ws" | "net inject"
             | "net intercept" | "net resume" | "net drop" | "net respond" | "net rule add"
             | "net rule list" | "net rule rm" | "net rule clear" | "net override" | "net rules"
             | "net replay" => ResolverPolicy::Existing,
-            "video coverage"
+            "evidence timeline"
+            | "video coverage"
             | "devices"
             | "update"
             | "init"
@@ -1140,7 +1141,7 @@ mod tests {
         for (call, expected_count) in [
             ("selection.resolve(&config)", 15),
             ("selection.resolve_existing(&config)", 3),
-            ("selection.resolve_online(&config)", 1),
+            ("selection.resolve_online(&config)", 2),
         ] {
             assert_eq!(
                 cli_source.matches(call).count(),
@@ -1409,6 +1410,7 @@ mod tests {
                 "installer::probe_existing(",
                 &[
                     ("cmd/collect.rs", 1),
+                    ("cmd/evidence.rs", 1),
                     ("cmd/doctor.rs", 1),
                     ("cmd/why.rs", 1),
                 ],
@@ -1464,6 +1466,7 @@ mod tests {
         // Tie the non-central callers to the dependency table they exercise.
         for (path, dependency) in [
             ("collect", D::ExistingServerProbe),
+            ("evidence checkpoint", D::ExistingServerProbe),
             ("why", D::ExistingServerProbe),
             ("doctor", D::ServerEnsureReady),
             ("app install", D::PackageInstaller),

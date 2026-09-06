@@ -233,6 +233,44 @@ fn require_package(package: Option<String>, command: &str) -> Result<String> {
     })
 }
 
+/// Read one bounded private file into memory for field projection, without
+/// emitting or persisting its raw contents.
+pub async fn private_read_evidence(
+    serial: &Serial,
+    package: &str,
+    remote: &str,
+) -> Result<Vec<u8>> {
+    ensure_run_as(serial, package).await?;
+    let remote = normalize_private_path(remote)?;
+    let stat = private_stat(serial, package, &remote).await?;
+    if stat.kind != StatePathKind::File || stat.bytes > 1024 * 1024 {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "evidence_private_file_limit",
+            "evidence",
+            "evidence projection requires a regular private file of at most 1 MiB",
+        )
+        .next_actions(["select a smaller private JSON or SharedPreferences file"])
+        .into());
+    }
+    let bytes = run_as_bytes(
+        serial,
+        package,
+        &format!("head -c 1048577 {}", shell_quote(&remote)),
+    )
+    .await?;
+    if bytes.len() as u64 != stat.bytes || bytes.len() > 1024 * 1024 {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "evidence_private_file_changed",
+            "evidence",
+            "private file changed during evidence capture",
+        )
+        .retryable(true)
+        .next_actions(["retry the checkpoint after the app finishes writing state"])
+        .into());
+    }
+    Ok(bytes)
+}
+
 pub async fn private_pull(
     serial: &Serial,
     package: &str,

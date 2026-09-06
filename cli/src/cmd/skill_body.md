@@ -11,12 +11,10 @@ shadowdroid commands --json --describe 'ui tap'
 shadowdroid commands --guide net
 ```
 
-The catalog gives paths, constraints, output modes, and hints. Before using a
-domain, read its guide: `--guide net` (proxy, TLS trust, capture
-sessions, rules, in-app OkHttp AAR), `--guide debugger` (Studio plugin, debug
-sessions, Layout Inspector fallbacks, recompositions), or `--guide state` (app
-state snapshot/restore, appops scoping, profile files, private files).
-Covered groups alias to their guide (`aar` → net, `layout` → debugger).
+The catalog gives paths, constraints, output modes, and hints. Before first
+use, read `--guide net` (proxy/AAR), `--guide debugger` (Studio/layout),
+`--guide state` (private files/app state), or `--guide evidence` (checkpoints
+and video coverage). Group aliases work too: `aar` → net, `video` → evidence.
 
 ## First contact and device selection
 

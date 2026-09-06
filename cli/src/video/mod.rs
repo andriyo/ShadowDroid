@@ -174,3 +174,8 @@ pub async fn run(args: &VideoArgs, serial: &Serial) -> Result<()> {
         VideoCmd::Daemon(daemon_args) => daemon::run(daemon_args.clone()).await,
     }
 }
+
+/// Evidence markers never start a recorder or change its lifecycle.
+pub async fn checkpoint_marker(serial: &Serial, label: &str) -> Result<serde_json::Value> {
+    commands::mark_value(serial, label).await
+}

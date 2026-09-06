@@ -38,6 +38,10 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 
+# Evidence projections: JWT payload decoding and Android SharedPreferences XML.
+base64 = "0.22.1"
+quick-xml = "0.37.5"
+
 # ── ADB protocol (no shell-out to adb binary) ───────────────────────────
 # 3.x is a breaking change from 2.x; touch points are in device/adb.rs.
 # Disable the default framebuffer feature because ShadowDroid never requests it.

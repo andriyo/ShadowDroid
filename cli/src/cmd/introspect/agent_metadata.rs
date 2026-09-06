@@ -11,7 +11,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "use_when": [
                 "Discover ShadowDroid's command tree, flags, output contracts, and agent decision hints without scraping human help text.",
                 "Inspect one command before constructing it, or fetch a shallow catalog when the full tree would cost unnecessary context.",
-                "Read a domain driving guide (--guide net|debugger|state) before first use of that domain."
+                "Read a domain driving guide (--guide net|debugger|state|evidence) before first use of that domain."
             ],
             "output": "schema_version 3 JSON catalog with command paths, complete argument construction data, output contracts, and normalized next_actions; a positional path or --describe returns one command, --search finds relevant contracts, --guide returns one domain driving guide, and --compact removes long guidance",
             "side_effects": ["none"],
@@ -22,6 +22,19 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
                 "commands --search 'response body' --json",
                 "commands --guide net --json"
             ]
+        })),
+        "evidence" | "evidence checkpoint" => Some(serde_json::json!({
+            "use_when":["Correlate UI, network, video and projected private state in one checkpoint."],
+            "output":"protected evidence bundle; missing probes are saved with a nonzero evidence_partial result",
+            "side_effects":["writes local evidence files and appends network/video markers; never starts a device, server, proxy or recorder"],
+            "next_actions":["evidence timeline <bundle>","commands --guide evidence","video status","net status"],
+            "examples":["evidence checkpoint 'after refresh' --out evidence --spec probes.json"]
+        })),
+        "evidence timeline" => Some(serde_json::json!({
+            "use_when":["Review saved checkpoints in event-time order without a device."],
+            "output":"deduplicated projected records with event and observation times; clocks are not automatically aligned",
+            "side_effects":["none"],
+            "next_actions":["commands --json --describe 'evidence checkpoint'"]
         })),
         "video coverage" => Some(serde_json::json!({
             "use_when":["Assess encoded coverage, missing segments and marker ranges in a saved recording."],

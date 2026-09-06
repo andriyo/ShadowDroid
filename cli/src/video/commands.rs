@@ -179,7 +179,7 @@ pub async fn status(serial: &Serial) -> Result<()> {
     Ok(())
 }
 
-pub async fn mark(serial: &Serial, label: &str) -> Result<()> {
+pub async fn mark_value(serial: &Serial, label: &str) -> Result<Value> {
     if label.trim().is_empty() || label.chars().count() > 1000 {
         return Err(crate::diagnostic::DiagnosticError::new(
             "video_invalid_marker",
@@ -226,7 +226,11 @@ pub async fn mark(serial: &Serial, label: &str) -> Result<()> {
     if let Value::Object(fields) = &mut body {
         fields.remove("ok");
     }
-    crate::events::emit_action("video_mark", &body);
+    Ok(body)
+}
+
+pub async fn mark(serial: &Serial, label: &str) -> Result<()> {
+    crate::events::emit_action("video_mark", &mark_value(serial, label).await?);
     Ok(())
 }
 

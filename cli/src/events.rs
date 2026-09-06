@@ -1448,6 +1448,7 @@ fn specialize_action(template: &str, map: &serde_json::Map<String, serde_json::V
         ("<device>", &["device"]),
         ("<remote>", &["remote"]),
         ("<local>", &["local"]),
+        ("<bundle>", &["bundle"]),
     ];
     let mut action = template.to_string();
     for (placeholder, keys) in PLACEHOLDERS {
