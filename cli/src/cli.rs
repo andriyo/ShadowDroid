@@ -1441,7 +1441,7 @@ pub struct NetRuleExplainArgs {
 #[derive(clap::Args)]
 pub struct NetRuleAddArgs {
     /// block | delay | map-local | map-remote | respond | set-request-header |
-    /// set-status | set-response-header | replace | ws-drop | ws-set-text
+    /// set-status | set-response-header | replace | set-json | ws-drop | ws-set-text
     pub kind: String,
     /// Match flows whose host contains this (substring).
     #[arg(long)]
@@ -1461,7 +1461,7 @@ pub struct NetRuleAddArgs {
     /// Match flows with this response content-type (substring).
     #[arg(long)]
     pub content_type: Option<String>,
-    /// Match a GraphQL operationName in the URL query or JSON request body (respond only).
+    /// Match a GraphQL operationName in the URL query or JSON request body (HTTP rules).
     #[arg(long, value_name = "NAME")]
     pub operation_name: Option<String>,
     /// Synthetic response status (respond only; default 200).
@@ -1478,7 +1478,8 @@ pub struct NetRuleAddArgs {
     pub body_file: Option<PathBuf>,
     /// Kind-specific positionals: block [status], delay <ms>, map-local <file>,
     /// map-remote <host:port>, respond (use flags), set-request-header <name> <value>,
-    /// set-response-header <name> <value>, set-status <code>, replace <regex> <repl>.
+    /// set-response-header <name> <value>, set-status <code>, replace <regex> <repl>,
+    /// set-json <pointer> <expected-json> <value-json> [max-applications=1].
     #[arg(value_name = "ARGS")]
     pub args: Vec<String>,
 }
@@ -3385,8 +3386,7 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
         }
         NetCmd::Rule(rc) => match rc {
             NetRuleCmd::Add(a) => {
-                let respond_options = a.operation_name.is_some()
-                    || a.status.is_some()
+                let respond_options = a.status.is_some()
                     || !a.header.is_empty()
                     || a.body.is_some()
                     || a.body_file.is_some();
@@ -3394,7 +3394,7 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
                     return Err(crate::diagnostic::DiagnosticError::new(
                         "invalid_net_rule_options",
                         "input",
-                        "--operation-name, --status, --header, --body, and --body-file are only valid for a `respond` rule",
+                        "--status, --header, --body, and --body-file are only valid for a `respond` rule",
                     )
                     .detail(json!({"kind": a.kind}))
                     .next_actions(["use `shadowdroid net rule add respond --help`"])

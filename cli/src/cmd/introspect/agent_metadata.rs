@@ -1212,7 +1212,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "net rule list" => Some(serde_json::json!({
             "use_when": ["Need to inspect currently active proxy mutation rules."],
-            "output": "active rules JSON",
+            "output": "active rules JSON; set-json rules include runtime applications, rejections and last_error",
             "side_effects": ["none"],
             "next_actions": ["net rule add", "net rule rm <id>", "net rule clear"]
         })),

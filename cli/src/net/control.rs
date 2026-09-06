@@ -95,7 +95,19 @@ fn publish_rule_set(
         .collect();
     let public: Vec<_> = staged
         .iter()
-        .map(|(id, rule)| public_rule(id, &rule.spec))
+        .map(|(id, rule)| {
+            let mut public = public_rule(id, &rule.spec);
+            if matches!(
+                &rule.spec.action,
+                crate::net::RuleAction::Transform {
+                    transform: crate::net::RuleTransform::SetJson { .. }
+                }
+            ) {
+                public["runtime"] =
+                    serde_json::to_value(&*rule.json_runtime.lock().unwrap()).unwrap();
+            }
+            public
+        })
         .collect();
     let ids: Vec<_> = public
         .iter()
@@ -734,7 +746,19 @@ pub async fn serve_client(
                 .read()
                 .unwrap()
                 .iter()
-                .map(|(id, rule)| public_rule(id, &rule.spec))
+                .map(|(id, rule)| {
+                    let mut public = public_rule(id, &rule.spec);
+                    if matches!(
+                        &rule.spec.action,
+                        crate::net::RuleAction::Transform {
+                            transform: crate::net::RuleTransform::SetJson { .. }
+                        }
+                    ) {
+                        public["runtime"] =
+                            serde_json::to_value(&*rule.json_runtime.lock().unwrap()).unwrap();
+                    }
+                    public
+                })
                 .collect();
             write_json(&mut wr, &json!({"ok": true, "rules": rules})).await?;
         }

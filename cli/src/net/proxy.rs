@@ -1442,6 +1442,7 @@ async fn proxy_request(
                     &mut resp_headers,
                     &mut no_body,
                     false,
+                    &req_bytes,
                 )
             } else {
                 Vec::new()
@@ -1569,6 +1570,7 @@ async fn proxy_request(
             &mut resp_headers,
             &mut resp_bytes,
             plaintext_body,
+            &req_bytes,
         )
     } else {
         Vec::new()
@@ -2743,6 +2745,7 @@ fn apply_response_rules(
     headers: &mut Vec<(String, String)>,
     body: &mut Bytes,
     allow_body: bool,
+    request_body: &[u8],
 ) -> Vec<String> {
     let rules = shared.rules.read().unwrap();
     let original_status = *status;
@@ -2775,7 +2778,7 @@ fn apply_response_rules(
             method,
             status: match_status,
             content_type: match_content_type,
-            body,
+            body: request_body,
             direction: None,
             opcode: None,
         }) {
@@ -2812,6 +2815,19 @@ fn apply_response_rules(
                     }
                 }
             }
+            RuleAction::Transform {
+                transform: RuleTransform::SetJson { .. },
+            } if allow_body => match rule.apply_json(body) {
+                Ok(Some(replacement)) => {
+                    *body = replacement;
+                    strip_body_validators(headers);
+                    applied = true;
+                }
+                Ok(None) => {}
+                Err(code) => {
+                    tracing::warn!(rule_id = %id, code, "JSON response edit rejected; response unchanged")
+                }
+            },
             _ => {}
         }
         if applied {
@@ -3236,6 +3252,7 @@ pub(crate) fn rule_runtime_observation(rule: CompiledRule) -> serde_json::Value 
                 &mut headers,
                 &mut body,
                 true,
+                b"",
             );
             serde_json::json!({
                 "phase": "response",
@@ -4284,6 +4301,101 @@ mod tests {
     }
 
     #[test]
+    fn json_response_edit_matches_request_operation_and_enforces_one_success() {
+        let rule = super::super::rule::compile_rule(
+            serde_json::from_value(serde_json::json!({
+                "matcher": {"type":"graphql_operation", "equals":"SwitchProfile"},
+                "action": {"category":"transform", "transform": {
+                    "type":"set_json", "pointer":"/extensions/expiresIn", "expected":600,
+                    "value":30, "max_applications":1
+                }}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let runtime = rule.json_runtime.clone();
+        let shared = super::shared_with_rules(vec![("once".into(), rule)]);
+        let apply = |request: &[u8], source: &[u8]| {
+            let mut status = Some(200);
+            let mut headers = vec![
+                ("content-type".into(), "application/json".into()),
+                ("etag".into(), "stale".into()),
+            ];
+            let mut body = bytes::Bytes::copy_from_slice(source);
+            let ids = apply_response_rules(
+                &shared,
+                "POST",
+                "api.test",
+                "/graphql",
+                "https://api.test/graphql",
+                &mut status,
+                &mut headers,
+                &mut body,
+                true,
+                request,
+            );
+            assert_eq!(headers.iter().any(|(key, _)| key == "etag"), ids.is_empty());
+            (ids, body)
+        };
+        let source = br#"{"extensions":{"expiresIn":600,"accessToken":"unchanged"}}"#;
+        let operation = br#"{"operationName":"SwitchProfile"}"#;
+        assert_eq!(
+            apply(br#"{"operationName":"RefreshToken"}"#, source)
+                .1
+                .as_ref(),
+            source
+        );
+        let missing = br#"{"extensions":{}}"#;
+        assert_eq!(apply(operation, missing).1.as_ref(), missing);
+        assert_eq!(
+            runtime.lock().unwrap().last_error,
+            Some("json_pointer_missing")
+        );
+        let mismatch = br#"{"extensions":{"expiresIn":null}}"#;
+        assert_eq!(apply(operation, mismatch).1.as_ref(), mismatch);
+        assert_eq!(
+            runtime.lock().unwrap().last_error,
+            Some("json_expected_value_mismatch")
+        );
+        let (ids, body) = apply(operation, source);
+        assert_eq!(ids, ["once"]);
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["extensions"]["expiresIn"], 30);
+        assert_eq!(value["extensions"]["accessToken"], "unchanged");
+        assert_eq!(apply(operation, source).1.as_ref(), source);
+        assert_eq!(runtime.lock().unwrap().applications, 1);
+        assert_eq!(runtime.lock().unwrap().rejections, 2);
+    }
+
+    #[test]
+    fn json_response_edit_limit_is_shared_across_concurrent_requests() {
+        let rule = super::super::rule::compile_rule(
+            serde_json::from_value(serde_json::json!({
+                "action": {"category":"transform", "transform": {
+                    "type":"set_json", "pointer":"/a~1b/0", "expected":null,
+                    "value":30, "max_applications":1
+                }}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let count = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..12)
+                .map(|_| {
+                    let rule = rule.clone();
+                    scope.spawn(move || rule.apply_json(br#"{"a/b":[null]}"#).unwrap().is_some())
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|t| u32::from(t.join().unwrap()))
+                .sum::<u32>()
+        });
+        assert_eq!(count, 1);
+        assert_eq!(rule.json_runtime.lock().unwrap().applications, 1);
+    }
+
+    #[test]
     fn response_rules_match_original_or_current_status_explicitly() {
         let compile = |id: &str, spec: RuleSpec| {
             (
@@ -4340,6 +4452,7 @@ mod tests {
             &mut headers,
             &mut body,
             true,
+            b"",
         );
         assert_eq!(status, Some(503));
         assert!(headers.iter().any(|(name, value)| {

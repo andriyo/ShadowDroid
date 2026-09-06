@@ -99,6 +99,13 @@ pub enum RuleTransform {
         pattern: String,
         replacement: String,
     },
+    /// Replace an existing RFC 6901 JSON pointer only when its old value matches.
+    SetJson {
+        pointer: String,
+        expected: Value,
+        value: Value,
+        max_applications: u32,
+    },
     SetWebsocketText {
         text: String,
     },
@@ -135,6 +142,13 @@ pub fn action_summary(action: &RuleAction) -> Value {
         let body_bytes = body.as_array().map(Vec::len).unwrap_or_default();
         response.insert("body_bytes".into(), json!(body_bytes));
         response.insert("upstream_bypassed".into(), json!(true));
+    }
+    if let Some(transform) = value.get_mut("transform").and_then(Value::as_object_mut)
+        && transform.get("type").and_then(Value::as_str) == Some("set_json")
+    {
+        transform.remove("expected");
+        transform.remove("value");
+        transform.insert("values_omitted".into(), true.into());
     }
     value
 }
@@ -287,7 +301,8 @@ impl RuleSpec {
                 }
                 RuleTransform::SetStatus { .. }
                 | RuleTransform::SetResponseHeader { .. }
-                | RuleTransform::ReplaceBody { .. } => RulePhase::Response,
+                | RuleTransform::ReplaceBody { .. }
+                | RuleTransform::SetJson { .. } => RulePhase::Response,
                 RuleTransform::SetWebsocketText { .. } => RulePhase::Websocket,
             },
             RuleAction::Terminal { terminal } => match terminal {
@@ -308,6 +323,7 @@ impl RuleSpec {
                 RuleTransform::SetStatus { .. } => "set_status",
                 RuleTransform::SetResponseHeader { .. } => "set_response_header",
                 RuleTransform::ReplaceBody { .. } => "replace_body",
+                RuleTransform::SetJson { .. } => "set_json",
                 RuleTransform::SetWebsocketText { .. } => "set_websocket_text",
             },
             RuleAction::Terminal { terminal } => match terminal {
@@ -421,6 +437,29 @@ fn legacy_action(
                 },
             })
         }
+        "set-json" => {
+            if !(3..=4).contains(&args.len()) {
+                return Err(
+                    "set-json expects <pointer> <expected-json> <value-json> [max-applications]"
+                        .into(),
+                );
+            }
+            Ok(RuleAction::Transform {
+                transform: RuleTransform::SetJson {
+                    pointer: args[0].clone(),
+                    expected: serde_json::from_str(&args[1])
+                        .map_err(|_| "expected value must be JSON")?,
+                    value: serde_json::from_str(&args[2])
+                        .map_err(|_| "replacement value must be JSON")?,
+                    max_applications: args
+                        .get(3)
+                        .map(|v| v.parse::<u32>())
+                        .transpose()
+                        .map_err(|_| "max-applications must be a positive integer")?
+                        .unwrap_or(1),
+                },
+            })
+        }
         "replace" => {
             exact(2)?;
             Ok(RuleAction::Transform {
@@ -462,6 +501,63 @@ pub struct CompiledRule {
     pub spec: RuleSpec,
     pub replace_regex: Option<Regex>,
     pub local_response: Option<CompiledLocalResponse>,
+    pub json_runtime: std::sync::Arc<std::sync::Mutex<JsonRuntime>>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct JsonRuntime {
+    pub applications: u32,
+    pub rejections: u64,
+    pub last_error: Option<&'static str>,
+}
+
+impl CompiledRule {
+    /// The lock spans validation and mutation, so concurrent requests cannot
+    /// exceed a one-shot rule's application limit. Rejections leave bytes intact.
+    pub fn apply_json(&self, body: &[u8]) -> Result<Option<Bytes>, &'static str> {
+        let RuleAction::Transform {
+            transform:
+                RuleTransform::SetJson {
+                    pointer,
+                    expected,
+                    value,
+                    max_applications,
+                },
+        } = &self.spec.action
+        else {
+            return Ok(None);
+        };
+        let mut runtime = self.json_runtime.lock().unwrap();
+        if runtime.applications >= *max_applications {
+            return Ok(None);
+        }
+        let result = (|| {
+            let mut document: Value =
+                serde_json::from_slice(body).map_err(|_| "json_body_invalid")?;
+            let field = document
+                .pointer_mut(pointer)
+                .ok_or("json_pointer_missing")?;
+            if field != expected {
+                return Err("json_expected_value_mismatch");
+            }
+            *field = value.clone();
+            serde_json::to_vec(&document)
+                .map(Bytes::from)
+                .map_err(|_| "json_encode_failed")
+        })();
+        match result {
+            Ok(bytes) => {
+                runtime.applications += 1;
+                runtime.last_error = None;
+                Ok(Some(bytes))
+            }
+            Err(code) => {
+                runtime.rejections += 1;
+                runtime.last_error = Some(code);
+                Err(code)
+            }
+        }
+    }
 }
 
 pub fn compile_rule(spec: RuleSpec) -> Result<CompiledRule, String> {
@@ -493,6 +589,27 @@ pub fn compile_rule(spec: RuleSpec) -> Result<CompiledRule, String> {
                     Some(Regex::new(pattern).map_err(|error| {
                         format!("invalid replacement regex {pattern:?}: {error}")
                     })?);
+            }
+            RuleTransform::SetJson {
+                pointer,
+                expected,
+                value,
+                max_applications,
+            } => {
+                if !pointer.starts_with('/')
+                    || pointer
+                        .split('~')
+                        .skip(1)
+                        .any(|s| !s.starts_with(['0', '1']))
+                {
+                    return Err("set-json requires a non-root RFC 6901 JSON pointer".into());
+                }
+                if *max_applications == 0 {
+                    return Err("max-applications must be positive".into());
+                }
+                if expected == value {
+                    return Err("set-json expected and replacement values must differ".into());
+                }
             }
             RuleTransform::SetWebsocketText { .. } => {}
         },
@@ -541,6 +658,7 @@ pub fn compile_rule(spec: RuleSpec) -> Result<CompiledRule, String> {
         spec,
         replace_regex,
         local_response,
+        json_runtime: Default::default(),
     })
 }
 
@@ -626,10 +744,7 @@ fn validate_phase_matchers(spec: &RuleSpec) -> Result<(), String> {
                 | MatcherField::Direction
                 | MatcherField::Opcode
         ),
-        RulePhase::Response => matches!(
-            field,
-            MatcherField::GraphqlOperation | MatcherField::Direction | MatcherField::Opcode
-        ),
+        RulePhase::Response => matches!(field, MatcherField::Direction | MatcherField::Opcode),
         RulePhase::Websocket => !matches!(
             field,
             MatcherField::Host | MatcherField::Direction | MatcherField::Opcode

@@ -201,3 +201,12 @@ OkHttp calls. It does not instrument Cronet, QUIC, or other HTTP clients.
 
 Use `aar install --coroutine-probes --build` to activate DebugProbes for
 `aar coroutines` in debug builds.
+
+## Guarded JSON experiments
+
+`net rule add set-json --host api.example.com --operation-name SwitchProfile
+/extensions/expiresIn 600 30 1` replaces one existing JSON pointer only when
+its old value matches. The final positional is the successful-application
+limit (default one), enforced across concurrent requests. Response operation
+matchers inspect the request body. `net rule list` exposes `runtime.applications`,
+`rejections`, and `last_error`; installing a rule does not prove it ran.

@@ -189,3 +189,27 @@ no app code changes, and supports capture, intercept, mutation, rules, fixtures,
 HAR/curl export, and replay. Use `aar` for apps you can build when you need the
 debug-only in-app agent for process/coroutine diagnostics, or above-TLS capture
 of pinned OkHttp traffic.
+
+### Guarded JSON response edits
+
+Use an RFC 6901 JSON pointer to change one existing field, with an expected old
+JSON value and a limit on successful applications (default: one):
+
+```sh
+shadowdroid --target tv net rule add set-json --host api.example.com --path /graphql --method POST --operation-name SwitchProfile /extensions/expiresIn 600 30 1
+shadowdroid --target tv net rule list
+```
+
+GraphQL response rules match the **request's** operation name. Missing pointers,
+invalid JSON, or unexpected old values leave the response unchanged and record
+`json_pointer_missing`, `json_body_invalid`, or `json_expected_value_mismatch`
+in the rule's `runtime.last_error`. `runtime.rejections` and `applications`
+show what actually happened; installing a rule is not proof that it applied.
+Limits count successful edits, including concurrent flows, and reset when the
+rule is reinstalled or the daemon restarts. Configured values are omitted from
+rule summaries. Streamed/undecodable responses are not edited. Standard flow
+`modified` and `rule_ids` fields identify successful mutations.
+
+Canonical rule files use a `transform` action with `type: "set_json"`,
+`pointer`, `expected`, `value`, and `max_applications` fields. JSON null is a
+value; an absent field never satisfies an expected null.
