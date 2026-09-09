@@ -4385,13 +4385,15 @@ mod tests {
             .await;
         let mut decision = insert_held(&shared.held, "f1");
         shared.held_bytes.store(123, Ordering::Relaxed);
-        shared
-            .held
-            .lock()
-            .unwrap()
-            .get_mut("f1")
-            .unwrap()
-            .held_charge = Some((shared.held_bytes.clone(), 123));
+        let original = {
+            let mut held = shared.held.lock().unwrap();
+            let flow = held.get_mut("f1").unwrap();
+            // This timestamp lost one ULP in the JSON round trip in CI.
+            // Keep the live expiry from insert_held so the fixture cannot age out.
+            flow.held_at = 1_788_978_517.216_045_9;
+            flow.held_charge = Some((shared.held_bytes.clone(), 123));
+            flow.lifecycle()
+        };
         let before = interception_control_request(shared.clone(), json!({"op": "status"})).await;
         assert_eq!(before["intercepting"], true);
         assert_eq!(before["ws_intercepting"], true);
@@ -4441,8 +4443,20 @@ mod tests {
         let terminal = shared.terminal_holds.lock().unwrap().get("f1").unwrap();
         assert_eq!(terminal.state, "released");
         assert_eq!(terminal.action.as_deref(), Some("resume"));
-        assert_eq!(reply["held_at"], terminal.held_at);
-        assert_eq!(reply["expires_at"], terminal.expires_at);
+        assert_eq!(terminal.held_at, original.held_at);
+        assert_eq!(terminal.expires_at, original.expires_at);
+        // JSON decoding can shift epoch-second floats by one ULP. Keep the
+        // wire tolerance to one microsecond; internal preservation is exact above.
+        for (field, expected) in [
+            ("held_at", original.held_at),
+            ("expires_at", original.expires_at),
+        ] {
+            let actual = reply[field].as_f64().expect("numeric lifecycle timestamp");
+            assert!(
+                (actual - expected).abs() <= 1e-6,
+                "{field} changed across JSON serialization: expected {expected}, got {actual}"
+            );
+        }
     }
 
     #[test]
