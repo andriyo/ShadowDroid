@@ -192,3 +192,5 @@ overwriting it, then requires stored and effective values to agree for two
 seconds. This guards against delayed framework write-back; it is not a portable
 proof that every vendor's settings storage has flushed to disk. Recovery fixtures
 also reboot the disposable emulator and check the restored value again.
+Night-mode baselines retain Android's distinct `custom_schedule` and
+`custom_bedtime` values when restoring a temporary light/dark override.

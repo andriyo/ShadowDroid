@@ -248,10 +248,7 @@ async fn read(serial: &Serial, field: &Field) -> Result<Option<String>> {
                 .trim()
                 .strip_prefix("Night mode: ")
                 .context("night mode query unsupported")?;
-            anyhow::ensure!(
-                matches!(mode, "yes" | "no" | "auto" | "custom"),
-                "unsupported night mode: {mode}"
-            );
+            anyhow::ensure!(valid_night_mode(mode), "unsupported night mode: {mode}");
             Some(mode.into())
         }
     })
@@ -292,10 +289,7 @@ async fn write(serial: &Serial, field: &Field, value: Option<&str>) -> Result<()
         }
         Field::Night => {
             let v = value.context("missing night mode")?;
-            anyhow::ensure!(
-                matches!(v, "yes" | "no" | "auto" | "custom"),
-                "invalid night mode"
-            );
+            anyhow::ensure!(valid_night_mode(v), "invalid night mode");
             format!("cmd uimode night {v}")
         }
     };
@@ -406,6 +400,13 @@ fn font_scale_settled(
     now.duration_since(*since.get_or_insert(now)) >= std::time::Duration::from_secs(2)
 }
 
+fn valid_night_mode(value: &str) -> bool {
+    matches!(
+        value,
+        "yes" | "no" | "auto" | "custom" | "custom_schedule" | "custom_bedtime"
+    )
+}
+
 pub async fn metadata(serial: &Serial) -> Result<serde_json::Value> {
     Ok(
         serde_json::json!({"font_scale":read(serial,&Field::Setting{namespace:"system".into(),key:"font_scale".into()}).await?,"night":read(serial,&Field::Night).await?,"size":adb::shell(serial,"wm size").await?,"density":adb::shell(serial,"wm density").await?,"rotation":read(serial,&Field::Setting{namespace:"system".into(),key:"user_rotation".into()}).await?,"accelerometer_rotation":read(serial,&Field::Setting{namespace:"system".into(),key:"accelerometer_rotation".into()}).await?}),
@@ -415,6 +416,22 @@ pub async fn metadata(serial: &Serial) -> Result<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn custom_night_modes_remain_distinct_restorable_values() {
+        for mode in [
+            "yes",
+            "no",
+            "auto",
+            "custom",
+            "custom_schedule",
+            "custom_bedtime",
+        ] {
+            assert!(valid_night_mode(mode));
+        }
+        for mode in ["unknown", "custom_other", "custom_bedtime; reboot", ""] {
+            assert!(!valid_night_mode(mode));
+        }
+    }
     #[test]
     fn font_scale_settling_restarts_after_delayed_framework_writeback() {
         let start = std::time::Instant::now();
