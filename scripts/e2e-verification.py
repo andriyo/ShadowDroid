@@ -130,6 +130,7 @@ def main():
                 if probe.stdout.strip() == '1': break
                 time.sleep(.5)
             else: raise AssertionError('device did not reboot')
+            assert adb('shell', 'settings', 'get', 'system', 'font_scale') == before, 'restored font scale did not survive reboot'
             call('session', 'recover', '--external-workers-stopped')
             call('session', 'observe', '--subscription', 'after-recovery')
         print(json.dumps({'status': 'passed', 'evidence': str(args.out), 'scope': 'tool contracts, no model/benchmark uplift claim'}))

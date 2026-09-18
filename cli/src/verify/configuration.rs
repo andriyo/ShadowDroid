@@ -102,8 +102,13 @@ impl Journal {
             key: key.into(),
         };
         if let Some(value) = config.font_scale {
-            self.change(serial, path, setting("font_scale"), Some(value.to_string()))
-                .await?;
+            self.change(
+                serial,
+                path,
+                setting("font_scale"),
+                Some(format!("{value:?}")),
+            )
+            .await?;
         }
         if let Some(value) = config.rotation {
             self.change(
@@ -288,7 +293,56 @@ async fn write(serial: &Serial, field: &Field, value: Option<&str>) -> Result<()
             format!("cmd uimode night {v}")
         }
     };
-    adb::shell_mutating(serial, command).await?;
+    if matches!(field,Field::Setting{namespace,key} if namespace=="system" && key=="accelerometer_rotation")
+        && value == Some("1")
+    {
+        adb::shell_mutating(serial, "wm user-rotation free").await?;
+    } else {
+        adb::shell_mutating(serial, command).await?;
+    }
+    if matches!(field,Field::Setting{key,..} if key=="user_rotation" || key=="accelerometer_rotation")
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut stable_since = None;
+        loop {
+            let mut matched = read(serial, field).await?.as_deref() == value;
+            if matches!(field,Field::Setting{key,..} if key=="user_rotation")
+                && adb::shell(serial, "settings get system accelerometer_rotation")
+                    .await?
+                    .trim()
+                    == "0"
+            {
+                let dump = adb::shell(serial, "dumpsys input").await?;
+                let actual = dump
+                    .lines()
+                    .find(|line| line.contains("displayId=0,") && line.contains("Viewport"))
+                    .and_then(|line| {
+                        line.split("orientation=")
+                            .nth(1)?
+                            .split(',')
+                            .next()?
+                            .parse::<u8>()
+                            .ok()
+                    });
+                if let Some(expected) = value.and_then(|s| s.parse::<u8>().ok()) {
+                    matched &= actual == Some(expected);
+                }
+            }
+            if matched {
+                let since = stable_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= std::time::Duration::from_millis(300) {
+                    break;
+                }
+            } else {
+                stable_since = None;
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "rotation setting/effective display did not settle"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
     if matches!(field,Field::Setting{key,..} if key=="font_scale") {
         let expected = value
             .unwrap_or("1.0")

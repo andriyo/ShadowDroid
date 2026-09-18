@@ -65,8 +65,10 @@ pub async fn matrix(
             );
         }
         let mut journey = journey.clone();
+        let configuration_index =
+            usize::from(matches!(journey.steps.first(), Some(Step::Start { .. })));
         journey.steps.insert(
-            0,
+            configuration_index,
             Step::Configure {
                 configuration: cell.configuration.clone(),
             },
