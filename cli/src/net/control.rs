@@ -1256,7 +1256,11 @@ pub async fn is_running(serial: &Serial) -> bool {
     status_matches_live_daemon(serial, &status, daemon_pid(serial))
 }
 
-fn status_matches_live_daemon(serial: &Serial, status: &Value, marker_pid: Option<u32>) -> bool {
+pub(crate) fn status_matches_live_daemon(
+    serial: &Serial,
+    status: &Value,
+    marker_pid: Option<u32>,
+) -> bool {
     status.get("ok").and_then(Value::as_bool) == Some(true)
         && status.get("running").and_then(Value::as_bool) == Some(true)
         && status.get("serial").and_then(Value::as_str) == Some(serial.as_str())

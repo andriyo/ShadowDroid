@@ -9,8 +9,24 @@ as `http` events on the same timeline as `screen` when `watch` is running.
 
 The pre-existing device proxy setting is persisted before wiring; a repeated
 `net start` repairs wiring to an already-running daemon, while `net stop`
-restores that exact setting and reports separate raw-IP and DNS connectivity
-checks (`--canary-host` selects the neutral DNS probe).
+attempts to restore that exact setting without overwriting unowned wiring.
+`proxy_restoration` and `adb_reverse_restoration` are `restored`, `not_needed`,
+or `unresolved`; `cleanup_complete` requires both to be resolved. Recovery
+snapshots remain until readback verifies restoration. An unowned proxy with no
+daemon/snapshot is preserved with an actionable warning.
+
+`network_reachable` reports only raw-IP ping plus DNS (`--canary-host` selects
+the DNS probe). `application_connectivity` is `not_checked`; verify an app HTTP
+request separately. The legacy `connectivity_restored` field is now null and
+must not be used as a boolean success check. Teardown errors preserve the
+underlying typed cause plus `phase`, `completed_phases`, and total `elapsed_ms`
+in `detail`. Progress is on stderr; stdout remains one terminal JSON object.
+
+`net status` now exits nonzero with `net_status_incomplete` when a required
+observation fails. Its `detail` retains partial results, `complete:false`,
+`http_proxy_state:unknown`, and typed per-observation errors. Unknown match
+results are null. A successfully read absent proxy has `http_proxy:null` and
+`http_proxy_state:known`; only a complete observation returns action success.
 
 ## Capture host scope
 
@@ -255,3 +271,13 @@ rule summaries. Streamed/undecodable responses are not edited. Standard flow
 Canonical rule files use a `transform` action with `type: "set_json"`,
 `pointer`, `expected`, `value`, and `max_applications` fields. JSON null is a
 value; an absent field never satisfies an expected null.
+
+## Prepared edits and client deadlines
+
+For deterministic response changes, prepare a narrowly matched rule before
+triggering the request, save its returned id, verify the app result, then remove
+that id in `finally`. Avoid clearing unrelated rules. Use a response-phase
+replacement when upstream must still execute; request-phase `respond` bypasses
+upstream. `commands --guide net` includes a concrete operation-scoped recipe.
+A configured hold deadline does not extend the app's timeout. Client cancellation
+is not repaired by increasing the proxy hold; observe the outcome before replay.

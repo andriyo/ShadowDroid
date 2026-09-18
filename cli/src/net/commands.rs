@@ -762,13 +762,94 @@ struct PingCheck {
     host: String,
     resolved: bool,
     reachable: bool,
+    observation_error: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct ConnectivityCheck {
     raw_ip: PingCheck,
     dns: PingCheck,
-    connectivity_restored: bool,
+    network_reachable: bool,
+}
+
+/// Keep the underlying typed failure when an observation is only one part of
+/// a larger result. Unknown is different from a successfully observed absence.
+fn observation_error(error: &anyhow::Error) -> Value {
+    let diagnostic = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::diagnostic::DiagnosticError>());
+    json!({
+        "code": crate::cli::error_code_of(error),
+        "stage": crate::cli::error_stage_of(error),
+        "retryable": crate::cli::error_retryable_of(error),
+        "msg": format!("{error:#}"),
+        "detail": diagnostic.map(|error| &error.detail),
+        "next_actions": diagnostic.map(|error| &error.next_actions),
+    })
+}
+
+fn proxy_observation(result: Result<Option<String>>) -> (Option<String>, Option<Value>) {
+    match result {
+        Ok(value) => (value, None),
+        Err(error) => (None, Some(observation_error(&error))),
+    }
+}
+
+fn proxy_restoration(
+    current: &Option<String>,
+    prior: Option<&Option<String>>,
+    removed: bool,
+) -> &'static str {
+    match prior {
+        Some(expected) if current == expected => "restored",
+        Some(_) => "unresolved",
+        None if current.as_deref().is_none_or(|value| value == ":0") => {
+            if removed {
+                "restored"
+            } else {
+                "not_needed"
+            }
+        }
+        None => "unresolved",
+    }
+}
+
+struct TeardownProgress {
+    started: std::time::Instant,
+    phase: &'static str,
+    completed: Vec<&'static str>,
+}
+
+impl TeardownProgress {
+    fn advance(&mut self, phase: &'static str) {
+        self.completed.push(self.phase);
+        self.phase = phase;
+        tracing::info!(
+            phase,
+            elapsed_ms = self.started.elapsed().as_millis(),
+            "network teardown"
+        );
+    }
+
+    fn error(&self, error: anyhow::Error) -> anyhow::Error {
+        crate::diagnostic::DiagnosticError::new(
+            crate::cli::error_code_of(&error),
+            "net_stop",
+            format!("network teardown failed during {}: {error}", self.phase),
+        )
+        .retryable(crate::cli::error_retryable_of(&error))
+        .detail(json!({
+            "phase": self.phase,
+            "elapsed_ms": self.started.elapsed().as_millis(),
+            "completed_phases": self.completed,
+            "cause": observation_error(&error),
+        }))
+        .next_actions([
+            "inspect the failed phase and cause; do not assume earlier mutations were rolled back",
+            "run `shadowdroid net status`, then retry `shadowdroid net stop` for this device",
+        ])
+        .into()
+    }
 }
 
 pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
@@ -1099,8 +1180,26 @@ pub async fn stop(
     canary_host: &str,
     ca_cert: &Path,
 ) -> Result<()> {
+    let mut progress = TeardownProgress {
+        started: std::time::Instant::now(),
+        phase: "acquire_lock",
+        completed: Vec::new(),
+    };
+    stop_inner(serial, revoke_ca, canary_host, ca_cert, &mut progress)
+        .await
+        .map_err(|error| progress.error(error))
+}
+
+async fn stop_inner(
+    serial: &Serial,
+    revoke_ca: bool,
+    canary_host: &str,
+    ca_cert: &Path,
+    progress: &mut TeardownProgress,
+) -> Result<()> {
     let lifecycle_serial = net_lifecycle_serial(serial);
     let _lifecycle_guard = installer::acquire_lifecycle_lock(&lifecycle_serial)?;
+    progress.advance("observe_initial_state");
     let state = load_device_network_state(serial)?;
     let daemon_status = control::request(serial, json!({"op": "status"})).await.ok();
     if let Some(status) = &daemon_status {
@@ -1115,9 +1214,14 @@ pub async fn stop(
             .filter(|startup_id| !startup_id.is_empty());
     }
     let initial_http_proxy = read_http_proxy(serial).await?;
-    let already_stopped = daemon_status.is_none() && pid.is_none() && state.is_none();
+    let already_stopped = daemon_status.is_none()
+        && pid.is_none()
+        && state.is_none()
+        && !paths::ctl_path(serial)?.try_exists()?;
 
-    let daemon_evidence = daemon_status.is_some() || pid.is_some();
+    progress.advance("stop_daemon");
+    let daemon_evidence =
+        daemon_status.is_some() || pid.is_some() || paths::ctl_path(serial)?.try_exists()?;
     let stop_requested = if daemon_status.is_some() {
         request_daemon_stop(serial).await
     } else {
@@ -1136,11 +1240,11 @@ pub async fn stop(
     }
     let stopped = daemon_evidence;
 
+    progress.advance("restore_device_wiring");
     let mut warnings = Vec::<String>::new();
     let (http_proxy_restored, adb_reverse_restored, adb_reverse_removed, prior_http_proxy) =
         if let Some(state) = &state {
             let outcome = restore_network_state(serial, state).await?;
-            remove_device_network_state(serial)?;
             warnings.extend(outcome.warnings);
             (
                 outcome.http_proxy_restored,
@@ -1187,24 +1291,54 @@ pub async fn stop(
         } else {
             // Idempotent already-stopped path: do not overwrite a proxy setting
             // owned by the user or another tool.
-            (false, false, false, initial_http_proxy)
+            (false, false, false, None)
         };
 
+    progress.advance("verify_proxy");
+    let current_http_proxy = read_http_proxy(serial).await?;
+    let restoration = proxy_restoration(
+        &current_http_proxy,
+        state.as_ref().map(|state| &state.prior_http_proxy),
+        http_proxy_restored,
+    );
+    progress.advance("verify_reverse");
+    let reverse_restoration = if let Some(state) = &state {
+        if reverse_host_port(serial, state.device_port).await? == state.prior_reverse_host_port {
+            "restored"
+        } else {
+            "unresolved"
+        }
+    } else if daemon_status.is_some() {
+        if adb_reverse_removed {
+            "restored"
+        } else {
+            "unresolved"
+        }
+    } else {
+        "not_needed"
+    };
+    let cleanup_complete = restoration != "unresolved" && reverse_restoration != "unresolved";
+    // Keep recovery evidence until readback confirms both pieces of wiring.
+    if cleanup_complete && state.is_some() {
+        remove_device_network_state(serial)?;
+    }
+    if restoration == "unresolved" {
+        warnings.push("proxy restoration is unresolved: preserved unowned device settings; inspect `net status` and `doctor --json` before choosing device-scoped repair".into());
+    }
+    progress.advance("check_network_reachability");
     let connectivity = connectivity_check(serial, canary_host).await;
-    let connectivity_restored = connectivity.connectivity_restored;
     let raw_ip_check = serde_json::to_value(&connectivity.raw_ip)?;
     let dns_check = serde_json::to_value(&connectivity.dns)?;
-    if !connectivity.connectivity_restored {
+    if !connectivity.network_reachable {
         warnings.push(format!(
-            "device connectivity is degraded after proxy teardown (raw IP reachable: {}, DNS resolved: {}); run `shadowdroid doctor --fix` or repair the device network before continuing",
+            "raw reachability checks did not establish connectivity after teardown (raw IP reachable: {}, DNS resolved: {}); inspect `shadowdroid doctor --json` and verify an app HTTP request",
             connectivity.raw_ip.reachable, connectivity.dns.resolved
         ));
     }
 
+    progress.advance("revoke_ca");
     let ca_removed = if revoke_ca {
-        crate::net::trust::remove(serial, ca_cert)
-            .await
-            .unwrap_or(false)
+        crate::net::trust::remove(serial, ca_cert).await?
     } else {
         false
     };
@@ -1217,43 +1351,67 @@ pub async fn stop(
             "already_stopped": already_stopped,
             "http_proxy_restored": http_proxy_restored,
             "prior_http_proxy": prior_http_proxy,
-            "current_http_proxy": read_http_proxy(serial).await?,
+            "initial_http_proxy": initial_http_proxy,
+            "current_http_proxy": current_http_proxy,
+            "proxy_restoration": restoration,
+            "cleanup_complete": cleanup_complete,
+            "adb_reverse_restoration": reverse_restoration,
             "adb_reverse_restored": adb_reverse_restored,
             "adb_reverse_removed": adb_reverse_removed,
             "prior_reverse_host_port": state.as_ref().and_then(|state| state.prior_reverse_host_port),
             "raw_ip_check": raw_ip_check,
             "dns_check": dns_check,
-            "connectivity_restored": connectivity_restored,
+            // Deprecated: ping and DNS cannot establish application connectivity.
+            "connectivity_restored": null,
+            "network_reachable": connectivity.network_reachable,
+            "application_connectivity": "not_checked",
             "connectivity": connectivity,
             "revoke_ca": revoke_ca,
             "ca_removed": ca_removed,
             "warnings": warnings,
+            "elapsed_ms": progress.started.elapsed().as_millis(),
         }),
     );
     Ok(())
 }
 
 pub async fn status(serial: &Serial, ca_cert: Option<&Path>) -> Result<()> {
-    let running = control::is_running(serial).await;
-    let daemon = if running {
-        control::request(serial, json!({"op": "status"})).await.ok()
+    // No marker is a known absence. A stale/unreadable control endpoint is an
+    // unknown observation, not proof that the daemon has stopped.
+    let has_markers =
+        paths::ctl_path(serial)?.try_exists()? || paths::pid_path(serial)?.try_exists()?;
+    let (daemon, daemon_error) = if has_markers {
+        match control::request(serial, json!({"op": "status"})).await {
+            Ok(value)
+                if control::status_matches_live_daemon(
+                    serial,
+                    &value,
+                    control::daemon_pid(serial),
+                ) =>
+            {
+                (Some(value), None)
+            }
+            Ok(value) => (
+                Some(value),
+                Some(
+                    json!({"code": "net_daemon_identity_mismatch", "stage": "net", "retryable": false}),
+                ),
+            ),
+            Err(error) => (None, Some(observation_error(&error))),
+        }
     } else {
-        None
+        (None, None)
     };
+    let running = daemon_error.is_none().then_some(daemon.is_some());
     let port = daemon
         .as_ref()
         .map_or(Ok(None), |status| daemon_port_field(status, "port"))?;
     let host_port = daemon
         .as_ref()
         .map_or(Ok(None), |status| daemon_port_field(status, "host_port"))?;
-
-    let http_proxy = adb::shell(serial, "settings get global http_proxy")
-        .await
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && s != "null");
-
-    let http_proxy_matches = port.is_some_and(|port| proxy_points_at(&http_proxy, port));
+    let (http_proxy, http_proxy_error) = proxy_observation(read_http_proxy(serial).await);
+    let http_proxy_matches = (http_proxy_error.is_none() && daemon_error.is_none())
+        .then(|| port.is_some_and(|port| proxy_points_at(&http_proxy, port)));
     let (adb_reverse_matches, adb_reverse_mappings, adb_reverse_error) = match (port, host_port) {
         (Some(device_port), Some(host_port)) => match adb::reverse_list(serial).await {
             Ok(mappings) => {
@@ -1262,34 +1420,48 @@ pub async fn status(serial: &Serial, ca_cert: Option<&Path>) -> Result<()> {
                     .into_iter()
                     .map(|mapping| json!({"device": mapping.device, "host": mapping.host}))
                     .collect::<Vec<_>>();
-                (matches, mappings, None)
+                (Some(matches), mappings, None)
             }
-            Err(err) => (false, Vec::new(), Some(err.to_string())),
+            Err(error) => (None, Vec::new(), Some(observation_error(&error))),
         },
-        _ => (false, Vec::new(), None),
+        _ => (daemon_error.is_none().then_some(false), Vec::new(), None),
     };
-    let pointed = http_proxy_matches && adb_reverse_matches;
-
-    emit(
-        "net_status",
-        json!({
-            "device": serial,
-            "running": running,
-            "daemon": daemon,
-            "http_proxy": http_proxy,
-            "http_proxy_matches": http_proxy_matches,
-            "adb_reverse_matches": adb_reverse_matches,
-            "adb_reverse_mappings": adb_reverse_mappings,
-            "adb_reverse_error": adb_reverse_error,
-            "pointed_at_proxy": pointed,
-            // The CA `net start` would use here (resolved), falling back to the
-            // global CA when resolution isn't possible.
-            "ca": ca_cert.map(|p| p.display().to_string()),
-            "ca_generated": ca_cert
-                .map(|p| p.exists())
-                .unwrap_or_else(|| paths::ca_cert_path().map(|p| p.exists()).unwrap_or(false)),
-        }),
-    );
+    let complete =
+        http_proxy_error.is_none() && daemon_error.is_none() && adb_reverse_error.is_none();
+    let body = json!({
+        "device": serial,
+        "complete": complete,
+        "running": running,
+        "daemon": daemon,
+        "daemon_state": if daemon_error.is_none() { "known" } else { "unknown" },
+        "daemon_error": daemon_error,
+        "http_proxy": http_proxy,
+        "http_proxy_state": if http_proxy_error.is_none() { "known" } else { "unknown" },
+        "http_proxy_error": http_proxy_error,
+        "http_proxy_matches": http_proxy_matches,
+        "adb_reverse_matches": adb_reverse_matches,
+        "adb_reverse_mappings": adb_reverse_mappings,
+        "adb_reverse_error": adb_reverse_error,
+        "pointed_at_proxy": http_proxy_matches.zip(adb_reverse_matches).map(|(proxy, reverse)| proxy && reverse),
+        "ca": ca_cert.map(|p| p.display().to_string()),
+        "ca_generated": ca_cert.map(|p| p.exists())
+            .unwrap_or_else(|| paths::ca_cert_path().map(|p| p.exists()).unwrap_or(false)),
+    });
+    if !complete {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "net_status_incomplete",
+            "net_status",
+            "network status could not be completely observed",
+        )
+        .retryable(true)
+        .detail(body)
+        .next_actions([
+            "inspect detail.http_proxy_error, detail.daemon_error, and detail.adb_reverse_error",
+            "run `shadowdroid devices` and retry `shadowdroid net status` for the same device",
+        ])
+        .into());
+    }
+    emit("net_status", body);
     Ok(())
 }
 
@@ -1525,7 +1697,7 @@ async fn connectivity_check(serial: &Serial, canary_host: &str) -> ConnectivityC
     let raw_ip = ping_check(serial, RAW_IP_CANARY).await;
     let dns = ping_check(serial, canary_host).await;
     ConnectivityCheck {
-        connectivity_restored: raw_ip.reachable && dns.resolved,
+        network_reachable: raw_ip.reachable && dns.resolved,
         raw_ip,
         dns,
     }
@@ -1537,8 +1709,15 @@ async fn ping_check(serial: &Serial, host: &str) -> PingCheck {
         "ping -c 1 -W 2 {} 2>&1; echo {EXIT_MARKER}$?",
         device_shell_quote(host)
     );
-    let output = adb::shell(serial, command).await.unwrap_or_default();
-    parse_ping_check(host, &output)
+    match adb::shell(serial, command).await {
+        Ok(output) => parse_ping_check(host, &output),
+        Err(error) => PingCheck {
+            host: host.to_string(),
+            resolved: false,
+            reachable: false,
+            observation_error: Some(observation_error(&error)),
+        },
+    }
 }
 
 fn parse_ping_check(host: &str, output: &str) -> PingCheck {
@@ -1561,6 +1740,7 @@ fn parse_ping_check(host: &str, output: &str) -> PingCheck {
         host: host.to_string(),
         resolved: exit.is_some() && !name_error,
         reachable: exit == Some(0),
+        observation_error: None,
     }
 }
 
@@ -3967,6 +4147,62 @@ mod tests {
         let m = matcher_from_url_glob("*.example.com");
         assert_eq!(m.host.as_deref(), Some(".example.com"));
         assert_eq!(m.path, None);
+    }
+
+    #[test]
+    fn failed_proxy_read_preserves_typed_error_instead_of_known_absence() {
+        let error = crate::diagnostic::DiagnosticError::new("adb_timeout", "adb", "read timed out")
+            .retryable(true)
+            .detail(json!({"timeout_ms": 20000}))
+            .into();
+        let (value, error) = proxy_observation(Err(error));
+        assert!(value.is_none());
+        let error = error.expect("an unknown observation must carry its cause");
+        assert_eq!(error["code"], "adb_timeout");
+        assert_eq!(error["detail"]["timeout_ms"], 20000);
+        assert_eq!(proxy_observation(Ok(None)), (None, None));
+    }
+
+    #[test]
+    fn restoration_requires_known_prior_state_or_an_inactive_proxy() {
+        let dangling = Some("localhost:9090".into());
+        let custom = Some("proxy.example:3128".into());
+        assert_eq!(proxy_restoration(&dangling, None, false), "unresolved");
+        assert_eq!(proxy_restoration(&custom, None, false), "unresolved");
+        assert_eq!(proxy_restoration(&custom, Some(&custom), false), "restored");
+        assert_eq!(
+            proxy_restoration(&dangling, Some(&custom), false),
+            "unresolved"
+        );
+        assert_eq!(proxy_restoration(&None, None, false), "not_needed");
+        assert_eq!(
+            proxy_restoration(&Some(":0".into()), None, false),
+            "not_needed"
+        );
+        assert_eq!(proxy_restoration(&None, Some(&None), false), "restored");
+    }
+
+    #[test]
+    fn teardown_error_keeps_phase_and_original_timeout() {
+        let mut progress = TeardownProgress {
+            started: std::time::Instant::now(),
+            phase: "acquire_lock",
+            completed: vec![],
+        };
+        progress.advance("observe_initial_state");
+        let error = progress.error(
+            crate::diagnostic::DiagnosticError::new("adb_timeout", "adb", "read timed out")
+                .retryable(true)
+                .detail(json!({"timeout_ms":20000}))
+                .into(),
+        );
+        let error = error
+            .downcast_ref::<crate::diagnostic::DiagnosticError>()
+            .unwrap();
+        assert_eq!(error.code, "adb_timeout");
+        assert_eq!(error.detail["phase"], "observe_initial_state");
+        assert_eq!(error.detail["cause"]["detail"]["timeout_ms"], 20000);
+        assert_eq!(error.detail["completed_phases"], json!(["acquire_lock"]));
     }
 
     #[test]
