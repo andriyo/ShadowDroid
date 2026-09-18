@@ -251,7 +251,13 @@ Check every command's exit status; the last successful shell command does not
 make earlier failures successful. Serialize device lifecycle changes. For a
 short, expected contention window, `--lock-timeout-ms 2000` waits up to two
 seconds **per lifecycle lock acquisition** before returning retryable
-`device_lifecycle_busy` with `waited_ms`. The default remains zero, and the
-maximum is 30000. Waiting never removes a lock file or takes ownership from
+`device_lifecycle_busy` with `waited_ms`. The default is 2000 ms; pass zero for immediate failure. The
+maximum is 30000 ms. Named-AVD resolution takes this lock even for read commands. Waiting never removes a lock file or takes ownership from
 another process. Long-running command orchestration should still set its own
 overall deadline.
+
+Use `set -o pipefail` around formatting pipelines and `&&` between dependent
+commands. Read `commands --guide workflow` for the copyable checked Python
+invocation and guarded UI recovery recipes. After a guard rejection, require a
+fresh consistent snapshot and reselect the target before applying a fresh guard.
+An action with delivered or unknown input must be observed before retrying.

@@ -17,6 +17,11 @@ pub(super) struct Guide {
 
 pub(super) const GUIDES: &[Guide] = &[
     Guide {
+        topic: "workflow",
+        covers: &["ui"],
+        content: include_str!("guides/workflow.md"),
+    },
+    Guide {
         topic: "evidence",
         covers: &["evidence", "video"],
         content: include_str!("guides/evidence.md"),

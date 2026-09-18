@@ -6,12 +6,16 @@ builds; ShadowDroid verifies on devices.
 Use the live machine catalog to discover syntax:
 
 ```bash
-shadowdroid commands --json --depth 1
-shadowdroid commands --json --describe 'ui tap'
+shadowdroid commands --json --depth 0  # shared globals/effect definitions, once per version
+shadowdroid commands ui --json --compact
+shadowdroid commands --search 'response body' --json --compact
+shadowdroid commands --json --describe 'ui tap' --compact
 shadowdroid commands --guide net
 ```
 
-The catalog gives paths, constraints, output modes, and hints. Before first
+Reuse syntax within one CLI/schema version. Search before guessing.
+`--compact` references shared metadata; full JSON remains available.
+JSON-native one-shot commands accept `--json`. Before first
 use, read `--guide net` (proxy/AAR), `--guide debugger` (Studio/layout),
 `--guide state` (private files/app state), or `--guide evidence` (checkpoints
 and video coverage). Group aliases work too: `aar` → net, `video` → evidence.
@@ -24,13 +28,9 @@ shadowdroid --target mobile connect
 shadowdroid -d emulator-5554 doctor --json
 ```
 
-Prefer a project-configured named target (`--target mobile|tv`,
-`default_target`) over persisting an ephemeral serial; a target reuses a
-running emulator by AVD name and starts one only if its config says
-`start: "if-needed"`. Otherwise never silently choose between attached devices
-or start an emulator: read `devices`, pass global `-d <serial>`, or ask.
-Explicit `-d/--device` overrides target selection; `--takeover` only when
-reassigning another project's claimed AVD is intentional.
+Prefer a configured named target; otherwise discover `devices` and pass `-d`.
+Explicit `-d` overrides targets. Never guess among devices or boot an AVD unless
+its target allows `start:if-needed`. `--takeover` deliberately reassigns ownership.
 
 `connect` may install the instrumentation APKs and claims Android's single
 `UiAutomation` slot; wrap Espresso/UI Automator runs in
@@ -49,8 +49,25 @@ Treat stdout as data and the process exit code as authoritative:
   (HAR, curl, fixtures) write an artifact and return a small JSON summary; a
   few setup/report commands default to human output — request `--json`.
 
-Check each child’s exit status in batches. Serialize device lifecycle changes;
-use `--lock-timeout-ms 2000` for bounded contention. Never delete an active lock.
+For one-shot batches, preserve every child's output and exit status:
+
+```python
+import subprocess
+import sys
+
+def checked_run(argv):
+    r = subprocess.run(argv, capture_output=True, text=True)
+    sys.stdout.write(r.stdout)
+    sys.stderr.write(r.stderr)
+    if r.returncode:
+        raise SystemExit(r.returncode if r.returncode > 0 else 128 - r.returncode)
+    return r.stdout
+```
+
+Use `pipefail` and `&&` for dependencies; `set -e` alone is insufficient.
+Never discard error/detail, events, or input/postcondition evidence. Serialize
+lifecycle mutations. Named-target reads also lock: the default wait is 2000 ms
+(`--lock-timeout-ms 0` fails immediately). Never delete an active lock.
 
 Branch on `ok`/`code`, inspect `detail`, follow the most relevant
 `next_actions` entry; never parse `msg` to recover state. Inside a `watch`
@@ -59,14 +76,9 @@ stream a `type:"error"` record is a timeline event, not the one-shot envelope
 
 ## Project config and recovery
 
-`config init --project --app Example --package com.example.app --json` stores
-repeated device/app/debugger values (user `~/.shadowdroid/config.json`;
-project `.shadowdroid/config.json` discovered from ancestors; nearer values
-override, CLI flags win). Config is data, not shell code — identifier fields
-are validated and quoted at the device-shell boundary; shell syntax fails
-typed. Run `config validate --json` after editing a committed config;
-validate/paths/schema and `commands --json` still run when a malformed config
-blocks everything else.
+Use `config init --project` for defaults and `config validate --json` after
+edits. CLI flags win. Discovery and config validate/paths/schema remain usable
+when malformed config blocks other commands. See `commands --guide state`.
 
 ## Predictable read, act, confirm loop
 
@@ -83,11 +95,9 @@ gesture-only surface. `--text`/`--desc` match normalized case-insensitive
 substrings (`--exact` requires the full value; values starting with `-` need
 the equals form, `--text=-50%`).
 
-Selector actions are strict: multiple non-exact matches fail as
-`ambiguous_match` rather than choosing one, and taps resolve a non-clickable
-child to its nearest enabled clickable ancestor or fail typed
-(`--coordinate-fallback` only when raw center injection is intended). Set
-range controls with `ui set-progress --value/--percent`.
+Selectors fail on ambiguity. Taps require an enabled clickable target/ancestor;
+`--coordinate-fallback` explicitly permits raw input. Use `ui set-progress` for
+range controls; see `commands --guide workflow` for selector details.
 
 Check-act-observe (full flag semantics: `commands --describe 'ui tap'`):
 
@@ -102,10 +112,12 @@ Check-act-observe (full flag semantics: `commands --describe 'ui tap'`):
 - `ui wait` timeouts are typed non-zero `wait_timeout` failures; never treat
   one as successful polling.
 
-Use `--redact` for output; screenshots
-are pixel-masked only when explicitly requested (`--redact-pixels`,
-`--redact-screenshots`) and stay labeled potentially sensitive. On
-TV/leanback prefer `ui focus` and `ui key dpad_*`.
+After guard rejection, reobserve, require consistency, reselect, and use a fresh
+guard. Check input delivery before retrying. See `commands --guide workflow`
+for interaction hashes, handles, and recovery examples.
+
+`--redact` covers structured output; screenshot pixel masking requires
+`--redact-pixels`/`--redact-screenshots`. On TV use `ui focus` and `ui key dpad_*`.
 
 ## Failure triage
 
@@ -117,8 +129,7 @@ TV/leanback prefer `ui focus` and `ui key dpad_*`.
   reads an existing server session or degrades to adb evidence; never starts an
   AVD/server or forward.
 
-UI and app results may carry an `events` array for a crash/ANR detected since
-the previous invocation; inspect it before probing further.
+Inspect UI/app `events` for crashes/ANRs before probing further.
 
 ## App, device, permission, and file operations
 
@@ -130,34 +141,31 @@ shadowdroid appops set com.example.app CAMERA ignore --scope uid
 shadowdroid files pull --run-as --app com.example.app files/state.json local.json
 ```
 
-These verbs verify readback: permission/app-op changes, profile apply/reset,
-explicit file modes, app clear/stop, and install steps fail typed, non-zero
-when the requested state was not reached. Use `device shell` only when no
-typed verb exists. Private file/state access requires a debuggable package
+Mutations verify readback and fail typed/non-zero when state was not reached. Use `device shell` only when no
+typed verb exists; quote the entire shell command. Read `commands --guide workflow`
+for app start/wait and text-entry recipes. Private file/state access requires a debuggable package
 with working `run-as` and never prints file contents. Read
 `commands --guide state` before appops scoping, `profile apply --file`, or
 `app state` snapshot/restore work.
 
 ## Android Studio debugger and layout
 
-The optional Studio plugin adds debugger control and Layout Inspector data
-(start from `debug auto Example`). Expression evaluation is real evaluation
-with possible side effects. With several debug sessions prefer stable session
-`id`s; if ambiguous, stop and choose — never act on an arbitrary session.
-`debug logpoint` observes without suspending.
-Read `commands --guide debugger` before debugger or layout work.
+Use `commands --guide debugger` before Studio/debugger/layout work.
+`debug auto Example` starts the workflow. Expression evaluation can have side
+effects. With multiple sessions, select an observed stable `id`; never choose
+arbitrarily. `debug logpoint` observes without suspension.
 
 ## Network debugging
 
 `net` is a host-side MITM proxy: `net start` changes the device proxy,
-`net stop` restores it. Run `net check <pkg>` before assuming HTTPS will
+`net stop` attempts owned restoration and reports `proxy_restoration`. Run `net check <pkg>` before assuming HTTPS will
 decrypt; `tls_error` means the app rejected the MITM path. Pinned OkHttp
 traffic needs the optional in-app AAR companion. Read `commands --guide net`
-before `net` or `aar` work.
+before `net` or `aar` work: it covers unknown observations, unresolved cleanup,
+and prepared response rules. Ping/DNS never prove application HTTP connectivity.
 
 ## Maintenance and self-improvement
 
-`skill --sync` refreshes pristine installed skills after upgrades (hand-edits
-preserved). Pristine legacy duplicates are backed up and retired; customized copies are
-reported. Opt-in `usage enable` + `usage report` builds a local friction
-backlog — local-only, no argument values recorded.
+`skill --sync` updates pristine skills, preserves customizations, and retires
+pristine duplicates. Opt-in `usage enable` + `usage report` records local command
+metadata without argument values.

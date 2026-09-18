@@ -241,3 +241,34 @@ links existing network/video markers, UI and selected private/HTTP fields.
 `evidence timeline investigation` orders saved events by payload time when
 provided, retaining observation time separately. Missing probes save a partial
 checkpoint and return nonzero. See docs/evidence.md for the projection spec.
+
+## Reliable observation, cleanup, and prepared edits
+
+`net status` reports `complete:true` only when the required observations
+succeeded. A failed observation exits nonzero with `net_status_incomplete`;
+`detail` retains daemon/device evidence and typed `http_proxy_error`,
+`daemon_error`, and `adb_reverse_error`. Unknown match results are null.
+`http_proxy_state:unknown` never means a successfully observed absent proxy.
+
+After `net stop`, inspect `proxy_restoration:restored|not_needed|unresolved`
+and `cleanup_complete`. Unowned settings are preserved and produce an explicit
+warning. `network_reachable` is only raw-IP reachability plus DNS resolution;
+`application_connectivity:not_checked` means no application HTTP proof was
+obtained. The deprecated `connectivity_restored` field is null. Verify an app
+request through its actual network stack when HTTP proof matters. Failures
+include `phase`, `elapsed_ms`, `completed_phases`, and the underlying typed
+`cause` in `detail`; the ADB timeout applies per operation, not to the entire
+teardown. Progress goes to stderr, leaving stdout as one terminal JSON object.
+
+For a deterministic edit, prepare the body and install a rule before triggering
+the request. Match host, method, path and operation name as narrowly as possible.
+For example, discover `net rule add`, install `respond --host api.example.com
+--method POST --operation-name currentSession --status 200 --header
+content-type=application/json --body-file response.json`, save the returned rule
+id, then trigger and verify the request. Remove exactly that id using `net rule
+rm <id>` in a `finally` block, including when the UI action fails; do not clear
+other rules. This bounds the rule's lifetime to the operation being tested.
+Use a response-phase replacement when the upstream request must still execute.
+An HTTP hold of 60 seconds cannot extend a client's 10-second timeout. If a hold
+was canceled or expired, observe the current app state and arrange a new request
+only when replaying the operation is appropriate.
