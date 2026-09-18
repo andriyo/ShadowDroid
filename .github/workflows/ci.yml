@@ -347,6 +347,10 @@ jobs:
       - name: Prepare candidate and headless host
         run: |
           chmod +x cli/target/debug/shadowdroid
+          # Restore Gradle's APK layout so reconnects discover this candidate,
+          # including after instrumentation has released UiAutomation.
+          mkdir -p server/app/build/outputs/apk/debug
+          mv server/app/build/outputs/apk/androidTest/debug/app-debug.apk server/app/build/outputs/apk/debug/app-debug.apk
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "platforms;android-36"
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
