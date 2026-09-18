@@ -593,125 +593,6 @@ pub fn save(path: &Path, value: &Value) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn key_journey() -> Journey {
-        serde_json::from_value(json!({
-            "package":"example.app", "destinations":[], "steps":[
-                {"action":"remember","target":{"by":"rid","value":"label"},"name":"before"},
-                {"action":"key","name":"back"},
-                {"action":"compare","target":{"by":"rid","value":"label"},"memory":"before","different":true}
-            ]
-        })).unwrap()
-    }
-
-    #[test]
-    fn keys_require_immediate_postconditions() {
-        let mut journey = key_journey();
-        journey.validate().unwrap();
-        journey.steps.pop();
-        assert!(
-            journey
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("postcondition")
-        );
-        journey.steps.push(Step::Capture {
-            name: "after".into(),
-        });
-        assert!(
-            journey.validate().is_err(),
-            "a screenshot alone cannot prove key outcome"
-        );
-    }
-
-    #[tokio::test]
-    async fn keys_use_observed_postconditions_without_replay() {
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-
-        for (injected, observed, expected) in [
-            (false, "after", Status::Passed),
-            (false, "before", Status::Failed),
-            (true, "before", Status::Failed),
-        ] {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let client = ServerClient::new(listener.local_addr().unwrap().port()).unwrap();
-            let server = tokio::spawn(async move {
-                for index in 0..3 {
-                    let (socket, _) = listener.accept().await.unwrap();
-                    let mut socket = BufReader::new(socket);
-                    let mut request = String::new();
-                    let mut length = 0;
-                    loop {
-                        let mut line = String::new();
-                        assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
-                        if let Some(value) =
-                            line.to_ascii_lowercase().strip_prefix("content-length:")
-                        {
-                            length = value.trim().parse::<usize>().unwrap();
-                        }
-                        request.push_str(&line);
-                        if line == "\r\n" {
-                            break;
-                        }
-                    }
-                    let mut body = vec![0; length];
-                    socket.read_exact(&mut body).await.unwrap();
-                    let response = if index == 1 {
-                        assert!(request.starts_with("POST /v1/guarded/key "), "{request}");
-                        assert!(request.to_ascii_lowercase().contains("x-shadowdroid-if-screen: before"));
-                        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), json!({"name":"back"}));
-                        json!({"ok":injected})
-                    } else {
-                        assert!(request.starts_with("GET /v1/screen/stable?"), "keys must not be repeated: {request}");
-                        json!({"stable":true,"settle_ms":0,"quiet_period_ms":150,"screen":{
-                            "screen_hash":"before","snapshot_state":"consistent",
-                            "viewport":{"w":320,"h":640},"current_app":{"package":"example.app"},
-                            "element_count":1,"elements":[{"id":0,"rid":"label","text":if index==0 {"before"} else {observed}}]
-                        }})
-                    }.to_string();
-                    socket.get_mut().write_all(format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                        response.len(), response
-                    ).as_bytes()).await.unwrap();
-                    socket.get_mut().shutdown().await.unwrap();
-                }
-            });
-            let journey = key_journey();
-            journey.validate().unwrap();
-            let out = tempfile::tempdir().unwrap();
-            let mut journal = Journal::default();
-            let mut memories = BTreeMap::from([("before".into(), "before".into())]);
-            for (index, step) in journey.steps.iter().skip(1).enumerate() {
-                let (status, evidence) = execute(
-                    step,
-                    &journey,
-                    &client,
-                    &Serial::new("fixture"),
-                    out.path(),
-                    &mut journal,
-                    &out.path().join("journal.json"),
-                    &mut memories,
-                )
-                .await
-                .unwrap();
-                if index == 0 {
-                    assert_eq!(status, Status::Passed);
-                    assert_eq!(evidence["injected"], injected);
-                    assert_eq!(evidence["injection_result"], "advisory");
-                    assert_eq!(evidence["replayed"], false);
-                } else {
-                    assert_eq!(status, expected);
-                }
-            }
-            server.await.unwrap();
-        }
-    }
-}
-
 async fn state(serial: &Serial, package: &str) -> Result<Value> {
     let dump = adb::shell(serial, "dumpsys activity activities").await?;
     let resumed = dump
@@ -880,4 +761,123 @@ async fn lifecycle(
         },
         evidence,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key_journey() -> Journey {
+        serde_json::from_value(json!({
+            "package":"example.app", "destinations":[], "steps":[
+                {"action":"remember","target":{"by":"rid","value":"label"},"name":"before"},
+                {"action":"key","name":"back"},
+                {"action":"compare","target":{"by":"rid","value":"label"},"memory":"before","different":true}
+            ]
+        })).unwrap()
+    }
+
+    #[test]
+    fn keys_require_immediate_postconditions() {
+        let mut journey = key_journey();
+        journey.validate().unwrap();
+        journey.steps.pop();
+        assert!(
+            journey
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("postcondition")
+        );
+        journey.steps.push(Step::Capture {
+            name: "after".into(),
+        });
+        assert!(
+            journey.validate().is_err(),
+            "a screenshot alone cannot prove key outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn keys_use_observed_postconditions_without_replay() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        for (injected, observed, expected) in [
+            (false, "after", Status::Passed),
+            (false, "before", Status::Failed),
+            (true, "before", Status::Failed),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = ServerClient::new(listener.local_addr().unwrap().port()).unwrap();
+            let server = tokio::spawn(async move {
+                for index in 0..3 {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let mut socket = BufReader::new(socket);
+                    let mut request = String::new();
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+                        if let Some(value) =
+                            line.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
+                            length = value.trim().parse::<usize>().unwrap();
+                        }
+                        request.push_str(&line);
+                        if line == "\r\n" {
+                            break;
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    socket.read_exact(&mut body).await.unwrap();
+                    let response = if index == 1 {
+                        assert!(request.starts_with("POST /v1/guarded/key "), "{request}");
+                        assert!(request.to_ascii_lowercase().contains("x-shadowdroid-if-screen: before"));
+                        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), json!({"name":"back"}));
+                        json!({"ok":injected})
+                    } else {
+                        assert!(request.starts_with("GET /v1/screen/stable?"), "keys must not be repeated: {request}");
+                        json!({"stable":true,"settle_ms":0,"quiet_period_ms":150,"screen":{
+                            "screen_hash":"before","snapshot_state":"consistent",
+                            "viewport":{"w":320,"h":640},"current_app":{"package":"example.app"},
+                            "element_count":1,"elements":[{"id":0,"rid":"label","text":if index==0 {"before"} else {observed}}]
+                        }})
+                    }.to_string();
+                    socket.get_mut().write_all(format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        response.len(), response
+                    ).as_bytes()).await.unwrap();
+                    socket.get_mut().shutdown().await.unwrap();
+                }
+            });
+            let journey = key_journey();
+            journey.validate().unwrap();
+            let out = tempfile::tempdir().unwrap();
+            let mut journal = Journal::default();
+            let mut memories = BTreeMap::from([("before".into(), "before".into())]);
+            for (index, step) in journey.steps.iter().skip(1).enumerate() {
+                let (status, evidence) = execute(
+                    step,
+                    &journey,
+                    &client,
+                    &Serial::new("fixture"),
+                    out.path(),
+                    &mut journal,
+                    &out.path().join("journal.json"),
+                    &mut memories,
+                )
+                .await
+                .unwrap();
+                if index == 0 {
+                    assert_eq!(status, Status::Passed);
+                    assert_eq!(evidence["injected"], injected);
+                    assert_eq!(evidence["injection_result"], "advisory");
+                    assert_eq!(evidence["replayed"], false);
+                } else {
+                    assert_eq!(status, expected);
+                }
+            }
+            server.await.unwrap();
+        }
+    }
 }
