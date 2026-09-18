@@ -7,6 +7,15 @@
 pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
     let key = path.join(" ");
     match key.as_str() {
+        "session" | "session open" | "session close" | "session handoff" | "session observe"
+        | "session status" | "session recover" => Some(serde_json::json!({
+            "use_when":["Coordinate multiple cooperating agents: one driver per device, passive advisers and parallel independent devices."],
+            "output":"persistent reservation, explicit handoff generation or a bounded passive observation with an independent crash subscription",
+            "prerequisites":["all clients use this CLI version and the same --authority-dir; same-host ADB at 127.0.0.1:5037; direct adb/IDE/human actions are outside the cooperative authority"],
+            "side_effects":["writes host ownership or subscription state; never expires or steals an interrupted operation; observe never reconnects the server"],
+            "next_actions":["session status", "commands session open --json", "commands session observe --json"],
+            "examples":["--device emulator-5554 session open --agent driver-a", "--device emulator-5554 session observe --subscription adviser-b"]
+        })),
         "verify" | "verify plan" | "verify plan validate" | "verify junit" | "verify compare" => {
             Some(serde_json::json!({
                 "use_when":["Validate explicit requirement coverage or inspect saved test evidence before claiming completion."],

@@ -6,6 +6,8 @@ The default should be **one active driver per device, multiple observers and adv
 
 Concurrency is a foundation of the first verification release. Add identity, ownership enforcement, independent event subscriptions, and reliable handoff before allowing verification runs to share a host/device fleet. More elaborate subleases and fleet scheduling can follow.
 
+Implementation tracking: the [session guide](sessions.md) describes the current local reservation gate, passive subscriptions, authority marker and explicit recovery. Distributed coordination and arbitrary-client endpoint enforcement remain outside that implementation.
+
 ## 1. What the current implementation protects
 
 | Existing mechanism | Verified source behavior | Remaining boundary |

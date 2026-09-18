@@ -146,6 +146,10 @@ fn guide_catalog(topic: &str) -> Result<serde_json::Value> {
 
 /// Canonical driving-guide topics; keeps the skill body's pointer stubs in
 /// lockstep with the guides actually served.
+pub fn changes_device(path: &str) -> bool {
+    effects::changes_device(path)
+}
+
 #[cfg(test)]
 pub(crate) fn guide_topics() -> Vec<&'static str> {
     guides::GUIDES.iter().map(|guide| guide.topic).collect()

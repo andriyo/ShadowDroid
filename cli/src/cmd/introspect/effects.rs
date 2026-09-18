@@ -324,11 +324,35 @@ const SERVER: &[D] = &[
     D::ServerEnsureReady,
 ];
 
+pub(super) fn changes_device(path: &str) -> bool {
+    leaf_contract(path).is_none_or(|c| {
+        c.effects
+            .iter()
+            .any(|e| matches!(e, E::DeviceMutate | E::UnboundedExternalCommand))
+    })
+}
+
 /// Exact registry for executable public leaves. Deliberately no prefix/default
 /// arm: adding a Clap command without choosing a contract fails the exhaustive
 /// catalog test.
 fn leaf_contract(path: &str) -> Option<LeafEffectContract> {
     Some(match path {
+        "session open" | "session close" | "session handoff" | "session recover" => leaf(
+            &[E::HostRead, E::HostWrite, E::DeviceRead, E::DeviceMutate],
+            &[D::ConfigLoad, D::TargetResolveOnline],
+        ),
+        "session observe" => leaf(
+            &[E::HostRead, E::HostWrite, E::DeviceRead],
+            &[
+                D::ConfigLoad,
+                D::TargetResolveOnline,
+                D::ExistingServerProbe,
+            ],
+        ),
+        "session status" => leaf(
+            &[E::HostRead, E::HostWrite, E::DeviceRead],
+            &[D::ConfigLoad, D::TargetResolveOnline],
+        ),
         "verify plan validate" | "verify compare" => leaf(&[E::HostRead], &[]),
         "verify junit" => leaf(&[E::HostRead, E::HostWrite], &[D::ArtifactWriter]),
         // Introspection/recovery commands dispatched before normal config load.
@@ -1046,7 +1070,14 @@ mod tests {
     /// dispatch classifier without its effect dependency fails mechanically.
     fn expected_resolver_policy(path: &str) -> ResolverPolicy {
         match path {
-            "collect" | "evidence checkpoint" => ResolverPolicy::Online,
+            "collect"
+            | "evidence checkpoint"
+            | "session open"
+            | "session close"
+            | "session handoff"
+            | "session observe"
+            | "session status"
+            | "session recover" => ResolverPolicy::Online,
             "disconnect" | "video status" | "video mark" | "video stop" | "net ca import"
             | "net ca info" | "net ca reset" | "net stop" | "net status" | "net log"
             | "net checkpoint" | "net show" | "net export" | "net ws" | "net inject"
@@ -1146,7 +1177,7 @@ mod tests {
         for (call, expected_count) in [
             ("selection.resolve(&config)", 15),
             ("selection.resolve_existing(&config)", 3),
-            ("selection.resolve_online(&config)", 2),
+            ("selection.resolve_online(&config)", 4),
         ] {
             assert_eq!(
                 cli_source.matches(call).count(),
@@ -1418,6 +1449,7 @@ mod tests {
                     ("cmd/evidence.rs", 1),
                     ("cmd/doctor.rs", 1),
                     ("cmd/why.rs", 1),
+                    ("runtime.rs", 1),
                 ],
             ),
             ("adb::forward(", &[("cmd/agent.rs", 1)]),

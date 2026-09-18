@@ -11,7 +11,7 @@ mod commands;
 mod control;
 mod coverage;
 mod daemon;
-mod paths;
+pub(crate) mod paths;
 mod session;
 
 use crate::ids::Serial;

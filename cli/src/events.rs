@@ -580,7 +580,9 @@ pub fn emit_result(value: &impl Serialize) {
     if let serde_json::Value::Object(map) = &mut value {
         attach_next_actions(map);
     }
-    emit(&value);
+    if !crate::runtime::defer_terminal(&value) {
+        emit(&value);
+    }
 }
 
 /// Non-panicking stdout sink used by the crate-local `print!`/`println!`
@@ -675,7 +677,10 @@ fn action_envelope(cmd: &str, body: &serde_json::Value) -> serde_json::Value {
 /// one-shot command prints. The single builder for the action envelope (was
 /// reimplemented per module).
 pub fn emit_action(cmd: &str, body: &serde_json::Value) {
-    emit(&action_envelope(cmd, body));
+    let value = action_envelope(cmd, body);
+    if !crate::runtime::defer_terminal(&value) {
+        emit(&value);
+    }
 }
 
 /// Build the `{"type":"error","stage":…,"code":…,"msg":…, …extra}` envelope.

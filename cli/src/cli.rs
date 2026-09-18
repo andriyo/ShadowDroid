@@ -75,6 +75,14 @@ In-app agent: embed a debug-only AAR for in-process debugging of apps you build 
 Plus app & device control, permissions, display profiles, diagnostics (`doctor`), and Android Studio / debugger integration."
 )]
 pub struct Cli {
+    /// Driver token returned by session open or handoff; required for a reserved device.
+    #[arg(long, global = true, env = "SHADOWDROID_SESSION")]
+    pub session: Option<String>,
+
+    /// Shared same-host ownership directory. All cooperating clients must use the same authority.
+    #[arg(long, global = true, env = "SHADOWDROID_AUTHORITY_DIR")]
+    pub authority_dir: Option<PathBuf>,
+
     /// ADB serial. Defaults to $SHADOWDROID_DEVICE / $ANDROID_SERIAL / sole attached device.
     #[arg(short, long, global = true, env = "SHADOWDROID_DEVICE")]
     pub device: Option<String>,
@@ -152,6 +160,8 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Cmd {
+    /// Reserve devices for drivers and provide passive observations to advisers.
+    Session(crate::runtime::SessionArgs),
     /// Plan verification and inspect test evidence with explicit coverage.
     Verify(crate::verify::VerifyArgs),
     /// Correlate UI, network, video and projected application state.
@@ -1757,11 +1767,24 @@ impl DeviceSelection {
     }
 
     async fn resolve(&self, config: &ShadowDroidConfig) -> Result<Serial> {
+        let serial = self.resolve_raw(config).await?;
+        crate::runtime::admit(&serial).await?;
+        Ok(serial)
+    }
+
+    async fn resolve_raw(&self, config: &ShadowDroidConfig) -> Result<Serial> {
         if let Some(device) = self.explicit_device.as_deref() {
             return resolve_serial(Some(device)).await;
         }
         if let Some(target) = self.target_name(config) {
-            let serial = crate::device::target::resolve(config, target, self.takeover).await?;
+            let serial = if crate::runtime::token().is_some() || crate::runtime::has_reservations()?
+            {
+                // Managed sessions require a preconfigured online device. Never
+                // reboot/start a target before its runtime ownership is checked.
+                crate::device::target::resolve_existing(config, target, self.takeover).await?
+            } else {
+                crate::device::target::resolve(config, target, self.takeover).await?
+            };
             crate::events::set_current_device(serial.to_string());
             return Ok(serial);
         }
@@ -1769,6 +1792,12 @@ impl DeviceSelection {
     }
 
     async fn resolve_existing(&self, config: &ShadowDroidConfig) -> Result<Serial> {
+        let serial = self.resolve_existing_raw(config).await?;
+        crate::runtime::admit(&serial).await?;
+        Ok(serial)
+    }
+
+    async fn resolve_existing_raw(&self, config: &ShadowDroidConfig) -> Result<Serial> {
         if let Some(device) = self.explicit_device.as_deref() {
             return resolve_serial(Some(device)).await;
         }
@@ -1786,6 +1815,12 @@ impl DeviceSelection {
     /// collection must reject an explicit/configured serial that is not in
     /// adb's usable-device inventory before it creates an evidence bundle.
     async fn resolve_online(&self, config: &ShadowDroidConfig) -> Result<Serial> {
+        let serial = self.resolve_online_raw(config).await?;
+        crate::runtime::admit(&serial).await?;
+        Ok(serial)
+    }
+
+    async fn resolve_online_raw(&self, config: &ShadowDroidConfig) -> Result<Serial> {
         if let Some(device) = self.explicit_device.as_deref() {
             return resolve_online_serial(device).await;
         }
@@ -1856,7 +1891,9 @@ impl DeviceSelection {
 pub async fn run() -> Result<()> {
     let started = std::time::Instant::now();
     let result = run_inner().await;
+    let completion = crate::runtime::finish(&result).await;
     crate::cmd::usage::record(started, &result);
+    completion?;
     result
 }
 
@@ -1909,6 +1946,11 @@ async fn run_inner() -> Result<()> {
             .unwrap_or_default(),
     )?;
     crate::device::installer::set_lifecycle_wait_ms(u64::from(cli.lock_timeout_ms));
+    crate::runtime::configure(
+        cli.session.clone(),
+        cli.authority_dir.clone(),
+        cli.lock_timeout_ms,
+    )?;
     let selection = DeviceSelection {
         explicit_device: cli
             .device
@@ -1954,6 +1996,10 @@ async fn run_inner() -> Result<()> {
     // are pure host-side `adb`.
     match &cmd {
         Cmd::Devices => return cmd_devices(&config).await,
+        Cmd::Session(args) => {
+            let serial = selection.resolve_online_raw(&config).await?;
+            return crate::runtime::run(&serial, args).await;
+        }
         Cmd::Evidence(args) => {
             if let crate::cmd::evidence::EvidenceCmd::Timeline { bundle } = &args.command {
                 return crate::cmd::evidence::timeline(bundle);
@@ -1992,6 +2038,15 @@ async fn run_inner() -> Result<()> {
             // but still honor an explicit device/target to pick the matching
             // session. Resolve only here so passive commands stay passive even
             // when a target reference needs repair.
+            if crate::runtime::token().is_some()
+                || crate::runtime::has_reservations()?
+                || crate::cmd::introspect::changes_device(
+                    crate::events::current_command_path().unwrap_or("debug"),
+                )
+            {
+                // Host bridge labels alone do not reserve the paused process.
+                let _ = selection.resolve_online(&config).await?;
+            }
             let debugger_device = selection.debugger_filter(&config)?;
             return crate::cmd::debug::run_host_only(args, debugger_device.as_deref()).await;
         }
@@ -2024,6 +2079,11 @@ async fn run_inner() -> Result<()> {
             json,
         } => {
             let doctor_device = selection.doctor_device(&config).await?;
+            if let Some(serial) = &doctor_device {
+                crate::runtime::admit(&Serial::new(serial)).await?;
+            } else if *fix {
+                let _ = selection.resolve_online(&config).await?;
+            }
             return crate::cmd::doctor::run(
                 doctor_device.as_deref(),
                 *fix,
@@ -2173,6 +2233,7 @@ async fn run_inner() -> Result<()> {
     match cmd {
         // handled in phase 1
         Cmd::Devices
+        | Cmd::Session(_)
         | Cmd::Connect
         | Cmd::Disconnect
         | Cmd::Test { .. }

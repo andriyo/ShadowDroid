@@ -229,21 +229,25 @@ struct CrashCursor {
     fingerprints: Vec<String>,
 }
 
+static SUBSCRIPTION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn set_subscription(subscription: String) {
+    let _ = SUBSCRIPTION.set(subscription);
+}
+
 fn state_path(serial: &Serial) -> Result<PathBuf> {
-    let sanitized: String = serial
-        .as_str()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
+    let identity = format!(
+        "{}:{}:{}",
+        crate::runtime::subscription_scope(),
+        serial.as_str(),
+        SUBSCRIPTION.get().map(String::as_str).unwrap_or("driver")
+    );
     Ok(crate::hostenv::shadowdroid_home()?
         .join("state")
-        .join(format!("{sanitized}.json")))
+        .join(format!(
+            "{}.json",
+            blake3::hash(identity.as_bytes()).to_hex()
+        )))
 }
 
 fn load_state(serial: &Serial) -> DeviceState {
@@ -259,10 +263,9 @@ fn save_state(serial: &Serial, state: &DeviceState) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(text) = serde_json::to_string(state) {
-        // Best-effort: a failed cursor write means an event may be re-reported
-        // next command, never lost.
-        let _ = std::fs::write(path, text);
+    if let Ok(value) = serde_json::to_value(state) {
+        // A failed write causes a repeated event; never a partial/corrupt cursor.
+        let _ = crate::cmd::artifact::write_json(&path, &value);
     }
 }
 
@@ -313,6 +316,23 @@ pub async fn finish_probe(probe: Option<Probe>) -> Vec<Value> {
 /// then move the cursor to (device now − slack). First run initializes the
 /// cursor without reporting history — `log`/`why` are the history verbs.
 async fn probe_once(serial: &Serial) -> Vec<Value> {
+    // Serialize a consumer's cursor, independently of driver ownership. Different
+    // consumers can observe the same crash; a busy consumer retries on its next read.
+    let _cursor_lock = match state_path(serial).and_then(|path| {
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.with_extension("lock"))?;
+        file.try_lock().map_err(anyhow::Error::from)?;
+        Ok(file)
+    }) {
+        Ok(lock) => lock,
+        Err(_) => return Vec::new(),
+    };
+
     let scan = match scan(serial, "crash,system", 200, true, None).await {
         Ok(scan) => scan,
         Err(err) => {

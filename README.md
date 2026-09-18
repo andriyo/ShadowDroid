@@ -357,6 +357,7 @@ replace them. Any other agent that can run a shell command can bootstrap from
   sample app.
 - [Agent verification roadmap](docs/agent-verification-roadmap.md) — proposed
 - [Requirement verification](docs/verification.md) — plan validation, JUnit evidence and baseline comparisons.
+- [Concurrent agent sessions](docs/sessions.md) — one device driver, passive advisers, handoffs and recovery.
   phases, implementation work, acceptance gates, and agent-effectiveness evaluation.
 - [Concurrent-agent design](docs/concurrency-roadmap.md) — proposed resource
   boundaries, device ownership, observers, coordination, and handoff contracts.
