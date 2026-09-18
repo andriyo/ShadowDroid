@@ -34,7 +34,7 @@ Use task-specific checks; do not run every configuration after every edit.
   "checks": [{"id":"state-test","adapter":{
     "kind":"junit","argv":["./gradlew",":app:testDebugUnitTest","--rerun"],
     "cwd":".","timeout_ms":120000,"reports":["app/build/test-results/testDebugUnitTest"],
-    "selection":"project tests that assert draft restoration","min_tests":1
+    "selection":"project tests that assert draft restoration","minimum_tests":1
   }}]
 }
 ```
