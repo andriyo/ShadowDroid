@@ -62,7 +62,7 @@ use crate::fusion::{Outcome, top_screen_texts};
 use crate::proto::{Element, SelectorQuery};
 use crate::watch::watcher::PermissionDialogPolicy;
 
-#[derive(Parser)]
+#[derive(clap::Args)]
 #[command(
     name = "shadowdroid",
     version,
@@ -90,8 +90,8 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub takeover: bool,
 
-    /// Wait up to this many milliseconds for a device lifecycle lock (default: fail immediately).
-    #[arg(long, global = true, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=30000))]
+    /// Wait up to this many milliseconds for a lifecycle or named-AVD resolution lock. Use 0 to fail immediately.
+    #[arg(long, global = true, default_value_t = 2000, value_parser = clap::value_parser!(u32).range(0..=30000))]
     pub lock_timeout_ms: u32,
 
     /// Local APK to install instead of normal APK resolution. Can be either:
@@ -382,6 +382,7 @@ pub enum Cmd {
 #[derive(Subcommand)]
 pub enum AppCmd {
     /// Launch the app's default activity, or an explicit activity with --activity.
+    #[command(visible_alias = "launch")]
     Start {
         /// App package, app alias from config, or installed package name.
         #[arg(value_name = "PACKAGE")]
@@ -817,6 +818,7 @@ pub enum UiCmd {
     /// Move D-pad focus to a selector (TV/leanback), then optionally activate it (--center).
     Focus(FocusArgs),
     /// Type into the focused field, or into an element matched by --id/--text/--rid/--desc/--xpath.
+    #[command(visible_alias = "type")]
     Text {
         value: String,
         /// Clear the field's existing contents before typing.
@@ -1537,6 +1539,53 @@ pub struct NetDaemonArgs {
     /// Additional string regex to redact (internal daemon handoff; repeatable).
     #[arg(long = "redaction-pattern")]
     pub redaction_pattern: Vec<String>,
+}
+
+// Add a compatibility flag from the same output-mode registry used by discovery.
+// It is intentionally absent from source-text and streaming commands. Keeping
+// this in CommandFactory makes runtime parsing, tests, and the catalog agree.
+impl Parser for Cli {}
+
+impl CommandFactory for Cli {
+    fn command() -> clap::Command {
+        json_compatibility(
+            <Self as clap::Args>::augment_args(clap::Command::new("shadowdroid")),
+            &[],
+        )
+    }
+
+    fn command_for_update() -> clap::Command {
+        json_compatibility(
+            <Self as clap::Args>::augment_args_for_update(clap::Command::new("shadowdroid")),
+            &[],
+        )
+    }
+}
+
+fn json_compatibility(mut command: clap::Command, path: &[String]) -> clap::Command {
+    if !path.is_empty()
+        && !command.has_subcommands()
+        && !command.is_hide_set()
+        && matches!(
+            crate::cmd::introspect::output_mode(path),
+            "json" | "json_action_with_artifact"
+        )
+        && !command
+            .get_arguments()
+            .any(|arg| arg.get_long() == Some("json"))
+    {
+        command = command.arg(
+            clap::Arg::new("json_compatibility")
+                .long("json")
+                .action(clap::ArgAction::SetTrue)
+                .help("Accepted for compatibility; output is always JSON."),
+        );
+    }
+    command.mut_subcommands(|child| {
+        let mut path = path.to_vec();
+        path.push(child.get_name().to_string());
+        json_compatibility(child, &path)
+    })
 }
 
 /// Parse argv, converting clap's plaintext usage errors into the same
@@ -7159,6 +7208,45 @@ mod tests {
         assert!(
             quiet.get_env().is_none(),
             "SHADOWDROID_QUIET must be resolved manually, not via clap",
+        );
+    }
+
+    #[test]
+    fn json_compatibility_and_exact_aliases_share_the_live_parser() {
+        for args in [
+            vec!["devices", "--json"],
+            vec!["net", "status", "--json"],
+            vec!["app", "info", "com.example.app", "--json"],
+            vec!["app", "launch", "com.example.app", "--json"],
+            vec!["ui", "type", "hello", "--json"],
+        ] {
+            let parsed = Cli::try_parse_from(std::iter::once("shadowdroid").chain(args));
+            assert!(parsed.is_ok(), "{:?}", parsed.err());
+        }
+        assert!(matches!(
+            Cli::try_parse_from(["shadowdroid", "app", "launch"])
+                .unwrap()
+                .cmd,
+            Cmd::App(AppCmd::Start { .. })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["shadowdroid", "ui", "type", "hello"])
+                .unwrap()
+                .cmd,
+            Cmd::Ui(UiCmd::Text { .. })
+        ));
+        assert!(Cli::try_parse_from(["shadowdroid", "log", "--json"]).is_err());
+        assert_eq!(
+            Cli::try_parse_from(["shadowdroid", "devices"])
+                .unwrap()
+                .lock_timeout_ms,
+            2000
+        );
+        assert_eq!(
+            Cli::try_parse_from(["shadowdroid", "--lock-timeout-ms", "0", "devices"])
+                .unwrap()
+                .lock_timeout_ms,
+            0
         );
     }
 

@@ -123,12 +123,18 @@ fn acquire_lifecycle_lock_wait(
                 return Err(crate::diagnostic::DiagnosticError::new(
                     "device_lifecycle_busy",
                     "device",
-                    format!("another ShadowDroid process is changing device {serial}"),
+                    if serial.as_str().starts_with("avd:") {
+                        format!("another ShadowDroid process is resolving target {serial}; read commands also acquire this lock")
+                    } else {
+                        format!("another ShadowDroid process holds the lifecycle lock for device {serial}")
+                    },
                 )
                 .retryable(true)
                 .detail(serde_json::json!({
                     "device": serial.as_str(),
                     "owner_pid": owner,
+                    "owner_state": if owner.is_some() { "recorded" } else { "unknown" },
+                    "lock_scope": if serial.as_str().starts_with("avd:") { "target_resolution" } else { "device_lifecycle" },
                     "waited_ms": started.elapsed().as_millis(),
                     "lock": path.display().to_string(),
                 }))

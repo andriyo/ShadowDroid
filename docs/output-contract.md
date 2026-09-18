@@ -69,3 +69,25 @@ empty Android shell response. Permission/app-op changes, profile apply/reset,
 explicit file modes, app clear/stop, install steps, and goal-directed
 scroll/focus operations exit non-zero when readback disagrees, with requested
 and observed state in `detail`. See [device-state.md](device-state.md).
+
+## JSON compatibility and lean discovery
+
+JSON-native one-shot commands accept a no-op `--json` flag, including `devices`,
+`app info`, and `net status`. This does not change streaming or source-text
+commands. `app launch` aliases `app start`; `ui type` aliases `ui text`.
+
+Read `commands --json --depth 0` once per CLI/schema version for shared global
+arguments and effect definitions. Scoped `commands <path> --json --compact`
+uses lean projection v1 of full schema v3: it retains local syntax, constraints,
+effects, output/success contracts, and examples, omitting false/null/empty
+argument fields and the default Unknown value hint. The `projection` object
+identifies defaults and the shared metadata command. Full JSON stays available
+for validation. Use `commands --search '<operation>' --json --compact` before
+guessing syntax. The supported leaf size budget is 12 KiB with at least a 35%
+reduction for representative commands; full output retains all metadata.
+
+Failures in shell pipelines/batches need explicit propagation: `pipefail`,
+`&&`, or a checked subprocess runner. Preserve the original envelope and
+`detail`, `events`, snapshot consistency, input delivery and postconditions.
+See `commands --guide workflow` for runnable recipes. Network partial-observation
+and cleanup semantics are documented in [network.md](network.md).

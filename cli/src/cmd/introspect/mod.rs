@@ -43,7 +43,7 @@ pub fn run(
     } else {
         catalog_with_depth(root, depth)
     };
-    if compact && search.is_none() {
+    if compact {
         compact_catalog(&mut catalog);
     }
     if json {
@@ -86,15 +86,19 @@ fn describe_catalog(root: &Command, raw_path: &str) -> Option<serde_json::Value>
     let mut command = root;
     let mut parent = Vec::new();
     for name in &names {
-        command = command
-            .get_subcommands()
-            .find(|candidate| candidate.get_name() == *name && !candidate.is_hide_set())?;
-        parent.push((*name).to_string());
+        command = command.get_subcommands().find(|candidate| {
+            (candidate.get_name() == *name
+                || candidate.get_all_aliases().any(|alias| alias == *name))
+                && !candidate.is_hide_set()
+        })?;
+        parent.push(command.get_name().to_string());
     }
+    let canonical_path = parent.join(" ");
     parent.pop();
     Some(serde_json::json!({
         "schema_version": 3,
-        "path": names.join(" "),
+        "path": canonical_path,
+        "version": root.get_version().unwrap_or(""),
         "effect_model": effect_model_json(),
         "global_args": args(root).into_iter().filter(|arg| arg["global"] == true).collect::<Vec<_>>(),
         // Include one level of child names/contracts for namespace queries such
@@ -252,12 +256,25 @@ fn nearest_command_paths(root: &Command, query: &str, limit: usize) -> Vec<Strin
 }
 
 fn compact_catalog(catalog: &mut serde_json::Value) {
+    // Projection defaults are explicit so omitting empty values loses no
+    // invocation constraints. Full schema v3 remains available unchanged.
+    catalog["projection"] = serde_json::json!({
+        "name": "lean", "version": 1,
+        "omitted_argument_values": [false, null, [], "Unknown"],
+        "shared_metadata": "shadowdroid commands --json --depth 0",
+        "schema_version": 3,
+        "cli_version": env!("CARGO_PKG_VERSION"),
+    });
+    if let Some(object) = catalog.as_object_mut() {
+        object.remove("global_args");
+        object.remove("effect_model");
+    }
     if let Some(command) = catalog.get_mut("command") {
         compact_command(command);
     }
     if let Some(commands) = catalog
         .get_mut("commands")
-        .and_then(|value| value.as_array_mut())
+        .and_then(serde_json::Value::as_array_mut)
     {
         for command in commands {
             compact_command(command);
@@ -269,17 +286,33 @@ fn compact_command(command: &mut serde_json::Value) {
     let Some(object) = command.as_object_mut() else {
         return;
     };
-    let examples = object
+    if let Some(examples) = object
         .remove("agent")
-        .and_then(|agent| agent.get("examples").cloned());
-    if let Some(examples) = examples {
+        .and_then(|agent| agent.get("examples").cloned())
+    {
         object.insert("examples".into(), examples);
     }
-    if let Some(subcommands) = object
-        .get_mut("subcommands")
-        .and_then(|value| value.as_array_mut())
+    if let Some(arguments) = object
+        .get_mut("args")
+        .and_then(serde_json::Value::as_array_mut)
     {
-        for child in subcommands {
+        arguments.retain(|arg| arg["global"] != true);
+        for argument in arguments {
+            if let Some(argument) = argument.as_object_mut() {
+                argument.retain(|key, value| {
+                    !(value.is_null()
+                        || value == false
+                        || value.as_array().is_some_and(Vec::is_empty)
+                        || (key == "value_hint" && value == "Unknown"))
+                });
+            }
+        }
+    }
+    if let Some(children) = object
+        .get_mut("subcommands")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for child in children {
             compact_command(child);
         }
     }
@@ -327,7 +360,10 @@ fn command_json(
     let mut o = serde_json::Map::new();
     o.insert("name".into(), cmd.get_name().into());
     o.insert("path".into(), path.join(" ").into());
-    let aliases = cmd.get_aliases().map(str::to_string).collect::<Vec<_>>();
+    let aliases = cmd
+        .get_all_aliases()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
     if !aliases.is_empty() {
         o.insert("aliases".into(), serde_json::json!(aliases));
     }
@@ -772,7 +808,7 @@ fn example_tokens(arg: &Arg) -> Vec<String> {
     tokens
 }
 
-fn output_mode(path: &[String]) -> &'static str {
+pub(crate) fn output_mode(path: &[String]) -> &'static str {
     let joined = path.join(" ");
     match joined.as_str() {
         "watch" | "log" | "net log" | "net ws" | "debug replay" | "debug logpoint follow" => {
@@ -950,6 +986,56 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn lean_projection_preserves_nondefault_argument_constraints_and_canonical_aliases() {
+        let root = Cli::command();
+        for path in ["ui tap", "ui text", "app start", "devices", "net rule add"] {
+            let full = describe_catalog(&root, path).unwrap();
+            let mut lean = full.clone();
+            compact_catalog(&mut lean);
+            let bytes = serde_json::to_vec(&lean).unwrap().len();
+            assert!(bytes < 12 * 1024, "{path}: {bytes}");
+            assert!(
+                bytes * 100 < serde_json::to_vec(&full).unwrap().len() * 65,
+                "{path}: insufficient reduction"
+            );
+            assert_eq!(lean["command"]["contract"], full["command"]["contract"]);
+            assert_eq!(
+                lean["command"]["argument_groups"],
+                full["command"]["argument_groups"]
+            );
+            for arg in full["command"]["args"].as_array().unwrap() {
+                let projected = lean["command"]["args"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["name"] == arg["name"])
+                    .unwrap();
+                for (key, value) in arg.as_object().unwrap() {
+                    if !(value.is_null()
+                        || value == false
+                        || value.as_array().is_some_and(Vec::is_empty)
+                        || (key == "value_hint" && value == "Unknown"))
+                    {
+                        assert_eq!(&projected[key], value, "{path}: {} {key}", arg["name"]);
+                    }
+                }
+            }
+            assert_eq!(
+                lean["projection"]["shared_metadata"],
+                "shadowdroid commands --json --depth 0"
+            );
+        }
+        assert_eq!(
+            describe_catalog(&root, "app launch").unwrap()["path"],
+            "app start"
+        );
+        assert_eq!(
+            describe_catalog(&root, "ui type").unwrap()["path"],
+            "ui text"
         );
     }
 
