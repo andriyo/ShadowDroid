@@ -3,7 +3,7 @@ builds; ShadowDroid verifies on devices.
 
 ## Discover before constructing a command
 
-Use the live machine catalog to discover syntax:
+Discover syntax from the live catalog:
 
 ```bash
 shadowdroid commands --json --depth 0  # shared globals/effect definitions, once per version
@@ -13,12 +13,12 @@ shadowdroid commands --json --describe 'ui tap' --compact
 shadowdroid commands --guide net
 ```
 
-Reuse syntax within one CLI/schema version. Search before guessing.
+Reuse syntax within one CLI/schema version.
 `--compact` references shared metadata; full JSON remains available.
-JSON-native one-shot commands accept `--json`. Before first
-use, read `--guide net` (proxy/AAR), `--guide debugger` (Studio/layout),
+Before first use, read `--guide net` (proxy/AAR), `--guide debugger` (Studio/layout),
 `--guide state` (private files/app state), or `--guide evidence` (checkpoints
-and video coverage). Group aliases work too: `aar` → net, `video` → evidence.
+and video coverage). Use `--guide verification` for coding-task checks and concurrent agents.
+Aliases: `aar` → net, `video` → evidence.
 
 ## First contact and device selection
 
@@ -28,9 +28,9 @@ shadowdroid --target mobile connect
 shadowdroid -d emulator-5554 doctor --json
 ```
 
-Prefer a configured named target; otherwise discover `devices` and pass `-d`.
-Explicit `-d` overrides targets. Never guess among devices or boot an AVD unless
-its target allows `start:if-needed`. `--takeover` deliberately reassigns ownership.
+Prefer a named target; otherwise discover `devices` and pass `-d`.
+Explicit `-d` overrides targets. Never guess devices or boot an AVD unless
+its target allows `start:if-needed`. `--takeover` reassigns ownership.
 
 `connect` may install the instrumentation APKs and claims Android's single
 `UiAutomation` slot; wrap Espresso/UI Automator runs in
@@ -65,19 +65,20 @@ def checked_run(argv):
 ```
 
 Use `pipefail` and `&&` for dependencies; `set -e` alone is insufficient.
-Never discard error/detail, events, or input/postcondition evidence. Serialize
-lifecycle mutations. Named-target reads also lock: the default wait is 2000 ms
+Keep error/detail, events, and input/postcondition evidence. Serialize
+lifecycle mutations. Reserve multi-step work with a driver session; observers
+remain passive. Named-target operations also lock: the default wait is 2000 ms
 (`--lock-timeout-ms 0` fails immediately). Never delete an active lock.
 
-Branch on `ok`/`code`, inspect `detail`, follow the most relevant
-`next_actions` entry; never parse `msg` to recover state. Inside a `watch`
+Branch on `ok`/`code`, inspect `detail`, follow `next_actions`;
+never parse `msg` to recover state. Inside a `watch`
 stream a `type:"error"` record is a timeline event, not the one-shot envelope
 — keep consuming. Operational logs go to stderr (`--quiet` silences).
 
 ## Project config and recovery
 
-Use `config init --project` for defaults and `config validate --json` after
-edits. CLI flags win. Discovery and config validate/paths/schema remain usable
+Use `config init --project`, then `config validate --json` after edits. CLI flags
+win. Discovery and config validate/paths/schema remain usable
 when malformed config blocks other commands. See `commands --guide state`.
 
 ## Predictable read, act, confirm loop

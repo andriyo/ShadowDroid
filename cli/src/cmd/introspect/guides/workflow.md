@@ -19,7 +19,9 @@ def checked_run(argv):
 For shell formatters use `set -o pipefail`; use `&&` for dependent actions.
 Do not rely on `set -e` alone. Keep the full failure envelope, including `detail`,
 `events`, snapshot consistency, input delivery, and postcondition evidence.
-Serialize lifecycle mutations. Named AVD resolution also locks for read commands.
+Serialize lifecycle mutations. Reserve multi-step experiments with a driver
+session (`commands --guide verification`). Named targets resolve an existing
+device during admission; observer reads never boot or repair it.
 The default bounded lock wait is 2000 ms; `--lock-timeout-ms 0` fails immediately.
 Never delete an active lock or use `--takeover` to bypass ordinary contention.
 
