@@ -329,6 +329,8 @@ const SERVER: &[D] = &[
 /// catalog test.
 fn leaf_contract(path: &str) -> Option<LeafEffectContract> {
     Some(match path {
+        "verify plan validate" | "verify compare" => leaf(&[E::HostRead], &[]),
+        "verify junit" => leaf(&[E::HostRead, E::HostWrite], &[D::ArtifactWriter]),
         // Introspection/recovery commands dispatched before normal config load.
         "commands" => leaf(HOST_READ, &[]),
         "usage status" | "config paths" | "config schema" | "config explain"
@@ -1051,7 +1053,10 @@ mod tests {
             | "net intercept" | "net resume" | "net drop" | "net respond" | "net rule add"
             | "net rule list" | "net rule rm" | "net rule clear" | "net override" | "net rules"
             | "net replay" => ResolverPolicy::Existing,
-            "evidence timeline"
+            "verify plan validate"
+            | "verify compare"
+            | "verify junit"
+            | "evidence timeline"
             | "video coverage"
             | "devices"
             | "update"

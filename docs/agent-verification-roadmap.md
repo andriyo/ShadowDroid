@@ -1,6 +1,6 @@
 # Agent verification roadmap
 
-Status: proposed implementation roadmap; no features in this document are implemented by this change. Written 2026-09-18 against source commit `add874bd004e313014889a420abcba555b0df070` (`main`, source version `1.1.0`). The baseline below describes inspected source, not an installed binary or a new device-validation result.
+Status: implementation in progress. The [verification guide](verification.md) records shipped local command contracts; the work packages below remain acceptance targets until individually validated. Written 2026-09-18 against source commit `add874bd004e313014889a420abcba555b0df070` (`main`, source version `1.1.0`). The baseline below describes inspected source, not an installed binary or a new device-validation result.
 
 The objective is to help an AI coding agent finish Android engineering tasks with evidence that the requested behavior works. The first investment is a persistent requirement checklist connected to lifecycle checks and existing tests. Subsequent work adds visual review, database checks, migration diagnostics, and Android system-boundary probes.
 

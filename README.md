@@ -356,6 +356,7 @@ replace them. Any other agent that can run a shell command can bootstrap from
 - [Field Lab walkthroughs](samples/README.md) — scripted journeys against the
   sample app.
 - [Agent verification roadmap](docs/agent-verification-roadmap.md) — proposed
+- [Requirement verification](docs/verification.md) — plan validation, JUnit evidence and baseline comparisons.
   phases, implementation work, acceptance gates, and agent-effectiveness evaluation.
 - [Concurrent-agent design](docs/concurrency-roadmap.md) — proposed resource
   boundaries, device ownership, observers, coordination, and handoff contracts.

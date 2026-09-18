@@ -152,6 +152,8 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Cmd {
+    /// Plan verification and inspect test evidence with explicit coverage.
+    Verify(crate::verify::VerifyArgs),
     /// Correlate UI, network, video and projected application state.
     Evidence(crate::cmd::evidence::EvidenceArgs),
     // ── session / diagnostics (flat) ──────────────────────────
@@ -1886,6 +1888,7 @@ async fn run_inner() -> Result<()> {
                 *compact,
             );
         }
+        Cmd::Verify(args) => return crate::verify::run(args),
         Cmd::Config(args) => return crate::cmd::config::run(args),
         Cmd::Skill(args) => return crate::cmd::skill::run(args),
         Cmd::Usage(args) => return crate::cmd::usage::run(args),
@@ -1963,6 +1966,7 @@ async fn run_inner() -> Result<()> {
         | Cmd::Commands { .. }
         | Cmd::Config(_)
         | Cmd::Skill(_)
+        | Cmd::Verify(_)
         | Cmd::Usage(_) => {
             unreachable!("recovery command handled before config load")
         }
@@ -2177,6 +2181,7 @@ async fn run_inner() -> Result<()> {
         | Cmd::Doctor { .. }
         | Cmd::Collect { .. }
         | Cmd::Evidence(_)
+        | Cmd::Verify(_)
         | Cmd::Commands { .. }
         | Cmd::Log(_)
         | Cmd::Why(_)

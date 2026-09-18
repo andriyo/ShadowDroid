@@ -7,6 +7,15 @@
 pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
     let key = path.join(" ");
     match key.as_str() {
+        "verify" | "verify plan" | "verify plan validate" | "verify junit" | "verify compare" => {
+            Some(serde_json::json!({
+                "use_when":["Validate explicit requirement coverage or inspect saved test evidence before claiming completion."],
+                "output":"versioned plan diagnostics, normalized JUnit outcomes, or a baseline comparison; saved XML has unknown execution freshness",
+                "side_effects":["offline host reads; verify junit --out writes a normalized report"],
+                "next_actions":["commands verify plan validate --json", "commands verify junit --json", "commands verify compare --json"],
+                "examples":["verify plan validate verification.json", "verify junit --report TEST-app.xml --selection all --out baseline.json"]
+            }))
+        }
         "commands" => Some(serde_json::json!({
             "use_when": [
                 "Discover ShadowDroid's command tree, flags, output contracts, and agent decision hints without scraping human help text.",

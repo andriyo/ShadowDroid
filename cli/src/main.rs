@@ -56,6 +56,7 @@ mod release;
 mod selector;
 mod transfer;
 mod update;
+mod verify;
 mod video;
 mod watch;
 
