@@ -91,6 +91,13 @@ A `journey` adapter contains `package`, `destinations`, a bounded `timeout_ms` (
 
 An assertion checks exact match count (default 1), optional text, enabled, selected and checked state. `count: 0` is an absence check in the observed accessibility tree, not proof of complete app semantics. `remember` records a named element's text; `compare` checks it against `memory` with optional `different: true`. A test app can expose an activity-instance identifier to prove recreation separately from rotation. Capture-only journeys remain untested; screenshots are review evidence and do not establish visual compliance.
 
+A `key` step requires an immediately following `assert` or `compare` for its
+postcondition. The key is guarded by a fresh stable screen and sent once.
+Android's raw injection result is advisory: `false` can accompany a delivered
+key, so it is retained without claiming failed delivery or pressing again.
+Only the following observation establishes the requested outcome; a missing
+postcondition is rejected before execution, and a failing one fails the journey.
+
 Lifecycle modes are `background_resume`, `background_kill_restore`, and `force_stop_cold_launch`, each with an explicit `resume_activity`. They record foreground component, task ID and main PID. Background experiments reorder the prior top activity to the front; they do not use the normal `app start` task-clearing behavior. Process termination requires a saved, stopped activity, working `run-as`, an explicit SIGKILL of the original PID, observed process absence, and restoration of the same task/top activity with a new PID. This is a debuggable-app simulation, not every low-memory condition. Unavailable saved state, denied access, a process that never died, or an unverified task restoration is blocked. Force-stop is recorded as a separate cold-launch experiment.
 
 Configuration steps support rotation (0–3), font scale (0.5–3), system night mode, display size, and density. They journal exact prior settings, including unset values and absent display overrides, before mutation and verify readback. Cleanup runs after success and known failures. A value changed by another owner produces a conflict instead of being overwritten. An interrupted run retains its journal; `verify recover ... --external-workers-stopped` restores only still-owned values and releases build ownership. It does not clear an unknown device operation: the separate session recovery remains required. Recovery changes the journal, so old evidence is never silently upgraded to a pass.

@@ -57,6 +57,8 @@ Use `--host-only` for explicitly host-only plans.
 - Journeys: stable selectors, assertions and declared destinations; remember and
   compare values across background/resume or saved-task process-kill simulation.
   Rotation alone does not prove recreation; force-stop is a separate cold launch.
+  Follow each key immediately with an assert/compare postcondition. Injection
+  booleans are advisory; never repeat a key merely because injection returned false.
 - Matrices: a few relevant theme/orientation/font/display configurations, with
   explicit app-data reset policy. Configuration changes are not render assertions.
 - SQLite: parameterized bounded reads of a quiescent private snapshot; requires
