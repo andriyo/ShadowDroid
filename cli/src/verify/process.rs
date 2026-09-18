@@ -68,6 +68,22 @@ async fn capture(mut reader: impl AsyncRead + Unpin, path: &Path) -> Result<u64>
     Ok(total)
 }
 
+/// Use the filesystem's own clock granularity for freshness comparisons.
+/// Linux inode mtimes can lag CLOCK_REALTIME by a clock tick, even for a file
+/// just created by the child. Comparing against a userspace instant falsely
+/// rejects these reports. The marker is removed before the child is spawned.
+pub fn filesystem_time(cwd: &Path) -> Result<std::time::SystemTime> {
+    let marker = tempfile::Builder::new()
+        .prefix(".shadowdroid-freshness-")
+        .tempfile_in(cwd)
+        .context("create filesystem freshness marker")?;
+    marker
+        .as_file()
+        .metadata()?
+        .modified()
+        .context("read filesystem freshness clock")
+}
+
 pub async fn run(
     argv: &[String],
     cwd: &Path,
@@ -185,10 +201,9 @@ async fn stop_tree(pid: u32) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    #[cfg(unix)]
     #[tokio::test]
     async fn timeout_reaps_the_child_and_prevents_delayed_group_writes() {
         let dir = tempfile::tempdir().unwrap();

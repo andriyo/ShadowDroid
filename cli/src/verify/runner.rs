@@ -473,7 +473,7 @@ async fn execute_junit(
         let _guard = crate::device::installer::acquire_lifecycle_lock(serial)?;
         crate::cli::free_ui_automation_slot(serial).await?;
     }
-    let started = SystemTime::now();
+    let started = process::filesystem_time(args.cwd)?;
     let execution = process::run(args.argv, args.cwd, args.timeout_ms, out, serial).await;
     if args.instrumentation {
         let serial = serial.unwrap();
@@ -545,7 +545,7 @@ async fn execute_junit(
     let uncertain = interrupted || execution.timed_out || !cleanup_errors.is_empty();
     Ok((
         status,
-        json!({"adapter":"junit","execution":execution,"report":report,"baseline_comparison":comparison,"stale_reports":stale,"instrumentation":args.instrumentation,"source_to_apk":"not_established_by_junit_alone"}),
+        json!({"adapter":"junit","execution":execution,"report":report,"baseline_comparison":comparison,"stale_reports":stale,"freshness_clock":"filesystem_marker_in_command_cwd","instrumentation":args.instrumentation,"source_to_apk":"not_established_by_junit_alone"}),
         uncertain,
         interrupted,
     ))

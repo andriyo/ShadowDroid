@@ -110,6 +110,19 @@ fn baseline_comparison_preserves_failure_and_missing_tests() {
 
 #[test]
 fn external_test_fixture() {
+    if std::fs::read_to_string("fixture-mode.txt").is_ok_and(|mode| mode == "backdated") {
+        std::fs::write(
+            "tests.xml",
+            "<testsuite><testcase name=\"state\"/></testsuite>",
+        )
+        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open("tests.xml")
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+            .unwrap();
+    }
     if std::fs::read_to_string("fixture-mode.txt").is_ok_and(|mode| mode == "directory") {
         std::fs::write(
             "reports/device/tests.xml",
@@ -318,4 +331,29 @@ fn recursive_junit_directories_preserve_empty_selection_and_find_fresh_reports()
         ],
     );
     assert_eq!(code, 0, "{result}");
+}
+
+#[test]
+fn newly_copied_but_backdated_reports_remain_stale() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    let mut plan = host_plan(&source, "backdated");
+    plan["requirements"].as_array_mut().unwrap().pop();
+    std::fs::write(source.join("plan.json"), serde_json::to_vec(&plan).unwrap()).unwrap();
+    let out = temp.path().join("run");
+    let (code, _) = run(
+        &source,
+        &[
+            "verify",
+            "run",
+            "plan.json",
+            "--host-only",
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    );
+    assert_ne!(code, 0);
+    let (_, report) = run(&source, &["verify", "report", out.to_str().unwrap()]);
+    assert_eq!(report["check_statuses"]["unit"], "stale", "{report}");
 }

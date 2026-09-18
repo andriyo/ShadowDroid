@@ -7,10 +7,7 @@ use crate::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{
-    path::{Path, PathBuf},
-    time::SystemTime,
-};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,7 +53,7 @@ pub async fn run(
     let cwd = root.join(&build.cwd);
     let apk = cwd.join(&build.apk);
     let prior = std::fs::metadata(&apk).ok().and_then(|m| m.modified().ok());
-    let started = SystemTime::now();
+    let started = process::filesystem_time(&cwd)?;
     let execution = process::run(&build.argv, &cwd, build.timeout_ms, out, Some(serial)).await?;
     if execution.timed_out || execution.interrupted {
         let interrupted = execution.interrupted;
