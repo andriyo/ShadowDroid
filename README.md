@@ -355,6 +355,10 @@ replace them. Any other agent that can run a shell command can bootstrap from
   policy, pixel boundaries, trust model, and what stays local.
 - [Field Lab walkthroughs](samples/README.md) — scripted journeys against the
   sample app.
+- [Agent verification roadmap](docs/agent-verification-roadmap.md) — proposed
+  phases, implementation work, acceptance gates, and agent-effectiveness evaluation.
+- [Concurrent-agent design](docs/concurrency-roadmap.md) — proposed resource
+  boundaries, device ownership, observers, coordination, and handoff contracts.
 
 
 ## Contributing
