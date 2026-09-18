@@ -355,10 +355,12 @@ replace them. Any other agent that can run a shell command can bootstrap from
   policy, pixel boundaries, trust model, and what stays local.
 - [Field Lab walkthroughs](samples/README.md) — scripted journeys against the
   sample app.
-- [Agent verification roadmap](docs/agent-verification-roadmap.md) — proposed
-- [Requirement verification](docs/verification.md) — plan validation, JUnit evidence and baseline comparisons.
-- [Concurrent agent sessions](docs/sessions.md) — one device driver, passive advisers, handoffs and recovery.
-  phases, implementation work, acceptance gates, and agent-effectiveness evaluation.
+- [Agent verification roadmap](docs/agent-verification-roadmap.md) — implementation status,
+  acceptance gates and remaining experiments.
+- [Requirement verification](docs/verification.md) — executable plans, build/JUnit evidence,
+  lifecycle, configuration, SQLite, visual and Android platform checks (experimental).
+- [Concurrent agent sessions](docs/sessions.md) — one device driver, passive advisers,
+  handoffs and recovery.
 - [Concurrent-agent design](docs/concurrency-roadmap.md) — proposed resource
   boundaries, device ownership, observers, coordination, and handoff contracts.
 
@@ -389,10 +391,12 @@ are Gradle projects (`server/`, `samples/`, `shadowdroid-plugin/`).
 ## FAQ
 
 **Is ShadowDroid a test framework?**
-No. There's no assertion DSL or test runner — it's a fast, observable control
-surface an agent drives live. It *can* launch your existing instrumentation
-tests (`shadowdroid test`, which frees the `UiAutomation` slot first), but it
-isn't a replacement for Espresso or JUnit.
+ShadowDroid drives the live agent loop and now offers experimental requirement
+verification: bounded journeys, a small assertion vocabulary, existing-test
+orchestration and durable evidence. Gradle, Espresso and JUnit remain responsible
+for project builds and test suites. `shadowdroid commands --guide verification`
+explains how to choose checks, preserve unresolved requirements and coordinate
+multiple agents.
 
 **How is it different from Appium, Maestro, or Espresso?**
 Those are built for authored test suites — WebDriver scripts, YAML flows,

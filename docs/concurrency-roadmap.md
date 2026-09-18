@@ -1,6 +1,6 @@
 # Concurrent agents and resource ownership
 
-Status: proposed design, 2026-09-18, grounded in source commit `add874bd004e313014889a420abcba555b0df070`. This extends the [agent verification roadmap](agent-verification-roadmap.md); it does not describe implemented session or lease commands.
+Status: C0/C1 local cooperative sessions implemented and emulator-tested; C2/C3 remain conditional. The design below was written 2026-09-18 against source commit `add874bd004e313014889a420abcba555b0df070`. See the [session guide](sessions.md) for actual syntax and the [validation report](verification-validation.md) for tested boundaries.
 
 The default should be **one active driver per device, multiple observers and advisers, and parallel drivers on isolated devices**. Agents divide engineering responsibility by task or feature; ShadowDroid coordinates the runtime resources those tasks actually touch. A project name, app package, or screen region is not a sufficient device-isolation boundary.
 
@@ -8,7 +8,7 @@ Concurrency is a foundation of the first verification release. Add identity, own
 
 Implementation tracking: the [session guide](sessions.md) describes the current local reservation gate, passive subscriptions, authority marker and explicit recovery. Distributed coordination and arbitrary-client endpoint enforcement remain outside that implementation.
 
-## 1. What the current implementation protects
+## 1. Baseline before the session implementation
 
 | Existing mechanism | Verified source behavior | Remaining boundary |
 | --- | --- | --- |
@@ -23,7 +23,7 @@ Implementation tracking: the [session guide](sessions.md) describes the current 
 | [Debugger logpoints](../cli/src/cmd/debugger.rs) | Ownership labels exist; the default label is `shadowdroid` | Shared defaults are not distinct agent identities, and debugger process control still affects the app globally |
 | [Effect catalog](../cli/src/cmd/introspect/effects.rs) | Commands declare possible effects, including automatic server bring-up | Observer admission must consider transitive effects, not just a read-sounding command name |
 
-These are source findings, not newly reproduced failures. Keep existing safeguards and extend their coverage rather than assuming a new session label alone prevents interference.
+These are historical baseline source findings; the session implementation addresses the shared-authority and cursor gaps. Keep existing safeguards and extend their coverage rather than assuming a new session label alone prevents interference.
 
 ## 2. Demarcation lines
 

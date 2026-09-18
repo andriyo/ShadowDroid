@@ -1,6 +1,6 @@
 # Agent verification roadmap
 
-Status: implementation in progress. The [verification guide](verification.md) records shipped local command contracts; the work packages below remain acceptance targets until individually validated. Written 2026-09-18 against source commit `add874bd004e313014889a420abcba555b0df070` (`main`, source version `1.1.0`). The baseline below describes inspected source, not an installed binary or a new device-validation result.
+Status: E01–E10 and local E13/C0–C1 implementation delivered as experimental capabilities, with local validation recorded in the [validation report](verification-validation.md). E01 effectiveness measurement is a small pilot, and E12 Linux CI/publication gates remain separate. E11, model judging, physical camera/Wear and distributed coordination are conditional follow-ons. The [verification guide](verification.md) records actual command contracts; the original work packages below preserve the broader acceptance targets. Written 2026-09-18 against source commit `add874bd004e313014889a420abcba555b0df070` (`main`, source version `1.1.0`). The baseline below describes inspected source, not an installed binary or a new device-validation result.
 
 The objective is to help an AI coding agent finish Android engineering tasks with evidence that the requested behavior works. The first investment is a persistent requirement checklist connected to lifecycle checks and existing tests. Subsequent work adds visual review, database checks, migration diagnostics, and Android system-boundary probes.
 
@@ -242,7 +242,7 @@ Implement the [concurrency roadmap](concurrency-roadmap.md): canonical resource 
 
 ## 6. Proposed CLI and artifacts
 
-These names are design candidates, not commands users can run today. Final syntax must follow the live command catalog and existing output/effect conventions.
+This table preserves the original design candidates. Implemented syntax is documented in the verification/session guides and live command catalog; do not infer unimplemented commands from this proposal.
 
 | Proposed surface | Responsibility |
 | --- | --- |

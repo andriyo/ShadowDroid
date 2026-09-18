@@ -141,7 +141,7 @@ def main():
             call("session", "close", serial=args.peer, token=peer_token)
         call("session", "close", token=token)
     summary = {"suite": "agent-sessions", "passed": True, "device": args.device, "peer": args.peer,
-               "covered": ["exclusive-driver", "private-authority-rejection", "passive-observer", "independent-device", "independent-crash-cursors", "handoff-fencing", "instrumentation-slot", "interrupted-recovery"]}
+               "covered": ["exclusive-driver", "private-authority-rejection", "passive-observer", "independent-crash-cursors", "handoff-fencing", "instrumentation-slot", "interrupted-recovery"] + (["independent-device"] if args.peer else [])}
     (args.out / "summary.json").write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary))
 
