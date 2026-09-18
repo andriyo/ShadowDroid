@@ -87,6 +87,7 @@ x509-parser = "0.18"     # inspect a user-provided CA cert (SPKI match, CA flag,
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] } # keep zip and proxy decompression on the same backend
 brotli = "8"             # decompress captured `br` response bodies (pure Rust; keeps the single binary)
 ruzstd = "0.8"           # decompress captured `zstd` response bodies (pure Rust decoder, no libzstd C dep)
+rusqlite = { version = "0.40.2", features = ["bundled", "hooks", "limits"] }
 
 [dev-dependencies]
 # Generated algebraic/model checks. No fork/timeout features are needed, which

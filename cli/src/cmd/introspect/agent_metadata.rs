@@ -17,9 +17,9 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "examples":["--device emulator-5554 session open --agent driver-a", "--device emulator-5554 session observe --subscription adviser-b"]
         })),
         "verify run" => Some(serde_json::json!({
-            "use_when":["Execute a versioned requirement plan with bounded test commands and immutable evidence."],
+            "use_when":["Execute a versioned requirement plan with tests, UI journeys, lifecycle/configuration experiments and SQLite evidence."],
             "output":"run directory, per-check artifacts and requirement report; nonzero when requirements, freshness, cleanup or execution remain unresolved",
-            "side_effects":["external commands have unbounded transitive effects; --host-only refuses device adapters; instrumentation checks release UiAutomation and leave it disconnected"],
+            "side_effects":["external commands have unbounded transitive effects; --host-only refuses device adapters; instrumentation releases UiAutomation; journeys can change app/configuration state; SQLite snapshots force-stop the app"],
             "prerequisites":["new output directory outside source root; isolated source/build root; fresh JUnit output from each invocation"],
             "next_actions":["verify report <run-directory>","commands verify plan validate --json"],
             "examples":["verify run verification.json --host-only --out /tmp/verification-run"]

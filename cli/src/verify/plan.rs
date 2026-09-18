@@ -44,6 +44,20 @@ pub struct Check {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Adapter {
+    Matrix {
+        journey: super::journey::Journey,
+        cells: Vec<super::journey::MatrixCell>,
+        #[serde(default)]
+        reset_app_data: bool,
+    },
+    Sqlite {
+        package: String,
+        database: String,
+        query: super::sqlite::Query,
+    },
+    Journey {
+        journey: super::journey::Journey,
+    },
     /// Runs the project's existing test framework; passing requires fresh JUnit evidence.
     Junit {
         argv: Vec<String>,
@@ -105,6 +119,40 @@ impl Plan {
                 bail!("invalid or duplicate check ID: {}", check.id);
             }
             match &check.adapter {
+                Adapter::Matrix { journey, cells, .. } => {
+                    journey.validate()?;
+                    anyhow::ensure!(
+                        !cells.is_empty() && cells.len() <= 32,
+                        "matrix requires 1..32 cells"
+                    );
+                    let mut ids = BTreeSet::new();
+                    for cell in cells {
+                        anyhow::ensure!(
+                            valid_id(&cell.id) && ids.insert(&cell.id),
+                            "invalid/duplicate matrix cell ID"
+                        );
+                        cell.configuration.validate()?;
+                    }
+                }
+                Adapter::Sqlite {
+                    package,
+                    database,
+                    query,
+                } => {
+                    crate::config::validate_android_package(package)?;
+                    anyhow::ensure!(
+                        database.starts_with("databases/")
+                            && !std::path::Path::new(database)
+                                .components()
+                                .any(|c| matches!(
+                                    c,
+                                    std::path::Component::ParentDir | std::path::Component::RootDir
+                                )),
+                        "database must be a relative databases/ path"
+                    );
+                    query.validate()?;
+                }
+                Adapter::Journey { journey } => journey.validate()?,
                 Adapter::Junit {
                     argv,
                     cwd,

@@ -762,6 +762,69 @@ fn now_ms() -> u64 {
 }
 
 async fn snapshot(serial: &Serial, package: &str, out: &Path, includes: &[String]) -> Result<()> {
+    capture_snapshot(serial, package, out, includes, true).await
+}
+
+/// A verification-only quiescent snapshot with retained SQLite sidecars and a
+/// second byte-level check while the app remains stopped. No nested CLI output.
+pub(crate) async fn verification_snapshot(
+    serial: &Serial,
+    package: &str,
+    out: &Path,
+    database: &str,
+) -> Result<()> {
+    let database = normalize_private_path(database)?;
+    anyhow::ensure!(
+        database.starts_with("databases/"),
+        "database must be a private databases/ path"
+    );
+    capture_snapshot(serial, package, out, &[database], false).await?;
+    let manifest: SnapshotManifest =
+        serde_json::from_slice(&std::fs::read(out.join("manifest.json"))?)?;
+    ensure_no_package_processes(serial, package).await?;
+    for file in &manifest.files {
+        let bytes = read_private_file(serial, package, &file.path, file.bytes).await?;
+        anyhow::ensure!(
+            sha256_bytes(&bytes) == file.sha256,
+            "database/sidecar changed during quiescent snapshot"
+        );
+    }
+    let (_, current_files) = enumerate_snapshot(serial, package, &manifest.roots).await?;
+    anyhow::ensure!(
+        current_files.len() == manifest.files.len()
+            && manifest
+                .files
+                .iter()
+                .all(|file| current_files.contains_key(&file.path)),
+        "snapshot file membership changed"
+    );
+    ensure_no_package_processes(serial, package).await?;
+    Ok(())
+}
+async fn ensure_no_package_processes(serial: &Serial, package: &str) -> Result<()> {
+    let processes = adb::shell(serial, "ps -A -o NAME").await?;
+    anyhow::ensure!(
+        processes
+            .lines()
+            .next()
+            .is_some_and(|line| line.trim() == "NAME"),
+        "cannot inspect package processes"
+    );
+    anyhow::ensure!(
+        !processes
+            .lines()
+            .any(|name| name.trim() == package || name.trim().starts_with(&format!("{package}:"))),
+        "package process still running; database snapshot is unavailable"
+    );
+    Ok(())
+}
+async fn capture_snapshot(
+    serial: &Serial,
+    package: &str,
+    out: &Path,
+    includes: &[String],
+    emit: bool,
+) -> Result<()> {
     if out.exists() {
         return Err(crate::diagnostic::DiagnosticError::new(
             "snapshot_destination_exists",
@@ -780,6 +843,14 @@ async fn snapshot(serial: &Serial, package: &str, out: &Path, includes: &[String
 
     let roots = snapshot_roots(serial, package, includes).await?;
     let (directories, files) = enumerate_snapshot(serial, package, &roots).await?;
+    if !emit {
+        ensure_no_package_processes(serial, package).await?;
+        anyhow::ensure!(
+            files.values().map(|s| s.bytes as u128).sum::<u128>() <= 64 * 1024 * 1024
+                && files.len() <= 100,
+            "verification database snapshot exceeds 64 MiB/100 files"
+        );
+    }
     let parent = out
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -836,6 +907,9 @@ async fn snapshot(serial: &Serial, package: &str, out: &Path, includes: &[String
     if let Err(error) = std::fs::rename(&kept, out) {
         let _ = std::fs::remove_dir_all(&kept);
         return Err(error).with_context(|| format!("publishing snapshot {}", out.display()));
+    }
+    if !emit {
+        return Ok(());
     }
     let total_bytes = manifest.files.iter().map(|file| file.bytes).sum::<u64>();
     emit_action(

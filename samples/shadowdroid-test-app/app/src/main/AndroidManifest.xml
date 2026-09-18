@@ -19,6 +19,10 @@
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="true">
 
+        <activity android:name=".VerificationFixtureActivity" android:exported="true" />
+        <activity android:name=".BrokenVerificationFixtureActivity" android:exported="true" />
+        <activity android:name=".VerificationDetailActivity" android:exported="false" />
+
         <activity
             android:name=".FocusFixtureActivity"
             android:exported="true"

@@ -307,17 +307,17 @@ pub fn build_lock(root: &Path) -> Result<BuildGuard> {
     Ok(guard)
 }
 
-pub fn recover_build(root: &Path, run: &Path) -> Result<()> {
+pub fn recover_build(root: &Path, run: &Path) -> Result<BuildGuard> {
     let guard = build_guard(root)?;
     if !guard.journal.exists() {
-        return Ok(());
+        return Ok(guard);
     }
     let record: Value = serde_json::from_slice(&std::fs::read(&guard.journal)?)?;
     anyhow::ensure!(
         record["run"].as_str() == run.to_str(),
         "build ownership belongs to a different run; inspect that run first"
     );
-    guard.complete()
+    Ok(guard)
 }
 
 fn key(serial: &Serial) -> String {
@@ -442,8 +442,11 @@ pub async fn admit(serial: &Serial) -> Result<()> {
     let mut state = read_state(&path, serial)?;
     verify_owner(&state, options.token.as_deref())?;
     let command = crate::events::current_command_path().unwrap_or("unknown");
-    let recovery_cleanup =
-        state.in_flight.is_some() && matches!(command, "net stop" | "video stop" | "disconnect");
+    let recovery_cleanup = state.in_flight.is_some()
+        && matches!(
+            command,
+            "net stop" | "video stop" | "disconnect" | "verify recover"
+        );
     if !recovery_cleanup {
         require_idle(&state)?;
     }

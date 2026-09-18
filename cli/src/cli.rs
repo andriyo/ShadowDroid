@@ -1925,14 +1925,20 @@ async fn run_inner() -> Result<()> {
                 *compact,
             );
         }
-        Cmd::Verify(args) if matches!(args.command, crate::verify::VerifyCmd::Recover { .. }) => {
+        Cmd::Verify(crate::verify::VerifyArgs {
+            command:
+                crate::verify::VerifyCmd::Recover {
+                    run,
+                    external_workers_stopped,
+                },
+        }) => {
             crate::redaction::configure(redact_requested, Default::default())?;
             crate::runtime::configure(
                 cli.session.clone(),
                 cli.authority_dir.clone(),
                 cli.lock_timeout_ms,
             )?;
-            return crate::verify::run(args);
+            return crate::verify::runner::recover(run, *external_workers_stopped).await;
         }
         Cmd::Verify(args) if !matches!(args.command, crate::verify::VerifyCmd::Run { .. }) => {
             crate::redaction::configure(redact_requested, Default::default())?;

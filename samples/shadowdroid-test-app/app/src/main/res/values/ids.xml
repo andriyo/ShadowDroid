@@ -78,4 +78,12 @@
     <item name="coroutines_root" type="id" />
     <item name="coroutines_status" type="id" />
     <item name="coroutines_spawn_button" type="id" />
+    <item name="verification_title" type="id" />
+    <item name="verification_instance" type="id" />
+    <item name="verification_theme" type="id" />
+    <item name="verification_name" type="id" />
+    <item name="verification_saved" type="id" />
+    <item name="verification_save" type="id" />
+    <item name="verification_next" type="id" />
+    <item name="verification_detail" type="id" />
 </resources>

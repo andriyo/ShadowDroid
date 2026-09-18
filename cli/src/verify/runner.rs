@@ -172,6 +172,69 @@ pub async fn run(plan_path: &Path, out: &Path, serial: Option<&crate::ids::Seria
             }
         } else {
             match &check.adapter {
+                Adapter::Matrix {
+                    journey,
+                    cells,
+                    reset_app_data,
+                } => {
+                    let execution = super::journey::matrix(
+                        journey,
+                        cells,
+                        *reset_app_data,
+                        serial.context("matrix requires a device")?,
+                        &dir,
+                        &mut manifest.cleanup_errors,
+                    )
+                    .await;
+                    from_execution(&check.id, start, execution, &mut interrupted)
+                }
+                Adapter::Sqlite {
+                    package,
+                    database,
+                    query,
+                } => {
+                    let execution = super::sqlite::run(
+                        serial.context("SQLite snapshot requires a device")?,
+                        package,
+                        database,
+                        query,
+                        &dir,
+                    )
+                    .await;
+                    from_execution(&check.id, start, execution, &mut interrupted)
+                }
+                Adapter::Journey { journey } => {
+                    let execution = super::journey::run(
+                        journey,
+                        serial.context("journey requires a device")?,
+                        &dir,
+                        &mut manifest.cleanup_errors,
+                    )
+                    .await;
+                    match execution {
+                        Ok((status, evidence, uncertain, was_interrupted)) => {
+                            interrupted |= was_interrupted;
+                            CheckResult {
+                                id: check.id.clone(),
+                                status,
+                                started_ms: start,
+                                finished_ms: crate::runtime::now_ms(),
+                                outcome_unknown: uncertain,
+                                evidence,
+                                artifacts: BTreeMap::new(),
+                            }
+                        }
+                        Err(e) => CheckResult {
+                            id: check.id.clone(),
+                            status: Status::Blocked,
+                            started_ms: start,
+                            finished_ms: crate::runtime::now_ms(),
+                            outcome_unknown: true,
+                            evidence: json!({"reason":"journey_error","error":format!("{e:#}")}),
+                            artifacts: BTreeMap::new(),
+                        },
+                    }
+                }
                 Adapter::Junit {
                     argv,
                     cwd,
@@ -221,15 +284,7 @@ pub async fn run(plan_path: &Path, out: &Path, serial: Option<&crate::ids::Seria
                 }
             }
         };
-        for entry in std::fs::read_dir(&dir)? {
-            let path = entry?.path();
-            if path.is_file() {
-                result.artifacts.insert(
-                    path.strip_prefix(&out)?.to_owned(),
-                    provenance::hash(&std::fs::read(&path)?),
-                );
-            }
-        }
+        hash_artifacts(&out, &dir, &mut result.artifacts)?;
         unknown |= result.outcome_unknown;
         statuses.insert(check.id.clone(), result.status);
         let path = PathBuf::from("checks").join(&check.id).join("result.json");
@@ -405,7 +460,7 @@ fn stamp(path: &Path) -> Result<(SystemTime, String)> {
     ))
 }
 
-pub fn recover(out: &Path, external_workers_stopped: bool) -> Result<()> {
+pub async fn recover(out: &Path, external_workers_stopped: bool) -> Result<()> {
     anyhow::ensure!(
         external_workers_stopped,
         "review/stop all external workers, then explicitly pass --external-workers-stopped; no action will be replayed"
@@ -413,7 +468,35 @@ pub fn recover(out: &Path, external_workers_stopped: bool) -> Result<()> {
     let out = out.canonicalize()?;
     let manifest: Manifest = serde_json::from_slice(&std::fs::read(out.join("manifest.json"))?)?;
     anyhow::ensure!(manifest.schema_version == 1, "unsupported run schema");
-    crate::runtime::recover_build(&manifest.inputs.root, &out)?;
+    manifest.plan.validate()?;
+    let guard = crate::runtime::recover_build(&manifest.inputs.root, &out)?;
+    let mut cleanup_errors = Vec::new();
+    if let Some(serial) = &manifest.device {
+        let serial = crate::ids::Serial::new(serial);
+        crate::runtime::admit(&serial).await?;
+        for check in &manifest.plan.checks {
+            let dir = out.join("checks").join(&check.id);
+            let mut paths = vec![dir.join("configuration-journal.json")];
+            if let Adapter::Matrix { cells, .. } = &check.adapter {
+                paths.extend(
+                    cells
+                        .iter()
+                        .map(|cell| dir.join(&cell.id).join("configuration-journal.json")),
+                );
+            }
+            for path in paths {
+                if path.exists() {
+                    let mut journal = super::configuration::Journal::read(&path)?;
+                    cleanup_errors.extend(journal.restore(&serial, &path).await);
+                }
+            }
+        }
+    }
+    anyhow::ensure!(
+        cleanup_errors.is_empty(),
+        "configuration recovery failed; ownership retained: {cleanup_errors:?}"
+    );
+    guard.complete()?;
     event(
         &out,
         json!({"event":"external_workers_stopped_attested","at_ms":crate::runtime::now_ms(),"device_recovery_still_required":manifest.device.is_some()}),
@@ -489,7 +572,7 @@ fn report_value(out: &Path, manifest: &Manifest, at_run: bool) -> Result<Value> 
     )
 }
 
-pub fn reduce(statuses: impl IntoIterator<Item = Status>) -> Status {
+pub(super) fn reduce(statuses: impl IntoIterator<Item = Status>) -> Status {
     let values = statuses.into_iter().collect::<Vec<_>>();
     for priority in [
         Status::Failed,
@@ -506,6 +589,52 @@ pub fn reduce(statuses: impl IntoIterator<Item = Status>) -> Status {
     } else {
         Status::Untested
     }
+}
+
+fn from_execution(
+    id: &str,
+    start: u64,
+    execution: Result<(Status, Value, bool, bool)>,
+    interrupted: &mut bool,
+) -> CheckResult {
+    match execution {
+        Ok((status, evidence, unknown, was_interrupted)) => {
+            *interrupted |= was_interrupted;
+            CheckResult {
+                id: id.into(),
+                status,
+                started_ms: start,
+                finished_ms: crate::runtime::now_ms(),
+                outcome_unknown: unknown,
+                evidence,
+                artifacts: BTreeMap::new(),
+            }
+        }
+        Err(e) => CheckResult {
+            id: id.into(),
+            status: Status::Blocked,
+            started_ms: start,
+            finished_ms: crate::runtime::now_ms(),
+            outcome_unknown: true,
+            evidence: json!({"reason":"adapter_error","error":format!("{e:#}")}),
+            artifacts: BTreeMap::new(),
+        },
+    }
+}
+fn hash_artifacts(root: &Path, dir: &Path, hashes: &mut BTreeMap<PathBuf, String>) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        anyhow::ensure!(!path.is_symlink(), "evidence symlinks are not supported");
+        if path.is_dir() {
+            hash_artifacts(root, &path, hashes)?;
+        } else if path.is_file() {
+            hashes.insert(
+                path.strip_prefix(root)?.to_owned(),
+                provenance::hash(&std::fs::read(path)?),
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

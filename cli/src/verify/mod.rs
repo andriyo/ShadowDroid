@@ -1,9 +1,12 @@
 //! Deterministic requirement verification and evidence, independent of a model provider.
+mod configuration;
+mod journey;
 pub mod junit;
 pub mod plan;
 mod process;
 mod provenance;
 pub mod runner;
+mod sqlite;
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
@@ -102,10 +105,7 @@ fn run_inner(args: &VerifyArgs) -> Result<()> {
     match &args.command {
         VerifyCmd::Run { .. } => anyhow::bail!("live verification must use coordinated dispatch"),
         VerifyCmd::Report { run } => return runner::report(run),
-        VerifyCmd::Recover {
-            run,
-            external_workers_stopped,
-        } => return runner::recover(run, *external_workers_stopped),
+        VerifyCmd::Recover { .. } => anyhow::bail!("recovery must use coordinated dispatch"),
         VerifyCmd::Plan {
             command: PlanCmd::Validate { plan },
         } => {
