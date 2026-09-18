@@ -197,6 +197,16 @@ struct CaFileLock {
     _file: File,
 }
 
+impl Drop for CaFileLock {
+    fn drop(&mut self) {
+        // A concurrently spawned child can briefly inherit the open file
+        // description before exec closes CLOEXEC descriptors. Explicitly
+        // release our lease instead of waiting for every inherited copy to
+        // close; otherwise a subsequent CA mutation can spuriously see busy.
+        let _ = self._file.unlock();
+    }
+}
+
 #[derive(Debug)]
 pub struct CaReadLease {
     _lock: Option<CaFileLock>,
@@ -1575,6 +1585,23 @@ mod tests {
         KeyPair::from_pem(&pkcs8).unwrap();
     }
 }
+#[test]
+#[cfg(unix)]
+fn ca_lease_release_does_not_wait_for_an_inherited_descriptor() {
+    for exclusive in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = acquire_ca_lock(dir.path(), exclusive).unwrap();
+        // dup shares the open file description just as fork does, making the
+        // child-inheritance window deterministic without forking the test host.
+        let inherited = lease._file.try_clone().unwrap();
+        assert!(try_acquire_ca_write_lock(dir.path()).is_err());
+        drop(lease);
+        let next_lease = try_acquire_ca_write_lock(dir.path()).unwrap();
+        drop(next_lease);
+        drop(inherited);
+    }
+}
+
 #[test]
 fn ca_lock_blocks_replacement_while_a_reader_is_active() {
     let dir = tempfile::tempdir().unwrap();
