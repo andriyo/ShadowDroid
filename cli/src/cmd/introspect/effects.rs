@@ -353,7 +353,19 @@ fn leaf_contract(path: &str) -> Option<LeafEffectContract> {
             &[E::HostRead, E::HostWrite, E::DeviceRead],
             &[D::ConfigLoad, D::TargetResolveOnline],
         ),
-        "verify plan validate" | "verify compare" => leaf(&[E::HostRead], &[]),
+        "verify run" => leaf(
+            TEST_EFFECTS,
+            &[
+                D::ConfigLoad,
+                D::TargetResolveOnline,
+                D::ExternalCommand,
+                D::ArtifactWriter,
+                D::ManagedProcessStop,
+                D::PortMappingMutation,
+            ],
+        ),
+        "verify recover" => leaf(&[E::HostRead, E::HostWrite], &[D::ArtifactWriter]),
+        "verify report" | "verify plan validate" | "verify compare" => leaf(&[E::HostRead], &[]),
         "verify junit" => leaf(&[E::HostRead, E::HostWrite], &[D::ArtifactWriter]),
         // Introspection/recovery commands dispatched before normal config load.
         "commands" => leaf(HOST_READ, &[]),
@@ -1070,7 +1082,8 @@ mod tests {
     /// dispatch classifier without its effect dependency fails mechanically.
     fn expected_resolver_policy(path: &str) -> ResolverPolicy {
         match path {
-            "collect"
+            "verify run"
+            | "collect"
             | "evidence checkpoint"
             | "session open"
             | "session close"
@@ -1084,7 +1097,9 @@ mod tests {
             | "net intercept" | "net resume" | "net drop" | "net respond" | "net rule add"
             | "net rule list" | "net rule rm" | "net rule clear" | "net override" | "net rules"
             | "net replay" => ResolverPolicy::Existing,
-            "verify plan validate"
+            "verify recover"
+            | "verify report"
+            | "verify plan validate"
             | "verify compare"
             | "verify junit"
             | "evidence timeline"
@@ -1177,7 +1192,7 @@ mod tests {
         for (call, expected_count) in [
             ("selection.resolve(&config)", 15),
             ("selection.resolve_existing(&config)", 3),
-            ("selection.resolve_online(&config)", 4),
+            ("selection.resolve_online(&config)", 5),
         ] {
             assert_eq!(
                 cli_source.matches(call).count(),

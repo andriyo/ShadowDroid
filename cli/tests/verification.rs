@@ -107,3 +107,167 @@ fn baseline_comparison_preserves_failure_and_missing_tests() {
     assert_eq!(result["unresolved"], true);
     assert_eq!(result["regression_free"], false);
 }
+
+#[test]
+fn external_test_fixture() {
+    if std::fs::read_to_string("fixture-mode.txt").is_ok_and(|mode| mode == "sleep") {
+        std::thread::sleep(std::time::Duration::from_secs(10));
+    }
+    if std::fs::read_to_string("fixture-mode.txt").is_ok_and(|mode| mode == "write") {
+        std::fs::write(
+            "tests.xml",
+            "<testsuite><testcase name=\"state\"/></testsuite>",
+        )
+        .unwrap();
+    }
+}
+
+fn host_plan(source: &Path, mode: &str) -> Value {
+    std::fs::write(source.join("input.txt"), "candidate").unwrap();
+    std::fs::write(source.join("fixture-mode.txt"), mode).unwrap();
+    json!({"schema_version":1,"task":"keep state and include secondary route","inputs":["input.txt","fixture-mode.txt"],
+        "requirements":[{"id":"state","text":"keep state","source":"task","checks":["unit"]},{"id":"route","text":"include secondary route","source":"task"}],
+        "checks":[{"id":"unit","adapter":{"kind":"junit","argv":[std::env::current_exe().unwrap(),"--exact","external_test_fixture","--nocapture"],"cwd":".","timeout_ms":10000,"reports":["tests.xml"],"selection":"all"}}]})
+}
+
+#[test]
+fn executable_ledger_preserves_omitted_requirements_and_detects_staleness_and_tampering() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    let plan = host_plan(&source, "write");
+    std::fs::write(source.join("plan.json"), serde_json::to_vec(&plan).unwrap()).unwrap();
+    let output = temp.path().join("run");
+    let (code, value) = run(
+        &source,
+        &[
+            "verify",
+            "run",
+            "plan.json",
+            "--host-only",
+            "--out",
+            output.to_str().unwrap(),
+        ],
+    );
+    assert_ne!(code, 0, "omitted route must not pass: {value}");
+    assert_eq!(value["code"], "verification_unresolved", "{value}");
+    let (_, report) = run(&source, &["verify", "report", output.to_str().unwrap()]);
+    assert_eq!(report["check_statuses"]["unit"], "passed", "{report}");
+    assert_eq!(report["requirements"][1]["status"], "untested");
+    std::fs::write(source.join("input.txt"), "different candidate").unwrap();
+    let (_, report) = run(&source, &["verify", "report", output.to_str().unwrap()]);
+    assert_eq!(report["source_inputs_current"], false);
+    assert_eq!(report["requirements"][0]["status"], "stale");
+    std::fs::write(output.join("checks/unit/report-0.xml"), "tampered").unwrap();
+    let (_, report) = run(&source, &["verify", "report", output.to_str().unwrap()]);
+    assert_eq!(report["check_statuses"]["unit"], "blocked");
+    assert!(!report["evidence_issues"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn zero_exit_cannot_reuse_old_xml_and_failed_prerequisites_block_dependents() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    let mut plan = host_plan(&source, "noop");
+    std::fs::write(
+        source.join("tests.xml"),
+        "<testsuite><testcase name=\"old\"/></testsuite>",
+    )
+    .unwrap();
+    let mut downstream = plan["checks"][0].clone();
+    downstream["id"] = json!("dependent");
+    downstream["depends_on"] = json!(["unit"]);
+    plan["checks"].as_array_mut().unwrap().push(downstream);
+    std::fs::write(source.join("plan.json"), serde_json::to_vec(&plan).unwrap()).unwrap();
+    let output = temp.path().join("run");
+    let (code, value) = run(
+        &source,
+        &[
+            "verify",
+            "run",
+            "plan.json",
+            "--host-only",
+            "--out",
+            output.to_str().unwrap(),
+        ],
+    );
+    assert_ne!(code, 0, "{value}");
+    let (_, report) = run(&source, &["verify", "report", output.to_str().unwrap()]);
+    assert_eq!(report["check_statuses"]["unit"], "stale", "{report}");
+    assert_eq!(report["check_statuses"]["dependent"], "blocked");
+}
+
+#[test]
+fn interrupted_build_requires_explicit_recovery_and_new_runs_can_pass() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    let mut plan = host_plan(&source, "sleep");
+    plan["requirements"].as_array_mut().unwrap().pop();
+    plan["checks"][0]["adapter"]["timeout_ms"] = json!(100);
+    std::fs::write(source.join("plan.json"), serde_json::to_vec(&plan).unwrap()).unwrap();
+    let output = temp.path().join("interrupted");
+    let next = temp.path().join("next");
+    let args = [
+        "verify",
+        "run",
+        "plan.json",
+        "--host-only",
+        "--out",
+        output.to_str().unwrap(),
+    ];
+    let (code, value) = run(&source, &args);
+    assert_ne!(code, 0, "{value}");
+    assert_eq!(value["code"], "verification_outcome_unknown", "{value}");
+    let (_, report) = run(&source, &["verify", "report", output.to_str().unwrap()]);
+    assert_eq!(report["execution_complete"], false);
+    let (_, value) = run(
+        &source,
+        &[
+            "verify",
+            "run",
+            "plan.json",
+            "--host-only",
+            "--out",
+            next.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(value["code"], "build_recovery_required", "{value}");
+    assert_ne!(
+        run(&source, &["verify", "recover", output.to_str().unwrap()]).0,
+        0
+    );
+    assert_eq!(
+        run(
+            &source,
+            &[
+                "verify",
+                "recover",
+                output.to_str().unwrap(),
+                "--external-workers-stopped"
+            ]
+        )
+        .0,
+        0
+    );
+    std::fs::write(source.join("fixture-mode.txt"), "write").unwrap();
+    plan["checks"][0]["adapter"]["timeout_ms"] = json!(10000);
+    std::fs::write(source.join("plan.json"), serde_json::to_vec(&plan).unwrap()).unwrap();
+    let (code, value) = run(
+        &source,
+        &[
+            "verify",
+            "run",
+            "plan.json",
+            "--host-only",
+            "--out",
+            next.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, 0, "{value}");
+    assert_eq!(
+        value["report"]["requirements_satisfied_at_run"], true,
+        "{value}"
+    );
+}

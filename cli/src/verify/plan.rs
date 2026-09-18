@@ -12,6 +12,9 @@ pub struct Plan {
     pub task: String,
     pub requirements: Vec<Requirement>,
     pub checks: Vec<Check>,
+    /// Source root relative to the plan file. Git inputs include dirty and untracked files.
+    #[serde(default = "dot")]
+    pub source_root: PathBuf,
     /// Explicit source/reference/fixture inputs. Empty input sets cannot establish freshness.
     #[serde(default)]
     pub inputs: Vec<PathBuf>,
@@ -50,7 +53,17 @@ pub enum Adapter {
         selection: String,
         #[serde(default = "one")]
         minimum_tests: usize,
+        /// Release the device's UiAutomation slot around this test command.
+        #[serde(default)]
+        instrumentation: bool,
+        /// Optional normalized report from the same test selection.
+        #[serde(default)]
+        baseline: Option<PathBuf>,
     },
+}
+
+fn dot() -> PathBuf {
+    PathBuf::from(".")
 }
 
 fn one() -> usize {
@@ -99,6 +112,7 @@ impl Plan {
                     reports,
                     selection,
                     minimum_tests,
+                    ..
                 } => {
                     if argv.is_empty()
                         || argv[0].is_empty()
@@ -212,6 +226,7 @@ mod tests {
                 not_applicable: None,
             }],
             inputs: vec![],
+            source_root: dot(),
             checks: vec![],
         };
         let adapter = Adapter::Junit {
@@ -221,6 +236,8 @@ mod tests {
             reports: vec!["a.xml".into()],
             selection: "all".into(),
             minimum_tests: 1,
+            instrumentation: false,
+            baseline: None,
         };
         plan.checks.push(Check {
             id: "a".into(),

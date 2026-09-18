@@ -1,6 +1,9 @@
 //! Deterministic requirement verification and evidence, independent of a model provider.
 pub mod junit;
 pub mod plan;
+mod process;
+mod provenance;
+pub mod runner;
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
@@ -27,6 +30,24 @@ pub struct VerifyArgs {
 
 #[derive(Subcommand)]
 pub enum VerifyCmd {
+    /// Execute a bounded plan and preserve immutable per-check evidence.
+    Run {
+        plan: PathBuf,
+        /// New evidence directory outside the source root.
+        #[arg(long)]
+        out: PathBuf,
+        /// Run only host adapters; refuse all device and instrumentation checks.
+        #[arg(long)]
+        host_only: bool,
+    },
+    /// Read a saved run and recheck source/plan and evidence hashes without a device.
+    Report { run: PathBuf },
+    /// Release an interrupted run's source/build ownership after external-worker review.
+    Recover {
+        run: PathBuf,
+        #[arg(long)]
+        external_workers_stopped: bool,
+    },
     /// Validate requirement coverage, adapter inputs and dependency ordering offline.
     Plan {
         #[command(subcommand)]
@@ -79,6 +100,12 @@ pub fn run(args: &VerifyArgs) -> Result<()> {
 
 fn run_inner(args: &VerifyArgs) -> Result<()> {
     match &args.command {
+        VerifyCmd::Run { .. } => anyhow::bail!("live verification must use coordinated dispatch"),
+        VerifyCmd::Report { run } => return runner::report(run),
+        VerifyCmd::Recover {
+            run,
+            external_workers_stopped,
+        } => return runner::recover(run, *external_workers_stopped),
         VerifyCmd::Plan {
             command: PlanCmd::Validate { plan },
         } => {

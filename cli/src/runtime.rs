@@ -265,6 +265,61 @@ async fn release_anchor(serial: &Serial, root: &Path) -> Result<()> {
     Ok(())
 }
 
+pub struct BuildGuard {
+    _lock: File,
+    journal: PathBuf,
+}
+impl BuildGuard {
+    pub fn begin(&self, run: &Path) -> Result<()> {
+        crate::cmd::artifact::write_json(
+            &self.journal,
+            &json!({"run":run,"pid":std::process::id(),"started_ms":now_ms(),"outcome":"running"}),
+        )?;
+        Ok(())
+    }
+    pub fn complete(&self) -> Result<()> {
+        if self.journal.exists() {
+            std::fs::remove_file(&self.journal)?;
+        }
+        Ok(())
+    }
+}
+
+fn build_guard(root: &Path) -> Result<BuildGuard> {
+    let options = options()?;
+    let root_dir = options.root.join("builds");
+    let identity = Serial::new(root.canonicalize()?.display().to_string());
+    let lock=lock_at(&root_dir,&identity,options.wait_ms)
+        .map_err(|e|crate::diagnostic::DiagnosticError::new("build_output_busy","verify",format!("another verifier owns this source/build root: {e}")).next_actions(["use an isolated worktree and build output directory, or wait for the active verification to finish"]))?;
+    Ok(BuildGuard {
+        _lock: lock,
+        journal: root_dir.join(format!("{}.operation.json", key(&identity))),
+    })
+}
+
+pub fn build_lock(root: &Path) -> Result<BuildGuard> {
+    let guard = build_guard(root)?;
+    if guard.journal.exists() {
+        return Err(crate::diagnostic::DiagnosticError::new("build_recovery_required","verify","a prior verifier did not finish; stop/review external workers before releasing its build ownership")
+        .detail(serde_json::from_slice::<Value>(&std::fs::read(&guard.journal)?)?)
+        .next_actions(["shadowdroid verify recover <interrupted-run> --external-workers-stopped"]).into());
+    }
+    Ok(guard)
+}
+
+pub fn recover_build(root: &Path, run: &Path) -> Result<()> {
+    let guard = build_guard(root)?;
+    if !guard.journal.exists() {
+        return Ok(());
+    }
+    let record: Value = serde_json::from_slice(&std::fs::read(&guard.journal)?)?;
+    anyhow::ensure!(
+        record["run"].as_str() == run.to_str(),
+        "build ownership belongs to a different run; inspect that run first"
+    );
+    guard.complete()
+}
+
 fn key(serial: &Serial) -> String {
     blake3::hash(format!("adb:127.0.0.1:5037:{}", serial.as_str()).as_bytes())
         .to_hex()
@@ -471,7 +526,10 @@ pub async fn finish(result: &Result<()>) -> Result<()> {
             .any(|cause| cause.downcast_ref::<reqwest::Error>().is_some())
             || matches!(
                 crate::cli::error_code_of(error).as_str(),
-                "adb_timeout" | "test_command_runner_failed" | "test_command_interrupted"
+                "adb_timeout"
+                    | "test_command_runner_failed"
+                    | "test_command_interrupted"
+                    | "verification_outcome_unknown"
             )
     });
     if uncertain {

@@ -1925,7 +1925,19 @@ async fn run_inner() -> Result<()> {
                 *compact,
             );
         }
-        Cmd::Verify(args) => return crate::verify::run(args),
+        Cmd::Verify(args) if matches!(args.command, crate::verify::VerifyCmd::Recover { .. }) => {
+            crate::redaction::configure(redact_requested, Default::default())?;
+            crate::runtime::configure(
+                cli.session.clone(),
+                cli.authority_dir.clone(),
+                cli.lock_timeout_ms,
+            )?;
+            return crate::verify::run(args);
+        }
+        Cmd::Verify(args) if !matches!(args.command, crate::verify::VerifyCmd::Run { .. }) => {
+            crate::redaction::configure(redact_requested, Default::default())?;
+            return crate::verify::run(args);
+        }
         Cmd::Config(args) => return crate::cmd::config::run(args),
         Cmd::Skill(args) => return crate::cmd::skill::run(args),
         Cmd::Usage(args) => return crate::cmd::usage::run(args),
@@ -1996,6 +2008,30 @@ async fn run_inner() -> Result<()> {
     // are pure host-side `adb`.
     match &cmd {
         Cmd::Devices => return cmd_devices(&config).await,
+        Cmd::Verify(crate::verify::VerifyArgs {
+            command:
+                crate::verify::VerifyCmd::Run {
+                    plan,
+                    out,
+                    host_only,
+                },
+        }) => {
+            // Invalid plans are rejected before device ownership or lifecycle work.
+            crate::verify::plan::Plan::read(plan).map_err(|e| {
+                crate::diagnostic::DiagnosticError::new(
+                    "verification_input_invalid",
+                    "verify",
+                    format!("{e:#}"),
+                )
+                .next_actions(["shadowdroid verify plan validate <plan>"])
+            })?;
+            let serial = if *host_only {
+                None
+            } else {
+                Some(selection.resolve_online(&config).await?)
+            };
+            return crate::verify::runner::run(plan, out, serial.as_ref()).await;
+        }
         Cmd::Session(args) => {
             let serial = selection.resolve_online_raw(&config).await?;
             return crate::runtime::run(&serial, args).await;
@@ -6120,7 +6156,7 @@ async fn cmd_disconnect(serial: &Serial) -> Result<()> {
 /// Release the device's single UiAutomation slot held by ShadowDroid's
 /// instrumentation: force-stop our packages, kill instrument zombies, drop the
 /// port forward. Shared by `disconnect` and `test`.
-async fn free_ui_automation_slot(serial: &Serial) -> Result<()> {
+pub(crate) async fn free_ui_automation_slot(serial: &Serial) -> Result<()> {
     adb::am_force_stop(serial, installer::TEST_PACKAGE).await?;
     adb::am_force_stop(serial, installer::APP_PACKAGE).await?;
     adb::kill_instrument_zombies(serial).await?;

@@ -16,6 +16,26 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "next_actions":["session status", "commands session open --json", "commands session observe --json"],
             "examples":["--device emulator-5554 session open --agent driver-a", "--device emulator-5554 session observe --subscription adviser-b"]
         })),
+        "verify run" => Some(serde_json::json!({
+            "use_when":["Execute a versioned requirement plan with bounded test commands and immutable evidence."],
+            "output":"run directory, per-check artifacts and requirement report; nonzero when requirements, freshness, cleanup or execution remain unresolved",
+            "side_effects":["external commands have unbounded transitive effects; --host-only refuses device adapters; instrumentation checks release UiAutomation and leave it disconnected"],
+            "prerequisites":["new output directory outside source root; isolated source/build root; fresh JUnit output from each invocation"],
+            "next_actions":["verify report <run-directory>","commands verify plan validate --json"],
+            "examples":["verify run verification.json --host-only --out /tmp/verification-run"]
+        })),
+        "verify recover" => Some(serde_json::json!({
+            "use_when":["An interrupted verifier retained source/build ownership and all external workers have been reviewed and stopped."],
+            "output":"explicit worker attestation and source-lock release; original unknown results remain unchanged; device recovery is separate",
+            "side_effects":["writes a recovery event and releases the source/build journal; never replays checks"],
+            "next_actions":["session status", "verify report <run-directory>"]
+        })),
+        "verify report" => Some(serde_json::json!({
+            "use_when":["Resume an investigation after interruption or inspect source/evidence staleness."],
+            "output":"historical check results with current source, plan and artifact integrity checks; does not reobserve the device",
+            "side_effects":["host reads only"],
+            "next_actions":["commands verify run --json"]
+        })),
         "verify" | "verify plan" | "verify plan validate" | "verify junit" | "verify compare" => {
             Some(serde_json::json!({
                 "use_when":["Validate explicit requirement coverage or inspect saved test evidence before claiming completion."],
