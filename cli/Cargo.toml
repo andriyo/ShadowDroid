@@ -78,7 +78,7 @@ http = "1.4"
 http-body-util = "0.1"
 bytes = "1"
 tokio-rustls = "0.26"
-rustls = "0.23"
+rustls = "0.23.45" # minimum patched version for RUSTSEC-2026-0285
 rustls-platform-verifier = "0.7" # make --verify-upstream apply to WSS as well as HTTP(S)
 # AWS-LC gives rcgen RSA key generation; generated roots use RSA-2048 for
 # compatibility with older/non-GMS Android certificate pickers.
