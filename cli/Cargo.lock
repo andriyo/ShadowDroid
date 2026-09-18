@@ -2145,7 +2145,7 @@ dependencies = [
 
 [[package]]
 name = "shadowdroid"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "adb_client",
  "anyhow",

@@ -1,5 +1,8 @@
 # Verification implementation and validation
 
+This records the implementation checkpoint before the v1.2.0 release. For
+publication status and release validation, see the [release page](https://github.com/andriyo/ShadowDroid/releases/tag/v1.2.0).
+
 The September 2026 implementation is experimental and locally committed. It
 adds deterministic tooling and evaluation infrastructure; no official Android
 Bench score or improvement claim is made. The methodology's task set is private.
