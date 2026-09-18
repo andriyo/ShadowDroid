@@ -171,6 +171,7 @@ pub async fn run(plan_path: &Path, out: &Path, serial: Option<&crate::ids::Seria
                 Some(journey.package.as_str())
             }
             Adapter::Sqlite { package, .. } => Some(package.as_str()),
+            Adapter::PlatformTest { test } => Some(test.package.as_str()),
             _ => None,
         };
         let before_app = if let (Some(package), Some(serial)) = (package, serial) {
@@ -200,6 +201,17 @@ pub async fn run(plan_path: &Path, out: &Path, serial: Option<&crate::ids::Seria
             }
         } else {
             match &check.adapter {
+                Adapter::PlatformTest { test } => {
+                    let execution = execute_platform(
+                        test,
+                        &root,
+                        &dir,
+                        serial.context("platform checks require a device")?,
+                        &mut manifest.cleanup_errors,
+                    )
+                    .await;
+                    from_execution(&check.id, start, execution, &mut interrupted)
+                }
                 Adapter::VisualComparison { comparison } => {
                     let execution=super::visual::run(&root,&out,&dir,comparison).or_else(|e|Ok((Status::Blocked,json!({"reason":"visual_evidence_unavailable","error":format!("{e:#}")}),false,false)));
                     from_execution(&check.id, start, execution, &mut interrupted)
@@ -346,7 +358,9 @@ pub async fn run(plan_path: &Path, out: &Path, serial: Option<&crate::ids::Seria
         };
         if let (Some(package), Some(serial), Ok(before)) = (package, serial, &before_app) {
             let after = super::build::installed_apks(serial, package).await;
-            let stable = after.as_ref().is_ok_and(|after| after == before);
+            let stable = after
+                .as_ref()
+                .is_ok_and(|after| super::build::same_installed_apks(before, after));
             let bound = built_packages.get(package).is_some_and(|(id, hash)| {
                 before.len() == 1
                     && before[0]["blake3"] == *hash
@@ -442,12 +456,18 @@ async fn execute_junit(
     serial: Option<&crate::ids::Serial>,
     cleanup_errors: &mut Vec<String>,
 ) -> Result<(Status, Value, bool, bool)> {
-    let paths = args
+    let declared = args
         .reports
         .iter()
         .map(|p| args.cwd.join(p))
         .collect::<Vec<_>>();
-    let previous = paths.iter().map(|p| stamp(p).ok()).collect::<Vec<_>>();
+    let previous = report_paths(&declared)?
+        .into_iter()
+        .map(|p| {
+            let value = stamp(&p).ok();
+            (p, value)
+        })
+        .collect::<BTreeMap<_, _>>();
     if args.instrumentation {
         let serial = serial.context("instrumentation needs a selected device")?;
         let _guard = crate::device::installer::acquire_lifecycle_lock(serial)?;
@@ -467,6 +487,7 @@ async fn execute_junit(
         }
     }
     let execution = execution?;
+    let paths = report_paths(&declared)?;
     let mut report = junit::TestReport::new(args.selection.to_owned());
     let mut stale = Vec::new();
     for (index, path) in paths.iter().enumerate() {
@@ -474,11 +495,11 @@ async fn execute_junit(
         if current
             .as_ref()
             .is_some_and(|(modified, _)| *modified < started)
-            || (current.is_some() && current == previous[index])
+            || (current.is_some() && Some(&current) == previous.get(path))
         {
             stale.push(path.display().to_string());
         }
-        if path.exists() {
+        if path.is_file() {
             anyhow::ensure!(
                 std::fs::metadata(path)?.len() <= 16 * 1024 * 1024,
                 "JUnit XML exceeds 16 MiB"
@@ -528,6 +549,100 @@ async fn execute_junit(
         uncertain,
         interrupted,
     ))
+}
+
+async fn execute_platform(
+    spec: &super::platform::PlatformTest,
+    root: &Path,
+    out: &Path,
+    serial: &crate::ids::Serial,
+    cleanup: &mut Vec<String>,
+) -> Result<(Status, Value, bool, bool)> {
+    let api = crate::device::adb::shell(serial, "getprop ro.build.version.sdk")
+        .await?
+        .trim()
+        .parse::<u32>()?;
+    if !(spec.min_api..=spec.max_api).contains(&api) {
+        return Ok((
+            Status::Blocked,
+            json!({"reason":"outside_declared_api_support","api":api,"min_api":spec.min_api,"max_api":spec.max_api}),
+            false,
+            false,
+        ));
+    }
+    let cwd = root.join(&spec.cwd);
+    let args = JunitArgs {
+        argv: &spec.argv,
+        cwd: &cwd,
+        timeout_ms: spec.timeout_ms,
+        reports: &spec.reports,
+        selection: &spec.selection,
+        minimum_tests: spec.contracts.len(),
+        instrumentation: true,
+        baseline: None,
+    };
+    let (execution_status, mut evidence, unknown, interrupted) =
+        execute_junit(&args, out, Some(serial), cleanup).await?;
+    let report: junit::TestReport = serde_json::from_value(evidence["report"].clone())?;
+    let (contract_status, contracts) = spec.evaluate(&report);
+    evidence["adapter"] = json!("platform_test");
+    evidence["api"] = json!(api);
+    evidence["boundaries"] = contracts;
+    Ok((
+        reduce([execution_status, contract_status]),
+        evidence,
+        unknown,
+        interrupted,
+    ))
+}
+
+fn report_paths(declared: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    fn visit(
+        path: &Path,
+        depth: usize,
+        files: &mut Vec<PathBuf>,
+        visited: &mut usize,
+    ) -> Result<()> {
+        *visited += 1;
+        anyhow::ensure!(
+            *visited <= 5000,
+            "JUnit report discovery exceeds directory bounds"
+        );
+        anyhow::ensure!(
+            depth <= 8 && files.len() < 1000,
+            "JUnit report discovery exceeds bounds"
+        );
+        anyhow::ensure!(!path.is_symlink(), "JUnit report symlinks are unsupported");
+        if path.is_dir() {
+            let mut entries = std::fs::read_dir(path)?
+                .take(1001)
+                .map(|e| e.map(|v| v.path()))
+                .collect::<std::io::Result<Vec<_>>>()?;
+            anyhow::ensure!(
+                entries.len() <= 1000,
+                "JUnit directory exceeds 1000 entries"
+            );
+            entries.sort();
+            let before = files.len();
+            for child in entries {
+                if child.is_dir() || child.extension().is_some_and(|e| e == "xml") {
+                    visit(&child, depth + 1, files, visited)?;
+                }
+            }
+            if before == files.len() && depth == 0 {
+                files.push(path.to_owned());
+            } // Empty selections stay unresolved.
+        } else {
+            files.push(path.to_owned());
+        }
+        Ok(())
+    }
+    let mut paths = vec![];
+    let mut visited = 0;
+    for path in declared {
+        visit(path, 0, &mut paths, &mut visited)?;
+    }
+    Ok(paths)
 }
 
 fn stamp(path: &Path) -> Result<(SystemTime, String)> {
@@ -651,9 +766,10 @@ fn report_value(out: &Path, manifest: &Manifest, at_run: bool) -> Result<Value> 
             && statuses.get(&c.id) == Some(&Status::Passed)
     });
     let app_checks_bound = manifest.plan.checks.iter().all(|c| match c.adapter {
-        Adapter::Journey { .. } | Adapter::Matrix { .. } | Adapter::Sqlite { .. } => {
-            build_bindings.get(&c.id) == Some(&true)
-        }
+        Adapter::Journey { .. }
+        | Adapter::Matrix { .. }
+        | Adapter::Sqlite { .. }
+        | Adapter::PlatformTest { .. } => build_bindings.get(&c.id) == Some(&true),
         Adapter::Junit {
             instrumentation: true,
             ..

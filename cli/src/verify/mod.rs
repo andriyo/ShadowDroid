@@ -5,6 +5,7 @@ mod constraints;
 mod journey;
 pub mod junit;
 pub mod plan;
+mod platform;
 mod process;
 mod provenance;
 pub mod runner;

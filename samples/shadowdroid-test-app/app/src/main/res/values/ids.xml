@@ -86,4 +86,9 @@
     <item name="verification_save" type="id" />
     <item name="verification_next" type="id" />
     <item name="verification_detail" type="id" />
+    <item name="platform_value" type="id" />
+    <item name="platform_send" type="id" />
+    <item name="platform_media" type="id" />
+    <item name="platform_pip" type="id" />
+    <item name="verification_widget_text" type="id" />
 </resources>

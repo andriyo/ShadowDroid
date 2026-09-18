@@ -11,6 +11,7 @@ android {
         applicationId = "io.github.andriyo.shadowdroid.sample"
         minSdk = 24
         targetSdk = 36
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         versionCode = 1
         versionName = "0.1.0"
     }
@@ -53,6 +54,9 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("com.squareup.okhttp3:okhttp:5.4.0")
     testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test:runner:1.7.0")
+    androidTestImplementation("androidx.test.ext:junit:1.3.0")
+    androidTestImplementation("androidx.test.uiautomator:uiautomator:2.4.0")
 }
 
 // >>> shadowdroid coroutine probes (managed by `shadowdroid aar`) — do not edit

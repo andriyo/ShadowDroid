@@ -110,6 +110,13 @@ fn baseline_comparison_preserves_failure_and_missing_tests() {
 
 #[test]
 fn external_test_fixture() {
+    if std::fs::read_to_string("fixture-mode.txt").is_ok_and(|mode| mode == "directory") {
+        std::fs::write(
+            "reports/device/tests.xml",
+            "<testsuite><testcase name=\"state\"/></testsuite>",
+        )
+        .unwrap();
+    }
     if std::fs::read_to_string("fixture-mode.txt").is_ok_and(|mode| mode == "sleep") {
         std::thread::sleep(std::time::Duration::from_secs(10));
     }
@@ -270,4 +277,45 @@ fn interrupted_build_requires_explicit_recovery_and_new_runs_can_pass() {
         value["report"]["requirements_satisfied_at_run"], true,
         "{value}"
     );
+}
+
+#[test]
+fn recursive_junit_directories_preserve_empty_selection_and_find_fresh_reports() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    std::fs::create_dir_all(source.join("reports/device/empty")).unwrap();
+    let mut plan = host_plan(&source, "nothing");
+    plan["requirements"] = json!([{"id":"state","text":"state","source":"task","checks":["unit"]}]);
+    plan["checks"][0]["adapter"]["reports"] = json!(["reports"]);
+    std::fs::write(source.join("plan.json"), serde_json::to_vec(&plan).unwrap()).unwrap();
+    let out = temp.path().join("empty");
+    let (code, _) = run(
+        &source,
+        &[
+            "verify",
+            "run",
+            "plan.json",
+            "--host-only",
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    );
+    assert_ne!(code, 0);
+    let (_, report) = run(&source, &["verify", "report", out.to_str().unwrap()]);
+    assert_eq!(report["check_statuses"]["unit"], "blocked", "{report}");
+    // Missing reports must not quarantine a finished host process.
+    std::fs::write(source.join("fixture-mode.txt"), "directory").unwrap();
+    let out = temp.path().join("fresh");
+    let (code, result) = run(
+        &source,
+        &[
+            "verify",
+            "run",
+            "plan.json",
+            "--host-only",
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, 0, "{result}");
 }

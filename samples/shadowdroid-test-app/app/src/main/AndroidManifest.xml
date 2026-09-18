@@ -19,6 +19,14 @@
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="true">
 
+        <activity android:name=".PlatformVerificationActivity" android:exported="true"
+            android:supportsPictureInPicture="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout" />
+        <activity android:name=".VerificationIntentReceiver" android:exported="false" />
+        <receiver android:name=".VerificationWidgetProvider" android:exported="false">
+            <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE" /></intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/verification_widget_info" />
+        </receiver>
         <activity android:name=".VerificationFixtureActivity" android:exported="true" />
         <activity android:name=".BrokenVerificationFixtureActivity" android:exported="true" />
         <activity android:name=".VerificationDetailActivity" android:exported="false" />

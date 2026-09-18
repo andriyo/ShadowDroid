@@ -44,6 +44,9 @@ pub struct Check {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Adapter {
+    PlatformTest {
+        test: super::platform::PlatformTest,
+    },
     VisualComparison {
         comparison: super::visual::Comparison,
     },
@@ -177,6 +180,7 @@ impl Plan {
                 bail!("invalid or duplicate check ID: {}", check.id);
             }
             match &check.adapter {
+                Adapter::PlatformTest { test } => test.validate()?,
                 Adapter::VisualComparison { comparison } => comparison.validate()?,
                 Adapter::Connect { .. } => {}
                 Adapter::BuildInstall { build } => build.validate()?,

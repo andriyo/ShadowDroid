@@ -114,6 +114,20 @@ pub async fn run(
         false,
     ))
 }
+pub fn same_installed_apks(before: &[Value], after: &[Value]) -> bool {
+    // Android assigns a fresh randomized /data/app directory on reinstall.
+    // Compare the complete multiset of bytes, not the installation location.
+    let identity = |apks: &[Value]| -> Option<Vec<(String, u64)>> {
+        let mut entries = apks
+            .iter()
+            .map(|apk| Some((apk["blake3"].as_str()?.to_owned(), apk["bytes"].as_u64()?)))
+            .collect::<Option<Vec<_>>>()?;
+        entries.sort();
+        Some(entries)
+    };
+    !before.is_empty() && identity(before).is_some_and(|before| Some(before) == identity(after))
+}
+
 pub async fn installed_apks(serial: &Serial, package: &str) -> Result<Vec<Value>> {
     crate::config::validate_android_package(package)?;
     let paths = adb::shell(serial, format!("pm path {package}")).await?;
@@ -129,7 +143,7 @@ pub async fn installed_apks(serial: &Serial, package: &str) -> Result<Vec<Value>
         "missing or excessive installed APKs"
     );
     let mut result = vec![];
-    let mut total=0u64;
+    let mut total = 0u64;
     for path in paths {
         let quoted = crate::events::shell_token(path);
         let size = adb::shell(serial, format!("stat -c %s {quoted}"))
@@ -138,8 +152,11 @@ pub async fn installed_apks(serial: &Serial, package: &str) -> Result<Vec<Value>
             .parse::<u64>()
             .context("installed APK size unavailable")?;
         anyhow::ensure!(size <= 256 * 1024 * 1024, "installed APK exceeds 256 MiB");
-        total+=size;
-        anyhow::ensure!(total<=512*1024*1024,"installed APK set exceeds 512 MiB");
+        total += size;
+        anyhow::ensure!(
+            total <= 512 * 1024 * 1024,
+            "installed APK set exceeds 512 MiB"
+        );
         let bytes = adb::shell_bytes(serial, format!("cat {quoted}")).await?;
         anyhow::ensure!(
             bytes.len() as u64 == size,
@@ -148,4 +165,25 @@ pub async fn installed_apks(serial: &Serial, package: &str) -> Result<Vec<Value>
         result.push(json!({"path":path,"bytes":size,"blake3":provenance::hash(&bytes)}));
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    #[test]
+    fn reinstall_locations_do_not_change_apk_identity_but_content_and_splits_do() {
+        let before = vec![json!({"path":"/old/base.apk","blake3":"aaa","bytes":42})];
+        let after = vec![json!({"path":"/new/base.apk","blake3":"aaa","bytes":42})];
+        assert!(same_installed_apks(&before, &after));
+        assert!(!same_installed_apks(
+            &before,
+            &[json!({"blake3":"bbb","bytes":42})]
+        ));
+        assert!(!same_installed_apks(
+            &before,
+            &[after[0].clone(), after[0].clone()]
+        ));
+        assert!(!same_installed_apks(&[], &[]));
+        assert!(!same_installed_apks(&[json!({})], &[json!({})]));
+    }
 }

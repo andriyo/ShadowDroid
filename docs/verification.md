@@ -140,3 +140,42 @@ python3 scripts/e2e-verification-visual.py --device emulator-5556 --out /tmp/ver
 ```
 
 The build fixture requires the sample's supported JDK in `JAVA_HOME`. The recovery fixture reboots the selected emulator. These suites preserve successful and defective attempts: state loss, missing secondary binding, light-only rendering, UI-only persistence, wrong resolved dependency, stale artifacts, viewport mismatch, and interruption. They validate tool behavior; they do not measure coding-agent effectiveness on the private Android Bench dataset.
+
+## Platform boundary contracts
+
+`platform_test` takes a `test` object with `package`, `min_api`, `max_api`,
+`argv`, `cwd`, `timeout_ms`, `reports`, `selection`, and named `contracts`.
+Each contract declares `boundary` (`outbound_intent`, `media_session`,
+`widget_update`, `picture_in_picture`), exact JUnit `class` and `test`, and
+`observation` (`actual`, or `stubbed` for intents only). Missing, duplicate,
+skipped or unsupported cases stay blocked. Only those named project assertions
+establish the stated boundary; unrelated passing tests cannot satisfy it.
+
+The adapter checks the device API, releases UiAutomation around instrumentation,
+and records installed APK contents before/after. Configure the test runner to
+leave the tested app installed for the final identity check. With AGP's connected
+test task, use `-Pandroid.injected.androidTest.leaveApksInstalledAfterRun=true`.
+Reinstallation into a different Android directory is allowed if all APK content
+hashes and sizes remain identical. A missing or different APK prevents a pass.
+JUnit `reports` accept files or bounded directories of XML, including dynamic
+AGP device report names; existing cached XML does not become fresh evidence.
+
+The sample's actual instrumented assertions exercise randomized intent payloads,
+MediaController session-destruction callbacks, a real AppWidgetHost receiving a
+second RemoteViews update, and Activity PiP state. Correct and seeded defective
+variants run with:
+
+```bash
+python3 scripts/e2e-verification-platform.py --device emulator-5556 --out /tmp/platform-fixtures
+```
+
+A released MediaSession does not prove every audio/decoder resource was released.
+One widget host does not cover all launchers. These fixtures require API 29+ and
+were locally exercised on API 36; physical camera and Wear behavior are outside
+this adapter's demonstrated scope. Camera/Wear and deeper headless Compose
+inspection remain conditional roadmap investigations.
+
+Configuration restoration waits for effective font scale and settled display
+rotation as well as stored values. A matrix starting with `start` applies its
+configuration after the initial launch, so a portrait-only launcher cannot mask
+a landscape app experiment. Unsupported app-enforced orientation stays blocked.
