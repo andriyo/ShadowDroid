@@ -1,5 +1,7 @@
 //! Deterministic requirement verification and evidence, independent of a model provider.
+mod build;
 mod configuration;
+mod constraints;
 mod journey;
 pub mod junit;
 pub mod plan;
@@ -7,6 +9,7 @@ mod process;
 mod provenance;
 pub mod runner;
 mod sqlite;
+mod visual;
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};

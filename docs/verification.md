@@ -110,3 +110,33 @@ The `sqlite` adapter declares `package`, a private `database` path under `databa
 This adapter **force-stops the app** and uses the existing protected app-state snapshot machinery, preserving SQLite sidecars. It checks that package processes remain stopped and rechecks file bytes/membership before querying the copy. Snapshots are capped at 64 MiB/100 files. Keep this experiment separate from transient saved-state tests. Cooperating device ownership excludes writers; an external process that bypasses ownership remains outside that guarantee.
 
 SQLite opens the copy read-only, with query-only mode, trusted schema disabled and an authorizer denying writes, attachments, pragmas, extensions and other mutation capabilities. A quick integrity check precedes the query. The engine enforces time/size limits; default limits are 100 rows and 2 seconds (maximum 1000 rows/10 seconds), 64 KiB text values and 1 MiB projected output. BLOBs are projected as byte counts and content hashes. Missing access, unsupported encryption, corruption, denied SQL or truncated results are blocked, never an inferred empty result. The source database is not queried or modified by SQLite. Full private snapshots stay local with restricted permissions; projected summaries follow `--redact`.
+
+## Build identity and migration constraints
+
+`build_install` accepts a `build` object with explicit `argv`, `cwd`, `timeout_ms`, `apk` (relative to cwd), and `package`. It runs the build, requires a freshly produced APK, installs it, and independently hashes the installed bytes. An up-to-date old APK is stale; choose the project's correct clean/rerun invocation. This installer supports a single APK; installed split sets are observed and cannot silently pass as a matching base APK. The evidence records the build command and its limits: an observed build/install chain is not a hermetic build attestation.
+
+Device checks hash the installed APK set before and after their observations. A change invalidates the check. `current_edits_verified_at_run` requires successful build provenance, unchanged source inputs, and device checks linked through dependencies to the matching build. Historical reports still do not reobserve the current device. Plain JUnit instrumentation cannot by itself establish this binding. `connect` is an explicit setup adapter with optional `server_apk`, useful after instrumentation released UiAutomation; it may install/start the server and does not verify app requirements.
+
+`source_constraints` takes `rules.files`, `required_patterns`, `forbidden_patterns`, and/or `forbidden_extensions`. It reports exact file/line matches and labels the result as a text-search heuristic, not architectural proof. Rules come from the task, with no invented universal restrictions. Files and references are automatically included in the input fingerprint.
+
+`resolved_dependencies` takes a `dependencies` object: Gradle `argv`, absolute project `module` (for example `:app`), resolvable `configuration`, `timeout_ms`, and `required`/`forbidden` coordinates (`group`, `name`, `version`). A generated init script reads Gradle's resolved component graph. Declaration text is not treated as resolution. Only the selected configuration is covered; use project tests/build checks for other variants and secondary UI journeys for runtime DI bindings.
+
+## Visual contracts and review bundles
+
+A journey `capture` produces PNG and metadata with their shared hash, before/after UI observations, configuration, timestamps, consistency, and conservative accessibility findings. Unstable captures are blocked. `--redact` applies pixel redaction using the observed tree; an unstable image is not written when it cannot be redacted safely. Bounds can suggest small controls, missing labels or off-screen geometry, but findings alone do not prove touch bounds, clipping, contrast or full Compose semantics.
+
+`visual_comparison` takes a `comparison` object with `reference_png`, `reference_metadata`, `capture_check`, `capture_name`, optional matrix `cell`, an explicit `max_changed_fraction`, optional `channel_tolerance` (0–255), and optional masks (`bounds: [left, top, right, bottom]`, `reason`). The check must depend on its capture check. Reference and candidate configuration/viewport, image hashes and capture consistency must match before comparison. The bundle retains reference, actual, difference image, metadata and findings. Masks and thresholds remain visible; masking every pixel is rejected. Inputs are capped at 32 MiB/16 megapixels per PNG.
+
+A passing comparison means the declared pixel contract passed. It is not a semantic visual judgment or an Android Bench score. Review the image pairs with the calling vision-capable agent, and keep behavior checks separate. System image variation can cause differences even in a correct app; masks must be explicit and justified. No model API, network cost or uncalibrated visual judge is introduced.
+
+## Reproduce the fixture checks
+
+Build the CLI, server APK pair and sample app, then use an explicitly selected disposable emulator:
+
+```bash
+python3 scripts/e2e-verification.py --device emulator-5556 --exercise-recovery --out /tmp/verification-fixtures
+python3 scripts/e2e-verification-build.py --device emulator-5556 --out /tmp/verification-build
+python3 scripts/e2e-verification-visual.py --device emulator-5556 --out /tmp/verification-visual
+```
+
+The build fixture requires the sample's supported JDK in `JAVA_HOME`. The recovery fixture reboots the selected emulator. These suites preserve successful and defective attempts: state loss, missing secondary binding, light-only rendering, UI-only persistence, wrong resolved dependency, stale artifacts, viewport mismatch, and interruption. They validate tool behavior; they do not measure coding-agent effectiveness on the private Android Bench dataset.

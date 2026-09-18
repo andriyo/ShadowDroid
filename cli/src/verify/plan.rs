@@ -44,6 +44,21 @@ pub struct Check {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Adapter {
+    VisualComparison {
+        comparison: super::visual::Comparison,
+    },
+    Connect {
+        server_apk: Option<PathBuf>,
+    },
+    BuildInstall {
+        build: super::build::Build,
+    },
+    SourceConstraints {
+        rules: super::constraints::SourceRules,
+    },
+    ResolvedDependencies {
+        dependencies: super::constraints::Dependencies,
+    },
     Matrix {
         journey: super::journey::Journey,
         cells: Vec<super::journey::MatrixCell>,
@@ -103,6 +118,49 @@ impl Plan {
         Ok(plan)
     }
 
+    pub fn is_ancestor(&self, ancestor: &str, check: &str) -> bool {
+        let mut pending = vec![check];
+        let mut seen = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Some(check) = self.checks.iter().find(|c| c.id == id) {
+                for parent in &check.depends_on {
+                    if parent == ancestor {
+                        return true;
+                    }
+                    pending.push(parent);
+                }
+            }
+        }
+        false
+    }
+    pub fn tracked_inputs(&self) -> Vec<PathBuf> {
+        let mut paths = self.inputs.iter().cloned().collect::<BTreeSet<_>>();
+        for check in &self.checks {
+            match &check.adapter {
+                Adapter::VisualComparison { comparison } => {
+                    paths.insert(comparison.reference_png.clone());
+                    paths.insert(comparison.reference_metadata.clone());
+                }
+                Adapter::SourceConstraints { rules } => paths.extend(rules.files.iter().cloned()),
+                Adapter::Junit {
+                    baseline: Some(path),
+                    ..
+                } => {
+                    paths.insert(path.clone());
+                }
+                Adapter::Connect {
+                    server_apk: Some(path),
+                } => {
+                    paths.insert(path.clone());
+                }
+                _ => {}
+            }
+        }
+        paths.into_iter().collect()
+    }
     pub fn validate(&self) -> Result<()> {
         if self.schema_version != 1 {
             bail!("unsupported plan schema_version: {}", self.schema_version);
@@ -119,6 +177,11 @@ impl Plan {
                 bail!("invalid or duplicate check ID: {}", check.id);
             }
             match &check.adapter {
+                Adapter::VisualComparison { comparison } => comparison.validate()?,
+                Adapter::Connect { .. } => {}
+                Adapter::BuildInstall { build } => build.validate()?,
+                Adapter::SourceConstraints { rules } => rules.validate()?,
+                Adapter::ResolvedDependencies { dependencies } => dependencies.validate()?,
                 Adapter::Matrix { journey, cells, .. } => {
                     journey.validate()?;
                     anyhow::ensure!(
@@ -208,6 +271,14 @@ impl Plan {
             }
         }
         self.execution_order()?;
+        for check in &self.checks {
+            if let Adapter::VisualComparison { comparison } = &check.adapter {
+                anyhow::ensure!(
+                    self.is_ancestor(&comparison.capture_check, &check.id),
+                    "visual check must depend on its capture check"
+                );
+            }
+        }
         Ok(())
     }
 

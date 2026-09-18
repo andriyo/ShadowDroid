@@ -18,7 +18,7 @@ def main():
     parser.add_argument('--cli', type=Path, default=Path(__file__).resolve().parents[1] / 'cli/target/debug/shadowdroid')
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[1]
-    args.out.mkdir(parents=True, exist_ok=False)
+    args.out.mkdir(parents=True, mode=0o700, exist_ok=False)
     source = args.out / 'source'
     source.mkdir()
     (source / 'fixture.txt').write_text('Seeded state, secondary route, theme and persistence contracts v1')

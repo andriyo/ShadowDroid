@@ -81,7 +81,11 @@ impl Journal {
         self.save(path)?; // Intent is durable before the mutation, including its exact predecessor.
         write(serial, &field, value.as_deref()).await?;
         anyhow::ensure!(
-            read(serial, &field).await? == value,
+            equivalent(
+                &field,
+                read(serial, &field).await?.as_deref(),
+                value.as_deref()
+            ),
             "configuration readback mismatch: {field:?}"
         );
         Ok(())
@@ -113,7 +117,7 @@ impl Journal {
                 serial,
                 path,
                 setting("user_rotation"),
-                Some(value.to_string()),
+                Some(format!("{value:?}")),
             )
             .await?;
         }
@@ -169,10 +173,13 @@ impl Journal {
             let change = &self.changes[index];
             let result = async {
                 let current = read(serial,&change.field).await?;
-                if current == change.before { return Ok(()); }
-                anyhow::ensure!(current == change.owned, "configuration ownership conflict for {:?}: current={current:?}, last_owned={:?}",change.field,change.owned);
+                if equivalent(&change.field,current.as_deref(),change.before.as_deref()) {
+                    if matches!(&change.field,Field::Setting{key,..} if key=="font_scale") {write(serial,&change.field,change.before.as_deref()).await?;}
+                    return Ok(());
+                }
+                anyhow::ensure!(equivalent(&change.field,current.as_deref(),change.owned.as_deref()), "configuration ownership conflict for {:?}: current={current:?}, last_owned={:?}",change.field,change.owned);
                 write(serial,&change.field,change.before.as_deref()).await?;
-                anyhow::ensure!(read(serial,&change.field).await? == change.before,"configuration restore readback mismatch");
+                anyhow::ensure!(equivalent(&change.field,read(serial,&change.field).await?.as_deref(),change.before.as_deref()),"configuration restore readback mismatch");
                 Ok::<(),anyhow::Error>(())
             }.await;
             match result {
@@ -187,6 +194,19 @@ impl Journal {
         }
         errors
     }
+}
+
+fn equivalent(field: &Field, a: Option<&str>, b: Option<&str>) -> bool {
+    if a == b {
+        return true;
+    }
+    if matches!(field,Field::Setting{key,..} if key=="font_scale")
+        && let (Some(a), Some(b)) = (a, b)
+        && let (Ok(a), Ok(b)) = (a.parse::<f32>(), b.parse::<f32>())
+    {
+        return a.is_finite() && b.is_finite() && a == b;
+    }
+    false
 }
 
 async fn read(serial: &Serial, field: &Field) -> Result<Option<String>> {
@@ -269,6 +289,37 @@ async fn write(serial: &Serial, field: &Field, value: Option<&str>) -> Result<()
         }
     };
     adb::shell_mutating(serial, command).await?;
+    if matches!(field,Field::Setting{key,..} if key=="font_scale") {
+        let expected = value
+            .unwrap_or("1.0")
+            .parse::<f32>()
+            .context("invalid font-scale predecessor")?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let dump = adb::shell(serial, "dumpsys activity processes").await?;
+            let effective = dump.lines().find_map(|line| {
+                line.trim()
+                    .strip_prefix("mGlobalConfiguration: {")?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<f32>()
+                    .ok()
+            });
+            if effective == Some(expected) {
+                if value.is_none() && read(serial, field).await?.as_deref() == Some("1.0") {
+                    adb::shell_mutating(serial, "settings delete system font_scale").await?;
+                }
+                if equivalent(field, read(serial, field).await?.as_deref(), value) {
+                    break;
+                }
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "effective font scale did not converge to requested setting"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
     Ok(())
 }
 
@@ -276,4 +327,19 @@ pub async fn metadata(serial: &Serial) -> Result<serde_json::Value> {
     Ok(
         serde_json::json!({"font_scale":read(serial,&Field::Setting{namespace:"system".into(),key:"font_scale".into()}).await?,"night":read(serial,&Field::Night).await?,"size":adb::shell(serial,"wm size").await?,"density":adb::shell(serial,"wm density").await?,"rotation":read(serial,&Field::Setting{namespace:"system".into(),key:"user_rotation".into()}).await?,"accelerometer_rotation":read(serial,&Field::Setting{namespace:"system".into(),key:"accelerometer_rotation".into()}).await?}),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn font_normalization_preserves_unset_and_different_values() {
+        let field = Field::Setting {
+            namespace: "system".into(),
+            key: "font_scale".into(),
+        };
+        assert!(equivalent(&field, Some("1"), Some("1.0")));
+        assert!(!equivalent(&field, None, Some("1.0")));
+        assert!(!equivalent(&field, Some("1.3"), Some("1.4")));
+    }
 }

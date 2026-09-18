@@ -360,6 +360,7 @@ fn leaf_contract(path: &str) -> Option<LeafEffectContract> {
                 D::TargetResolveOnline,
                 D::ExternalCommand,
                 D::ExistingServerProbe,
+                D::ServerEnsureReady,
                 D::ArtifactWriter,
                 D::ManagedProcessStop,
                 D::PortMappingMutation,
@@ -1459,7 +1460,7 @@ mod tests {
             ("installer::ensure_ready_for_command(", &[("cli.rs", 2)]),
             (
                 "installer::ensure_ready(",
-                &[("cli.rs", 2), ("cmd/doctor.rs", 1)],
+                &[("cli.rs", 2), ("cmd/doctor.rs", 1), ("verify/build.rs", 1)],
             ),
             (
                 "installer::probe_existing(",
@@ -1479,7 +1480,10 @@ mod tests {
             ),
             ("adb::reverse_replace(", &[("net/commands.rs", 4)]),
             ("adb::reverse_remove(", &[("cmd/doctor.rs", 1)]),
-            ("adb::install(", &[("cmd/app_install.rs", 1)]),
+            (
+                "adb::install(",
+                &[("cmd/app_install.rs", 1), ("verify/build.rs", 1)],
+            ),
             ("adb::uninstall(", &[("cmd/app_install.rs", 1)]),
         ];
 

@@ -427,6 +427,11 @@ async fn boot_id(serial: &Serial) -> Result<String> {
     Ok(id.to_owned())
 }
 
+/// Token-free identity for evidence; the session credential never enters reports.
+pub fn evidence_context() -> Option<Value> {
+    ACTIVE.lock().unwrap().as_ref().map(|active|json!({"device":active.state.serial,"generation":active.state.generation,"agent":active.state.owner.as_ref().map(|o|&o.agent),"boot_id":active.state.in_flight.as_ref().map(|i|&i.boot_id),"operation":active.state.in_flight.as_ref().map(|i|&i.request_id)}))
+}
+
 /// Called exactly once after canonical device resolution and before device work.
 pub async fn admit(serial: &Serial) -> Result<()> {
     if let Some(active) = ACTIVE.lock().unwrap().as_ref() {
@@ -713,6 +718,9 @@ pub async fn run(serial: &Serial, args: &SessionArgs) -> Result<()> {
                 owner.needs_observation = true;
             }
             write_state(&path, &state)?;
+            if state.owner.is_none() {
+                release_anchor(serial, &options.root).await?;
+            }
             crate::events::emit_action("session_recover", &public_state(&state));
         }
         SessionCmd::Close => {

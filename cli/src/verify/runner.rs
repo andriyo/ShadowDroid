@@ -39,6 +39,8 @@ pub struct Manifest {
     pub inputs: Inputs,
     pub source_changed_during_run: bool,
     pub device: Option<String>,
+    #[serde(default)]
+    pub session_context: Option<Value>,
     pub started_ms: u64,
     pub finished_ms: Option<u64>,
     pub execution_complete: bool,
@@ -102,13 +104,15 @@ pub async fn run(plan_path: &Path, out: &Path, serial: Option<&crate::ids::Seria
                     Adapter::Junit {
                         instrumentation: false,
                         ..
-                    }
+                    } | Adapter::SourceConstraints { .. }
+                        | Adapter::ResolvedDependencies { .. }
+                        | Adapter::VisualComparison { .. }
                 ),
                 "--host-only cannot run device/instrumentation checks"
             );
         }
     }
-    let inputs = provenance::snapshot(&root, &plan.inputs)?;
+    let inputs = provenance::snapshot(&root, &plan.tracked_inputs())?;
     anyhow::ensure!(
         !inputs.files.is_empty() && !inputs.files.values().any(|v| v == "missing"),
         "verification needs present source/fixture inputs; use a Git source root or explicit inputs"
@@ -127,6 +131,7 @@ pub async fn run(plan_path: &Path, out: &Path, serial: Option<&crate::ids::Seria
         inputs,
         source_changed_during_run: false,
         device: serial.map(ToString::to_string),
+        session_context: crate::runtime::evidence_context(),
         started_ms: crate::runtime::now_ms(),
         finished_ms: None,
         execution_complete: false,
@@ -141,6 +146,7 @@ pub async fn run(plan_path: &Path, out: &Path, serial: Option<&crate::ids::Seria
     )?;
     source_lock.begin(&out)?;
     let mut statuses = BTreeMap::new();
+    let mut built_packages: BTreeMap<String, (String, String)> = BTreeMap::new();
     let mut unknown = false;
     let mut interrupted = false;
     for index in manifest.plan.execution_order()? {
@@ -160,6 +166,18 @@ pub async fn run(plan_path: &Path, out: &Path, serial: Option<&crate::ids::Seria
             .filter(|id| statuses.get(*id) != Some(&Status::Passed))
             .cloned()
             .collect::<Vec<_>>();
+        let package = match &check.adapter {
+            Adapter::Journey { journey } | Adapter::Matrix { journey, .. } => {
+                Some(journey.package.as_str())
+            }
+            Adapter::Sqlite { package, .. } => Some(package.as_str()),
+            _ => None,
+        };
+        let before_app = if let (Some(package), Some(serial)) = (package, serial) {
+            super::build::installed_apks(serial, package).await
+        } else {
+            Ok(Vec::new())
+        };
         let mut result = if unknown || interrupted || !unmet.is_empty() {
             CheckResult {
                 id: check.id.clone(),
@@ -170,8 +188,50 @@ pub async fn run(plan_path: &Path, out: &Path, serial: Option<&crate::ids::Seria
                 evidence: json!({"reason":"dependency_or_execution_blocked","unmet_dependencies":unmet,"earlier_outcome_unknown":unknown,"interrupted":interrupted}),
                 artifacts: BTreeMap::new(),
             }
+        } else if let Err(error) = &before_app {
+            CheckResult {
+                id: check.id.clone(),
+                status: Status::Blocked,
+                started_ms: start,
+                finished_ms: crate::runtime::now_ms(),
+                outcome_unknown: false,
+                evidence: json!({"reason":"installed_apk_identity_unavailable","error":format!("{error:#}")}),
+                artifacts: BTreeMap::new(),
+            }
         } else {
             match &check.adapter {
+                Adapter::VisualComparison { comparison } => {
+                    let execution=super::visual::run(&root,&out,&dir,comparison).or_else(|e|Ok((Status::Blocked,json!({"reason":"visual_evidence_unavailable","error":format!("{e:#}")}),false,false)));
+                    from_execution(&check.id, start, execution, &mut interrupted)
+                }
+                Adapter::Connect { server_apk } => {
+                    let apk = server_apk.as_deref().map(|p| root.join(p));
+                    let execution = super::build::connect(
+                        serial.context("connect needs a device")?,
+                        apk.as_deref(),
+                    )
+                    .await;
+                    from_execution(&check.id, start, execution, &mut interrupted)
+                }
+                Adapter::BuildInstall { build } => {
+                    let execution = super::build::run(
+                        build,
+                        &root,
+                        serial.context("build/install needs a device")?,
+                        &dir,
+                    )
+                    .await;
+                    from_execution(&check.id, start, execution, &mut interrupted)
+                }
+                Adapter::SourceConstraints { rules } => {
+                    let execution=super::constraints::source(&root,rules).or_else(|e|Ok((Status::Blocked,json!({"reason":"source_constraint_unavailable","error":format!("{e:#}")}),false,false)));
+                    from_execution(&check.id, start, execution, &mut interrupted)
+                }
+                Adapter::ResolvedDependencies { dependencies } => {
+                    let execution =
+                        super::constraints::dependencies(&root, dependencies, &dir).await;
+                    from_execution(&check.id, start, execution, &mut interrupted)
+                }
                 Adapter::Matrix {
                     journey,
                     cells,
@@ -284,6 +344,28 @@ pub async fn run(plan_path: &Path, out: &Path, serial: Option<&crate::ids::Seria
                 }
             }
         };
+        if let (Some(package), Some(serial), Ok(before)) = (package, serial, &before_app) {
+            let after = super::build::installed_apks(serial, package).await;
+            let stable = after.as_ref().is_ok_and(|after| after == before);
+            let bound = built_packages.get(package).is_some_and(|(id, hash)| {
+                before.len() == 1
+                    && before[0]["blake3"] == *hash
+                    && manifest.plan.is_ancestor(id, &check.id)
+            }) && stable;
+            result.evidence["installed_apks_before"] = json!(before);
+            result.evidence["installed_apks_after"] = json!(after.as_ref().ok());
+            result.evidence["apk_identity_stable"] = json!(stable);
+            result.evidence["bound_to_observed_build"] = json!(bound);
+            if result.status == Status::Passed && !stable {
+                result.status = Status::Stale;
+            }
+        }
+        if result.status == Status::Passed
+            && let Adapter::BuildInstall { build } = &check.adapter
+            && let Some(hash) = result.evidence["apk_hash"].as_str()
+        {
+            built_packages.insert(build.package.clone(), (check.id.clone(), hash.into()));
+        }
         hash_artifacts(&out, &dir, &mut result.artifacts)?;
         unknown |= result.outcome_unknown;
         statuses.insert(check.id.clone(), result.status);
@@ -300,7 +382,7 @@ pub async fn run(plan_path: &Path, out: &Path, serial: Option<&crate::ids::Seria
         save_manifest(&out, &manifest)?;
     }
     manifest.source_changed_during_run =
-        provenance::snapshot(&root, &manifest.plan.inputs)? != manifest.inputs;
+        provenance::snapshot(&root, &manifest.plan.tracked_inputs())? != manifest.inputs;
     manifest.finished_ms = Some(crate::runtime::now_ms());
     manifest.execution_complete = !unknown && !interrupted;
     save_manifest(&out, &manifest)?;
@@ -518,6 +600,7 @@ pub fn report(out: &Path) -> Result<()> {
 fn report_value(out: &Path, manifest: &Manifest, at_run: bool) -> Result<Value> {
     let mut statuses = BTreeMap::new();
     let mut evidence_issues = Vec::new();
+    let mut build_bindings = BTreeMap::new();
     for check in &manifest.plan.checks {
         let Some(reference) = manifest.checks.get(&check.id) else {
             statuses.insert(check.id.clone(), Status::Untested);
@@ -535,6 +618,10 @@ fn report_value(out: &Path, manifest: &Manifest, at_run: bool) -> Result<Value> 
         };
         match read() {
             Ok(result) => {
+                build_bindings.insert(
+                    check.id.clone(),
+                    result.evidence["bound_to_observed_build"] == true,
+                );
                 statuses.insert(check.id.clone(), result.status);
             }
             Err(e) => {
@@ -543,7 +630,7 @@ fn report_value(out: &Path, manifest: &Manifest, at_run: bool) -> Result<Value> 
             }
         }
     }
-    let current = provenance::snapshot(&manifest.inputs.root, &manifest.plan.inputs);
+    let current = provenance::snapshot(&manifest.inputs.root, &manifest.plan.tracked_inputs());
     let current_plan = Plan::read(&manifest.plan_path).and_then(|p| provenance::json_hash(&p));
     let stale = manifest.source_changed_during_run
         || current
@@ -559,6 +646,20 @@ fn report_value(out: &Path, manifest: &Manifest, at_run: bool) -> Result<Value> 
             else {reduce(requirement.checks.iter().map(|id|*statuses.get(id).unwrap_or(&Status::Untested)))};
         json!({"id":requirement.id,"text":requirement.text,"source":requirement.source,"status":status,"checks":requirement.checks,"not_applicable_reason":requirement.not_applicable})
     }).collect::<Vec<_>>();
+    let build_verified = manifest.plan.checks.iter().any(|c| {
+        matches!(c.adapter, Adapter::BuildInstall { .. })
+            && statuses.get(&c.id) == Some(&Status::Passed)
+    });
+    let app_checks_bound = manifest.plan.checks.iter().all(|c| match c.adapter {
+        Adapter::Journey { .. } | Adapter::Matrix { .. } | Adapter::Sqlite { .. } => {
+            build_bindings.get(&c.id) == Some(&true)
+        }
+        Adapter::Junit {
+            instrumentation: true,
+            ..
+        } => false,
+        _ => true,
+    });
     let applicable = requirements
         .iter()
         .filter(|r| r["status"] != "not_applicable")
@@ -568,7 +669,7 @@ fn report_value(out: &Path, manifest: &Manifest, at_run: bool) -> Result<Value> 
         .filter(|r| r["status"] == "passed")
         .count();
     Ok(
-        json!({"schema_version":1,"execution_complete":manifest.execution_complete,"active_check":manifest.active_check,"requirements_satisfied_at_run":manifest.execution_complete && applicable>0 && passed==applicable && !stale && evidence_issues.is_empty(),"scope":if at_run {"run_end"}else{"historical_results_with_current_source_and_evidence_checks"},"source_inputs_current":!stale,"device_state_currentness":if at_run {"observed_by_executed_checks"}else{"not_reobserved"},"applicable_requirements":applicable,"passed_requirements":passed,"excluded_requirements":requirements.len()-applicable,"requirements":requirements,"check_statuses":statuses,"cleanup_status":if !manifest.cleanup_errors.is_empty(){"failed"}else if !manifest.execution_complete{"unknown"}else{"complete"},"cleanup_errors":manifest.cleanup_errors,"evidence_issues":evidence_issues,"started_ms":manifest.started_ms,"finished_ms":manifest.finished_ms,"source_scope":manifest.inputs.source_scope,"limitations":["Plan completeness requires independent review against the original task.","External commands are not sandboxed; isolated worktrees, device selection and backend namespaces remain required.","A historical report does not prove the current installed APK or live device state."]}),
+        json!({"schema_version":1,"execution_complete":manifest.execution_complete,"active_check":manifest.active_check,"requirements_satisfied_at_run":manifest.execution_complete && applicable>0 && passed==applicable && !stale && evidence_issues.is_empty(),"scope":if at_run {"run_end"}else{"historical_results_with_current_source_and_evidence_checks"},"current_edits_verified_at_run":build_verified && app_checks_bound && passed==applicable && applicable>0 && manifest.execution_complete && !stale && evidence_issues.is_empty(),"build_provenance_observed":build_verified,"session_context":manifest.session_context,"source_inputs_current":!stale,"device_state_currentness":if at_run {"observed_by_executed_checks"}else{"not_reobserved"},"applicable_requirements":applicable,"passed_requirements":passed,"excluded_requirements":requirements.len()-applicable,"requirements":requirements,"check_statuses":statuses,"cleanup_status":if !manifest.cleanup_errors.is_empty(){"failed"}else if !manifest.execution_complete{"unknown"}else{"complete"},"cleanup_errors":manifest.cleanup_errors,"evidence_issues":evidence_issues,"started_ms":manifest.started_ms,"finished_ms":manifest.finished_ms,"source_scope":manifest.inputs.source_scope,"limitations":["Plan completeness requires independent review against the original task.","External commands are not sandboxed; isolated worktrees, device selection and backend namespaces remain required.","A historical report does not prove the current installed APK or live device state."]}),
     )
 }
 

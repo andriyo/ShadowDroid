@@ -543,38 +543,7 @@ async fn execute(
             )
             .await
         }
-        Step::Capture { name } => {
-            let before = client.stable_screen(200, 4000).await?;
-            let image = client.screenshot_png().await?;
-            let after = client.screen().await?;
-            let image = if crate::redaction::is_enabled() {
-                anyhow::ensure!(
-                    before.screen.screen_hash == after.screen_hash,
-                    "cannot redact an unstable capture safely"
-                );
-                crate::redaction::redact_png_if_active(&image, &before.screen)?.0
-            } else {
-                image
-            };
-            crate::cmd::artifact::write_bytes(&out.join(format!("{name}.png")), &image)?;
-            save(
-                &out.join(format!("{name}.json")),
-                &json!({"before":before.screen,"after":after,"configuration":super::configuration::metadata(serial).await?}),
-            )?;
-            let consistent = before.stable
-                && before.screen.snapshot_state == SnapshotState::Consistent
-                && after.snapshot_state == SnapshotState::Consistent
-                && before.screen.screen_hash == after.screen_hash;
-            // Capture is evidence collection, not an appearance assertion.
-            Ok((
-                if consistent {
-                    Status::Passed
-                } else {
-                    Status::Blocked
-                },
-                json!({"capture":name,"consistent":consistent,"visual_compliance":"not_evaluated"}),
-            ))
-        }
+        Step::Capture { name } => super::visual::capture(client, serial, out, name).await,
     }
 }
 async fn read_text(client: &ServerClient, target: &Target) -> Result<String> {
