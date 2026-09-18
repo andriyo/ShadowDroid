@@ -183,6 +183,12 @@ impl Journal {
                     return Ok(());
                 }
                 anyhow::ensure!(equivalent(&change.field,current.as_deref(),change.owned.as_deref()), "configuration ownership conflict for {:?}: current={current:?}, last_owned={:?}",change.field,change.owned);
+                if matches!(&change.field,Field::Setting{key,..} if key=="font_scale") {
+                    // A cancelled settings write can still have queued framework
+                    // configuration updates. Let that owned value settle before
+                    // replacing it, or its delayed write-back can undo recovery.
+                    wait_for_font_scale(serial,&change.field,current.as_deref()).await?;
+                }
                 write(serial,&change.field,change.before.as_deref()).await?;
                 anyhow::ensure!(equivalent(&change.field,read(serial,&change.field).await?.as_deref(),change.before.as_deref()),"configuration restore readback mismatch");
                 Ok::<(),anyhow::Error>(())
@@ -344,37 +350,60 @@ async fn write(serial: &Serial, field: &Field, value: Option<&str>) -> Result<()
         }
     }
     if matches!(field,Field::Setting{key,..} if key=="font_scale") {
-        let expected = value
-            .unwrap_or("1.0")
-            .parse::<f32>()
-            .context("invalid font-scale predecessor")?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let dump = adb::shell(serial, "dumpsys activity processes").await?;
-            let effective = dump.lines().find_map(|line| {
-                line.trim()
-                    .strip_prefix("mGlobalConfiguration: {")?
-                    .split_whitespace()
-                    .next()?
-                    .parse::<f32>()
-                    .ok()
-            });
-            if effective == Some(expected) {
-                if value.is_none() && read(serial, field).await?.as_deref() == Some("1.0") {
-                    adb::shell_mutating(serial, "settings delete system font_scale").await?;
-                }
-                if equivalent(field, read(serial, field).await?.as_deref(), value) {
-                    break;
-                }
-            }
-            anyhow::ensure!(
-                std::time::Instant::now() < deadline,
-                "effective font scale did not converge to requested setting"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
+        wait_for_font_scale(serial, field, value).await?;
     }
     Ok(())
+}
+
+async fn wait_for_font_scale(serial: &Serial, field: &Field, value: Option<&str>) -> Result<()> {
+    let expected = value
+        .unwrap_or("1.0")
+        .parse::<f32>()
+        .context("invalid font-scale predecessor")?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut stable_since = None;
+    loop {
+        let dump = adb::shell(serial, "dumpsys activity processes").await?;
+        let effective = dump.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix("mGlobalConfiguration: {")?
+                .split_whitespace()
+                .next()?
+                .parse::<f32>()
+                .ok()
+        });
+        let mut matched = false;
+        if effective == Some(expected) {
+            if value.is_none() && read(serial, field).await?.as_deref() == Some("1.0") {
+                adb::shell_mutating(serial, "settings delete system font_scale").await?;
+            }
+            matched = equivalent(field, read(serial, field).await?.as_deref(), value);
+        }
+        // SettingsProvider persists asynchronously and the framework can
+        // write its effective configuration back later. A single matching
+        // sample is not enough, especially directly after interruption.
+        if font_scale_settled(&mut stable_since, matched, std::time::Instant::now()) {
+            break;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "effective font scale did not converge to requested setting"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Ok(())
+}
+
+fn font_scale_settled(
+    since: &mut Option<std::time::Instant>,
+    matched: bool,
+    now: std::time::Instant,
+) -> bool {
+    if !matched {
+        *since = None;
+        return false;
+    }
+    now.duration_since(*since.get_or_insert(now)) >= std::time::Duration::from_secs(2)
 }
 
 pub async fn metadata(serial: &Serial) -> Result<serde_json::Value> {
@@ -386,6 +415,32 @@ pub async fn metadata(serial: &Serial) -> Result<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn font_scale_settling_restarts_after_delayed_framework_writeback() {
+        let start = std::time::Instant::now();
+        let mut since = None;
+        assert!(!font_scale_settled(&mut since, true, start));
+        assert!(!font_scale_settled(
+            &mut since,
+            false,
+            start + std::time::Duration::from_secs(1)
+        ));
+        assert!(!font_scale_settled(
+            &mut since,
+            true,
+            start + std::time::Duration::from_secs(2)
+        ));
+        assert!(!font_scale_settled(
+            &mut since,
+            true,
+            start + std::time::Duration::from_secs(3)
+        ));
+        assert!(font_scale_settled(
+            &mut since,
+            true,
+            start + std::time::Duration::from_secs(4)
+        ));
+    }
     #[test]
     fn font_normalization_preserves_unset_and_different_values() {
         let field = Field::Setting {

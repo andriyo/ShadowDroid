@@ -186,3 +186,9 @@ Configuration restoration waits for effective font scale and settled display
 rotation as well as stored values. A matrix starting with `start` applies its
 configuration after the initial launch, so a portrait-only launcher cannot mask
 a landscape app experiment. Unsupported app-enforced orientation stays blocked.
+
+Font-scale restoration waits for a pending owned change to settle before
+overwriting it, then requires stored and effective values to agree for two
+seconds. This guards against delayed framework write-back; it is not a portable
+proof that every vendor's settings storage has flushed to disk. Recovery fixtures
+also reboot the disposable emulator and check the restored value again.
