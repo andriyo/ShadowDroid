@@ -141,10 +141,11 @@ fn ws_har_entry(session: &crate::net::store::WsHarSession) -> Value {
 
 fn har_entry(f: &FlowRecord) -> Value {
     let url = crate::net::flow::url(&f.scheme, &f.host, f.port, &f.path);
+    let http_version = f.http_version.as_deref().unwrap_or("HTTP/1.1");
     let mut request = json!({
         "method": f.method,
         "url": url,
-        "httpVersion": "HTTP/1.1",
+        "httpVersion": http_version,
         "headers": har_headers(&f.req_headers),
         "queryString": har_query_string(&f.path),
         "cookies": har_request_cookies(&f.req_headers),
@@ -177,7 +178,7 @@ fn har_entry(f: &FlowRecord) -> Value {
         "response": {
             "status": f.status.unwrap_or(0),
             "statusText": "",
-            "httpVersion": "HTTP/1.1",
+            "httpVersion": http_version,
             "headers": har_headers(&f.resp_headers),
             "cookies": har_response_cookies(&f.resp_headers),
             "content": content,
@@ -621,6 +622,16 @@ mod tests {
         assert_eq!(har_entry(&flow)["request"]["cookies"], json!([]));
     }
 
+    #[test]
+    fn har_reports_the_captured_http_version() {
+        let mut flow = sample();
+        assert_eq!(har_entry(&flow)["request"]["httpVersion"], "HTTP/1.1");
+        flow.http_version = Some("HTTP/2.0".into());
+        let entry = har_entry(&flow);
+        assert_eq!(entry["request"]["httpVersion"], "HTTP/2.0");
+        assert_eq!(entry["response"]["httpVersion"], "HTTP/2.0");
+    }
+
     fn sample() -> FlowRecord {
         FlowRecord {
             id: "f1".into(),
@@ -656,6 +667,7 @@ mod tests {
             modified: false,
             request_body_modified: false,
             original_url: None,
+            http_version: None,
             upstream_bypassed: false,
             error: None,
             error_redacted: false,

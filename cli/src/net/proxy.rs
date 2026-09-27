@@ -1086,6 +1086,8 @@ struct PendingFlow {
     record: Mutex<Option<(FlowRecord, std::time::Instant)>>,
     /// The app's URL once an interception redirected the request.
     original_url: Mutex<Option<String>>,
+    /// The HTTP version of the app's request.
+    http_version: Option<String>,
 }
 
 /// Where a request was redirected to by `net resume --set-url`: every flow
@@ -1105,6 +1107,13 @@ fn note_redirect(original_url: &str, scheme: &str, host: &str, port: u16, path: 
             record.original_url = Some(original_url.to_string());
         }
     });
+}
+
+fn pending_http_version() -> Option<String> {
+    PENDING_FLOW
+        .try_with(|pending| pending.http_version.clone())
+        .ok()
+        .flatten()
 }
 
 fn pending_original_url() -> Option<String> {
@@ -1152,7 +1161,10 @@ async fn proxy_request(
     req: Request<Incoming>,
     tunnel: Option<(Scheme, Authority)>,
 ) -> Result<Response<ProxyBody>> {
-    let pending = Arc::new(PendingFlow::default());
+    let pending = Arc::new(PendingFlow {
+        http_version: Some(format!("{:?}", req.version())),
+        ..PendingFlow::default()
+    });
     let guard = ClientCancelGuard {
         ctx: ctx.clone(),
         pending: pending.clone(),
@@ -2297,6 +2309,7 @@ fn make_flow(p: FlowParts<'_>) -> FlowRecord {
         modified: p.modified,
         request_body_modified: p.request_body_modified,
         original_url: pending_original_url(),
+        http_version: pending_http_version(),
         upstream_bypassed: false,
         error: p.error,
         error_redacted: false,
@@ -4558,6 +4571,7 @@ mod tests {
             );
             assert_eq!(captured.path, "/slow");
             assert_eq!(captured.capture_session_id, "cancel-test");
+            assert_eq!(captured.http_version.as_deref(), Some("HTTP/1.1"));
             if held_response {
                 assert_eq!(captured.status, Some(200));
                 assert_eq!(captured.resp_body.as_deref(), Some("answer"));

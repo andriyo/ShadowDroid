@@ -93,6 +93,10 @@ pub struct FlowRecord {
     /// where it was forwarded, like a modified body describes what was sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_url: Option<String>,
+    /// The HTTP version the app spoke to the proxy ("HTTP/1.1", "HTTP/2.0"),
+    /// which its response came back on too. Absent in captures that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_version: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub upstream_bypassed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -207,6 +211,7 @@ impl FlowRecord {
             "modified": self.modified,
             "request_body_modified": self.request_body_modified,
             "original_url": self.original_url,
+            "http_version": self.http_version,
             "upstream_bypassed": self.upstream_bypassed,
             "error": self.error,
             "error_redacted": self.error_redacted,
@@ -453,6 +458,7 @@ mod tests {
             modified: false,
             request_body_modified: false,
             original_url: None,
+            http_version: None,
             upstream_bypassed: false,
             error: None,
             error_redacted: false,
