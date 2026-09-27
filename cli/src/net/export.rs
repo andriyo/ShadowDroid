@@ -14,7 +14,9 @@ use crate::net::flow::FlowRecord;
 /// A runnable `curl` command reproducing the request (textual body only).
 pub fn curl_command(f: &FlowRecord) -> String {
     let url = format!("{}://{}{}", f.scheme, f.host, f.path);
-    let mut parts = vec![format!("curl -X {} '{}'", f.method, sh(&url))];
+    // Every captured field is attacker-influenced: the method is an HTTP token,
+    // and tokens may contain shell metacharacters such as `` ` ``, `$`, `|`, `&`.
+    let mut parts = vec![format!("curl -X '{}' '{}'", sh(&f.method), sh(&url))];
     for (k, v) in &f.req_headers {
         if k.eq_ignore_ascii_case("content-length") || k.eq_ignore_ascii_case("host") {
             continue;
@@ -251,7 +253,7 @@ mod tests {
         let mut f = sample();
         f.req_headers = vec![("Accept".into(), "application/json".into())];
         let c = curl_command(&f);
-        assert!(c.contains("curl -X GET 'https://api.example.com/v1/me'"));
+        assert!(c.contains("curl -X 'GET' 'https://api.example.com/v1/me'"));
         assert!(c.contains("-H 'Accept: application/json'"));
     }
 
@@ -274,6 +276,36 @@ mod tests {
             None
         );
         assert_eq!(graphql_operation_name(&None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn curl_export_never_executes_captured_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut flow = sample();
+        // All valid RFC 9110 token characters; unquoted they run `touch`.
+        flow.method = "`touch${IFS}m`".into();
+        flow.path = "/x'$(touch${IFS}p)'".into();
+        flow.req_headers = vec![("X-A".into(), "'`touch h`'".into())];
+        flow.req_body = Some("'; touch b; '".into());
+        let script = format!(
+            "curl() {{ printf '%s\\n' \"$@\"; }}\n{}\n",
+            curl_command(&flow)
+        );
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let created: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert!(created.is_empty(), "script created files: {created:?}");
+        let args = String::from_utf8(output.stdout).unwrap();
+        let args: Vec<&str> = args.lines().collect();
+        assert_eq!(args[0], "-X");
+        assert_eq!(args[1], "`touch${IFS}m`");
+        assert_eq!(args[2], "https://api.example.com/x'$(touch${IFS}p)'");
     }
 
     fn sample() -> FlowRecord {
