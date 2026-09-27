@@ -621,3 +621,35 @@ fn non_utf8_argument_is_a_structured_usage_error() {
     assert_eq!(value["type"], "error", "{value}");
     assert_ne!(out.status.code(), Some(101), "must not panic");
 }
+
+#[test]
+fn bare_invocation_code_does_not_depend_on_supplied_globals() {
+    for (args, env) in [
+        (vec![], Some(("SHADOWDROID_DEVICE", "emulator-5554"))),
+        (vec!["-d", "emulator-5554"], None),
+        (vec!["--lock-timeout-ms", "0"], None),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_shadowdroid"));
+        command.args(&args).env("SHADOWDROID_QUIET", "1");
+        if let Some((name, value)) = env {
+            command.env(name, value);
+        }
+        let out = command.output().expect("spawn shadowdroid");
+        let value = one_json_line(&String::from_utf8_lossy(&out.stdout));
+        assert_eq!(
+            value["code"], "missing_subcommand",
+            "{args:?} {env:?}: {value}"
+        );
+        assert_eq!(out.status.code(), Some(2), "{args:?} {env:?}");
+    }
+    // A command group without its subcommand behaves the same with or
+    // without env-backed globals.
+    let out = Command::new(env!("CARGO_BIN_EXE_shadowdroid"))
+        .arg("net")
+        .env("SHADOWDROID_QUIET", "1")
+        .env("SHADOWDROID_DEVICE", "emulator-5554")
+        .output()
+        .expect("spawn shadowdroid");
+    let value = one_json_line(&String::from_utf8_lossy(&out.stdout));
+    assert_eq!(value["code"], "missing_subcommand", "{value}");
+}

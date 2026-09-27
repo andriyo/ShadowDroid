@@ -1653,9 +1653,16 @@ fn parse_cli() -> Cli {
                 let _ = err.print();
                 std::process::exit(0);
             }
-            // Bare invocation is a machine-readable usage failure. Explicit
-            // `--help` remains the human help path.
-            if kind == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand {
+            // Bare invocation (of the CLI or a command group) is a
+            // machine-readable usage failure. Explicit `--help` remains the
+            // human help path. clap reports it as MissingSubcommand instead
+            // when a global was supplied — by a flag or by an env var such as
+            // SHADOWDROID_DEVICE, which agents routinely set; both mean "no
+            // command was provided".
+            if matches!(
+                kind,
+                ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand | ErrorKind::MissingSubcommand
+            ) {
                 crate::cmd::usage::record_parse_error(
                     "MissingSubcommand",
                     false,
