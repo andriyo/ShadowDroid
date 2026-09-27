@@ -1,10 +1,12 @@
 package io.github.andriyo.shadowdroid.studio
 
+import com.intellij.lang.Language
 import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.project.Project
 import com.intellij.psi.PsiDocumentManager
 import com.intellij.psi.PsiErrorElement
 import com.intellij.psi.PsiExpressionCodeFragment
+import com.intellij.psi.PsiFileFactory
 import com.intellij.psi.PsiPrimitiveType
 import com.intellij.psi.SyntaxTraverser
 import com.intellij.xdebugger.breakpoints.XBreakpoint
@@ -61,8 +63,11 @@ internal object ExpressionValidation {
     ): List<Problem> {
         @Suppress("UNCHECKED_CAST")
         val type = breakpoint.type as XBreakpointType<XBreakpoint<*>, *>
-        val provider = type.getEditorsProvider(breakpoint, project) ?: return emptyList()
         val position = runCatching { breakpoint.sourcePosition }.getOrNull()
+        if (isKotlin(type, position?.file?.extension)) {
+            return kotlinSyntaxProblems(project, expression) ?: emptyList()
+        }
+        val provider = type.getEditorsProvider(breakpoint, project) ?: return emptyList()
         val document = provider.createDocument(
             project,
             XExpressionImpl.fromText(expression),
@@ -92,6 +97,29 @@ internal object ExpressionValidation {
             nonBooleanProblem(psi)?.let { problems += it }
         }
         return problems
+    }
+
+    private fun isKotlin(type: XBreakpointType<*, *>, extension: String?): Boolean =
+        type.id.startsWith("kotlin") || extension == "kt" || extension == "kts"
+
+    /**
+     * Syntax problems in a Kotlin expression, or null without the Kotlin
+     * plugin. The expression is parsed as a plain Kotlin file rather than
+     * through the Kotlin debugger's code-fragment factory, which may run a
+     * modal progress (invokeAndWait) and so must not be called from this
+     * background read action: it logged a SEVERE error blaming ShadowDroid.
+     * Semantic problems are deliberately left to the runtime evaluator.
+     */
+    private fun kotlinSyntaxProblems(project: Project, expression: String): List<Problem>? {
+        val kotlin = Language.findLanguageByID("kotlin") ?: return null
+        val prefix = "fun shadowDroidCondition() = run {\n"
+        val file = PsiFileFactory.getInstance(project)
+            .createFileFromText("shadowdroid_condition.kt", kotlin, "$prefix$expression\n}")
+        return SyntaxTraverser.psiTraverser(file)
+            .filter(PsiErrorElement::class.java)
+            .take(MAX_PROBLEMS)
+            .map { Problem("syntax", it.errorDescription, (it.textOffset - prefix.length).coerceAtLeast(0)) }
+            .toList()
     }
 
     private fun nonBooleanProblem(psi: com.intellij.psi.PsiFile): Problem? {
