@@ -120,9 +120,15 @@ impl ServerClient {
         path: &str,
         body: &B,
     ) -> Result<T> {
+        let read_only = READ_ONLY_POSTS.contains(&path);
         let path = self.action_path(path);
-        let request = self.http.post(format!("{}{}", self.base, path)).json(body);
-        let resp = self.apply_action_guard(request).send().await?;
+        let request =
+            self.apply_action_guard(self.http.post(format!("{}{}", self.base, path)).json(body));
+        let resp = if read_only {
+            request.send().await?
+        } else {
+            send_mutation(request).await?
+        };
         check_then_json(resp).await
     }
 
@@ -136,20 +142,19 @@ impl ServerClient {
         body: &B,
         timeout: Duration,
     ) -> Result<T> {
-        let resp = self
+        let request = self
             .http
             .post(format!("{}{}", self.base, path))
             .timeout(timeout)
-            .json(body)
-            .send()
-            .await?;
+            .json(body);
+        let resp = send_mutation(request).await?;
         check_then_json(resp).await
     }
 
     async fn post_empty<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         let path = self.action_path(path);
         let request = self.http.post(format!("{}{}", self.base, path));
-        let resp = self.apply_action_guard(request).send().await?;
+        let resp = send_mutation(self.apply_action_guard(request)).await?;
         check_then_json(resp).await
     }
 
@@ -584,13 +589,12 @@ impl ServerClient {
             .with_context(|| format!("stat {}", local.display()))?
             .len();
         let body = reqwest::Body::wrap_stream(ReaderStream::new(file));
-        let resp = self
+        let request = self
             .transfer_http
             .put(format!("{}{}", self.base, path))
             .header(reqwest::header::CONTENT_LENGTH, bytes)
-            .body(body)
-            .send()
-            .await?;
+            .body(body);
+        let resp = send_mutation(request).await?;
         check_then_json(resp).await
     }
 
@@ -611,6 +615,29 @@ impl ServerClient {
             .send()
             .await?;
         check_then_json(resp).await
+    }
+}
+
+/// POST routes that only read device state; every other POST/PUT mutates.
+const READ_ONLY_POSTS: &[&str] = &["/find"];
+
+/// Send a device-mutating request and record whether its outcome is known: any
+/// HTTP response means the server finished handling it, and a connect failure
+/// means it was never delivered. A timeout or a connection lost mid-request
+/// leaves the mutation unsettled (see [crate::runtime::begin_mutation]).
+async fn send_mutation(request: RequestBuilder) -> Result<Response> {
+    let pending = crate::runtime::begin_mutation();
+    let result = request.send().await;
+    if mutation_outcome_known(&result) {
+        pending.settle();
+    }
+    Ok(result?)
+}
+
+fn mutation_outcome_known(result: &reqwest::Result<Response>) -> bool {
+    match result {
+        Ok(_) => true,
+        Err(error) => error.is_connect(),
     }
 }
 
@@ -699,6 +726,57 @@ fn file_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn only_answered_or_undelivered_mutations_have_known_outcomes() {
+        let http = Client::builder()
+            .timeout(Duration::from_millis(300))
+            .build()
+            .unwrap();
+
+        // Connection refused: the request never reached the device server.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let refused = http
+            .post(format!("http://127.0.0.1:{closed_port}/v1/tap"))
+            .send()
+            .await;
+        assert!(mutation_outcome_known(&refused));
+
+        // Accepted but never answered: the tap may or may not have happened.
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent_port = silent.local_addr().unwrap().port();
+        let hold = tokio::spawn(async move {
+            let (_socket, _) = silent.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let unanswered = http
+            .post(format!("http://127.0.0.1:{silent_port}/v1/tap"))
+            .send()
+            .await;
+        assert!(unanswered.as_ref().is_err_and(reqwest::Error::is_timeout));
+        assert!(!mutation_outcome_known(&unanswered));
+        hold.abort();
+
+        // Any HTTP response, including an error status, is a definitive answer.
+        let answering = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let answering_port = answering.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = answering.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 412 Precondition Failed\r\ncontent-length: 0\r\n\r\n")
+                .await;
+        });
+        let answered = http
+            .post(format!("http://127.0.0.1:{answering_port}/v1/tap"))
+            .send()
+            .await;
+        assert!(mutation_outcome_known(&answered));
+    }
 
     #[test]
     fn classifies_screen_transport_errors_as_transient() {

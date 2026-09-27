@@ -7,12 +7,67 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static OPTIONS: OnceLock<Options> = OnceLock::new();
 static ACTIVE: Mutex<Option<Operation>> = Mutex::new(None);
 static TERMINAL: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+static UNSETTLED_MUTATIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// A device mutation handed to a transport whose answer has not arrived yet.
+/// [`PendingMutation::settle`] records a definitive answer (the device replied,
+/// or the transport proved the request was never delivered). Dropping it
+/// unsettled leaves the outcome unknown, which keeps the operation journal
+/// quarantined when the command fails.
+#[must_use = "settle the mutation once its outcome is known"]
+pub struct PendingMutation(());
+
+pub fn begin_mutation() -> PendingMutation {
+    UNSETTLED_MUTATIONS.fetch_add(1, Ordering::SeqCst);
+    PendingMutation(())
+}
+
+impl PendingMutation {
+    pub fn settle(self) {
+        UNSETTLED_MUTATIONS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn unsettled_mutations() -> usize {
+    UNSETTLED_MUTATIONS.load(Ordering::SeqCst)
+}
+
+/// Whether a failed operation may have left a device effect in an unknown
+/// state. Only then must the journal stay quarantined. Errors raised before any
+/// mutation was dispatched (guard refusals, selector ambiguity, host I/O, input
+/// validation), errors after the device answered (postcondition timeouts,
+/// server rejections), and failures of read-only commands have known outcomes.
+fn outcome_uncertain(error: &anyhow::Error, changes_device: bool, unsettled: usize) -> bool {
+    let diagnostic = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::diagnostic::DiagnosticError>());
+    match diagnostic.map(|d| d.code.as_str()) {
+        Some("test_command_interrupted" | "verification_outcome_unknown") => return true,
+        Some("test_command_runner_failed") => {
+            // A runner that never launched cannot have touched the device.
+            return diagnostic.is_some_and(|d| d.detail["runner_started"] != json!(false));
+        }
+        _ => {}
+    }
+    if !changes_device {
+        return false;
+    }
+    if unsettled > 0 {
+        return true;
+    }
+    // A timed-out native ADB call may still complete later. One that timed out
+    // while waiting for a worker slot never started.
+    diagnostic.is_some_and(|d| {
+        d.code == "adb_timeout" && d.detail["stage"] != json!("waiting_for_worker")
+    })
+}
 
 pub fn defer_terminal(value: &Value) -> bool {
     if crate::events::current_command_path() == Some("watch")
@@ -104,6 +159,7 @@ struct State {
 struct Operation {
     _lock: File,
     release_anchor: bool,
+    changes_device: bool,
     recovery_cleanup: bool,
     path: PathBuf,
     state: State,
@@ -505,9 +561,13 @@ pub async fn admit(serial: &Serial) -> Result<()> {
     }
     write_state(&path, &state)?;
     let release_anchor = state.owner.is_none() && changes_device && online;
+    // Mutations dispatched by admission itself (anchor claims) are settled;
+    // start this command's delivery accounting from a clean slate.
+    UNSETTLED_MUTATIONS.store(0, Ordering::SeqCst);
     *ACTIVE.lock().unwrap() = Some(Operation {
         _lock: lock,
         release_anchor,
+        changes_device,
         recovery_cleanup,
         path,
         state,
@@ -522,23 +582,7 @@ pub async fn finish(result: &Result<()>) -> Result<()> {
         return Ok(());
     };
     let uncertain = result.as_ref().err().is_some_and(|error| {
-        (!error.chain().any(|cause| {
-            cause
-                .downcast_ref::<crate::diagnostic::DiagnosticError>()
-                .is_some()
-                || cause
-                    .downcast_ref::<crate::device::client::ServerError>()
-                    .is_some()
-        })) || error
-            .chain()
-            .any(|cause| cause.downcast_ref::<reqwest::Error>().is_some())
-            || matches!(
-                crate::cli::error_code_of(error).as_str(),
-                "adb_timeout"
-                    | "test_command_runner_failed"
-                    | "test_command_interrupted"
-                    | "verification_outcome_unknown"
-            )
+        outcome_uncertain(error, operation.changes_device, unsettled_mutations())
     });
     if uncertain {
         // Retain the OS lock until process exit as well as the durable journal.
@@ -775,6 +819,108 @@ pub async fn run(serial: &Serial, args: &SessionArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn diagnostic(code: &str, detail: Value) -> anyhow::Error {
+        crate::diagnostic::DiagnosticError::new(code, "test", "failure")
+            .detail(detail)
+            .into()
+    }
+
+    #[test]
+    fn failures_with_known_outcomes_never_quarantine_the_device() {
+        let known: Vec<anyhow::Error> = vec![
+            // Guard refusals: nothing was sent to the device.
+            crate::fusion::ScreenChanged {
+                expected: "a".into(),
+                actual: "b".into(),
+                screen: json!({}),
+            }
+            .into(),
+            crate::fusion::InteractionChanged {
+                expected: "a".into(),
+                actual: "b".into(),
+                screen: json!({}),
+            }
+            .into(),
+            crate::fusion::StaleElement {
+                handle: "i:a/e:1".into(),
+                expected: "a".into(),
+                actual: "b".into(),
+                screen: json!({}),
+            }
+            .into(),
+            crate::selector::AmbiguousMatch {
+                query: "Allow".into(),
+                candidates: vec![],
+            }
+            .into(),
+            // The device answered; only the destination is unproven.
+            crate::fusion::ObservationFailure {
+                code: "postcondition_timeout",
+                message: "action was delivered".into(),
+                detail: json!({}),
+            }
+            .into(),
+            // Host-side input and filesystem failures.
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
+                .context("writing screenshot"),
+            anyhow::anyhow!("run output must be a new directory"),
+            diagnostic("element_not_found", json!({})),
+            diagnostic("adb_timeout", json!({"stage": "waiting_for_worker"})),
+            diagnostic(
+                "test_command_runner_failed",
+                json!({"runner_started": false}),
+            ),
+        ];
+        for error in &known {
+            assert!(
+                !outcome_uncertain(error, true, 0),
+                "must complete, not quarantine: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn unanswered_mutations_and_explicit_unknowns_stay_quarantined() {
+        let plain = anyhow::anyhow!("connection reset while sending tap");
+        assert!(outcome_uncertain(&plain, true, 1));
+        // Even a typed refusal cannot clear an earlier unanswered mutation.
+        let refusal: anyhow::Error = crate::fusion::ScreenChanged {
+            expected: "a".into(),
+            actual: "b".into(),
+            screen: json!({}),
+        }
+        .into();
+        assert!(outcome_uncertain(&refusal, true, 1));
+        assert!(outcome_uncertain(
+            &diagnostic("adb_timeout", json!({"stage": "running"})),
+            true,
+            0
+        ));
+        for code in ["test_command_interrupted", "verification_outcome_unknown"] {
+            assert!(outcome_uncertain(&diagnostic(code, json!({})), false, 0));
+        }
+        assert!(outcome_uncertain(
+            &diagnostic(
+                "test_command_runner_failed",
+                json!({"runner_started": true})
+            ),
+            true,
+            0
+        ));
+    }
+
+    #[test]
+    fn read_only_commands_never_quarantine_on_transport_failures() {
+        let plain = anyhow::anyhow!("connection reset while reading screen");
+        assert!(!outcome_uncertain(&plain, false, 1));
+        assert!(!outcome_uncertain(
+            &diagnostic("adb_timeout", json!({"stage": "running"})),
+            false,
+            0
+        ));
+    }
+
     #[test]
     fn driver_tokens_are_fenced_and_journal_never_expires() {
         let mut state = State {

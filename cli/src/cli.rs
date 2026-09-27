@@ -36,7 +36,7 @@
 //!    normalization stays consistent with `ui find`/`tap`.
 
 use crate::ids::Serial;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use clap::error::{ContextKind, ContextValue};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde_json::{Value, json};
@@ -2122,7 +2122,12 @@ async fn run_inner() -> Result<()> {
         } => {
             let doctor_device = selection.doctor_device(&config).await?;
             if let Some(serial) = &doctor_device {
-                crate::runtime::admit(&Serial::new(serial)).await?;
+                // Plain diagnosis is read-only and must keep working on offline,
+                // unauthorized, reserved or quarantined devices — the states it
+                // exists to explain. Only repairs take device ownership.
+                if *fix {
+                    crate::runtime::admit(&Serial::new(serial)).await?;
+                }
             } else if *fix {
                 let _ = selection.resolve_online(&config).await?;
             }
@@ -6224,6 +6229,7 @@ async fn cmd_test(
     let outcome = match command_result {
         Ok(outcome) => outcome,
         Err(error) => {
+            let runner_started = error.downcast_ref::<TestCommandNotLaunched>().is_none();
             let mut next_actions =
                 vec!["check that the test command exists and can be launched directly"];
             if post_test_cleanup_error.is_some() || reconnect_error.is_some() {
@@ -6237,6 +6243,7 @@ async fn cmd_test(
             .detail(json!({
                 "device": serial,
                 "command": command,
+                "runner_started": runner_started,
                 "reconnect_requested": reconnect,
                 "reconnected": reconnected,
                 "post_test_cleanup_error": post_test_cleanup_error,
@@ -6360,6 +6367,11 @@ struct TestCommandOutcome {
     interrupted: bool,
 }
 
+/// The test command never started, so it cannot have touched the device.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct TestCommandNotLaunched(String);
+
 async fn run_test_command_until<F>(
     command: &[String],
     interrupt: F,
@@ -6368,9 +6380,11 @@ async fn run_test_command_until<F>(
 where
     F: Future<Output = std::io::Result<()>>,
 {
-    let program = command
-        .first()
-        .ok_or_else(|| anyhow!("no command given; use `shadowdroid test -- <command>`"))?;
+    let program = command.first().ok_or_else(|| {
+        anyhow::Error::new(TestCommandNotLaunched(
+            "no command given; use `shadowdroid test -- <command>`".into(),
+        ))
+    })?;
     let mut child = tokio::process::Command::new(program)
         .args(&command[1..])
         .stdin(Stdio::inherit())
@@ -6378,7 +6392,12 @@ where
         .stderr(Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
-        .with_context(|| format!("failed to launch `{}`", command.join(" ")))?;
+        .map_err(|error| {
+            anyhow::Error::new(error).context(TestCommandNotLaunched(format!(
+                "failed to launch `{}`",
+                command.join(" ")
+            )))
+        })?;
     tokio::pin!(interrupt);
 
     tokio::select! {
