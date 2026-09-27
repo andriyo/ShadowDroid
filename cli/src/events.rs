@@ -538,7 +538,10 @@ pub fn screen_event(device: &str, screen: ScreenResponse, format: ScreenFormat) 
 /// objects. A serialization failure (practically impossible for our types)
 /// degrades to `{}` rather than panicking the process.
 pub fn emit(value: &impl Serialize) {
-    let value = serde_json::to_value(value).unwrap_or_else(|_| serde_json::json!({}));
+    let mut value = serde_json::to_value(value).unwrap_or_else(|_| serde_json::json!({}));
+    if crate::redaction::active_policy().is_some() {
+        redact_next_action_devices(&mut value, crate::device_ref::register);
+    }
     let value = crate::redaction::redact_output_if_active(value);
     write_stdout(
         format_args!(
@@ -1503,6 +1506,26 @@ fn specialize_action(template: &str, map: &serde_json::Map<String, serde_json::V
     action
 }
 
+/// Under `--redact`, replace the device serial in a record's own `next_actions`
+/// (for example each `net log` flow line) with its opaque handle, as terminal
+/// envelopes already do. Rewriting an already-redacted action is a no-op.
+fn redact_next_action_devices(
+    value: &mut serde_json::Value,
+    register: impl Fn(&str) -> anyhow::Result<String>,
+) {
+    let Some(actions) = value
+        .get_mut("next_actions")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for action in actions {
+        if let Some(text) = action.as_str() {
+            *action = serde_json::Value::String(redact_recovery_device(text, &register));
+        }
+    }
+}
+
 // Read the scope from the command itself: inventory actions may each select a
 // different device, with no top-level device in the surrounding envelope.
 fn redact_recovery_device(
@@ -1840,6 +1863,35 @@ mod tests {
             dynamic_next_actions(Some("devices"), &map),
             ["shadowdroid -d emulator-5554 connect"]
         );
+    }
+
+    #[test]
+    fn redacted_records_hide_the_serial_in_their_own_next_actions() {
+        let mut record = serde_json::json!({
+            "type": "http",
+            "id": "f1",
+            "next_actions": [
+                "shadowdroid -d emulator-5554 net show f1 --body",
+                "shadowdroid --redact -d @sd-device-first net export har f1",
+                "not a shadowdroid command",
+            ],
+        });
+        let register = |serial: &str| {
+            assert_eq!(serial, "emulator-5554");
+            Ok("@sd-device-first".to_string())
+        };
+        redact_next_action_devices(&mut record, register);
+        assert_eq!(
+            record["next_actions"],
+            serde_json::json!([
+                "shadowdroid --redact -d @sd-device-first net show f1 --body",
+                "shadowdroid --redact -d @sd-device-first net export har f1",
+                "not a shadowdroid command",
+            ])
+        );
+        let once = record.clone();
+        redact_next_action_devices(&mut record, register);
+        assert_eq!(record, once);
     }
 
     #[test]
