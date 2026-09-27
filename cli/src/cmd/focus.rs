@@ -111,8 +111,10 @@ pub async fn run(client: &ServerClient, args: &FocusArgs) -> Result<Outcome> {
         // detection and geometry.
         let current = effective_focused(&screen.elements);
 
-        // Arrived when the focused content is the selector target.
-        if current.is_some_and(|e| selector.matches(e, args.exact)) {
+        // Arrived only when the focused content IS the resolved target. A loose
+        // selector match is not enough: with "Allow" and "Don't allow" on
+        // screen, focus on "Don't allow" also substring-matches "Allow".
+        if arrived(current, &target) {
             let activated = if args.center {
                 client.key("dpad_center").await?;
                 true
@@ -236,6 +238,10 @@ fn center(el: &Element) -> (i32, i32) {
 
 /// Stable-enough identity for "is this the same focused element as last step?".
 /// Element ids are per-dump DFS order, so we key off the durable fields instead.
+fn arrived(current: Option<&Element>, target: &Element) -> bool {
+    current.is_some_and(|focused| focus_key(focused) == focus_key(target))
+}
+
 fn focus_key(el: &Element) -> String {
     format!(
         "{}|{}|{}|{:?}",
@@ -324,6 +330,33 @@ mod tests {
         let mut e = el(id, [0, id as i32 * 20, 10, id as i32 * 20 + 10], false);
         e.text = Some(text.into());
         e
+    }
+
+    #[test]
+    fn arrival_requires_the_resolved_target_not_a_similar_label() {
+        let sel = Selector::Text("Allow".into());
+        let mut allow = text_el(0, "Allow");
+        let mut deny = text_el(1, "Don't allow");
+        allow.focused = false;
+        deny.focused = true;
+        let elements = [allow.clone(), deny.clone()];
+        let target = resolve_target(&sel, &elements, false).unwrap().unwrap();
+        assert_eq!(target.text.as_deref(), Some("Allow"));
+        // Focus sits on "Don't allow", which also substring-matches "Allow".
+        assert!(sel.matches(&deny, false));
+        assert!(!arrived(effective_focused(&elements), &target));
+
+        let elements = [
+            Element {
+                focused: true,
+                ..allow.clone()
+            },
+            Element {
+                focused: false,
+                ..deny
+            },
+        ];
+        assert!(arrived(effective_focused(&elements), &target));
     }
 
     #[test]
