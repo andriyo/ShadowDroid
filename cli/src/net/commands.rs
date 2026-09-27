@@ -3684,6 +3684,22 @@ pub async fn rules_apply(serial: &Serial, file: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `net replay --clear`: stop serving the active replay set.
+pub async fn replay_clear(serial: &Serial) -> Result<()> {
+    let reply = checked_control_reply(
+        "replay_clear",
+        control::request(serial, json!({"op": "replay_clear"})).await?,
+    )?;
+    emit(
+        "net_replay_clear",
+        json!({
+            "cleared": reply.get("cleared").cloned().unwrap_or(json!(false)),
+            "next_actions": ["shadowdroid net status", "shadowdroid net log"],
+        }),
+    );
+    Ok(())
+}
+
 pub async fn replay(serial: &Serial, from: &Path, host: Option<String>) -> Result<()> {
     let metadata = std::fs::symlink_metadata(from)
         .with_context(|| format!("inspect replay input {}", from.display()))?;

@@ -1237,8 +1237,8 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "use_when": ["Need to serve saved responses without the real backend for deterministic app testing."],
             "prerequisites": ["an already-running current net daemon", "a complete unredacted fixtures bundle from net export fixtures"],
             "output": "atomic replay replacement JSON with generation, selected count, and active-set fingerprint",
-            "side_effects": ["atomically replaces replay behavior for exact matching traffic; invalid candidates leave the prior set active"],
-            "next_actions": ["net start", "watch", "ui dump"]
+            "side_effects": ["atomically replaces replay behavior for exact matching traffic; invalid candidates leave the prior set active; `--clear` stops replay (rule commands never touch it) so requests reach their servers again"],
+            "next_actions": ["net start", "watch", "ui dump", "net replay --clear"]
         })),
         "net rule" => Some(serde_json::json!({
             "use_when": ["Need declarative request/response mutation rules for repeated network scenarios."],

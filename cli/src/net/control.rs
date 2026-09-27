@@ -806,6 +806,10 @@ pub async fn serve_client(
             };
             write_json(&mut wr, &json!({"ok": true, "cleared": n})).await?;
         }
+        "replay_clear" => {
+            let previous = shared.replay.write().unwrap().take();
+            write_json(&mut wr, &json!({"ok": true, "cleared": previous.is_some()})).await?;
+        }
         "replay_replace_v1" => {
             let expected_startup_id = req
                 .get("expected_startup_id")

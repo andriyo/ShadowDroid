@@ -1351,11 +1351,14 @@ pub enum NetCmd {
     Replay {
         /// Directory (or manifest.json) produced by `net export fixtures`.
         /// Historical raw FlowRecord JSONL remains supported with strict parsing.
-        #[arg(long)]
-        from: PathBuf,
+        #[arg(long, required_unless_present = "clear")]
+        from: Option<PathBuf>,
         /// Select this exact canonical host from a multi-host bundle.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "clear")]
         host: Option<String>,
+        /// Stop serving the active replay set; requests reach their servers again.
+        #[arg(long, conflicts_with = "from")]
+        clear: bool,
     },
     /// Internal: run the proxy daemon in the foreground (spawned by `net start`).
     #[command(hide = true)]
@@ -3656,7 +3659,12 @@ async fn dispatch_net(c: &NetCmd, serial: &Serial, config: &ShadowDroidConfig) -
         },
         NetCmd::Override { url, file } => nc::override_local(serial, url, file).await,
         NetCmd::Rules { file } => nc::rules_apply(serial, file).await,
-        NetCmd::Replay { from, host } => nc::replay(serial, from, host.clone()).await,
+        NetCmd::Replay {
+            from: Some(from),
+            host,
+            ..
+        } => nc::replay(serial, from, host.clone()).await,
+        NetCmd::Replay { from: None, .. } => nc::replay_clear(serial).await,
         NetCmd::Daemon(a) => {
             crate::net::daemon::run(DaemonConfig {
                 serial: Serial::new(a.serial.clone()),
