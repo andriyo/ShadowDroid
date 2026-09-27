@@ -651,7 +651,9 @@ pub struct ContinueUntilArgs {
     /// Stable session id (preferred) or current index from `debug sessions`.
     #[arg(long)]
     pub session: Option<String>,
-    /// Source file path to match against the top frame.
+    /// Source file path to match against the top frame. Unless a breakpoint
+    /// already exists at --file:--line, a temporary one is set there for the
+    /// run and removed afterwards.
     #[arg(long, requires = "line")]
     pub file: Option<PathBuf>,
     /// One-based source line to match against the top frame.
@@ -1595,11 +1597,74 @@ fn validate_logpoint_stream(
 }
 
 async fn continue_until(bridge: &BridgeClient, args: &ContinueUntilArgs) -> Result<Value> {
-    let session_s = args.session.clone();
     let canonical_file = match &args.file {
         Some(path) => Some(canonicalize_for_bridge(path)?),
         None => None,
     };
+    // Resuming only stops where a breakpoint is, so a location with none would
+    // run straight past it. Arm a temporary one there unless the user already
+    // has a breakpoint on that line (never repurpose theirs).
+    let temporary_breakpoint = match (&canonical_file, args.line) {
+        (Some(file), Some(line)) => arm_location_breakpoint(bridge, file, line).await?,
+        _ => None,
+    };
+    let result = continue_until_matched(bridge, args, canonical_file.as_deref()).await;
+    if let Some(id) = &temporary_breakpoint {
+        // A temporary breakpoint deletes itself when hit; remove it otherwise.
+        let _ = bridge
+            .get(route::BREAKPOINT_REMOVE, &[(query::ID, Some(id.as_str()))])
+            .await;
+    }
+    let mut value = result?;
+    value["temporary_breakpoint"] = serde_json::json!(temporary_breakpoint.is_some());
+    Ok(value)
+}
+
+/// Add a temporary line breakpoint at `file:line` unless one already exists.
+/// Returns the id of the breakpoint that was added.
+async fn arm_location_breakpoint(
+    bridge: &BridgeClient,
+    file: &str,
+    line: u32,
+) -> Result<Option<String>> {
+    let existing = bridge.get(route::BREAKPOINTS, &[]).await?;
+    let already_there = existing
+        .get("breakpoints")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|breakpoint| {
+            breakpoint.get("line").and_then(Value::as_u64) == Some(u64::from(line))
+                && breakpoint.get("file").and_then(Value::as_str) == Some(file)
+                && breakpoint.get("enabled").and_then(Value::as_bool) != Some(false)
+        });
+    if already_there {
+        return Ok(None);
+    }
+    let line_s = line.to_string();
+    let added = bridge
+        .get(
+            route::BREAKPOINT_LINE,
+            &[
+                (query::FILE, Some(file)),
+                (query::LINE, Some(line_s.as_str())),
+                (query::ENABLED, Some("true")),
+                (query::TEMPORARY, Some("true")),
+            ],
+        )
+        .await?;
+    Ok(added
+        .pointer("/breakpoint/id")
+        .and_then(Value::as_str)
+        .map(str::to_string))
+}
+
+async fn continue_until_matched(
+    bridge: &BridgeClient,
+    args: &ContinueUntilArgs,
+    canonical_file: Option<&str>,
+) -> Result<Value> {
+    let session_s = args.session.clone();
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(args.timeout_ms);
     let mut resumes = 0u64;
 
@@ -1616,13 +1681,33 @@ async fn continue_until(bridge: &BridgeClient, args: &ContinueUntilArgs) -> Resu
 
         loop {
             if std::time::Instant::now() >= deadline {
-                return Ok(serde_json::json!({
-                    "ok": false,
+                let target = match (canonical_file, args.line) {
+                    (Some(file), Some(line)) => format!("{file}:{line}"),
+                    _ => "the condition".to_string(),
+                };
+                return Err(crate::diagnostic::DiagnosticError::new(
+                    "debug_wait_timeout",
+                    "debugger",
+                    format!(
+                        "continue-until did not stop at {target} within {}ms (resumed {resumes} time(s))",
+                        args.timeout_ms
+                    ),
+                )
+                .retryable(true)
+                .detail(serde_json::json!({
                     "type": "continue_until",
-                    "timeout": true,
+                    "file": canonical_file,
+                    "line": args.line,
+                    "condition": args.condition,
                     "resumes": resumes,
                     "session": args.session,
-                }));
+                    "timeout_ms": args.timeout_ms,
+                }))
+                .next_actions([
+                    "the app kept running; drive it to the target code path, then retry",
+                    "check the location with `shadowdroid debug breakpoints` and the session with `shadowdroid debug sessions`",
+                ])
+                .into());
             }
             tokio::time::sleep(std::time::Duration::from_millis(args.poll_ms.max(25))).await;
             let status = bridge.get(route::STATUS, &[]).await?;
@@ -1638,7 +1723,7 @@ async fn continue_until(bridge: &BridgeClient, args: &ContinueUntilArgs) -> Resu
                     ],
                 )
                 .await?;
-            let location_matches = match (&canonical_file, args.line) {
+            let location_matches = match (canonical_file, args.line) {
                 (Some(file), Some(line)) => stack_top_matches(&stack, file, line)?,
                 _ => true,
             };
@@ -2664,6 +2749,97 @@ mod tests {
                 .next_actions
                 .iter()
                 .any(|action| action == "shadowdroid debug stop --session session_7")
+        );
+    }
+
+    /// A bridge that answers every request by route and records the request
+    /// lines it saw.
+    async fn recording_bridge(
+        existing_breakpoints: Value,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = vec![0u8; 8192];
+                let read = socket.read(&mut request).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&request[..read]).to_string();
+                let target = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                log.lock().unwrap().push(target.clone());
+                let path = target.split('?').next().unwrap_or("");
+                let reply = match path {
+                    "/v1/breakpoints" => json!({"ok": true, "breakpoints": existing_breakpoints}),
+                    "/v1/breakpoints/line" => json!({"ok": true, "breakpoint": {"id": "bp_tmp"}}),
+                    "/v1/status" => {
+                        json!({"ok": true, "sessions": [{"id": "s1", "suspended": false}]})
+                    }
+                    _ => json!({"ok": true}),
+                }
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    reply.len(),
+                    reply
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{address}"), seen)
+    }
+
+    #[tokio::test]
+    async fn continue_until_a_line_arms_and_cleans_up_a_temporary_breakpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Main.kt");
+        std::fs::write(&file, "fun main() {}\n").unwrap();
+        let canonical = canonicalize_for_bridge(&file).unwrap();
+        let args = ContinueUntilArgs {
+            session: None,
+            file: Some(file.clone()),
+            line: Some(3),
+            condition: None,
+            timeout_ms: 200,
+            poll_ms: 25,
+        };
+
+        let (url, seen) = recording_bridge(json!([])).await;
+        let bridge = BridgeClient::new(Some(&url)).unwrap();
+        let error = continue_until(&bridge, &args).await.unwrap_err();
+        assert_eq!(crate::cli::error_code_of(&error), "debug_wait_timeout");
+        let seen = seen.lock().unwrap().clone();
+        let added = seen
+            .iter()
+            .find(|target| target.starts_with("/v1/breakpoints/line?"))
+            .expect("a temporary breakpoint is armed");
+        assert!(added.contains("temporary=true"), "{added}");
+        assert!(
+            seen.iter()
+                .any(|target| target.starts_with("/v1/breakpoints/remove?")
+                    && target.contains("id=bp_tmp")),
+            "{seen:?}"
+        );
+
+        // The user's own breakpoint on that line is used, never replaced.
+        let existing = json!([{"file": canonical, "line": 3, "enabled": true}]);
+        let (url, seen) = recording_bridge(existing).await;
+        let bridge = BridgeClient::new(Some(&url)).unwrap();
+        continue_until(&bridge, &args).await.unwrap_err();
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            !seen
+                .iter()
+                .any(|target| target.starts_with("/v1/breakpoints/line")
+                    || target.starts_with("/v1/breakpoints/remove")),
+            "{seen:?}"
         );
     }
 
