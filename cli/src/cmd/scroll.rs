@@ -45,10 +45,7 @@ pub struct ScrollArgs {
 pub async fn run(client: &ServerClient, args: &ScrollArgs) -> Result<Outcome> {
     let selector = args.selector.exactly_one()?;
 
-    // Fast path: drive a scrollable on-device. On any error (older server with
-    // no /v1/scroll route, or no scrollable container) fall back to the host
-    // loop below — the server returns matched=false (not an error) when the
-    // container exists but the item simply isn't there.
+    // Fast path: drive a scrollable on-device.
     let server = client
         .scroll(
             args.selector.rid.as_deref(),
@@ -61,17 +58,21 @@ pub async fn run(client: &ServerClient, args: &ScrollArgs) -> Result<Outcome> {
             args.exact,
         )
         .await;
-    if let Ok(resp) = server {
-        if resp.matched {
-            return emit_server(&selector, &resp, args.tap);
-        }
-        let screen = client.screen().await?;
-        return scroll_failure(&selector, resp.swipes, "server_no_match", &screen);
-    }
+    let server_swipes = match server {
+        Ok(resp) if resp.matched => return emit_server(&selector, &resp, args.tap),
+        // `matched:false` never taps. The server drives the first
+        // `By.scrollable` it finds and stops when UiObject2 reports no further
+        // progress, which on screens with several scrollables (typical in
+        // Compose) can be the wrong container after a single swipe. Continue
+        // with the host loop from here, within the remaining swipe budget.
+        Ok(resp) => resp.swipes,
+        Err(error) if !host_fallback_is_safe(&error, args.tap) => return Err(error),
+        Err(_) => 0,
+    };
 
     let swipe_dir = finger_direction(&args.direction);
 
-    let mut swipes = 0u32;
+    let mut swipes = server_swipes.min(args.max_swipes);
     let mut last_hash = String::new();
     loop {
         let screen = client.screen().await?;
@@ -106,6 +107,19 @@ pub async fn run(client: &ServerClient, args: &ScrollArgs) -> Result<Outcome> {
         swipe(client, swipe_dir, container.as_ref(), args.duration_ms).await?;
         swipes += 1;
     }
+}
+
+/// Whether a failed `/scroll` call may be retried by the host loop. A server
+/// answer (an older server without the route, no scrollable container) means
+/// nothing was tapped. A transport failure after the request was sent — a
+/// timeout, a dropped connection — may have tapped already when `--tap` was
+/// requested, and the host loop would tap a second time.
+fn host_fallback_is_safe(error: &anyhow::Error, tap: bool) -> bool {
+    !tap || error.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::device::client::ServerError>()
+            .is_some()
+    })
 }
 
 fn find_container<'a>(elements: &'a [Element], rid: &str) -> Option<&'a Element> {
@@ -224,4 +238,26 @@ fn emit(
             })),
         }),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_fallback_never_risks_a_second_tap() {
+        let answered = anyhow::Error::new(crate::device::client::ServerError {
+            status: reqwest::StatusCode::NOT_FOUND,
+            code: "no_scrollable".into(),
+            message: "no scrollable container found".into(),
+            detail: None,
+        });
+        let unanswered = anyhow::anyhow!("error sending request: operation timed out");
+        // Without --tap, scrolling further is always harmless.
+        assert!(host_fallback_is_safe(&unanswered, false));
+        assert!(host_fallback_is_safe(&answered, false));
+        // With --tap, only a definitive server answer proves nothing was tapped.
+        assert!(host_fallback_is_safe(&answered, true));
+        assert!(!host_fallback_is_safe(&unanswered, true));
+    }
 }
