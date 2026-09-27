@@ -413,8 +413,9 @@ fn build_native_event(lines: &[String], pid: Option<i32>) -> CrashEvent {
         if let Some(caps) = native_fatal_re().captures(&msg) {
             signal = caps.get(1).and_then(|m| m.as_str().parse::<i32>().ok());
             signal_name = caps.get(2).map(|m| m.as_str().to_string());
+            let tid = caps.get(3).and_then(|m| m.as_str().parse::<i32>().ok());
             if let Some(name) = caps.get(4) {
-                thread = Some(name.as_str().to_string());
+                thread = Some(native_thread_name(tid, pid, name.as_str()));
             }
             // The trailing `pid N (name)` here is the kernel's 15-character
             // truncated comm (e.g. `dowdroid.sample`), not the package; only
@@ -423,7 +424,10 @@ fn build_native_event(lines: &[String], pid: Option<i32>) -> CrashEvent {
         }
         if let Some(caps) = native_pid_line_re().captures(&msg) {
             if thread.is_none() {
-                thread = caps.get(3).map(|m| m.as_str().to_string());
+                let tid = caps.get(2).and_then(|m| m.as_str().parse::<i32>().ok());
+                thread = caps
+                    .get(3)
+                    .map(|m| native_thread_name(tid, pid, m.as_str()));
             }
             package = caps.get(4).map(|m| m.as_str().to_string());
             continue;
@@ -450,6 +454,17 @@ fn build_native_event(lines: &[String], pid: Option<i32>) -> CrashEvent {
         raw: lines.join("\n"),
         context: Vec::new(),
         device_info: serde_json::Value::Object(Default::default()),
+    }
+}
+
+/// The kernel names an app's main thread after its process, truncated to 15
+/// characters (e.g. `dowdroid.sample`), which reads like a mangled package.
+/// Report it as `main`, the name Java crash reports use for the same thread.
+fn native_thread_name(tid: Option<i32>, pid: Option<i32>, comm: &str) -> String {
+    if tid.is_some() && tid == pid {
+        "main".to_string()
+    } else {
+        comm.to_string()
     }
 }
 
@@ -602,6 +617,21 @@ mod tests {
         assert_eq!(evt.backtrace.len(), 2, "{:#?}", evt.backtrace);
         assert!(!evt.raw.contains("libother"));
         assert!(!evt.raw.contains("unrelated line"));
+    }
+
+    #[test]
+    fn native_main_thread_is_reported_as_main() {
+        // Real API 36 lines: the main thread's kernel name is the truncated
+        // process name.
+        let mut c = CrashCollector::default();
+        c.handle_line("09-27 00:05:19.896  4016  4016 F libc    : Fatal signal 11 (SIGSEGV), code 0 (SI_USER from pid 4928, uid 10218) in tid 4016 (dowdroid.sample), pid 4016 (dowdroid.sample)");
+        c.handle_line("09-27 00:05:20.108  4932  4932 F DEBUG   : pid: 4016, tid: 4016, name: dowdroid.sample  >>> io.github.andriyo.shadowdroid.sample <<<");
+        let evt = c.finalize_now().unwrap();
+        assert_eq!(evt.thread.as_deref(), Some("main"));
+        assert_eq!(
+            evt.package.as_deref(),
+            Some("io.github.andriyo.shadowdroid.sample")
+        );
     }
 
     #[test]
