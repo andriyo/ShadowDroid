@@ -2188,13 +2188,7 @@ pub async fn show(serial: &Serial, id: &str, opts: ShowOpts) -> Result<()> {
             return Ok(());
         }
         if let Some(path) = body_file {
-            return write_body_file(
-                id,
-                flow.resp_body.as_deref(),
-                flow.resp_truncated,
-                path,
-                false,
-            );
+            return write_body_file(id, &flow, path, false);
         }
         let mut detail = flow.detail(body);
         detail["held"] = json!(false);
@@ -2237,13 +2231,7 @@ pub async fn show(serial: &Serial, id: &str, opts: ShowOpts) -> Result<()> {
                     return Ok(());
                 }
                 if let Some(path) = body_file {
-                    return write_body_file(
-                        id,
-                        flow.resp_body.as_deref(),
-                        flow.resp_truncated,
-                        path,
-                        true,
-                    );
+                    return write_body_file(id, &flow, path, true);
                 }
                 let mut detail = flow.detail(body);
                 detail["held"] = json!(true);
@@ -2289,12 +2277,18 @@ pub async fn show(serial: &Serial, id: &str, opts: ShowOpts) -> Result<()> {
 /// if the response exceeded the capture cap.
 fn write_body_file(
     id: &str,
-    resp_body: Option<&str>,
-    truncated: bool,
+    flow: &crate::net::flow::FlowRecord,
     path: &Path,
     held: bool,
 ) -> Result<()> {
-    let Some(b) = resp_body else {
+    let truncated = flow.resp_truncated;
+    let Some(b) = flow.resp_body.as_deref() else {
+        if flow.streamed {
+            bail!(
+                "flow `{id}` streamed its response through the proxy, so its body was not \
+                 captured (only a textual part buffered before streaming began is kept)"
+            );
+        }
         bail!(
             "flow `{id}` has no captured response body (binary, empty, or non-textual content-type)"
         );

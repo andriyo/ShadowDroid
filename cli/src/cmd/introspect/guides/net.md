@@ -28,7 +28,10 @@ shadowdroid net stop
 Use `net check` before assuming HTTPS will decrypt. A `tls_error` means the app
 rejected the MITM path; inspect its reason. `--verify-upstream` validates HTTPS
 and WSS upstream certificates. Captured bodies are bounded; honor
-`req_truncated`/`resp_truncated` and original length fields.
+`req_truncated`/`resp_truncated` and original length fields. A `streamed`
+response (SSE or larger than the 8 MiB buffer) is recorded when streaming starts:
+its body is at most the part buffered before that, and `resp_len_unknown` means
+`resp_len` counts only those bytes.
 
 On a `watch` stream, completed `http`, held `http_intercept`, and `tls_error`
 events carry exact device-scoped `next_actions`; act on a held flow before its

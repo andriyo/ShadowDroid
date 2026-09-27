@@ -104,6 +104,10 @@ pub struct FlowRecord {
     /// the `content-length` hint when the server sent one, else 0.
     #[serde(default, skip_serializing_if = "is_false")]
     pub streamed: bool,
+    /// A streamed response had no `content-length`, so `resp_len` counts only
+    /// the bytes buffered before streaming began, not the whole response.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub resp_len_unknown: bool,
     /// The request body was streamed upstream (oversized upload), not buffered, so
     /// it isn't captured and request intercept was skipped. `req_len` is the
     /// `content-length` hint when the client sent one, else 0.
@@ -207,6 +211,7 @@ impl FlowRecord {
             "error": self.error,
             "error_redacted": self.error_redacted,
             "streamed": self.streamed,
+            "resp_len_unknown": self.resp_len_unknown,
             "req_streamed": self.req_streamed,
         });
         if body {
@@ -452,6 +457,7 @@ mod tests {
             error: None,
             error_redacted: false,
             streamed: false,
+            resp_len_unknown: false,
             req_streamed: false,
         };
         assert_eq!(

@@ -455,6 +455,7 @@ mod tests {
             error: None,
             error_redacted: false,
             streamed: false,
+            resp_len_unknown: false,
             req_streamed: false,
         }
     }

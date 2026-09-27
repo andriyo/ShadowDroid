@@ -1601,6 +1601,17 @@ async fn proxy_request_inner(
                 }
             }
             let final_status = streamed_status.unwrap_or(status_code);
+            // The part buffered before streaming began is real evidence; keep
+            // it (as a truncated body) when it is not content-encoded.
+            let identity = resp_headers.iter().all(|(name, value)| {
+                !name.eq_ignore_ascii_case("content-encoding")
+                    || value.trim().eq_ignore_ascii_case("identity")
+            });
+            let captured_prefix = if identity {
+                concat_chunks(&prefix)
+            } else {
+                Bytes::new()
+            };
             if in_scope {
                 let parts = FlowParts {
                     id: &id,
@@ -1614,7 +1625,7 @@ async fn proxy_request_inner(
                     req_streamed: req_streaming,
                     status: Some(final_status),
                     resp_headers: &resp_headers,
-                    resp_bytes: &[],
+                    resp_bytes: &captured_prefix,
                     dur_ms,
                     error: None,
                     matched: matched.clone(),
@@ -2290,6 +2301,7 @@ fn make_flow(p: FlowParts<'_>) -> FlowRecord {
         error: p.error,
         error_redacted: false,
         streamed: false,
+        resp_len_unknown: false,
         req_streamed: p.req_streamed,
     }
 }
@@ -2357,14 +2369,17 @@ fn finish_capture(ctx: &ProxyContext, mut rec: FlowRecord) {
     enqueue_flow(ctx, rec);
 }
 
-/// Capture a streamed (pass-through) flow: same metadata as [`capture`] but with
-/// no body, `streamed:true`, and `resp_len` set from the `content-length` hint
-/// (the real streamed length isn't known when the flow is recorded).
+/// Capture a streamed (pass-through) flow when streaming begins: same metadata
+/// as [`capture`], `streamed:true`, the textual part of `parts.resp_bytes` (what
+/// was buffered before streaming) as a truncated body, and `resp_len` from the
+/// `content-length` hint — or, without one, the buffered bytes with
+/// `resp_len_unknown` (the rest of the stream hasn't been seen yet).
 fn capture_streamed(ctx: &ProxyContext, parts: FlowParts<'_>, len_hint: Option<u64>) {
     let mut rec = make_flow(parts);
     stamp_capture_context(ctx, &mut rec);
     rec.streamed = true;
-    rec.resp_body = None;
+    rec.resp_truncated |= rec.resp_body.is_some();
+    rec.resp_len_unknown = len_hint.is_none();
     rec.resp_len = len_hint.unwrap_or(rec.resp_len);
     if let Some(policy) = &ctx.shared.redaction {
         policy.redact_flow_record(&mut rec);
@@ -3885,6 +3900,77 @@ mod tests {
             BodyRead::Error(e) => assert!(e.contains("boom")),
             _ => panic!("expected Error"),
         }
+    }
+
+    fn streamed_capture_ctx(
+        flow_tx: tokio::sync::mpsc::Sender<FlowRecord>,
+    ) -> (tempfile::TempDir, super::ProxyContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::default();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&key).unwrap();
+        let cert_path = dir.path().join("root.crt");
+        let key_path = dir.path().join("root.key");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        let ca = crate::net::ca::CertAuthority::load_from_files(&cert_path, &key_path).unwrap();
+        let ctx = super::ProxyContext {
+            ca,
+            client: super::build_upstream_client(false),
+            flow_tx,
+            shared: Arc::new(shared_with_rules(vec![])),
+            serial: "stream-test".into(),
+            capture_session_id: "stream-test".into(),
+            verify_upstream: false,
+            tasks: tokio_util::task::TaskTracker::new(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        };
+        (dir, ctx)
+    }
+
+    #[test]
+    fn streamed_capture_keeps_the_buffered_prefix_and_flags_unknown_length() {
+        let (flow_tx, mut flow_rx) = tokio::sync::mpsc::channel(4);
+        let (_dir, ctx) = streamed_capture_ctx(flow_tx);
+        let headers = vec![("Content-Type".to_string(), "text/plain".to_string())];
+        let parts = |resp_bytes: &'static [u8]| super::FlowParts {
+            id: "f1",
+            method: "GET",
+            scheme: "http",
+            host: "h",
+            port: 80,
+            path: "/big",
+            req_headers: &[],
+            req_bytes: &[],
+            req_streamed: false,
+            status: Some(200),
+            resp_headers: &headers,
+            resp_bytes,
+            dur_ms: 1,
+            error: None,
+            matched: None,
+            modified: false,
+            request_body_modified: false,
+            rule_ids: &[],
+        };
+
+        super::capture_streamed(&ctx, parts(b"first part"), None);
+        let rec = flow_rx.try_recv().unwrap();
+        assert!(rec.streamed);
+        assert_eq!(rec.resp_body.as_deref(), Some("first part"));
+        assert!(rec.resp_truncated, "the stream continued past the prefix");
+        assert!(rec.resp_len_unknown);
+        assert_eq!(rec.resp_len, 10);
+
+        // Server-sent events stream immediately: nothing buffered, length known
+        // only from content-length.
+        super::capture_streamed(&ctx, parts(b""), Some(96));
+        let rec = flow_rx.try_recv().unwrap();
+        assert_eq!(rec.resp_body, None);
+        assert!(!rec.resp_truncated);
+        assert!(!rec.resp_len_unknown);
+        assert_eq!(rec.resp_len, 96);
     }
 
     #[test]
