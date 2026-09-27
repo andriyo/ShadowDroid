@@ -277,7 +277,9 @@ internal object DebuggerValues {
         val fields = mutableListOf<Any?>()
         var instanceFieldCount = 0
         for (field in objectReference.referenceType().allFields()) {
-            if (field.isStatic) continue
+            // ART's java.lang.Object bookkeeping (shadow$_klass_,
+            // shadow$_monitor_) is on every object and is never app state.
+            if (field.isStatic || field.name().startsWith("shadow$")) continue
             instanceFieldCount++
             if (fields.size >= options.maxFields) continue
             fields += fieldToMap(objectReference, field, options, visiting)

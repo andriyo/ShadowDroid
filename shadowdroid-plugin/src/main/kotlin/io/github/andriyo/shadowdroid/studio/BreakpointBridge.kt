@@ -196,7 +196,8 @@ internal object BreakpointBridge {
                 logExpression = breakpoint.logExpressionObject?.expression,
                 logMessage = breakpoint.isLogMessage,
                 logStack = breakpoint.isLogStack,
-                message = message,
+                // Studio terminates each console log line; the event is the line.
+                message = message.removeSuffix("\n").removeSuffix("\r"),
                 evaluationError = evaluationError,
                 maxMessageChars = owned?.maxMessageChars ?: DEFAULT_LOGPOINT_MAX_MESSAGE_CHARS,
                 maxEventsPerSecond = owned?.maxEventsPerSecond ?: DEFAULT_LOGPOINT_MAX_EVENTS_PER_SECOND,
