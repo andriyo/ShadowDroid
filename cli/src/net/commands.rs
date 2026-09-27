@@ -2827,7 +2827,7 @@ pub async fn export(
         }
         "fixtures" => {
             let out = out.unwrap_or_else(|| PathBuf::from("shadowdroid-fixtures"));
-            let summary = crate::net::export::write_fixtures(&flows, &out)?;
+            let summary = crate::net::export::write_fixtures(&flows, &out, id.is_some())?;
             events::emit_result(&summary);
         }
         other => bail!("unknown export format {other:?} (curl|har|fixtures|jsonl)"),

@@ -1150,7 +1150,8 @@ pub enum NetCmd {
     },
     /// Export flows for interop: `har`, `curl`, or `fixtures` (a versioned,
     /// content-addressed replay bundle with exact request keys). Fixture export
-    /// rejects redacted, truncated, streamed, errored, or body-incomplete flows.
+    /// skips redacted, truncated, streamed, errored, or body-incomplete flows and
+    /// lists them in `skipped`; naming one flow id rejects it instead.
     Export {
         /// Export format: har, curl, fixtures, or jsonl (durable line-per-record
         /// stream; the machine-readable format for WebSocket messages).

@@ -209,9 +209,43 @@ pub fn graphql_operation_name(req_body: &Option<String>) -> Option<String> {
 /// Write the versioned, content-addressed replay bundle consumed by
 /// `net replay --from`. Pre-port records deliberately fall back to their
 /// scheme default; current proxy and AAR captures always carry the exact port.
-pub fn write_fixtures(flows: &[FlowRecord], out: &Path) -> Result<Value> {
-    let sources = flows
+/// Write a fixtures bundle. With `strict` (the caller named one flow) any
+/// unreplayable flow fails the export; otherwise flows that cannot be replayed
+/// (streamed, binary, errored, modified, ...) are skipped and listed, so one
+/// image download does not block exporting the rest of a session.
+pub fn write_fixtures(flows: &[FlowRecord], out: &Path, strict: bool) -> Result<Value> {
+    let mut skipped = Vec::new();
+    let eligible: Vec<&FlowRecord> = flows
         .iter()
+        .filter(
+            |flow| match crate::net::replay::validate_source_flow(flow) {
+                Ok(()) => true,
+                Err(_) if strict => true,
+                Err(error) => {
+                    skipped.push(json!({"id": flow.id, "reason": format!("{error:#}")}));
+                    false
+                }
+            },
+        )
+        .collect();
+    if eligible.is_empty() {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "net_export_nothing_replayable",
+            "net",
+            format!(
+                "none of the {} captured flows can be replayed from fixtures",
+                flows.len()
+            ),
+        )
+        .detail(json!({"skipped": skipped}))
+        .next_actions([
+            "inspect detail.skipped for why each flow is not replayable",
+            "capture a fresh, unmodified, unredacted textual request, then retry the export",
+        ])
+        .into());
+    }
+    let sources = eligible
+        .into_iter()
         .map(crate::net::replay::ReplaySource::from_flow_or_default_port)
         .collect::<Result<Vec<_>>>()?;
     let summary = crate::net::replay::write_bundle(&sources, out)?;
@@ -224,6 +258,7 @@ pub fn write_fixtures(flows: &[FlowRecord], out: &Path) -> Result<Value> {
         "out": out.display().to_string(),
         "manifest": summary.manifest.display().to_string(),
         "count": summary.count,
+        "skipped": skipped,
         "response_files": summary.response_files,
         "source_bundle_sha256": summary.source_bundle_sha256,
         "active_set_sha256": summary.active_set_sha256,
@@ -414,6 +449,42 @@ mod tests {
         assert!(curl_body_gap(&flow).unwrap().contains("redacted"));
         flow.req_streamed = true;
         assert!(curl_body_gap(&flow).unwrap().contains("streamed"));
+    }
+
+    #[test]
+    fn session_fixture_export_skips_unreplayable_flows() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = sample();
+        let mut streamed = sample();
+        streamed.id = "f2".into();
+        streamed.path = "/v1/stream".into();
+        streamed.streamed = true;
+
+        let report = write_fixtures(
+            &[good.clone(), streamed.clone()],
+            &dir.path().join("all"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(report["count"], 1, "{report}");
+        assert_eq!(report["skipped"][0]["id"], "f2");
+        assert!(
+            report["skipped"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("streamed")
+        );
+
+        // Naming one flow keeps the export strict.
+        assert!(write_fixtures(&[streamed.clone()], &dir.path().join("one"), true).is_err());
+        let error = write_fixtures(&[streamed], &dir.path().join("none"), false).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::diagnostic::DiagnosticError>()
+                .unwrap()
+                .code,
+            "net_export_nothing_replayable"
+        );
     }
 
     fn sample() -> FlowRecord {

@@ -164,7 +164,7 @@ pub async fn capture(
         outputs.insert("jsonl".into(), Value::String(path.display().to_string()));
     }
     if let Some(dir) = fixtures {
-        let report = export::write_fixtures(&flows, dir)?;
+        let report = export::write_fixtures(&flows, dir, false)?;
         outputs.insert("fixtures".into(), report);
     }
 
