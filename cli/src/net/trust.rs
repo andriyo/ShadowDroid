@@ -86,51 +86,100 @@ impl TrustContext {
 // Global + per-serial (never in the project folder): trust is a (CA, device)
 // fact. Keyed by CA fingerprint so a changed CA invalidates it automatically.
 
-const TRUST_CACHE_SCHEMA: u32 = 1;
+// Schema 2 added `device_identity`: an adb serial alone is reused by every
+// emulator on the same port, so a schema-1 entry may describe another device.
+const TRUST_CACHE_SCHEMA: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TrustCacheEntry {
     schema_version: u32,
     serial: String,
+    /// See [`device_identity`]; the entry only applies to this exact device.
+    device_identity: String,
     ca_fingerprint: String,
     /// The store the CA was verified in: `system` | `user`.
     store: String,
     verified_at: f64,
 }
 
-/// A prior "this CA is installed on this device" record, returned only when it
-/// matches `fingerprint` (a different/absent CA is a miss).
-fn read_trust_cache(serial: &Serial, fingerprint: &str) -> Option<TrustCacheEntry> {
-    read_trust_cache_at(&paths::trust_cache_path(serial).ok()?, serial, fingerprint)
+/// Which device answers on `serial` right now: its AVD name (emulators) and
+/// `android_id`, which Android regenerates on a data wipe. Emulator serials are
+/// reused by every AVD started on the same port, so a trust record keyed only
+/// by serial could vouch for a different, or wiped, device. `None` when the
+/// device cannot be identified; the cache is then not used.
+async fn device_identity(serial: &Serial) -> Option<String> {
+    let output = adb::shell(
+        serial,
+        "getprop ro.boot.qemu.avd_name; settings get secure android_id",
+    )
+    .await
+    .ok()?;
+    identity_from_output(&output)
 }
 
-fn read_trust_cache_at(path: &Path, serial: &Serial, fingerprint: &str) -> Option<TrustCacheEntry> {
+fn identity_from_output(output: &str) -> Option<String> {
+    let mut lines = output.lines().map(str::trim);
+    let avd = lines.next().unwrap_or_default();
+    let android_id = lines.next().unwrap_or_default();
+    (!android_id.is_empty() && android_id != "null")
+        .then(|| format!("avd={avd};android_id={android_id}"))
+}
+
+/// A prior "this CA is installed on this device" record, returned only when it
+/// matches `fingerprint` (a different/absent CA is a miss) and the device.
+fn read_trust_cache(
+    serial: &Serial,
+    identity: Option<&str>,
+    fingerprint: &str,
+) -> Option<TrustCacheEntry> {
+    read_trust_cache_at(
+        &paths::trust_cache_path(serial).ok()?,
+        serial,
+        identity?,
+        fingerprint,
+    )
+}
+
+fn read_trust_cache_at(
+    path: &Path,
+    serial: &Serial,
+    identity: &str,
+    fingerprint: &str,
+) -> Option<TrustCacheEntry> {
     if fingerprint.is_empty() {
         return None;
     }
     let entry: TrustCacheEntry = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
     (entry.schema_version == TRUST_CACHE_SCHEMA
         && entry.serial == serial.as_str()
+        && entry.device_identity == identity
         && entry.ca_fingerprint == fingerprint)
         .then_some(entry)
 }
 
 /// Record a positive trust-store verification so a later run can skip the probe.
-fn write_trust_cache(serial: &Serial, fingerprint: &str, store: &str) {
-    let Ok(path) = paths::trust_cache_path(serial) else {
+fn write_trust_cache(serial: &Serial, identity: Option<&str>, fingerprint: &str, store: &str) {
+    let (Ok(path), Some(identity)) = (paths::trust_cache_path(serial), identity) else {
         return;
     };
     let _ = paths::ensure_net_dir();
-    write_trust_cache_at(&path, serial, fingerprint, store);
+    write_trust_cache_at(&path, serial, identity, fingerprint, store);
 }
 
-fn write_trust_cache_at(path: &Path, serial: &Serial, fingerprint: &str, store: &str) {
+fn write_trust_cache_at(
+    path: &Path,
+    serial: &Serial,
+    identity: &str,
+    fingerprint: &str,
+    store: &str,
+) {
     if fingerprint.is_empty() {
         return;
     }
     let entry = TrustCacheEntry {
         schema_version: TRUST_CACHE_SCHEMA,
         serial: serial.to_string(),
+        device_identity: identity.to_string(),
         ca_fingerprint: fingerprint.to_string(),
         store: store.to_string(),
         verified_at: crate::events::now_ts(),
@@ -189,8 +238,9 @@ pub async fn run(
     }
 
     // Verify-once cache: a prior verification of this exact CA on this device.
+    let identity = device_identity(serial).await;
     if !tctx.fresh
-        && let Some(entry) = read_trust_cache(serial, &tctx.fingerprint)
+        && let Some(entry) = read_trust_cache(serial, identity.as_deref(), &tctx.fingerprint)
     {
         emit(json!({
             "installed": true,
@@ -236,7 +286,7 @@ pub async fn run(
 
     // Remember a positive verification so a later `net trust`/`net check` skips it.
     if installed {
-        write_trust_cache(serial, &tctx.fingerprint, store);
+        write_trust_cache(serial, identity.as_deref(), &tctx.fingerprint, store);
     }
 
     emit(json!({
@@ -289,6 +339,7 @@ pub async fn evidence(
         .await
         .map(|out| out.trim() == "0")
         .unwrap_or(false);
+    let identity = device_identity(serial).await;
 
     let (system_store, user_store, system_status, user_status, basis) = if tctx.asserted {
         // The user asserts trust; which store is unknown, so leave both booleans
@@ -300,10 +351,10 @@ pub async fn evidence(
             "asserted".to_string(),
             "asserted".to_string(),
         )
-    } else if let Some(entry) = (!tctx.fresh)
-        .then(|| read_trust_cache(serial, &tctx.fingerprint))
-        .flatten()
-    {
+    } else if let Some(entry) = match (tctx.fresh, &identity) {
+        (false, Some(identity)) => read_trust_cache(serial, Some(identity), &tctx.fingerprint),
+        _ => None,
+    } {
         let sys = entry.store == "system";
         let usr = entry.store == "user";
         (
@@ -328,9 +379,9 @@ pub async fn evidence(
         let usr = usr_status == CertStatus::Verified;
         // Refresh the cache on a positive verification (system takes precedence).
         if sys {
-            write_trust_cache(serial, &tctx.fingerprint, "system");
+            write_trust_cache(serial, identity.as_deref(), &tctx.fingerprint, "system");
         } else if usr {
-            write_trust_cache(serial, &tctx.fingerprint, "user");
+            write_trust_cache(serial, identity.as_deref(), &tctx.fingerprint, "user");
         }
         (
             sys,
@@ -576,32 +627,67 @@ fn emit(body: Value) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CertStatus, certificates_match, classify_cert_listing, read_trust_cache_at,
-        write_trust_cache_at,
+        CertStatus, certificates_match, classify_cert_listing, identity_from_output,
+        read_trust_cache_at, write_trust_cache_at,
     };
     use crate::ids::Serial;
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 
     #[test]
-    fn trust_cache_round_trips_and_rejects_fingerprint_or_serial_change() {
+    fn trust_cache_round_trips_and_rejects_fingerprint_serial_or_device_change() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("emulator-5554.trust.json");
         let serial = Serial::from("emulator-5554");
+        let device = "avd=Pixel_9;android_id=aaaa";
 
-        write_trust_cache_at(&path, &serial, "fp-aaa", "user");
-        let hit = read_trust_cache_at(&path, &serial, "fp-aaa").expect("cache hit");
+        write_trust_cache_at(&path, &serial, device, "fp-aaa", "user");
+        let hit = read_trust_cache_at(&path, &serial, device, "fp-aaa").expect("cache hit");
         assert_eq!(hit.store, "user");
 
         // A changed CA (different fingerprint) invalidates the cache.
-        assert!(read_trust_cache_at(&path, &serial, "fp-bbb").is_none());
-        // A different device never matches.
-        assert!(read_trust_cache_at(&path, &Serial::from("other-serial"), "fp-aaa").is_none());
+        assert!(read_trust_cache_at(&path, &serial, device, "fp-bbb").is_none());
+        // A different serial never matches.
+        let other = Serial::from("other-serial");
+        assert!(read_trust_cache_at(&path, &other, device, "fp-aaa").is_none());
+        // Another AVD on the same port, or the same AVD after a data wipe, is a
+        // different device.
+        let other_avd = "avd=ShadowDroid_Reliability_API36;android_id=bbbb";
+        assert!(read_trust_cache_at(&path, &serial, other_avd, "fp-aaa").is_none());
+        let wiped = "avd=Pixel_9;android_id=cccc";
+        assert!(read_trust_cache_at(&path, &serial, wiped, "fp-aaa").is_none());
 
         // An empty fingerprint (CA cert absent) never writes or matches.
         let empty = dir.path().join("empty.trust.json");
-        write_trust_cache_at(&empty, &serial, "", "user");
+        write_trust_cache_at(&empty, &serial, device, "", "user");
         assert!(!empty.exists());
-        assert!(read_trust_cache_at(&path, &serial, "").is_none());
+        assert!(read_trust_cache_at(&path, &serial, device, "").is_none());
+    }
+
+    #[test]
+    fn schema_one_entries_without_a_device_identity_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("emulator-5554.trust.json");
+        std::fs::write(
+            &path,
+            r#"{"schema_version":1,"serial":"emulator-5554","ca_fingerprint":"fp-aaa","store":"user","verified_at":1.0}"#,
+        )
+        .unwrap();
+        let serial = Serial::from("emulator-5554");
+        assert!(read_trust_cache_at(&path, &serial, "avd=;android_id=aaaa", "fp-aaa").is_none());
+    }
+
+    #[test]
+    fn device_identity_needs_an_android_id() {
+        assert_eq!(
+            identity_from_output("Pixel_9\nabc123\n").as_deref(),
+            Some("avd=Pixel_9;android_id=abc123")
+        );
+        assert_eq!(
+            identity_from_output("\nabc123\n").as_deref(),
+            Some("avd=;android_id=abc123")
+        );
+        assert_eq!(identity_from_output("Pixel_9\nnull\n"), None);
+        assert_eq!(identity_from_output(""), None);
     }
 
     fn test_ca(common_name: &str) -> String {
