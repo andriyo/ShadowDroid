@@ -12,7 +12,13 @@ import io.github.andriyo.shadowdroid.proto.Viewport
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.get
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 
 object StateRoutes {
     /** GET /v1/state — cheap version + viewport probe. GET /v1/device — detail. */
@@ -52,7 +58,7 @@ object StateRoutes {
         }
 
         route.get("/state") {
-            val pkg = activeWindowPackage(instr)
+            val pkg = withContext(Dispatchers.IO) { activeWindowPackageWithin(instr, ACTIVE_PACKAGE_WAIT_MS) }
             // Keep the lightweight state probe non-blocking. The screen route
             // applies the stricter bounded convergence policy when it also
             // returns a UI tree that must agree with this metadata.
@@ -83,6 +89,38 @@ object StateRoutes {
                 )
             call.respond(state)
         }
+    }
+}
+
+/**
+ * How long `/v1/state` waits for the active window's package. Reading it needs
+ * the foreground app's UI thread; an app paused at a debugger breakpoint (or in
+ * an ANR) never answers, and UiAutomation then blocks for its 5 s accessibility
+ * timeout on every call — the CLI's readiness probe included.
+ */
+private const val ACTIVE_PACKAGE_WAIT_MS = 750L
+
+private val activeWindowProbe =
+    Executors.newCachedThreadPool { runnable ->
+        Thread(runnable, "ShadowDroid active-window probe").apply { isDaemon = true }
+    }
+
+/**
+ * [activeWindowPackage], or null when the foreground app does not answer
+ * within [timeoutMs]. The probe keeps running on its own thread and ends at
+ * the platform timeout; a state probe never waits for it.
+ */
+private fun activeWindowPackageWithin(
+    instr: Instrumentation,
+    timeoutMs: Long,
+): String? {
+    val probe = activeWindowProbe.submit<String?> { activeWindowPackage(instr) }
+    return try {
+        probe.get(timeoutMs, TimeUnit.MILLISECONDS)
+    } catch (_: TimeoutException) {
+        null
+    } catch (_: ExecutionException) {
+        null
     }
 }
 
