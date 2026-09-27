@@ -152,7 +152,7 @@ pub enum DebuggerCmd {
 pub enum BreakCmd {
     /// Add a Java/Kotlin line breakpoint.
     Line {
-        /// Source file path.
+        /// Source file: a path, or a file name or path suffix Studio finds in the project.
         #[arg(long)]
         file: PathBuf,
         /// One-based source line number.
@@ -217,7 +217,7 @@ pub enum BreakCmd {
     },
     /// Add a Java/Kotlin field watchpoint at a source location.
     Field {
-        /// Source file path containing the field.
+        /// Source file containing the field: a path, or a file name or path suffix Studio finds in the project.
         #[arg(long)]
         file: PathBuf,
         /// One-based source line number.
@@ -282,7 +282,7 @@ pub enum LogpointCmd {
         .args(["expression", "log_message", "log_stack"])
 ))]
 pub struct LogpointAddArgs {
-    /// Source file path.
+    /// Source file: a path, or a file name or path suffix Studio finds in the project.
     #[arg(long)]
     pub file: PathBuf,
     /// One-based source line number.
@@ -1971,10 +1971,19 @@ pub(crate) fn layout_debugger_conflict_diagnostic(
         .next_actions(next_actions)
 }
 
+/// The source file as Studio should see it: canonical when it exists here.
+/// A relative path that doesn't (`MainActivity.kt`, `sample/MainActivity.kt`)
+/// goes to Studio as given, which finds it in the open project.
 fn canonicalize_for_bridge(path: &Path) -> Result<String> {
-    let canonical = std::fs::canonicalize(path)
-        .with_context(|| format!("source file not found: {}", path.display()))?;
-    Ok(canonical.display().to_string())
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => Ok(canonical.display().to_string()),
+        Err(_) if path.is_relative() && !path.as_os_str().is_empty() => {
+            Ok(path.display().to_string())
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("source file not found: {}", path.display()))
+        }
+    }
 }
 
 pub(crate) struct BridgeClient {
@@ -2854,6 +2863,16 @@ mod tests {
             .unwrap_err();
         assert_eq!(crate::cli::error_code_of(&error), "debug_session_running");
         assert!(!crate::cli::error_retryable_of(&error));
+    }
+
+    #[test]
+    fn missing_relative_sources_are_left_for_studio_to_find() {
+        assert_eq!(
+            canonicalize_for_bridge(Path::new("sample/NoSuchActivity.kt")).unwrap(),
+            "sample/NoSuchActivity.kt"
+        );
+        let missing = canonicalize_for_bridge(Path::new("/no/such/Activity.kt")).unwrap_err();
+        assert!(format!("{missing:#}").contains("source file not found"));
     }
 
     #[tokio::test]

@@ -7,7 +7,7 @@ import com.intellij.debugger.ui.breakpoints.JavaWildcardMethodBreakpointType
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
-import com.intellij.openapi.vfs.LocalFileSystem
+import com.intellij.openapi.vfs.VfsUtilCore
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.xdebugger.XDebuggerManager
 import com.intellij.xdebugger.XSourcePosition
@@ -22,7 +22,6 @@ import org.jetbrains.java.debugger.breakpoints.properties.JavaExceptionBreakpoin
 import org.jetbrains.java.debugger.breakpoints.properties.JavaFieldBreakpointProperties
 import org.jetbrains.java.debugger.breakpoints.properties.JavaLineBreakpointProperties
 import org.jetbrains.java.debugger.breakpoints.properties.JavaMethodBreakpointProperties
-import java.io.File
 import java.net.HttpURLConnection
 import java.nio.charset.StandardCharsets
 import java.util.Base64
@@ -308,8 +307,7 @@ internal object BreakpointBridge {
             // passes — so a rejected expression leaves no partially-configured
             // breakpoint (atomic, like update()).
             val prepared = StudioThreading.onIdeaThread {
-                val virtualFile = LocalFileSystem.getInstance().refreshAndFindFileByIoFile(File(file))
-                    ?: throw IllegalArgumentException("file not found in IDE VFS: $file")
+                val virtualFile = SourceFiles.resolve(project, file)
                 val chosen = lineBreakpointTypeFor(project, virtualFile, line - 1)
                 val existing = findLineBreakpoint(project, virtualFile.url, line - 1)
                 val target = existing ?: run {
@@ -415,8 +413,7 @@ internal object BreakpointBridge {
         var rollbackDone = false
         return try {
             prepared = StudioThreading.onIdeaThread {
-                val virtualFile = LocalFileSystem.getInstance().refreshAndFindFileByIoFile(File(file))
-                    ?: throw IllegalArgumentException("file not found in IDE VFS: $file")
+                val virtualFile = SourceFiles.resolve(project, file)
                 val chosen = lineBreakpointTypeFor(project, virtualFile, line - 1)
                 val existingAtLine = findLineBreakpoints(project, virtualFile.url, line - 1)
                 if (existingAtLine.isNotEmpty()) {
@@ -562,7 +559,7 @@ internal object BreakpointBridge {
                         ownedLogpoints[target] = OwnedLogpoint(
                             owner = owner,
                             createdByBridge = true,
-                            file = File(file).absolutePath,
+                            file = VfsUtilCore.urlToPath(target.fileUrl),
                             maxMessageChars = maxMessageChars,
                             maxEventsPerSecond = maxEventsPerSecond,
                             fingerprint = logpointFingerprint(target),
@@ -802,8 +799,7 @@ internal object BreakpointBridge {
         if (project == null) return BridgeProtocol.bad("no project")
         return try {
             val target = StudioThreading.onIdeaThread {
-                val virtualFile = LocalFileSystem.getInstance().refreshAndFindFileByIoFile(File(file))
-                    ?: throw IllegalArgumentException("file not found in IDE VFS: $file")
+                val virtualFile = SourceFiles.resolve(project, file)
                 // A Java field watchpoint never binds to a Kotlin property: the
                 // Kotlin plugin's own type resolves the backing field.
                 val extension = virtualFile.extension?.lowercase()
