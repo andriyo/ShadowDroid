@@ -319,13 +319,7 @@ async fn anchor(serial: &Serial, root: &Path, claim: bool) -> Result<()> {
         "invalid authority identity"
     );
     let binding = format!("{id}:{}", key(serial));
-    let command = if claim {
-        format!(
-            "if mkdir {ANCHOR} 2>/dev/null; then printf '%s' '{binding}' > {ANCHOR}/owner; fi; cat {ANCHOR}/owner 2>/dev/null"
-        )
-    } else {
-        format!("if [ -d {ANCHOR} ]; then cat {ANCHOR}/owner 2>/dev/null; else printf absent; fi")
-    };
+    let command = anchor_script(ANCHOR, DEVICE_CLOCKS, &binding, claim);
     let observed = if claim {
         crate::device::adb::shell_mutating(serial, command).await?
     } else {
@@ -334,10 +328,60 @@ async fn anchor(serial: &Serial, root: &Path, claim: bool) -> Result<()> {
     if observed.trim() == binding || (!claim && observed.trim() == "absent") {
         Ok(())
     } else {
-        Err(fail(
+        let incomplete = observed.trim().is_empty();
+        Err(crate::diagnostic::DiagnosticError::new(
             "authority_conflict",
+            "session",
             "device belongs to a different (or incomplete) authority; use the same shared --authority-dir, never private registries for a shared device",
-        ))
+        )
+        .detail(json!({
+            "marker": ANCHOR,
+            "incomplete_marker": incomplete,
+            "owner": (!incomplete).then(|| observed.trim().split(':').next().unwrap_or_default().to_string()),
+        }))
+        .next_actions([
+            "use the same --authority-dir / SHADOWDROID_AUTHORITY_DIR as the other client".to_string(),
+            format!(
+                "only if no other ShadowDroid client uses this device: adb -s {} shell rm -rf {ANCHOR}",
+                crate::events::shell_token(serial.as_str())
+            ),
+        ])
+        .into())
+    }
+}
+
+/// Shell commands for the device's boot time and a path's mtime, both in epoch
+/// seconds (toybox). Host tests substitute their platform's equivalents.
+struct Clocks {
+    boot_epoch: &'static str,
+    mtime: &'static str,
+}
+
+const DEVICE_CLOCKS: Clocks = Clocks {
+    boot_epoch: "sed -n 's/^btime //p' /proc/stat",
+    mtime: "stat -c %Y",
+};
+
+/// The anchor claim/read script. A marker whose `owner` is missing or empty is
+/// an interrupted claim; if its directory predates the current boot, the claim
+/// was lost to a crash, power loss or hard emulator kill, and nobody can hold
+/// it, so it is reclaimed. The owner is written under a temporary name and
+/// renamed, so a crash can no longer leave a half-written owner.
+fn anchor_script(anchor: &str, clocks: Clocks, binding: &str, claim: bool) -> String {
+    let Clocks { boot_epoch, mtime } = clocks;
+    let abandoned = format!(
+        "[ -d {anchor} ] && [ ! -s {anchor}/owner ] && [ \"$({mtime} {anchor})\" -lt \"$({boot_epoch})\" ]"
+    );
+    if claim {
+        format!(
+            "if {abandoned}; then mv {anchor} {anchor}.stale.$$ 2>/dev/null && rm -rf {anchor}.stale.$$; fi; \
+             if mkdir {anchor} 2>/dev/null; then printf '%s' '{binding}' > {anchor}/owner.tmp && mv -f {anchor}/owner.tmp {anchor}/owner; fi; \
+             cat {anchor}/owner 2>/dev/null"
+        )
+    } else {
+        format!(
+            "if [ ! -d {anchor} ] || {{ {abandoned}; }}; then printf absent; else cat {anchor}/owner 2>/dev/null; fi"
+        )
     }
 }
 
@@ -348,7 +392,7 @@ async fn release_anchor(serial: &Serial, root: &Path) -> Result<()> {
         "invalid authority identity"
     );
     let binding = format!("{id}:{}", key(serial));
-    let result=crate::device::adb::shell_mutating(serial,format!("if [ \"$(cat {ANCHOR}/owner 2>/dev/null)\" = '{binding}' ]; then rm {ANCHOR}/owner && rmdir {ANCHOR} && printf released; elif [ ! -d {ANCHOR} ]; then printf released; fi")).await?;
+    let result=crate::device::adb::shell_mutating(serial,format!("if [ \"$(cat {ANCHOR}/owner 2>/dev/null)\" = '{binding}' ]; then rm -f {ANCHOR}/owner {ANCHOR}/owner.tmp && rmdir {ANCHOR} && printf released; elif [ ! -d {ANCHOR} ]; then printf released; fi")).await?;
     anyhow::ensure!(
         result.trim() == "released",
         "authority anchor cleanup conflict; do not remove another authority's device marker"
@@ -887,6 +931,51 @@ pub async fn run(serial: &Serial, args: &SessionArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_anchor(anchor: &Path, boot_epoch: &'static str, claim: bool) -> String {
+        let clocks = Clocks {
+            boot_epoch,
+            mtime: if cfg!(target_os = "macos") {
+                "stat -f %m"
+            } else {
+                "stat -c %Y"
+            },
+        };
+        let script = anchor_script(anchor.to_str().unwrap(), clocks, "me:dev", claim);
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn anchor_claims_are_atomic_and_abandoned_markers_are_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("authority");
+        // Fresh claim writes the owner through a rename, leaving no temp file.
+        assert_eq!(run_anchor(&anchor, "echo 1", true), "me:dev");
+        assert!(!anchor.join("owner.tmp").exists());
+        std::fs::remove_dir_all(&anchor).unwrap();
+
+        // A marker left empty by an interrupted claim in the current boot
+        // (created after "boot" = epoch 1) is not reclaimed: it may be live.
+        std::fs::create_dir(&anchor).unwrap();
+        std::fs::write(anchor.join("owner"), "").unwrap();
+        assert_eq!(run_anchor(&anchor, "echo 1", true), "");
+        assert_eq!(run_anchor(&anchor, "echo 1", false), "");
+
+        // The same marker predating the current boot is abandoned: reads see
+        // it as absent and a claim takes it over.
+        assert_eq!(run_anchor(&anchor, "echo 4000000000", false), "absent");
+        assert_eq!(run_anchor(&anchor, "echo 4000000000", true), "me:dev");
+
+        // Another authority's live marker is never reclaimed, even if old.
+        std::fs::write(anchor.join("owner"), "other:dev").unwrap();
+        assert_eq!(run_anchor(&anchor, "echo 4000000000", true), "other:dev");
+    }
 
     fn stale_in_flight() -> InFlight {
         InFlight {
