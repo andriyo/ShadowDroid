@@ -1,5 +1,6 @@
 package io.github.andriyo.shadowdroid.studio
 
+import com.intellij.debugger.engine.JavaDebugProcess
 import com.intellij.debugger.engine.JavaStackFrame
 import com.intellij.debugger.jdi.LocalVariableProxyImpl
 import com.intellij.debugger.jdi.StackFrameProxyImpl
@@ -131,20 +132,61 @@ internal object DebuggerValues {
             return frameFromThread(javaFrame.stackFrameProxy.threadProxy(), 0, requestedFrame)
         }
 
-        val stacks = session.suspendContext?.executionStacks ?: XExecutionStack.EMPTY_ARRAY
+        val threads = suspendedThreads(session)
         val requestedIndex = parseIndex(requestedThread)
-        for (index in stacks.indices) {
-            val stack = stacks[index]
-            if (requestedIndex != null) {
-                if (requestedIndex != index) continue
-            } else if (requestedThread != stack.displayName) {
-                continue
-            }
-            val javaFrame = stack.topFrame as? JavaStackFrame ?: return null
-            return frameFromThread(javaFrame.stackFrameProxy.threadProxy(), index, requestedFrame)
-        }
-        throw IllegalArgumentException("thread not found: $requestedThread")
+        val index = if (requestedIndex != null) {
+            requestedIndex.takeIf { it in threads.indices }
+        } else {
+            // A plain thread name, or the quoted display name Studio shows.
+            threads.indexOfFirst { threadName(it) == requestedThread || requestedThread.startsWith("\"${threadName(it)}\"") }
+                .takeIf { it >= 0 }
+        } ?: throw IllegalArgumentException("thread not found: $requestedThread")
+        return frameFromThread(threads[index], index, requestedFrame)
     }
+
+    /**
+     * Every suspended thread of a Java/Kotlin session: the current thread
+     * first, the rest by name. `XSuspendContext.getExecutionStacks()` returns
+     * only the active thread for Java sessions (the full list is computed
+     * asynchronously on the manager thread), so listing and thread selection
+     * read the VM directly. Call on the debugger manager thread.
+     */
+    @JvmStatic
+    fun suspendedThreads(session: XDebugSession): List<ThreadReferenceProxyImpl> {
+        val process = (session.debugProcess as? JavaDebugProcess)?.debuggerSession?.process
+            ?: return emptyList()
+        val current = (session.currentStackFrame as? JavaStackFrame)?.stackFrameProxy?.threadProxy()
+        val others = process.virtualMachineProxy.allThreads()
+            .filter { it != current && isSuspended(it) }
+            .sortedBy { threadName(it) }
+        return listOfNotNull(current) + others
+    }
+
+    @JvmStatic
+    fun threadName(thread: ThreadReferenceProxyImpl): String =
+        try {
+            thread.name()
+        } catch (_: Throwable) {
+            "<unavailable>"
+        }
+
+    private fun isSuspended(thread: ThreadReferenceProxyImpl): Boolean =
+        try {
+            thread.isSuspended
+        } catch (_: Throwable) {
+            false
+        }
+
+    /** Up to [limit] frames of [thread], or the error that stopped reading them. */
+    @JvmStatic
+    fun threadFrames(thread: ThreadReferenceProxyImpl, limit: Int): List<Any> =
+        try {
+            thread.frames().take(limit).mapIndexed { index, frame ->
+                frameInfo(frame.location(), index, threadName(thread))
+            }
+        } catch (t: Throwable) {
+            listOf(BridgeProtocol.map("error", t.message))
+        }
 
     @JvmStatic
     @Throws(Exception::class)

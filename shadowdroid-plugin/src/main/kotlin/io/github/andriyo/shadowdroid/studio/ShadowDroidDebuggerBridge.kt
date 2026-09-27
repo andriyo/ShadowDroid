@@ -569,20 +569,13 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
             // a request right after a pause doesn't see missing frames.
             return try {
                 StudioThreading.onDebuggerThread(session, timeoutMs) {
-                    val stacks = session.suspendContext?.executionStacks ?: XExecutionStack.EMPTY_ARRAY
-                    val payload = mutableListOf<Any>()
-                    for (index in stacks.indices) {
-                        val top: XStackFrame? = stacks[index].topFrame
-                        val frames = mutableListOf<Any>()
-                        if (top is JavaStackFrame) {
-                            frames.addAll(DebuggerValues.javaFrames(session, top, limit, timeoutMs))
-                        } else if (top != null) {
-                            frames += DebuggerValues.frameInfo(top, 0)
-                        }
-                        payload += BridgeProtocol.map(
+                    val payload = DebuggerValues.suspendedThreads(session).mapIndexed { index, thread ->
+                        val frames = DebuggerValues.threadFrames(thread, limit)
+                        BridgeProtocol.map(
                             "index", index,
-                            "name", stacks[index].displayName,
-                            "top_frame", top?.let { DebuggerValues.frameInfo(it, 0) },
+                            "name", DebuggerValues.threadName(thread),
+                            "current", index == 0 && session.currentStackFrame is JavaStackFrame,
+                            "top_frame", frames.firstOrNull(),
                             "frames", frames,
                         )
                     }
@@ -763,7 +756,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
             val timeoutMs = BridgeProtocol.debuggerTimeoutMs(query)
             return try {
                 StudioThreading.onDebuggerThread(session, timeoutMs) {
-                    val threads = coroutineThreadsPayload(session, limit, timeoutMs)
+                    val threads = coroutineThreadsPayload(session, limit)
                     val continuations = continuationPayload(session, query, renderOptions, limit)
                     BridgeProtocol.ok(
                         "ok", true,
@@ -797,7 +790,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                         "type", "coroutine_threads",
                         "schema_version", 1,
                         "session", sessionInfo(sessionIndex(session), session),
-                        "threads", coroutineThreadsPayload(session, limit, timeoutMs),
+                        "threads", coroutineThreadsPayload(session, limit),
                     )
                 }
             } catch (t: Throwable) {
@@ -1046,28 +1039,18 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                 "valid_until", "resume",
             )
 
-        private fun coroutineThreadsPayload(session: XDebugSession, limit: Int, timeoutMs: Int): List<Any> {
-            val stacks = session.suspendContext?.executionStacks ?: XExecutionStack.EMPTY_ARRAY
-            val payload = mutableListOf<Any>()
-            for (index in stacks.indices) {
-                if (payload.size >= limit) break
-                val top = stacks[index].topFrame
-                val frames = mutableListOf<Any>()
-                if (top is JavaStackFrame) {
-                    frames.addAll(DebuggerValues.javaFrames(session, top, limit, timeoutMs))
-                } else if (top != null) {
-                    frames += DebuggerValues.frameInfo(top, 0)
-                }
-                payload += BridgeProtocol.map(
+        private fun coroutineThreadsPayload(session: XDebugSession, limit: Int): List<Any> =
+            DebuggerValues.suspendedThreads(session).take(limit).mapIndexed { index, thread ->
+                val name = DebuggerValues.threadName(thread)
+                val frames = DebuggerValues.threadFrames(thread, limit)
+                BridgeProtocol.map(
                     "index", index,
-                    "name", stacks[index].displayName,
-                    "dispatcher", dispatcherHint(stacks[index].displayName),
-                    "top_frame", top?.let { DebuggerValues.frameInfo(it, 0) },
+                    "name", name,
+                    "dispatcher", dispatcherHint(name),
+                    "top_frame", frames.firstOrNull(),
                     "frames", frames,
                 )
             }
-            return payload
-        }
 
         private fun continuationPayload(
             session: XDebugSession,
@@ -1079,12 +1062,15 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
             if (selected != null) {
                 return continuationCandidates(selected.proxy, renderOptions, limit)
             }
-            val stacks = session.suspendContext?.executionStacks ?: XExecutionStack.EMPTY_ARRAY
             val payload = mutableListOf<Any>()
-            for (stack in stacks) {
+            for (thread in DebuggerValues.suspendedThreads(session)) {
                 if (payload.size >= limit) break
-                val top = stack.topFrame as? JavaStackFrame ?: continue
-                payload.addAll(continuationCandidates(top.stackFrameProxy, renderOptions, limit - payload.size))
+                val top = try {
+                    thread.frames().firstOrNull()
+                } catch (_: Throwable) {
+                    null
+                } ?: continue
+                payload.addAll(continuationCandidates(top, renderOptions, limit - payload.size))
             }
             return payload
         }
