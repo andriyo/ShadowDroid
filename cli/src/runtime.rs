@@ -1179,7 +1179,10 @@ mod tests {
         let other = lock_at(dir.path(), &b, 0).unwrap();
         drop(other);
         drop(guard);
-        lock_at(dir.path(), &a, 0).unwrap();
+        // Parallel tests spawn subprocesses; a child between fork and exec can
+        // briefly hold a duplicate of the released descriptor. Released means
+        // re-acquirable, not instantly re-acquirable.
+        lock_at(dir.path(), &a, 2_000).unwrap();
         assert!(dir.path().join(format!("{}.lock", key(&a))).exists());
     }
 }
