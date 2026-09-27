@@ -282,6 +282,13 @@ internal object BreakpointBridge {
 
     private fun javaBreakpointReloadExecutor(): ExecutorService? = reloadExecutor
 
+    /** Whether this Studio has the reload queue [awaitAppliedToSessions] waits behind. */
+    internal fun hasReloadBarrier(): Boolean = reloadExecutor != null
+
+    internal fun hasKotlinLineType(): Boolean = lineBreakpointTypeById(KOTLIN_LINE_TYPE_ID) != null
+
+    internal fun hasKotlinFieldType(): Boolean = lineBreakpointTypeById(KOTLIN_FIELD_TYPE_ID) != null
+
     @JvmStatic
     fun addLine(query: Map<String, String>, project: Project?): Response {
         val file = query[BridgeQuery.FILE]

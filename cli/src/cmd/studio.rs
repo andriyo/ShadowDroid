@@ -124,6 +124,10 @@ pub struct BridgeInfo {
     pub pid: Option<u64>,
     /// Version of the plugin the running Studio loaded (older plugins omit it).
     pub plugin_version: Option<String>,
+    /// Which Studio internals the plugin could reach, and what runs degraded
+    /// without them (older plugins omit it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<serde_json::Value>,
     pub projects: Vec<serde_json::Value>,
 }
 
@@ -161,6 +165,8 @@ struct BridgeRegistry {
     pid: Option<u64>,
     #[serde(default)]
     plugin_version: Option<String>,
+    #[serde(default)]
+    compatibility: Option<serde_json::Value>,
     #[serde(default)]
     projects: Vec<serde_json::Value>,
 }
@@ -413,6 +419,7 @@ pub fn status_report(explicit_studio: Option<&Path>) -> Result<StudioReport> {
             )),
             _ => {}
         }
+        guidance.extend(compatibility_guidance(bridge.compatibility.as_ref()));
     }
 
     let report = StudioReport {
@@ -1068,6 +1075,28 @@ fn ensure_zip(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// One line per Studio internal the running plugin could not reach.
+fn compatibility_guidance(compatibility: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(compatibility) = compatibility else {
+        return Vec::new();
+    };
+    let studio = compatibility["studio_version"]
+        .as_str()
+        .unwrap_or("this Android Studio");
+    compatibility["degraded"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            Some(format!(
+                "{studio} does not expose what the ShadowDroid plugin uses for {}: {}. Update the plugin, or report it with this Studio version.",
+                entry["feature"].as_str()?,
+                entry["impact"].as_str()?,
+            ))
+        })
+        .collect()
+}
+
 fn bridge_status() -> Result<BridgeInfo> {
     let registry = shadowdroid_home()?.join(studio_contract::REGISTRY_FILE);
     if !registry.is_file() {
@@ -1078,6 +1107,7 @@ fn bridge_status() -> Result<BridgeInfo> {
             url: None,
             pid: None,
             plugin_version: None,
+            compatibility: None,
             projects: Vec::new(),
         });
     }
@@ -1093,6 +1123,7 @@ fn bridge_status() -> Result<BridgeInfo> {
         url: parsed.url,
         pid: parsed.pid,
         plugin_version: parsed.plugin_version,
+        compatibility: parsed.compatibility,
         projects: parsed.projects,
     })
 }
@@ -1257,6 +1288,22 @@ mod tests {
         assert_eq!(plugin_xml_version(xml).as_deref(), Some("1.2.0"));
         assert_eq!(plugin_xml_version("<idea-plugin/>"), None);
         assert_eq!(plugin_xml_version("<version></version>"), None);
+    }
+
+    #[test]
+    fn degraded_studio_internals_become_guidance() {
+        let compatibility = serde_json::json!({
+            "ok": false,
+            "studio_version": "Android Studio 2027.1",
+            "degraded": [{"feature": "running_devices_tabs", "impact": "enable it by hand"}],
+        });
+        let guidance = compatibility_guidance(Some(&compatibility));
+        assert_eq!(guidance.len(), 1);
+        assert!(guidance[0].starts_with("Android Studio 2027.1 does not expose"));
+        assert!(guidance[0].contains("running_devices_tabs: enable it by hand"));
+        let healthy = serde_json::json!({"ok": true, "degraded": []});
+        assert!(compatibility_guidance(Some(&healthy)).is_empty());
+        assert!(compatibility_guidance(None).is_empty());
     }
 
     #[test]

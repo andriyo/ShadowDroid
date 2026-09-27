@@ -284,6 +284,13 @@ internal object LayoutInspectorBridge {
         }
     }
 
+    /** Whether [runningDevicesTabs] can still reach the observer's private tab list. */
+    internal fun canReadRunningDevicesTabs(): Boolean = runCatching {
+        val observer = RunningDevicesStateObserver::class.java
+        observer.declaredFields.any { it.name == "existingTabs" } ||
+            observer.declaredMethods.any { it.name == "getAllTabsDeviceIds" }
+    }.getOrDefault(false)
+
     /** The device tabs Running Devices shows (the observer keeps them private). */
     private fun runningDevicesTabs(observer: RunningDevicesStateObserver): List<StreamingDeviceId> {
         val fromField = runCatching {
