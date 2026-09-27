@@ -97,6 +97,7 @@ Check-act-observe (full flag semantics: `commands --describe 'ui tap'`):
   `screen_changed` separately — a valid action may leave the screen unchanged.
 - `ui wait` timeouts are typed non-zero `wait_timeout` failures; never treat
   one as successful polling.
+- Re-reading: `ui dump --since <screen_hash>` returns `unchanged` or a `diff`.
 
 Never repeat delivered input (`retryable:false`) without observing first.
 `commands --guide workflow` covers interaction hashes, handles, and recovery.

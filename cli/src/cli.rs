@@ -610,6 +610,11 @@ pub enum UiCmd {
         /// How long --deep waits for Layout Inspector to produce a model.
         #[arg(long, default_value_t = 5_000)]
         studio_wait_ms: u64,
+        /// A `screen_hash` from an earlier read: report only what changed since
+        /// that screen (`unchanged: true` when nothing did). Falls back to the
+        /// full element list when that screen is no longer remembered.
+        #[arg(long, value_name = "SCREEN_HASH")]
+        since: Option<String>,
     },
     /// Audit the current screen for interactive elements lacking a stable
     /// selector (resource-id / Compose testTag) — the ones that force a test to
@@ -2445,6 +2450,7 @@ async fn dispatch_ui_inner(
             deep,
             studio_url,
             studio_wait_ms,
+            since,
         } => {
             cmd_screen(
                 serial,
@@ -2455,6 +2461,7 @@ async fn dispatch_ui_inner(
                 deep,
                 studio_url.as_deref(),
                 studio_wait_ms,
+                since.as_deref(),
             )
             .await
         }
@@ -5045,13 +5052,51 @@ async fn cmd_screen(
     deep: bool,
     studio_url: Option<&str>,
     studio_wait_ms: u64,
+    since: Option<&str>,
 ) -> Result<Outcome> {
     let screen = read_screen_with_reconnect(serial, apk, any_apk_version, client).await?;
+    let shape = |elements: &[crate::proto::Element]| -> Vec<serde_json::Value> {
+        elements
+            .iter()
+            .cloned()
+            .map(|element| {
+                if full {
+                    json!(element)
+                } else {
+                    json!(CompactElement::from(element))
+                }
+            })
+            .collect()
+    };
     let mut value = if full {
         serde_json::to_value(&screen)?
     } else {
         crate::fusion::compact_screen_value(&screen)
     };
+    if let Some(since) = since {
+        value["since"] = json!(since);
+        if since.eq_ignore_ascii_case(&screen.screen_hash) {
+            value["unchanged"] = json!(true);
+            value.as_object_mut().map(|map| map.remove("elements"));
+        } else if let Some(previous) = crate::screen_cache::load(since) {
+            value["unchanged"] = json!(false);
+            let diff = crate::screen_cache::diff(&shape(&previous), &shape(&screen.elements));
+            // When most of the screen changed, the plain list is the smaller answer.
+            if diff.to_string().len() < value["elements"].to_string().len() {
+                value["diff"] = diff;
+                value.as_object_mut().map(|map| map.remove("elements"));
+            } else {
+                value["diff_counts"] = diff["counts"].clone();
+                value["diff_skipped"] =
+                    json!("most of the screen changed, so every element is listed");
+            }
+        } else {
+            value["since_unknown"] = json!(true);
+            value["since_reason"] = json!(
+                "no remembered screen has that hash (only recent screens read on this host are kept), so every element is listed"
+            );
+        }
+    }
     value["accessibility_completeness"] = json!({
         "status": "unverified",
         "may_be_incomplete": true,

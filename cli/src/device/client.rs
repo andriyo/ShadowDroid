@@ -171,9 +171,14 @@ impl ServerClient {
         self.get("/device").await
     }
 
+    /// The current screen. Every read is remembered by its hash so a later
+    /// `ui dump --since <hash>` can answer with just the changes.
     pub async fn screen(&self) -> Result<ScreenResponse> {
-        self.get_retry("/screen", 4, Duration::from_millis(75))
-            .await
+        let screen: ScreenResponse = self
+            .get_retry("/screen", 4, Duration::from_millis(75))
+            .await?;
+        crate::screen_cache::remember(&screen);
+        Ok(screen)
     }
 
     pub async fn stable_screen(
@@ -181,10 +186,13 @@ impl ServerClient {
         quiet_ms: u32,
         timeout_ms: u32,
     ) -> Result<StableScreenResponse> {
-        self.get(&format!(
-            "/screen/stable?quiet_ms={quiet_ms}&timeout_ms={timeout_ms}"
-        ))
-        .await
+        let stable: StableScreenResponse = self
+            .get(&format!(
+                "/screen/stable?quiet_ms={quiet_ms}&timeout_ms={timeout_ms}"
+            ))
+            .await?;
+        crate::screen_cache::remember(&stable.screen);
+        Ok(stable)
     }
 
     pub async fn screenshot_png(&self) -> Result<Vec<u8>> {

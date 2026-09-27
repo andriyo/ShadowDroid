@@ -54,6 +54,7 @@ mod proto;
 mod redaction;
 mod release;
 mod runtime;
+mod screen_cache;
 mod selector;
 mod transfer;
 mod update;
