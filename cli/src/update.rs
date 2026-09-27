@@ -11,6 +11,10 @@ use std::path::Path;
 
 const DEFAULT_LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/andriyo/ShadowDroid/releases/latest";
+/// ShadowDroid is not published on crates.io (and a bare `cargo install
+/// shadowdroid` would install whoever claims that name), so cargo installs
+/// build from the release tag in this repository.
+const CARGO_GIT_SOURCE: &str = "https://github.com/andriyo/ShadowDroid";
 const DIRECT_UNIX_UPDATE_COMMAND: &str = "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/andriyo/ShadowDroid/releases/latest/download/shadowdroid-installer.sh | sh";
 const DIRECT_WINDOWS_UPDATE_COMMAND: &str = "powershell -ExecutionPolicy Bypass -c \"irm https://github.com/andriyo/ShadowDroid/releases/latest/download/shadowdroid-installer.ps1 | iex\"";
 
@@ -78,7 +82,7 @@ async fn check_latest() -> Result<UpdateCheck> {
     let install_path =
         std::env::current_exe().context("cannot determine current shadowdroid executable path")?;
     let install_method = detect_install_method(&install_path);
-    let update_command = update_command(install_method);
+    let update_command = update_command(install_method, &latest.tag_name);
 
     Ok(UpdateCheck {
         up_to_date: compare_versions(&current_version, &latest_version) != Ordering::Less,
@@ -175,20 +179,36 @@ fn normalize_path(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
-fn update_command(method: InstallMethod) -> String {
+fn update_command(method: InstallMethod, latest_tag: &str) -> String {
     match method {
         // `brew update` first so the tap actually sees the new release — a bare
         // `brew upgrade` runs against the cached formula and silently no-ops
         // right after a release.
         InstallMethod::Homebrew => "brew update && brew upgrade shadowdroid".to_string(),
         InstallMethod::Scoop => "scoop update shadowdroid".to_string(),
-        InstallMethod::Cargo => "cargo install shadowdroid --locked --force".to_string(),
+        InstallMethod::Cargo => cargo_update_command(latest_tag),
         InstallMethod::Direct => direct_update_command(),
         InstallMethod::Unknown => format!(
             "brew update && brew upgrade shadowdroid  # or: scoop update shadowdroid  # or: {}",
             direct_update_command()
         ),
     }
+}
+
+fn cargo_update_command(latest_tag: &str) -> String {
+    // The tag comes from the network and lands in a shell command: pin it only
+    // when it looks like a release tag.
+    let is_release_tag = latest_tag.starts_with('v')
+        && latest_tag.len() > 1
+        && latest_tag[1..]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'));
+    let tag = if is_release_tag {
+        format!(" --tag {latest_tag}")
+    } else {
+        String::new()
+    };
+    format!("cargo install --git {CARGO_GIT_SOURCE}{tag} --locked --force shadowdroid")
 }
 
 fn direct_update_command() -> String {
@@ -300,8 +320,21 @@ mod tests {
     #[test]
     fn homebrew_update_command_refreshes_tap_first() {
         assert_eq!(
-            update_command(InstallMethod::Homebrew),
+            update_command(InstallMethod::Homebrew, "v1.2.0"),
             "brew update && brew upgrade shadowdroid"
+        );
+    }
+
+    #[test]
+    fn cargo_updates_build_the_release_tag_from_github() {
+        assert_eq!(
+            update_command(InstallMethod::Cargo, "v1.3.0"),
+            "cargo install --git https://github.com/andriyo/ShadowDroid --tag v1.3.0 --locked --force shadowdroid"
+        );
+        // A tag that isn't shaped like a release never reaches the command.
+        assert_eq!(
+            update_command(InstallMethod::Cargo, "v1; rm -rf ~"),
+            "cargo install --git https://github.com/andriyo/ShadowDroid --locked --force shadowdroid"
         );
     }
 }
