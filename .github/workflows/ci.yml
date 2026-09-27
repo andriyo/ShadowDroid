@@ -5,6 +5,8 @@ on:
   push:
     branches:
       - main
+  # release.yml runs this whole suite on the tagged commit before publishing.
+  workflow_call:
 
 permissions:
   contents: read

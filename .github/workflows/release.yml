@@ -31,6 +31,15 @@ jobs:
           git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
           ./scripts/check-release-versions.sh "$version"
 
+  ci:
+    name: CI on the release commit
+    needs: verify-release-source
+    # The same suite as pushes to main, run on exactly the tagged commit:
+    # nothing is published unless it passes.
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   build-apks:
     name: Build Android server APKs
     needs: verify-release-source
@@ -280,8 +289,26 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Only this workflow's build outputs: the CI run in the same workflow
+      # uploads debug builds and test evidence that must not ship.
       - uses: actions/download-artifact@v8
         with:
+          name: android-server-apks
+          path: downloaded/android-server-apks
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: android-studio-plugin
+          path: downloaded/android-studio-plugin
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: agent-aar
+          path: downloaded/agent-aar
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: cli-*
           path: downloaded
 
       - name: Stage release assets
@@ -418,6 +445,7 @@ jobs:
   publish:
     name: Publish GitHub Release
     needs:
+      - ci
       - stage-release
       - smoke-candidate-installers
     runs-on: ubuntu-24.04
