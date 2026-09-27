@@ -1084,6 +1084,34 @@ tokio::task_local! {
 #[derive(Default)]
 struct PendingFlow {
     record: Mutex<Option<(FlowRecord, std::time::Instant)>>,
+    /// The app's URL once an interception redirected the request.
+    original_url: Mutex<Option<String>>,
+}
+
+/// Where a request was redirected to by `net resume --set-url`: every flow
+/// captured afterwards describes the forwarded request and names the original.
+fn note_redirect(original_url: &str, scheme: &str, host: &str, port: u16, path: &str) {
+    let _ = PENDING_FLOW.try_with(|pending| {
+        pending
+            .original_url
+            .lock()
+            .unwrap()
+            .get_or_insert_with(|| original_url.to_string());
+        if let Some((record, _)) = pending.record.lock().unwrap().as_mut() {
+            record.scheme = scheme.to_string();
+            record.host = host.to_string();
+            record.port = Some(port);
+            record.path = path.to_string();
+            record.original_url = Some(original_url.to_string());
+        }
+    });
+}
+
+fn pending_original_url() -> Option<String> {
+    PENDING_FLOW
+        .try_with(|pending| pending.original_url.lock().unwrap().clone())
+        .ok()
+        .flatten()
 }
 
 /// Why a flow was recorded without the proxy finishing the exchange.
@@ -1144,8 +1172,8 @@ async fn proxy_request_inner(
 ) -> Result<Response<ProxyBody>> {
     let (parts, body) = req.into_parts();
     let method = parts.method.clone();
-    let (scheme, host, path, mut url) = resolve_target(&parts.uri, &tunnel)?;
-    let port = effective_target_port(&parts.uri, &tunnel, &scheme);
+    let (mut scheme, mut host, mut path, mut url) = resolve_target(&parts.uri, &tunnel)?;
+    let mut port = effective_target_port(&parts.uri, &tunnel, &scheme);
     let mut req_headers = header_pairs(&parts.headers);
 
     // Read the request body, buffering up to the cap then streaming it upstream —
@@ -1440,8 +1468,22 @@ async fn proxy_request_inner(
                     if !m.is_noop() {
                         modified = true;
                         matched = Some("intercept".into());
+                        let original_url = url.clone();
                         request_body_modified |=
                             apply_request_mutation(&mut url, &mut req_headers, &mut req_bytes, &m);
+                        if url != original_url
+                            && let Ok(target) = reqwest::Url::parse(&url)
+                            && let Some(target_host) = target.host_str()
+                        {
+                            scheme = target.scheme().to_string();
+                            host = target_host.trim_matches(['[', ']']).to_string();
+                            port = target.port_or_known_default().unwrap_or(port);
+                            path = match target.query() {
+                                Some(query) => format!("{}?{query}", target.path()),
+                                None => target.path().to_string(),
+                            };
+                            note_redirect(&original_url, &scheme, &host, port, &path);
+                        }
                     }
                     if let Some(d) = m.delay_ms {
                         tokio::time::sleep(Duration::from_millis(d as u64)).await;
@@ -2243,6 +2285,7 @@ fn make_flow(p: FlowParts<'_>) -> FlowRecord {
         rule_ids: p.rule_ids.to_vec(),
         modified: p.modified,
         request_body_modified: p.request_body_modified,
+        original_url: pending_original_url(),
         upstream_bypassed: false,
         error: p.error,
         error_redacted: false,
@@ -4224,6 +4267,110 @@ mod tests {
 
     fn fail_open() -> HoldDecision {
         HoldDecision::Resume(Mutation::default())
+    }
+
+    #[tokio::test]
+    async fn resume_set_url_records_the_forwarded_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::default();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&key).unwrap();
+        let cert_path = dir.path().join("root.crt");
+        let key_path = dir.path().join("root.key");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        let ca = crate::net::ca::CertAuthority::load_from_files(&cert_path, &key_path).unwrap();
+        let (flow_tx, mut flow_rx) = tokio::sync::mpsc::channel(4);
+        let shared = Arc::new(shared_with_rules(vec![]));
+        *shared.intercept.write().unwrap() = Some(super::InterceptCfg {
+            matcher: crate::net::Matcher::default(),
+            at_request: true,
+            at_response: false,
+            hold_ms: 5_000,
+            on_timeout_drop: false,
+        });
+        let ctx = Arc::new(super::ProxyContext {
+            ca,
+            client: super::build_upstream_client(false),
+            flow_tx,
+            shared: shared.clone(),
+            serial: "set-url-test".into(),
+            capture_session_id: "set-url-test".into(),
+            verify_upstream: false,
+            tasks: tokio_util::task::TaskTracker::new(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        });
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut socket, _) = upstream.accept().await.unwrap();
+            let mut request = vec![];
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let (_stop_tx, stop_rx) = oneshot::channel();
+        let proxy_task = tokio::spawn(super::serve(ctx.clone(), listener, stop_rx));
+        let mut downstream = TcpStream::connect(proxy_addr).await.unwrap();
+        downstream
+            .write_all(format!("GET http://{upstream_addr}/original HTTP/1.1\r\nHost: {upstream_addr}\r\nConnection: close\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let held_id = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(id) = shared.held.lock().unwrap().keys().next().cloned() {
+                    break id;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let reply = interception_control_request(
+            shared.clone(),
+            serde_json::json!({
+                "op": "resume",
+                "id": held_id,
+                "mutation": crate::net::Mutation {
+                    set_url: Some(format!("http://{upstream_addr}/rewritten?x=1")),
+                    ..Default::default()
+                },
+            }),
+        )
+        .await;
+        assert_eq!(reply["released"], true, "{reply}");
+        let mut response = vec![];
+        downstream.read_to_end(&mut response).await.unwrap();
+        let upstream_request = upstream_task.await.unwrap();
+        assert!(
+            upstream_request.starts_with("GET /rewritten?x=1 "),
+            "{upstream_request}"
+        );
+
+        let captured = tokio::time::timeout(Duration::from_secs(2), flow_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(captured.path, "/rewritten?x=1");
+        assert_eq!(captured.port, Some(upstream_addr.port()));
+        assert_eq!(
+            captured.original_url.as_deref(),
+            Some(format!("http://{upstream_addr}/original").as_str())
+        );
+        assert!(crate::net::replay::validate_source_flow(&captured).is_err());
+        proxy_task.abort();
     }
 
     #[tokio::test]

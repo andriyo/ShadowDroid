@@ -450,6 +450,7 @@ mod tests {
             rule_ids: vec![],
             modified: false,
             request_body_modified: false,
+            original_url: None,
             upstream_bypassed: false,
             error: None,
             error_redacted: false,

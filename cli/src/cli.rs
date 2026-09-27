@@ -1301,7 +1301,9 @@ pub enum NetCmd {
         /// Delay the release by this many milliseconds (simulate latency).
         #[arg(long)]
         delay_ms: Option<u32>,
-        /// Rewrite the request URL before forwarding (request phase).
+        /// Rewrite the request URL before forwarding (request phase). The
+        /// captured flow then describes the forwarded URL and keeps the app's
+        /// URL in `original_url`.
         #[arg(long)]
         set_url: Option<String>,
     },

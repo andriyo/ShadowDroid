@@ -88,6 +88,11 @@ pub struct FlowRecord {
     /// ineligible for exact fixture export.
     #[serde(default, skip_serializing_if = "is_false")]
     pub request_body_modified: bool,
+    /// The app's URL when a request-phase interception (`net resume --set-url`)
+    /// sent the request elsewhere. `scheme`/`host`/`port`/`path` then describe
+    /// where it was forwarded, like a modified body describes what was sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_url: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub upstream_bypassed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -197,6 +202,7 @@ impl FlowRecord {
             "rule_ids": self.rule_ids,
             "modified": self.modified,
             "request_body_modified": self.request_body_modified,
+            "original_url": self.original_url,
             "upstream_bypassed": self.upstream_bypassed,
             "error": self.error,
             "error_redacted": self.error_redacted,
@@ -441,6 +447,7 @@ mod tests {
             rule_ids: vec![],
             modified: false,
             request_body_modified: false,
+            original_url: None,
             upstream_bypassed: false,
             error: None,
             error_redacted: false,

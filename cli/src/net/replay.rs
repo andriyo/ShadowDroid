@@ -682,7 +682,7 @@ fn key_from_flow(flow: &FlowRecord, effective_port: u16) -> Result<ReplayKey> {
     })
 }
 
-fn validate_source_flow(flow: &FlowRecord) -> Result<()> {
+pub(crate) fn validate_source_flow(flow: &FlowRecord) -> Result<()> {
     ensure!(flow.error.is_none(), "flow has an upstream/capture error");
     ensure!(flow.status.is_some(), "flow has no final response status");
     ensure!(!flow.req_streamed, "request body was streamed");
@@ -690,6 +690,10 @@ fn validate_source_flow(flow: &FlowRecord) -> Result<()> {
     ensure!(
         !flow.request_body_modified,
         "request body was modified after replay lookup; capture a fresh unmodified request"
+    );
+    ensure!(
+        flow.original_url.is_none(),
+        "request was redirected by an interception; capture a fresh unmodified request"
     );
     ensure!(!flow.streamed, "response body was streamed or binary");
     ensure!(!flow.resp_truncated, "response body was truncated");
