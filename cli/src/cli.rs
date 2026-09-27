@@ -1101,7 +1101,7 @@ pub enum NetCmd {
         /// Filter by response status code.
         #[arg(long)]
         status: Option<u16>,
-        /// Max number of flows to return (most recent first).
+        /// Return at most this many flows: the most recent ones, listed oldest first.
         #[arg(short = 'n', long, default_value_t = 50)]
         limit: usize,
         /// Restrict results to one capture session id returned by `net start`.
@@ -1199,7 +1199,7 @@ pub enum NetCmd {
         /// compression ratio, rate) instead of listing messages; needs a session id.
         #[arg(long)]
         stats: bool,
-        /// Max rows to return (most recent first).
+        /// Return at most this many rows: the most recent ones, listed oldest first.
         #[arg(short = 'n', long, default_value_t = 50)]
         limit: usize,
     },
