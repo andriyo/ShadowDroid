@@ -543,9 +543,13 @@ pub fn inspect(root: &Path, module: Option<&str>) -> Result<StatusReport> {
     };
     let module_gradle = module_build_gradle(root, &module)?;
     let gradle_text = fs::read_to_string(&module_gradle).unwrap_or_default();
-    let dependency_present = gradle_text.contains(DEP_MARKER);
+    // A hand-written dependency on the same AAR counts too (install leaves it
+    // alone rather than adding a second one).
+    let dependency_present =
+        gradle_text.contains(DEP_MARKER) || declares_aar(&gradle_text, APP_AAR_RELPATH);
     let aar_present = root.join(APP_AAR_RELPATH).is_file();
-    let okhttp_dependency_present = gradle_text.contains(OKHTTP_DEP_MARKER);
+    let okhttp_dependency_present = gradle_text.contains(OKHTTP_DEP_MARKER)
+        || declares_aar(&gradle_text, APP_OKHTTP_AAR_RELPATH);
     let okhttp_aar_present = root.join(APP_OKHTTP_AAR_RELPATH).is_file();
     let coroutine_probes = gradle_text.contains(PROBES_MARKER);
     Ok(StatusReport {
@@ -768,6 +772,19 @@ fn strip_line_comments(text: &str) -> String {
         .join("\n")
 }
 
+/// Whether code (not a comment) already depends on the AAR at `aar_relpath` —
+/// for example a hand-written line without ShadowDroid's marker. Matching the
+/// file name keeps `shadowdroid-agent.aar` distinct from the OkHttp companion.
+fn declares_aar(build: &str, aar_relpath: &str) -> bool {
+    let file_name = aar_relpath.rsplit('/').next().unwrap_or(aar_relpath);
+    strip_line_comments(build).lines().any(|line| {
+        line.contains(file_name)
+            && ["mplementation", "files(", "api(", "Api("]
+                .iter()
+                .any(|call| line.contains(call))
+    })
+}
+
 /// The Android *application* plugin — by id, the KMP accessor, or the version
 /// catalog alias Android Studio's template uses (`alias(libs.plugins.android.application)`)
 /// — not the bare Gradle `application` plugin used by JVM modules.
@@ -810,7 +827,7 @@ fn managed_lines(marker: &str, aar_relpath: &str) -> [String; 2] {
 fn wire_dependency(build_gradle: &Path, marker: &str, aar_relpath: &str) -> Result<bool> {
     let content = fs::read_to_string(build_gradle)
         .with_context(|| format!("read {}", build_gradle.display()))?;
-    if content.contains(marker) {
+    if content.contains(marker) || declares_aar(&content, aar_relpath) {
         return Ok(false);
     }
 
@@ -1237,6 +1254,21 @@ mod tests {
         assert!(!applies_android_application_plugin(
             "plugins { application }"
         ));
+    }
+
+    #[test]
+    fn existing_unmarked_dependencies_are_not_duplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let gradle = dir.path().join("build.gradle.kts");
+        let original = "dependencies {\n    debugImplementation(files(rootProject.file(\"shadowdroid/shadowdroid-agent-okhttp.aar\")))\n    // implementation(files(\"shadowdroid/shadowdroid-agent.aar\"))\n}\n";
+        fs::write(&gradle, original).unwrap();
+        assert!(!wire_dependency(&gradle, OKHTTP_DEP_MARKER, APP_OKHTTP_AAR_RELPATH).unwrap());
+        assert_eq!(fs::read_to_string(&gradle).unwrap(), original);
+        // A commented-out line does not count, and the core AAR is distinct
+        // from the OkHttp companion.
+        assert!(wire_dependency(&gradle, DEP_MARKER, APP_AAR_RELPATH).unwrap());
+        let wired = fs::read_to_string(&gradle).unwrap();
+        assert_eq!(wired.matches("shadowdroid-agent-okhttp.aar").count(), 1);
     }
 
     #[test]
