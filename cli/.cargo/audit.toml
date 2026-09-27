@@ -1,5 +1,7 @@
 [advisories]
-# Temporary exception, expires 2026-10-11.
+# Temporary exception, expires 2027-01-11 (renewed 2026-09-26: adb_client 3.2.3,
+# the latest release, still depends on rsa unconditionally and rsa has no
+# patched release). Keep this date in sync with rust-security-audit.yml.
 # RUSTSEC-2023-0071 affects non-constant-time RSA private-key operations. ShadowDroid
 # only uses adb_client's host ADB-server APIs; it never invokes adb_client's
 # direct-device authentication path that performs the affected RSA operation.
