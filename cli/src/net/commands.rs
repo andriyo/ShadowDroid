@@ -3283,7 +3283,7 @@ pub async fn override_local(serial: &Serial, url_glob: &str, file: &Path) -> Res
             file.display()
         );
     }
-    let matcher = matcher_from_url_glob(url_glob);
+    let (matcher, warnings) = matcher_from_url_glob(url_glob)?;
     let mut spec = RuleSpec::from_legacy_parts(
         "map-local".into(),
         matcher.clone(),
@@ -3305,6 +3305,7 @@ pub async fn override_local(serial: &Serial, url_glob: &str, file: &Path) -> Res
         json!({
             "url": url_glob,
             "effective_matcher": matcher,
+            "warnings": warnings,
             "file": file.display().to_string(),
             "rule": reply,
             "hint": "equivalent to `net rule add map-local <file> --host <host> --path <path>`",
@@ -3313,7 +3314,10 @@ pub async fn override_local(serial: &Serial, url_glob: &str, file: &Path) -> Res
     Ok(())
 }
 
-fn matcher_from_url_glob(url_glob: &str) -> Matcher {
+/// Turn a `net override` URL glob into a rule matcher, plus warnings about
+/// parts of the URL a rule cannot match on. Rules match a host and a path
+/// substring, so only leading/trailing `*` is meaningful and a port is dropped.
+fn matcher_from_url_glob(url_glob: &str) -> Result<(Matcher, Vec<String>)> {
     let mut raw = url_glob
         .trim()
         .trim_start_matches('*')
@@ -3322,18 +3326,58 @@ fn matcher_from_url_glob(url_glob: &str) -> Matcher {
     if let Some((_, rest)) = raw.split_once("://") {
         raw = rest.to_string();
     }
-    let (host, path) = match raw.split_once('/') {
-        Some((host, path)) => (
-            host.trim_matches('*'),
+    let (authority, path) = match raw.split_once('/') {
+        Some((authority, path)) => (
+            authority.trim_matches('*').to_string(),
             format!("/{}", path.trim_matches('*')),
         ),
-        None => (raw.trim_matches('*'), String::new()),
+        None => (raw.trim_matches('*').to_string(), String::new()),
     };
-    Matcher {
+    if authority.contains('*') || path.contains('*') {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "net_override_glob_unsupported",
+            "net",
+            format!(
+                "`{url_glob}` has a `*` inside the host or path; overrides match a host and a \
+                 path substring, so only a leading or trailing `*` is supported"
+            ),
+        )
+        .next_actions([
+            "drop the inner `*` and pass the longest literal path prefix, e.g. `https://api.example.com/v1/items*`",
+            "or use `net rule add map-local <file> --host <host> --path <substring>`",
+        ])
+        .into());
+    }
+    let mut warnings = Vec::new();
+    let host = split_authority_port(&authority, &mut warnings);
+    let matcher = Matcher {
         host: (!host.is_empty()).then(|| host.to_string()),
         path: (!path.is_empty() && path != "/").then_some(path),
         ..Default::default()
+    };
+    Ok((matcher, warnings))
+}
+
+/// Strip a `:port` (including after a bracketed IPv6 literal), noting it in
+/// `warnings`: captured flows keep the port separately from the host.
+fn split_authority_port<'a>(authority: &'a str, warnings: &mut Vec<String>) -> &'a str {
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((host, tail)) => (host, tail.strip_prefix(':')),
+            None => (authority, None),
+        }
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) if !host.contains(':') => (host, Some(port)),
+            _ => (authority, None),
+        }
+    };
+    if let Some(port) = port.filter(|port| !port.is_empty()) {
+        warnings.push(format!(
+            "rules match host and path only; the port :{port} is ignored and the override applies on every port of {host}"
+        ));
     }
+    host
 }
 
 /// `map-remote` rewrites scheme+host only and keeps the original request path. If
@@ -4196,13 +4240,35 @@ mod tests {
 
     #[test]
     fn url_glob_to_matcher_extracts_host_and_path() {
-        let m = matcher_from_url_glob("https://api.example.com/v1/dict*");
+        let (m, warnings) = matcher_from_url_glob("https://api.example.com/v1/dict*").unwrap();
         assert_eq!(m.host.as_deref(), Some("api.example.com"));
         assert_eq!(m.path.as_deref(), Some("/v1/dict"));
+        assert!(warnings.is_empty());
 
-        let m = matcher_from_url_glob("*.example.com");
+        let (m, _) = matcher_from_url_glob("*.example.com").unwrap();
         assert_eq!(m.host.as_deref(), Some(".example.com"));
         assert_eq!(m.path, None);
+    }
+
+    #[test]
+    fn url_glob_drops_ports_and_rejects_inner_wildcards() {
+        let (m, warnings) = matcher_from_url_glob("http://localhost:58180/v1/dict*").unwrap();
+        assert_eq!(m.host.as_deref(), Some("localhost"));
+        assert_eq!(m.path.as_deref(), Some("/v1/dict"));
+        assert!(warnings[0].contains(":58180"), "{warnings:?}");
+
+        let (m, warnings) = matcher_from_url_glob("https://[::1]:8443/x").unwrap();
+        assert_eq!(m.host.as_deref(), Some("::1"));
+        assert_eq!(warnings.len(), 1);
+
+        let error = matcher_from_url_glob("https://api.example.com/v1/*/items").unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::diagnostic::DiagnosticError>()
+                .unwrap()
+                .code,
+            "net_override_glob_unsupported"
+        );
     }
 
     #[test]
