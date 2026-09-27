@@ -712,32 +712,15 @@ fn detect_app_module(root: &Path) -> Result<String> {
     let text =
         fs::read_to_string(&settings).with_context(|| format!("read {}", settings.display()))?;
 
-    let mut candidates = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("include(") {
-            // include(":androidApp")  /  include(":foo:bar")
-            for raw in rest.split(',') {
-                if let Some(path) = raw.split('"').nth(1)
-                    && let Some(m) = path.strip_prefix(':')
-                {
-                    candidates.push(m.to_string());
-                }
-            }
-        }
-    }
+    let candidates = settings_includes(&text);
 
     for module in &candidates {
         let gradle = module_build_gradle(root, module);
         if let Ok(gradle) = gradle
             && let Ok(content) = fs::read_to_string(&gradle)
+            && applies_android_application_plugin(&content)
         {
-            // Match the Android application plugin specifically — not the
-            // bare Gradle `application` plugin used by JVM modules.
-            if content.contains("com.android.application") || content.contains("androidApplication")
-            {
-                return Ok(module.clone());
-            }
+            return Ok(module.clone());
         }
     }
 
@@ -751,6 +734,47 @@ fn detect_app_module(root: &Path) -> Result<String> {
             candidates.join(", ")
         }
     )
+}
+
+/// Module paths from a settings file: Kotlin `include(":a", ":b")`, Groovy
+/// `include ':a', ':b'` and `include(':a')`, and multi-line calls.
+fn settings_includes(text: &str) -> Vec<String> {
+    let text = strip_line_comments(text);
+    let calls = regex::Regex::new(r"(?ms)^\s*include\s*\((.*?)\)|^\s*include\s+([^\n]+)").unwrap();
+    let module = regex::Regex::new(r#"["']:([^"']+)["']"#).unwrap();
+    let mut modules = Vec::new();
+    for call in calls.captures_iter(&text) {
+        let arguments = call
+            .get(1)
+            .or_else(|| call.get(2))
+            .map_or("", |m| m.as_str());
+        for path in module.captures_iter(arguments) {
+            let name = path[1].to_string();
+            if !modules.contains(&name) {
+                modules.push(name);
+            }
+        }
+    }
+    modules
+}
+
+fn strip_line_comments(text: &str) -> String {
+    text.lines()
+        .map(|line| match line.find("//") {
+            Some(index) if !line[..index].contains(['"', '\'']) => &line[..index],
+            _ => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The Android *application* plugin — by id, the KMP accessor, or the version
+/// catalog alias Android Studio's template uses (`alias(libs.plugins.android.application)`)
+/// — not the bare Gradle `application` plugin used by JVM modules.
+fn applies_android_application_plugin(build: &str) -> bool {
+    build.contains("com.android.application")
+        || build.contains("androidApplication")
+        || build.contains("plugins.android.application")
 }
 
 fn module_build_gradle(root: &Path, module: &str) -> Result<PathBuf> {
@@ -791,31 +815,114 @@ fn wire_dependency(build_gradle: &Path, marker: &str, aar_relpath: &str) -> Resu
     }
 
     let managed = managed_lines(marker, aar_relpath);
-    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
-
-    let dep_idx = lines.iter().position(|l| {
-        let t = l.trim_start();
-        t.starts_with("dependencies {") || t.starts_with("dependencies{")
-    });
-
-    match dep_idx {
-        Some(i) => {
-            lines.insert(i + 1, managed[1].clone());
-            lines.insert(i + 1, managed[0].clone());
+    let newline = newline_of(&content);
+    let out = match top_level_dependencies_open(&content) {
+        // Right after the brace, on lines of their own — so a one-line
+        // `dependencies { … }` works too, and `aar remove` deleting the managed
+        // lines can never take user code with them.
+        Some(open) => {
+            let rest = &content[open..];
+            let separator = if rest.starts_with('\n') || rest.starts_with("\r\n") {
+                ""
+            } else {
+                newline
+            };
+            format!(
+                "{}{newline}{}{newline}{}{separator}{rest}",
+                &content[..open],
+                managed[0],
+                managed[1],
+            )
         }
         None => {
-            lines.push(String::new());
-            lines.push("dependencies {".to_string());
-            lines.push(managed[0].clone());
-            lines.push(managed[1].clone());
-            lines.push("}".to_string());
+            let mut out = content.clone();
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push_str(newline);
+            }
+            out.push_str(&format!(
+                "{newline}dependencies {{{newline}{}{newline}{}{newline}}}{newline}",
+                managed[0], managed[1]
+            ));
+            out
         }
-    }
-
-    let mut out = lines.join("\n");
-    out.push('\n');
-    fs::write(build_gradle, out).with_context(|| format!("write {}", build_gradle.display()))?;
+    };
+    write_build_file(build_gradle, &out)?;
     Ok(true)
+}
+
+/// Byte offset just after the `{` opening the module's top-level
+/// `dependencies` block. Blocks nested in `buildscript {}`, `subprojects {}`,
+/// `kotlin { sourceSets { … } }` etc., strings and comments are skipped, so
+/// the dependency never lands in the wrong block.
+fn top_level_dependencies_open(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'.';
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &bytes[i..];
+        if rest.starts_with(b"//") {
+            i += rest.iter().position(|&b| b == b'\n').unwrap_or(rest.len());
+            continue;
+        }
+        if rest.starts_with(b"/*") {
+            i += rest
+                .windows(2)
+                .position(|w| w == b"*/")
+                .map_or(rest.len(), |p| p + 2);
+            continue;
+        }
+        if let Some(quote) = [&b"\"\"\""[..], b"'''"]
+            .into_iter()
+            .find(|quote| rest.starts_with(quote))
+        {
+            let body = &rest[3..];
+            i += 3 + body
+                .windows(3)
+                .position(|w| w == quote)
+                .map_or(body.len(), |p| p + 3);
+            continue;
+        }
+        let c = bytes[i];
+        if c == b'"' || c == b'\'' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != c && bytes[i] != b'\n' {
+                i += if bytes[i] == b'\\' { 2 } else { 1 };
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'{' => depth += 1,
+            b'}' => depth = depth.saturating_sub(1),
+            b'd' if depth == 0
+                && bytes[i..].starts_with(b"dependencies")
+                && (i == 0 || !is_ident(bytes[i - 1])) =>
+            {
+                let mut j = i + "dependencies".len();
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if bytes.get(j) == Some(&b'{') {
+                    return Some(j + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn newline_of(text: &str) -> &'static str {
+    if text.contains("\r\n") { "\r\n" } else { "\n" }
+}
+
+/// Rewrite a build file atomically (a crash never leaves it half-written).
+fn write_build_file(path: &Path, text: &str) -> Result<()> {
+    crate::cmd::artifact::write_bytes(path, text.as_bytes())
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(())
 }
 
 /// Append the managed coroutine-probes block to the module build file.
@@ -837,13 +944,14 @@ fn wire_probes_block(build_gradle: &Path) -> Result<bool> {
     if content.contains(PROBES_MARKER) {
         return Ok(false);
     }
+    let newline = newline_of(&content);
     let mut out = content;
     if !out.ends_with('\n') {
-        out.push('\n');
+        out.push_str(newline);
     }
-    out.push('\n');
-    out.push_str(PROBES_BLOCK);
-    fs::write(build_gradle, out).with_context(|| format!("write {}", build_gradle.display()))?;
+    out.push_str(newline);
+    out.push_str(&PROBES_BLOCK.replace('\n', newline));
+    write_build_file(build_gradle, &out)?;
     Ok(true)
 }
 
@@ -874,9 +982,10 @@ fn unwire_probes(build_gradle: &Path) -> Result<bool> {
     while out.last().is_some_and(|l| l.trim().is_empty()) {
         out.pop();
     }
-    let mut text = out.join("\n");
-    text.push('\n');
-    fs::write(build_gradle, text).with_context(|| format!("write {}", build_gradle.display()))?;
+    let newline = newline_of(&content);
+    let mut text = out.join(newline);
+    text.push_str(newline);
+    write_build_file(build_gradle, &text)?;
     Ok(true)
 }
 
@@ -906,9 +1015,10 @@ fn unwire_dependency(build_gradle: &Path, marker: &str, asset_name: &str) -> Res
         out.push(line.to_string());
     }
 
-    let mut text = out.join("\n");
-    text.push('\n');
-    fs::write(build_gradle, text).with_context(|| format!("write {}", build_gradle.display()))?;
+    let newline = newline_of(&content);
+    let mut text = out.join(newline);
+    text.push_str(newline);
+    write_build_file(build_gradle, &text)?;
     Ok(true)
 }
 
@@ -1102,6 +1212,90 @@ fn yes_no(b: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_includes_cover_kotlin_groovy_and_multiline_forms() {
+        let kts = "rootProject.name = \"x\"\ninclude(\":app\")\ninclude(\":core:data\", \":feature\")\n// include(\":disabled\")\n";
+        assert_eq!(settings_includes(kts), vec!["app", "core:data", "feature"]);
+        let groovy = "include ':app', ':lib'\ninclude(':wear')\n";
+        assert_eq!(settings_includes(groovy), vec!["app", "lib", "wear"]);
+        let multiline = "include(\n    \":app\",\n    \":shared\",\n)\n";
+        assert_eq!(settings_includes(multiline), vec!["app", "shared"]);
+    }
+
+    #[test]
+    fn android_studio_template_alias_is_an_application_module() {
+        assert!(applies_android_application_plugin(
+            "plugins {\n    alias(libs.plugins.android.application)\n    alias(libs.plugins.kotlin.android)\n}\n"
+        ));
+        assert!(applies_android_application_plugin(
+            "plugins { id 'com.android.application' }"
+        ));
+        assert!(!applies_android_application_plugin(
+            "plugins {\n    alias(libs.plugins.android.library)\n}\n"
+        ));
+        assert!(!applies_android_application_plugin(
+            "plugins { application }"
+        ));
+    }
+
+    #[test]
+    fn dependency_goes_into_the_top_level_block_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let gradle = dir.path().join("build.gradle");
+        let original = "buildscript {\r\n    dependencies {\r\n        classpath 'x:y:1'\r\n    }\r\n}\r\nandroid { defaultConfig { resValue \"string\", \"brace\", \"}\" } }\r\n// dependencies { not this }\r\ndependencies { implementation 'a:b:1' }\r\n";
+        fs::write(&gradle, original).unwrap();
+        assert!(wire_dependency(&gradle, DEP_MARKER, APP_AAR_RELPATH).unwrap());
+        let wired = fs::read_to_string(&gradle).unwrap();
+        let managed = managed_lines(DEP_MARKER, APP_AAR_RELPATH);
+        // Inserted after the top-level brace on lines of their own, not
+        // inside buildscript, and the file keeps its CRLF line endings.
+        assert!(
+            wired.contains(&format!(
+                "dependencies {{\r\n{}\r\n{}\r\n implementation 'a:b:1' }}",
+                managed[0], managed[1]
+            )),
+            "{wired}"
+        );
+        assert!(wired.contains("    dependencies {\r\n        classpath 'x:y:1'"));
+        assert!(
+            !wired.replace("\r\n", "").contains('\n'),
+            "LF introduced: {wired:?}"
+        );
+        // Idempotent, and removal keeps the user's dependency; only the
+        // one-line block is split.
+        assert!(!wire_dependency(&gradle, DEP_MARKER, APP_AAR_RELPATH).unwrap());
+        assert!(unwire_dependency(&gradle, DEP_MARKER, AAR_ASSET).unwrap());
+        assert_eq!(
+            fs::read_to_string(&gradle).unwrap(),
+            original.replace(
+                "dependencies { implementation",
+                "dependencies {\r\n implementation"
+            )
+        );
+    }
+
+    #[test]
+    fn missing_top_level_dependencies_block_is_appended() {
+        let dir = tempfile::tempdir().unwrap();
+        let gradle = dir.path().join("build.gradle.kts");
+        fs::write(
+            &gradle,
+            "buildscript {\n    dependencies { }\n}\nplugins { id(\"com.android.application\") }",
+        )
+        .unwrap();
+        assert!(wire_dependency(&gradle, DEP_MARKER, APP_AAR_RELPATH).unwrap());
+        let wired = fs::read_to_string(&gradle).unwrap();
+        assert!(wired.contains("    dependencies { }\n}"), "{wired}");
+        assert!(
+            wired.ends_with(&format!(
+                "\ndependencies {{\n{}\n{}\n}}\n",
+                managed_lines(DEP_MARKER, APP_AAR_RELPATH)[0],
+                managed_lines(DEP_MARKER, APP_AAR_RELPATH)[1]
+            )),
+            "{wired}"
+        );
+    }
 
     fn kts(dir: &tempfile::TempDir) -> PathBuf {
         let p = dir.path().join("build.gradle.kts");
