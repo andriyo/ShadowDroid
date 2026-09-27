@@ -1160,7 +1160,9 @@ internal object BreakpointBridge {
         for (project in projects) {
             if (requestedProject != null && requestedProject != project) continue
             for (breakpoint in XDebuggerManager.getInstance(project).breakpointManager.allBreakpoints) {
-                if (id == breakpointId(project, breakpoint)) return ProjectBreakpoint(project, breakpoint)
+                if (id == breakpointId(project, breakpoint) || id == legacyBreakpointId(project, breakpoint)) {
+                    return ProjectBreakpoint(project, breakpoint)
+                }
             }
         }
         return null
@@ -1324,10 +1326,24 @@ internal object BreakpointBridge {
         )
     }
 
-    private fun breakpointId(project: Project, breakpoint: XBreakpoint<*>): String {
+    /**
+     * A breakpoint's stable id: a short hash of its identity (project, type,
+     * file, line, and kind details). The identity itself used to be the id,
+     * base64-encoded, which ran to hundreds of characters and was repeated in
+     * every listing and logpoint event.
+     */
+    private fun breakpointId(project: Project, breakpoint: XBreakpoint<*>): String =
+        BreakpointIds.short(breakpointIdentity(project, breakpoint))
+
+    /** The long id of plugins before 1.2.1, still accepted when looking up. */
+    private fun legacyBreakpointId(project: Project, breakpoint: XBreakpoint<*>): String =
+        "bp_" + Base64.getUrlEncoder().withoutPadding()
+            .encodeToString(breakpointIdentity(project, breakpoint).toByteArray(StandardCharsets.UTF_8))
+
+    private fun breakpointIdentity(project: Project, breakpoint: XBreakpoint<*>): String {
         val pos = breakpoint.sourcePosition
         val lineBreakpoint = breakpoint as? XLineBreakpoint<*>
-        val raw = listOf(
+        return listOf(
             project.basePath ?: project.name,
             breakpoint.type.id,
             lineBreakpoint?.fileUrl.orEmpty(),
@@ -1335,8 +1351,6 @@ internal object BreakpointBridge {
             (lineBreakpoint?.let { it.line + 1 } ?: -1).toString(),
             breakpointIdentityDetails(breakpoint.properties),
         ).joinToString("|")
-        return "bp_" + Base64.getUrlEncoder().withoutPadding()
-            .encodeToString(raw.toByteArray(StandardCharsets.UTF_8))
     }
 
     private fun breakpointIdentityDetails(props: Any?): String = when {
