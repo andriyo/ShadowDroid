@@ -149,6 +149,10 @@ pub(crate) struct CrashCollector {
     buffer: Vec<String>,
     kind: Option<CrashKind>,
     pid: Option<i32>,
+    /// Native tombstones are written by `crash_dump`/`debuggerd` under their
+    /// own pid, not the crashing process's. Bound once the tombstone's
+    /// `pid: N, tid: …` header names this block's crashing pid.
+    tombstone_pid: Option<i32>,
     last_seen: Option<Instant>,
 }
 
@@ -185,9 +189,22 @@ impl CrashCollector {
                 CrashKind::Native
             });
             self.pid = Some(parsed.pid);
+            self.tombstone_pid = None;
             self.buffer = vec![line.to_string()];
             self.last_seen = Some(Instant::now());
             return pending.into_iter().collect();
+        }
+
+        if !self.buffer.is_empty()
+            && self.kind == Some(CrashKind::Native)
+            && parsed.tag == "DEBUG"
+            && Some(parsed.pid) != self.pid
+        {
+            if self.accepts_tombstone_line(&parsed) {
+                self.buffer.push(line.to_string());
+                self.last_seen = Some(Instant::now());
+            }
+            return Vec::new();
         }
 
         if !self.buffer.is_empty() && Some(parsed.pid) == self.pid {
@@ -204,6 +221,27 @@ impl CrashCollector {
             }
         }
         Vec::new()
+    }
+
+    /// Whether a `DEBUG` line from another process belongs to this block's
+    /// tombstone. Header lines before the `pid:` line are accepted while no
+    /// dumper is bound; the `pid:` line binds the dumper only when it names
+    /// this block's crashing pid, so an unrelated tombstone is ignored.
+    fn accepts_tombstone_line(&mut self, parsed: &LogLine) -> bool {
+        if let Some(bound) = self.tombstone_pid {
+            return parsed.pid == bound;
+        }
+        match native_pid_line_re()
+            .captures(&parsed.msg)
+            .and_then(|caps| caps.get(1)?.as_str().parse::<i32>().ok())
+        {
+            Some(crashed) if Some(crashed) == self.pid => {
+                self.tombstone_pid = Some(parsed.pid);
+                true
+            }
+            Some(_) => false,
+            None => true,
+        }
     }
 
     fn finalize_if_quiet(&mut self, quiet: Duration) -> Option<CrashEvent> {
@@ -225,6 +263,7 @@ impl CrashCollector {
         let lines = std::mem::take(&mut self.buffer);
         let kind = self.kind.take().unwrap_or(CrashKind::Java);
         let pid = self.pid.take();
+        self.tombstone_pid = None;
         self.last_seen = None;
         Some(match kind {
             CrashKind::Java => build_java_event(&lines, pid),
@@ -377,6 +416,9 @@ fn build_native_event(lines: &[String], pid: Option<i32>) -> CrashEvent {
             if let Some(name) = caps.get(4) {
                 thread = Some(name.as_str().to_string());
             }
+            // The trailing `pid N (name)` here is the kernel's 15-character
+            // truncated comm (e.g. `dowdroid.sample`), not the package; only
+            // the tombstone's `>>> package <<<` header names the package.
             continue;
         }
         if let Some(caps) = native_pid_line_re().captures(&msg) {
@@ -528,6 +570,38 @@ mod tests {
         assert_eq!(evt.signal, Some(11));
         assert_eq!(evt.signal_name.as_deref(), Some("SIGSEGV"));
         assert_eq!(evt.backtrace.len(), 1);
+    }
+
+    #[test]
+    fn native_crash_collects_tombstone_written_by_crash_dump() {
+        let mut c = CrashCollector::default();
+        // The crashing app (pid 12345) logs the signal; crash_dump64 (pid 12400)
+        // writes the tombstone. Unrelated processes interleave.
+        let lines = [
+            "09-26 10:00:00.000 12345 12366 F libc    : Fatal signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0 in tid 12366 (RenderThread), pid 12345 (e.example.app)",
+            "09-26 10:00:00.050   555   555 I ActivityManager: unrelated line",
+            "09-26 10:00:00.100 12400 12400 F DEBUG   : *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** ***",
+            "09-26 10:00:00.100 12400 12400 F DEBUG   : Cmdline: com.example.app",
+            "09-26 10:00:00.100 12400 12400 F DEBUG   : pid: 12345, tid: 12366, name: RenderThread  >>> com.example.app <<<",
+            "09-26 10:00:00.110 12400 12400 F DEBUG   : backtrace:",
+            "09-26 10:00:00.111 12400 12400 F DEBUG   :       #00 pc 0000000000089abc  /apex/com.android.runtime/lib64/bionic/libc.so (abort+164)",
+            "09-26 10:00:00.112 12400 12400 F DEBUG   :       #01 pc 0000000000001234  /data/app/lib/arm64/libnative.so (crash+8)",
+            // Another dumper's tombstone for a different crash must not merge.
+            "09-26 10:00:00.200 13000 13000 F DEBUG   : pid: 9999, tid: 9999, name: other  >>> com.other <<<",
+            "09-26 10:00:00.201 13000 13000 F DEBUG   :       #00 pc 0000000000000001  /system/lib64/libother.so",
+        ];
+        for line in lines {
+            assert!(c.handle_line(line).is_empty());
+        }
+        let evt = c.finalize_now().unwrap();
+        assert_eq!(evt.kind, "native");
+        assert_eq!(evt.pid, Some(12345));
+        assert_eq!(evt.package.as_deref(), Some("com.example.app"));
+        assert_eq!(evt.thread.as_deref(), Some("RenderThread"));
+        assert_eq!(evt.signal_name.as_deref(), Some("SIGSEGV"));
+        assert_eq!(evt.backtrace.len(), 2, "{:#?}", evt.backtrace);
+        assert!(!evt.raw.contains("libother"));
+        assert!(!evt.raw.contains("unrelated line"));
     }
 
     #[test]
