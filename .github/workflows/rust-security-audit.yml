@@ -40,13 +40,6 @@ jobs:
       - name: Install cargo-audit
         run: cargo +1.97.0 install --locked cargo-audit --version 0.22.2
 
-      - name: Enforce temporary advisory exception expiry
-        run: |
-          if [[ "$(date -u +%F)" > "2027-01-10" ]]; then
-            echo "::error::Review or remove the expired RUSTSEC-2023-0071 exception"
-            exit 1
-          fi
-
       - name: Audit locked dependencies
         working-directory: cli
         run: cargo +1.97.0 audit

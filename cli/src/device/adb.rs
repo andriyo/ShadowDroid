@@ -1,18 +1,16 @@
-//! Thin wrapper over the `adb_client` crate. Talks to the host `adbd` over
-//! the ADB wire protocol (port 5037) — no shelling out to the `adb` binary,
-//! so a single static Rust binary works on any machine with a running adbd
-//! (no Android SDK required).
+//! Device operations over the host ADB server's wire protocol (port 5037, see
+//! [`super::adb_wire`]) — no shelling out to the `adb` binary, so a single
+//! static Rust binary works on any machine with a running adbd (no Android SDK
+//! required).
 //!
-//! All `adb_client` calls are synchronous. Public functions wrap each call
+//! All wire calls are synchronous. Public functions wrap each call
 //! in `tokio::task::spawn_blocking` so they're safe to .await from the async
 //! CLI dispatch without stalling the runtime. Every wrapper also has a host-side
 //! deadline: ADB is an external service and can hang when a transport wedges.
 
-use adb_client::ADBDeviceExt;
-use adb_client::server::ADBServer;
-use adb_client::server_device::ADBServerDevice;
+use super::adb_wire;
 use anyhow::{Context, Result, anyhow, bail};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,9 +42,7 @@ fn enqueue_remote_cleanup(serial: String, path: String) {
             .name("shadowdroid-adb-cleanup".into())
             .spawn(move || {
                 while let Ok(job) = receiver.recv() {
-                    if let Ok(mut device) = get_device_sync(&job.serial) {
-                        remove_remote_temp(&mut device, &job.path);
-                    }
+                    remove_remote_temp(&job.serial, &job.path);
                 }
             });
         sender
@@ -146,24 +142,14 @@ fn adb_timeout_error(label: &'static str, timeout: Duration, stage: &'static str
 /// unauthorized / no-permissions devices — those are not actionable.
 pub async fn list_devices() -> Result<Vec<String>> {
     bounded_blocking("list devices", ADB_TIMEOUT, || {
-        let mut server = ADBServer::default();
-        let devices = server.devices().map_err(|e| anyhow!("adb devices: {e}"))?;
-        // DeviceShort stringifies as `<serial> <state>`; we want only "device"
+        let devices = adb_wire::devices().context("adb devices")?;
         Ok(devices
             .into_iter()
-            .filter(|d| format!("{}", d.state) == "device")
-            .map(|d| d.identifier)
+            .filter(|(_, state)| state == "device")
+            .map(|(serial, _)| serial)
             .collect())
     })
     .await
-}
-
-/// Open a device handle by serial. Fails fast if the device isn't connected.
-fn get_device_sync(serial: &str) -> Result<ADBServerDevice> {
-    let mut server = ADBServer::default();
-    server
-        .get_device_by_name(serial)
-        .map_err(|e| anyhow!("get device {serial}: {e}"))
 }
 
 /// Run an `adb shell` command on the device, return stdout. stderr is logged
@@ -184,12 +170,10 @@ pub async fn shell_bytes(serial: impl Into<String>, cmd: impl Into<String>) -> R
     let serial = serial.into();
     let cmd = cmd.into();
     bounded_blocking("device shell bytes", ADB_TRANSFER_TIMEOUT, move || {
-        let mut device = get_device_sync(&serial)?;
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        device
-            .shell_command(&cmd, Some(&mut stdout), Some(&mut stderr))
-            .map_err(|error| anyhow!("adb shell binary command failed: {error}"))?;
+        adb_wire::shell(&serial, &cmd, Some(&mut stdout), Some(&mut stderr))
+            .context("adb shell binary command failed")?;
         if !stderr.is_empty() {
             debug!(
                 "adb shell binary stderr ({serial}): {}",
@@ -242,12 +226,10 @@ pub async fn shell_long_running(
         .map_err(|_| anyhow!("ADB blocking worker pool is closed"))?;
     spawn_blocking(move || {
         let _permit = permit;
-        let mut device = get_device_sync(&serial)?;
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let status = device
-            .shell_command(&cmd, Some(&mut stdout), Some(&mut stderr))
-            .map_err(|error| anyhow!("adb long-running shell {cmd:?}: {error}"))?;
+        let status = adb_wire::shell(&serial, &cmd, Some(&mut stdout), Some(&mut stderr))
+            .with_context(|| format!("adb long-running shell {cmd:?}"))?;
         Ok(LongShellOutput {
             status,
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
@@ -259,12 +241,10 @@ pub async fn shell_long_running(
 }
 
 fn shell_sync(serial: &str, cmd: &str) -> Result<String> {
-    let mut device = get_device_sync(serial)?;
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
-    device
-        .shell_command(&cmd, Some(&mut stdout), Some(&mut stderr))
-        .map_err(|e| anyhow!("adb shell {cmd:?}: {e}"))?;
+    adb_wire::shell(serial, cmd, Some(&mut stdout), Some(&mut stderr))
+        .with_context(|| format!("adb shell {cmd:?}"))?;
     if !stderr.is_empty() {
         debug!(
             "adb shell stderr ({serial}, {cmd:?}): {}",
@@ -280,10 +260,8 @@ pub async fn install(serial: impl Into<String>, apk_path: impl Into<PathBuf>) ->
     let serial = serial.into();
     let apk_path = apk_path.into();
     blocking_publication("install APK", move || {
-        let mut device = get_device_sync(&serial)?;
-        device
-            .install(&apk_path, None)
-            .map_err(|e| anyhow!("adb install {}: {e}", apk_path.display()))
+        adb_wire::install(&serial, &apk_path)
+            .with_context(|| format!("adb install {}", apk_path.display()))
     })
     .await
 }
@@ -294,10 +272,7 @@ pub async fn uninstall(serial: impl Into<String>, package: impl Into<String>) ->
     let serial = serial.into();
     let package = package.into();
     blocking_publication("uninstall package", move || {
-        let mut device = get_device_sync(&serial)?;
-        device
-            .uninstall(package.as_str(), None)
-            .map_err(|e| anyhow!("adb uninstall {package}: {e}"))
+        adb_wire::uninstall(&serial, &package).with_context(|| format!("adb uninstall {package}"))
     })
     .await
 }
@@ -314,7 +289,6 @@ pub async fn push(
     let local = local.into();
     let remote = remote.into();
     let staged = bounded_blocking("stage pushed file", ADB_TRANSFER_TIMEOUT, move || {
-        let mut device = get_device_sync(&serial)?;
         let mut file =
             std::fs::File::open(&local).with_context(|| format!("open {}", local.display()))?;
         let bytes = file
@@ -322,12 +296,12 @@ pub async fn push(
             .with_context(|| format!("stat {}", local.display()))?
             .len();
         let temp_remote = remote_temp_path(&remote)?;
-        if let Err(error) = device.push(&mut file, temp_remote.as_str()) {
-            remove_remote_temp(&mut device, &temp_remote);
-            return Err(anyhow!("adb push {} -> {remote}: {error}", local.display()));
+        if let Err(error) = adb_wire::push(&serial, &mut file, &temp_remote) {
+            remove_remote_temp(&serial, &temp_remote);
+            return Err(error.context(format!("adb push {} -> {remote}", local.display())));
         }
         Ok(StagedRemotePush {
-            device: Some(device),
+            pending: true,
             serial,
             temp_remote,
             remote,
@@ -339,7 +313,8 @@ pub async fn push(
 }
 
 struct StagedRemotePush {
-    device: Option<ADBServerDevice>,
+    /// The staged temp file still needs committing or cleaning up.
+    pending: bool,
     serial: String,
     temp_remote: String,
     remote: String,
@@ -348,23 +323,21 @@ struct StagedRemotePush {
 
 impl StagedRemotePush {
     fn commit(mut self) -> Result<u64> {
-        let device = self
-            .device
-            .as_mut()
-            .ok_or_else(|| anyhow!("staged ADB push lost its device connection"))?;
-        if let Err(error) = commit_remote_temp(device, &self.temp_remote, &self.remote) {
-            remove_remote_temp(device, &self.temp_remote);
-            self.device = None;
+        if !self.pending {
+            bail!("staged ADB push was already settled");
+        }
+        self.pending = false;
+        if let Err(error) = commit_remote_temp(&self.serial, &self.temp_remote, &self.remote) {
+            remove_remote_temp(&self.serial, &self.temp_remote);
             return Err(error);
         }
-        self.device = None;
         Ok(self.bytes)
     }
 }
 
 impl Drop for StagedRemotePush {
     fn drop(&mut self) {
-        if self.device.is_some() {
+        if self.pending {
             enqueue_remote_cleanup(self.serial.clone(), self.temp_remote.clone());
         }
     }
@@ -379,11 +352,8 @@ pub async fn pull(serial: impl Into<String>, remote: impl Into<String>) -> Resul
     let serial = serial.into();
     let remote = remote.into();
     bounded_blocking("pull file", ADB_TRANSFER_TIMEOUT, move || {
-        let mut device = get_device_sync(&serial)?;
         let mut buf: Vec<u8> = Vec::new();
-        device
-            .pull(&remote.as_str(), &mut buf)
-            .map_err(|e| anyhow!("adb pull {remote}: {e}"))?;
+        adb_wire::pull(&serial, &remote, &mut buf).with_context(|| format!("adb pull {remote}"))?;
         Ok(buf)
     })
     .await
@@ -415,10 +385,8 @@ pub async fn pull_to_path_with_timeout(
     let staged = bounded_blocking("stage pulled file", timeout, move || {
         let (mut temp, existing_permissions) =
             crate::transfer::atomic_temp_for_destination(&local)?;
-        let mut device = get_device_sync(&serial)?;
-        device
-            .pull(&remote.as_str(), temp.as_file_mut())
-            .map_err(|error| anyhow!("adb pull {remote}: {error}"))?;
+        adb_wire::pull(&serial, &remote, temp.as_file_mut())
+            .with_context(|| format!("adb pull {remote}"))?;
         temp.as_file_mut()
             .flush()
             .with_context(|| format!("flush temporary file for {}", local.display()))?;
@@ -481,13 +449,12 @@ fn remote_temp_path(remote: &str) -> Result<String> {
     })
 }
 
-fn commit_remote_temp(device: &mut ADBServerDevice, temp_remote: &str, remote: &str) -> Result<()> {
+fn commit_remote_temp(serial: &str, temp_remote: &str, remote: &str) -> Result<()> {
     let command = commit_remote_command(temp_remote, remote);
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
-    device
-        .shell_command(&command.as_str(), Some(&mut stdout), Some(&mut stderr))
-        .map_err(|error| anyhow!("commit adb push to {remote}: {error}"))?;
+    adb_wire::shell(serial, &command, Some(&mut stdout), Some(&mut stderr))
+        .with_context(|| format!("commit adb push to {remote}"))?;
     let stdout = String::from_utf8_lossy(&stdout);
     if stdout.contains(DESTINATION_UNSAFE_MARKER) {
         bail!("refusing to replace non-regular remote destination {remote}");
@@ -511,12 +478,12 @@ fn commit_remote_command(temp_remote: &str, remote: &str) -> String {
     )
 }
 
-fn remove_remote_temp(device: &mut ADBServerDevice, temp_remote: &str) {
+fn remove_remote_temp(serial: &str, temp_remote: &str) {
     let command = format!(
         "rm -f -- {}",
         crate::config::quote_device_shell_arg(temp_remote)
     );
-    let _ = device.shell_command(&command.as_str(), None, None);
+    let _ = adb_wire::shell(serial, &command, None, None);
 }
 
 #[cfg(unix)]
@@ -647,20 +614,14 @@ pub async fn reverse_list(serial: impl Into<String>) -> Result<Vec<ReverseMappin
     .await
 }
 
+const ADB_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+
 fn adb_server_connection() -> Result<TcpStream> {
-    let address = std::net::SocketAddr::from(([127, 0, 0, 1], 5037));
-    let stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))
-        .context("connect to local ADB server")?;
-    let timeout = Some(Duration::from_secs(2));
-    stream.set_read_timeout(timeout)?;
-    stream.set_write_timeout(timeout)?;
-    Ok(stream)
+    adb_wire::connect(Some(ADB_CONTROL_TIMEOUT))
 }
 
 fn adb_server_transport(serial: &str) -> Result<TcpStream> {
-    let mut stream = adb_server_connection()?;
-    adb_server_request(&mut stream, &format!("host:transport:{serial}"))?;
-    Ok(stream)
+    adb_wire::transport(serial, Some(ADB_CONTROL_TIMEOUT))
 }
 
 fn forward_list_sync() -> Result<String> {
@@ -762,32 +723,11 @@ fn verify_reverse_mapping_sync(serial: &str, device_port: u16, host_port: u16) -
 }
 
 fn adb_server_request(stream: &mut TcpStream, command: &str) -> Result<()> {
-    let request = format!("{:04x}{command}", command.len());
-    stream.write_all(request.as_bytes())?;
-
-    let mut status = [0_u8; 4];
-    stream.read_exact(&mut status)?;
-    match &status {
-        b"OKAY" => Ok(()),
-        b"FAIL" => {
-            let message = String::from_utf8_lossy(&adb_server_read_hex_body(stream)?).into_owned();
-            bail!("ADB server rejected {command:?}: {message}")
-        }
-        other => bail!(
-            "unexpected ADB server response to {command:?}: {:?}",
-            String::from_utf8_lossy(other)
-        ),
-    }
+    adb_wire::request(stream, command)
 }
 
 fn adb_server_read_hex_body(stream: &mut TcpStream) -> Result<Vec<u8>> {
-    let mut length = [0_u8; 4];
-    stream.read_exact(&mut length)?;
-    let length = usize::from_str_radix(std::str::from_utf8(&length)?, 16)
-        .context("parse ADB response length")?;
-    let mut body = vec![0_u8; length];
-    stream.read_exact(&mut body)?;
-    Ok(body)
+    adb_wire::read_hex_body(stream)
 }
 
 fn parse_reverse_list(output: &str) -> Vec<ReverseMapping> {
@@ -1009,12 +949,7 @@ pub async fn list_packages(serial: impl Into<String>) -> Result<Vec<String>> {
 /// `doctor` command needs to *surface* those unhealthy states.
 pub async fn list_devices_with_state() -> Result<Vec<(String, String)>> {
     bounded_blocking("list devices with state", ADB_TIMEOUT, || {
-        let mut server = ADBServer::default();
-        let devices = server.devices().map_err(|e| anyhow!("adb devices: {e}"))?;
-        Ok(devices
-            .into_iter()
-            .map(|d| (d.identifier, format!("{}", d.state)))
-            .collect())
+        adb_wire::devices().context("adb devices")
     })
     .await
 }

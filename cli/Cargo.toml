@@ -42,10 +42,7 @@ serde_json = "1.0.151"
 base64 = "0.22.1"
 quick-xml = "0.41.0"
 
-# ── ADB protocol (no shell-out to adb binary) ───────────────────────────
-# 3.x is a breaking change from 2.x; touch points are in device/adb.rs.
-# Disable the default framebuffer feature because ShadowDroid never requests it.
-adb_client = { version = "3.2", default-features = false }
+# The ADB server protocol is implemented in-tree (device/adb_wire.rs).
 
 # ── Logcat tail + crash parsing ─────────────────────────────────────────
 regex = "1.13"
