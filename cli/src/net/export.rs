@@ -38,6 +38,21 @@ pub fn curl_command(f: &FlowRecord) -> String {
     }
 }
 
+/// Why [`curl_command`] cannot send the request body the app sent, if it can't.
+pub fn curl_body_gap(f: &FlowRecord) -> Option<&'static str> {
+    if f.req_streamed {
+        Some("the request body was streamed upstream and not captured")
+    } else if f.req_body_redacted {
+        Some("the request body was redacted")
+    } else if f.req_truncated {
+        Some("the captured request body was truncated")
+    } else if f.req_body.is_none() && f.req_len > 0 {
+        Some("the request body is binary or non-textual and was not captured")
+    } else {
+        None
+    }
+}
+
 /// HAR 1.2 archive for a set of flows.
 pub fn to_har(flows: &[FlowRecord]) -> Value {
     build_har(flows.iter().map(har_entry).collect())
@@ -383,6 +398,22 @@ mod tests {
         let stdout = String::from_utf8(output.stdout).unwrap();
         let (_, sent) = stdout.split_once("STDIN:").unwrap();
         assert_eq!(sent, body);
+    }
+
+    #[test]
+    fn curl_body_gap_names_every_unreproducible_body() {
+        let mut flow = sample();
+        assert_eq!(curl_body_gap(&flow), None);
+        flow.req_len = 5;
+        assert!(curl_body_gap(&flow).unwrap().contains("binary"));
+        flow.req_body = Some("abc".into());
+        assert_eq!(curl_body_gap(&flow), None);
+        flow.req_truncated = true;
+        assert!(curl_body_gap(&flow).unwrap().contains("truncated"));
+        flow.req_body_redacted = true;
+        assert!(curl_body_gap(&flow).unwrap().contains("redacted"));
+        flow.req_streamed = true;
+        assert!(curl_body_gap(&flow).unwrap().contains("streamed"));
     }
 
     fn sample() -> FlowRecord {

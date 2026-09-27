@@ -1229,7 +1229,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "net export" => Some(serde_json::json!({
             "use_when": ["Need to turn captured flows into HAR, curl, or deterministic response fixtures for replay/testing.", "Need a durable line-per-record dump (jsonl) of flows and/or WebSocket messages for offline analysis."],
-            "output": "terminal action naming a durable artifact, byte/flow counts, safe inspection actions, and a confirmation-gated replay command for curl exports",
+            "output": "terminal action naming a durable artifact, byte/flow counts, safe inspection actions, and a confirmation-gated replay command for curl exports; a curl export reports faithful:false plus per-flow warnings when a replay cannot send the app's request body (binary, truncated, streamed, or redacted)",
             "side_effects": ["writes HAR to --out or shadowdroid-network.har, curl to --out or shadowdroid-network.curl.sh, fixtures to --out or shadowdroid-fixtures, and jsonl to --out or shadowdroid-network.jsonl"],
             "next_actions": ["net ws", "net replay", "collect"]
         })),

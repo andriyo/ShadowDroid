@@ -2770,13 +2770,24 @@ pub async fn export(
         "curl" => {
             let out = out.unwrap_or_else(|| PathBuf::from("shadowdroid-network.curl.sh"));
             let mut script = String::from("#!/bin/sh\nset -eu\n\n");
-            script.push_str(
-                &flows
-                    .iter()
-                    .map(crate::net::export::curl_command)
-                    .collect::<Vec<_>>()
-                    .join("\n\n"),
-            );
+            let mut warnings = Vec::new();
+            let commands: Vec<String> = flows
+                .iter()
+                .map(|flow| {
+                    let command = crate::net::export::curl_command(flow);
+                    match crate::net::export::curl_body_gap(flow) {
+                        Some(reason) => {
+                            warnings.push(json!({"id": flow.id, "reason": reason}));
+                            format!(
+                                "# WARNING {}: {reason}; this replay does not send the app's body\n{command}",
+                                flow.id
+                            )
+                        }
+                        None => command,
+                    }
+                })
+                .collect();
+            script.push_str(&commands.join("\n\n"));
             script.push('\n');
             let bytes = crate::cmd::artifact::write_bytes(&out, script.as_bytes())?;
             let token = crate::events::shell_token(&out.display().to_string());
@@ -2787,6 +2798,8 @@ pub async fn export(
                     "artifact": out.display().to_string(),
                     "bytes": bytes,
                     "count": flows.len(),
+                    "faithful": warnings.is_empty(),
+                    "warnings": warnings,
                     "replay": {
                         "command": format!("sh {token}"),
                         "requires_confirmation": true,
