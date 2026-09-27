@@ -4345,6 +4345,19 @@ async fn chmod_via_adb(serial: &Serial, mode: u32, remote: &str) -> bool {
 
 // ── emit helpers ────────────────────────────────────────────
 
+/// A crash or ANR staged for this envelope that explains a failed input action.
+fn app_failure_during_input(
+    error: &crate::device::client::ServerError,
+) -> Option<serde_json::Value> {
+    if !matches!(
+        error.code.as_str(),
+        "tap_failed" | "swipe_failed" | "text_failed" | "set_progress_failed"
+    ) {
+        return None;
+    }
+    crate::events::staged_app_failures().into_iter().next()
+}
+
 /// Render a failed command as one `{"type":"error",…}` line on stdout. Walks the
 /// `anyhow` chain for a [`ServerError`] so the server's machine `code`
 /// (`element_not_found`, …) and HTTP `status` survive; otherwise falls back to a
@@ -4362,6 +4375,44 @@ pub fn report_error(err: &anyhow::Error) {
                 "retryable": diagnostic.retryable,
                 "detail": diagnostic.detail,
                 "next_actions": diagnostic.next_actions,
+            }),
+        );
+    } else if let Some(se) = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<crate::device::client::ServerError>())
+        && let Some(failure) = app_failure_during_input(se)
+    {
+        // The input reached the app and the app died handling it (for example
+        // a click handler threw). Reporting the server's "action failed,
+        // retry" would invite repeating a destructive action.
+        let kind = failure
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("crash");
+        emit_error(
+            "run",
+            "app_crashed_during_action",
+            &format!(
+                "the app {} while handling this input ({}), so the input was delivered",
+                if kind == "anr" {
+                    "stopped responding"
+                } else {
+                    "crashed"
+                },
+                se.code
+            ),
+            json!({
+                "retryable": false,
+                "input_delivered": true,
+                "detail": {
+                    "server_code": se.code,
+                    "server_message": se.message,
+                    "server_detail": se.detail,
+                },
+                "next_actions": [
+                    "run `shadowdroid why` or `shadowdroid log --last 2m` for the crash before acting again",
+                    "do not repeat the input: relaunch the app and re-observe the screen first",
+                ],
             }),
         );
     } else if let Some(se) = err
@@ -7323,6 +7374,29 @@ mod tests {
             );
         }
         assert!(server_error_next_actions("new_unmapped_code", None).is_none());
+    }
+
+    #[test]
+    fn input_failures_explained_by_a_crash_are_delivered_not_retryable() {
+        let tap = crate::device::client::ServerError {
+            code: "tap_failed".into(),
+            message: "ACTION_CLICK failed".into(),
+            status: reqwest::StatusCode::BAD_REQUEST,
+            detail: None,
+        };
+        let missing = crate::device::client::ServerError {
+            code: "element_not_found".into(),
+            message: "no match".into(),
+            status: reqwest::StatusCode::NOT_FOUND,
+            detail: None,
+        };
+        crate::events::stash_events(vec![json!({"type": "crash", "package": "com.example"})]);
+        assert_eq!(app_failure_during_input(&tap).unwrap()["type"], "crash");
+        assert!(app_failure_during_input(&missing).is_none());
+        // Leave no staged events behind for other tests.
+        let mut drained = json!({});
+        crate::events::attach_events_to(&mut drained);
+        assert!(app_failure_during_input(&tap).is_none());
     }
 
     #[test]

@@ -658,6 +658,24 @@ pub fn stash_events(events: Vec<serde_json::Value>) {
     }
 }
 
+/// Staged crash/ANR events, left staged for the envelope, so an error can be
+/// classified by the app failure that explains it.
+pub fn staged_app_failures() -> Vec<serde_json::Value> {
+    PENDING_EVENTS
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event.get("type").and_then(serde_json::Value::as_str),
+                Some("crash" | "anr")
+            )
+        })
+        .collect()
+}
+
 fn take_events() -> Option<Vec<serde_json::Value>> {
     PENDING_EVENTS.lock().ok().and_then(|mut slot| slot.take())
 }
