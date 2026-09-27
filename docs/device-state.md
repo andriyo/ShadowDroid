@@ -32,6 +32,11 @@ positive, density a positive integer, size positive `WxH`, auto-rotation and
 stylus flags `0`/`1`, and user rotation `0`–`3`. A file conflicts with CLI
 setting overlays so no supplied value is silently ignored.
 
+`connect` sets `secure stylus_handwriting_enabled` to `0`, because the Android
+14+ stylus tutorial otherwise takes the first text-field focus. The prior value
+(or its absence) is recorded on the host, and `disconnect` restores it unless it
+changed in the meantime; its output reports `stylus_handwriting`.
+
 ## Files
 
 For shared/FUSE storage, omit `files push --mode`; when `--mode` is explicit,

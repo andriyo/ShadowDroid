@@ -65,22 +65,90 @@ struct WmState {
     override_value: Option<String>,
 }
 
+const STYLUS_SETTING: &str = "stylus_handwriting_enabled";
+
+/// The value `connect` replaced, kept on the host so `disconnect` can put the
+/// user's setting back. `prior: None` means the setting was unset.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct StylusRecord {
+    prior: Option<String>,
+}
+
+fn stylus_record_path(serial: &Serial) -> Result<std::path::PathBuf> {
+    let name: String = serial
+        .as_str()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    Ok(crate::hostenv::shadowdroid_home()?
+        .join("device-prep")
+        .join(format!("{name}.stylus.json")))
+}
+
 /// Disable the stylus-handwriting tutorial that otherwise intercepts the first
-/// text-field focus (and steals `text` input). Best-effort, idempotent, and a
-/// no-op on devices/Android versions without the setting. Returns the observed
-/// state. Called automatically by `connect` and folded into the `automation`
-/// preset, so text input "just works" for the common workflow.
+/// text-field focus (and steals `text` input). Called by `connect` and folded
+/// into the `automation` preset. The user's prior value is recorded on the host
+/// first — the original one, across repeated connects — and `disconnect`
+/// restores it via [restore_stylus_setting]. If the record cannot be written,
+/// the setting is left alone rather than changed irreversibly. Best-effort and
+/// a no-op on Android versions without the setting. Returns the observed state.
 pub async fn disable_stylus_tutorial(serial: &Serial) -> bool {
-    // `connect` deliberately treats this convenience as best-effort; profile
-    // apply/reset use the fallible mutation helpers directly and never discard
-    // their transport errors.
-    let _ = put_secure(serial, "stylus_handwriting_enabled", "0").await;
-    get_secure(serial, "stylus_handwriting_enabled")
+    let Ok(prior) = get_secure(serial, STYLUS_SETTING).await else {
+        return false;
+    };
+    if prior.as_deref() != Some("0") {
+        let recorded = stylus_record_path(serial).and_then(|path| {
+            if path.exists() {
+                return Ok(());
+            }
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            crate::cmd::artifact::write_json(&path, &serde_json::json!(StylusRecord { prior }))
+                .map(|_| ())
+        });
+        if recorded.is_err() || put_secure(serial, STYLUS_SETTING, "0").await.is_err() {
+            return false;
+        }
+    }
+    get_secure(serial, STYLUS_SETTING)
         .await
         .ok()
         .flatten()
         .as_deref()
         == Some("0")
+}
+
+/// Put back the stylus setting `connect` replaced. Leaves it alone when someone
+/// changed it since (it is no longer ShadowDroid's `0`). Returns a report for
+/// the `disconnect` output, or `None` when `connect` changed nothing.
+pub async fn restore_stylus_setting(serial: &Serial) -> Option<serde_json::Value> {
+    let path = stylus_record_path(serial).ok()?;
+    let record: StylusRecord = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+    let current = get_secure(serial, STYLUS_SETTING).await.ok()?;
+    let report = if current.as_deref() == Some("0") {
+        let restore = match &record.prior {
+            Some(value) => put_secure(serial, STYLUS_SETTING, value).await,
+            None => adb::shell(serial, format!("settings delete secure {STYLUS_SETTING}"))
+                .await
+                .map(|_| ()),
+        };
+        let observed = get_secure(serial, STYLUS_SETTING).await.ok().flatten();
+        let restored = restore.is_ok() && observed == record.prior;
+        serde_json::json!({"restored": restored, "value": observed})
+    } else {
+        serde_json::json!({"restored": false, "value": current, "reason": "changed_since_connect"})
+    };
+    if report["restored"] == true || report["reason"] == "changed_since_connect" {
+        let _ = std::fs::remove_file(&path);
+    }
+    Some(report)
 }
 
 #[derive(clap::Args)]
@@ -734,6 +802,19 @@ mod tests {
             size: None,
             rotation: None,
         }
+    }
+
+    #[test]
+    fn stylus_record_keeps_unset_distinct_and_names_files_safely() {
+        let path = stylus_record_path(&Serial::new("192.168.1.5:5555")).unwrap();
+        assert_eq!(
+            path.file_name().unwrap().to_str().unwrap(),
+            "192.168.1.5_5555.stylus.json"
+        );
+        let unset = serde_json::json!(StylusRecord { prior: None });
+        assert_eq!(unset, serde_json::json!({"prior": null}));
+        let back: StylusRecord = serde_json::from_value(unset).unwrap();
+        assert_eq!(back, StylusRecord { prior: None });
     }
 
     #[test]

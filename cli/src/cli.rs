@@ -174,7 +174,7 @@ pub enum Cmd {
     // ── session / diagnostics (flat) ──────────────────────────
     /// List attached devices / emulators.
     Devices,
-    /// Install the server APK, start it, and verify (also disables the stylus tutorial).
+    /// Install the server APK, start it, and verify (disables the stylus tutorial until disconnect).
     Connect,
     /// Stop the server and remove the port forward.
     Disconnect,
@@ -6194,10 +6194,11 @@ async fn cmd_connect(
 async fn cmd_disconnect(serial: &Serial) -> Result<()> {
     let _guard = installer::acquire_lifecycle_lock(serial)?;
     free_ui_automation_slot(serial).await?;
-    emit_action(
-        "disconnect",
-        &json!({"status": "disconnected", "device": serial}),
-    );
+    let mut out = json!({"status": "disconnected", "device": serial});
+    if let Some(stylus) = crate::cmd::device_profile::restore_stylus_setting(serial).await {
+        out["stylus_handwriting"] = stylus;
+    }
+    emit_action("disconnect", &out);
     Ok(())
 }
 
