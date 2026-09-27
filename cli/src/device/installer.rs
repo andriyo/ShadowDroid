@@ -766,15 +766,46 @@ async fn install_if_needed(serial: &Serial, pair: &ApkPair, any_apk_version: boo
     // decision off it would reinstall on every connect. The main package's
     // version is authoritative and the two APKs are always built together.
     let main_version = adb::pm_version(serial, APP_PACKAGE).await?;
-    if main_version.as_deref() != Some(EXPECTED_APK_VERSION) {
-        info!(
-            "reinstalling APKs (expected version {EXPECTED_APK_VERSION}, found main={:?})",
-            main_version
-        );
-        install_pair(serial, pair).await?;
-        return verify_installed_version(serial, pair.source, any_apk_version).await;
+    let test_changed = if main_version.as_deref() == Some(EXPECTED_APK_VERSION) {
+        Some(test_apk_changed(serial, &pair.test).await)
+    } else {
+        None
+    };
+    match release_reinstall_reason(main_version.as_deref(), test_changed) {
+        None => Ok(()),
+        Some(reason) => {
+            info!("reinstalling APKs ({reason})");
+            install_pair(serial, pair).await?;
+            verify_installed_version(serial, pair.source, any_apk_version).await
+        }
     }
-    Ok(())
+}
+
+/// Why a release/cached APK pair must be reinstalled, or `None` to reuse it.
+/// The server reports the main APK's `versionName`, but its code lives in the
+/// test APK: an upgrade interrupted between the two installs left the new main
+/// beside the old test APK, and every later connect reused that stale server
+/// under the new version label. So a matching version also needs matching
+/// test-APK bytes; if they cannot be compared, reinstall rather than risk it.
+fn release_reinstall_reason(
+    main_version: Option<&str>,
+    test_changed: Option<Result<bool>>,
+) -> Option<String> {
+    if main_version != Some(EXPECTED_APK_VERSION) {
+        return Some(format!(
+            "expected version {EXPECTED_APK_VERSION}, found main={main_version:?}"
+        ));
+    }
+    match test_changed {
+        Some(Ok(false)) => None,
+        Some(Ok(true)) => Some(format!(
+            "main APK is {EXPECTED_APK_VERSION} but the test APK carrying the server code is not"
+        )),
+        Some(Err(error)) => Some(format!(
+            "could not compare the installed test APK ({error}); reinstalling to be safe"
+        )),
+        None => Some("installed test APK was not checked".into()),
+    }
 }
 
 /// After installing a *user* APK (versioned cache / GitHub release), confirm it
@@ -997,6 +1028,29 @@ async fn ui_automation_failure_hint(serial: &Serial) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_half_finished_upgrade_is_reinstalled() {
+        // Upgrade interrupted after the main APK: version label matches, server
+        // bytes are old.
+        assert!(
+            release_reinstall_reason(Some(EXPECTED_APK_VERSION), Some(Ok(true)))
+                .unwrap()
+                .contains("test APK")
+        );
+        assert!(
+            release_reinstall_reason(
+                Some(EXPECTED_APK_VERSION),
+                Some(Err(anyhow!("no sha256sum")))
+            )
+            .is_some()
+        );
+        assert!(release_reinstall_reason(Some("0.9.0"), None).is_some());
+        assert_eq!(
+            release_reinstall_reason(Some(EXPECTED_APK_VERSION), Some(Ok(false))),
+            None
+        );
+    }
 
     #[test]
     fn apk_cache_is_visible_only_after_a_verified_pair_is_published() {
