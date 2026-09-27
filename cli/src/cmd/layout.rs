@@ -101,7 +101,7 @@ pub struct LayoutSnapshotArgs {
     #[arg(long, env = "SHADOWDROID_STUDIO_DEBUGGER_URL")]
     pub studio_url: Option<String>,
     /// Override the app package/process selected in Android Studio Layout Inspector.
-    #[arg(long)]
+    #[arg(long, alias = "package")]
     pub app: Option<String>,
     /// Override the process id selected in Android Studio Layout Inspector.
     #[arg(long)]
@@ -126,7 +126,7 @@ pub struct RecompositionArgs {
     #[arg(long, env = "SHADOWDROID_STUDIO_DEBUGGER_URL")]
     pub studio_url: Option<String>,
     /// Override the app package/process selected in Android Studio Layout Inspector.
-    #[arg(long)]
+    #[arg(long, alias = "package")]
     pub app: Option<String>,
     /// Override the process id selected in Android Studio Layout Inspector.
     #[arg(long)]
@@ -157,7 +157,7 @@ pub struct LayoutSourceArgs {
     #[arg(long, env = "SHADOWDROID_STUDIO_DEBUGGER_URL")]
     pub studio_url: Option<String>,
     /// Override the app package/process selected in Android Studio Layout Inspector.
-    #[arg(long)]
+    #[arg(long, alias = "package")]
     pub app: Option<String>,
     /// Override the process id selected in Android Studio Layout Inspector.
     #[arg(long)]

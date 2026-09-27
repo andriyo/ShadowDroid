@@ -31,7 +31,7 @@ use crate::watch::logcat::LogLine;
 pub struct LogArgs {
     /// App package or config alias to scope to (default: the configured app;
     /// `--all` for every process).
-    #[arg(long)]
+    #[arg(long, alias = "package")]
     pub app: Option<String>,
     /// Include every process (ignore the configured default app).
     #[arg(long)]

@@ -90,7 +90,7 @@ pub enum DebuggerCmd {
         #[arg(long)]
         project: Option<String>,
         /// App package/process to attach to.
-        #[arg(long)]
+        #[arg(long, alias = "app")]
         package: Option<String>,
         /// Process id to attach to.
         #[arg(long)]
@@ -779,7 +779,7 @@ pub struct AndroidClientArgs {
     #[arg(long)]
     pub project: Option<String>,
     /// Filter by app package/process.
-    #[arg(long)]
+    #[arg(long, alias = "app")]
     pub package: Option<String>,
     /// Filter by process id.
     #[arg(long)]

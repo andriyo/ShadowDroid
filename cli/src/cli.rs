@@ -211,7 +211,7 @@ pub enum Cmd {
     /// APK version, port forward, server reachability, UiAutomation owners.
     Doctor {
         /// Also run the per-app interceptability verdict (`net check <app>`).
-        #[arg(long)]
+        #[arg(long, alias = "package")]
         app: Option<String>,
         /// Attempt to repair the issues found.
         #[arg(long)]
@@ -228,7 +228,7 @@ pub enum Cmd {
     /// screen dump, screenshot, current activity, app info) into a directory.
     Collect {
         /// App package to scope the bundle to (defaults to the configured app).
-        #[arg(long)]
+        #[arg(long, alias = "package")]
         app: Option<String>,
         /// Output directory for the bundle (default: a timestamped temp dir).
         #[arg(short = 'o', long)]
@@ -314,7 +314,7 @@ pub enum Cmd {
     /// Watch the app timeline: UI changes, crashes, toasts, watchers, and network events when available.
     Watch {
         /// Only emit app-scoped events for this package. Permission dialogs are still allowed.
-        #[arg(long)]
+        #[arg(long, alias = "package")]
         app: Option<String>,
         /// Android Studio plugin bridge URL used for structured logpoint events.
         /// Defaults to config, then the plugin registry.
@@ -537,7 +537,7 @@ pub enum FilesCmd {
     /// List a directory on the device.
     Ls {
         /// Resolve the path inside this debuggable app's private data directory.
-        #[arg(long, requires = "run_as")]
+        #[arg(long, alias = "package", requires = "run_as")]
         app: Option<String>,
         /// Access the path through Android run-as instead of shared/server storage.
         #[arg(long)]
@@ -547,7 +547,7 @@ pub enum FilesCmd {
     /// Push a local file to the device.
     Push {
         /// Resolve the destination inside this debuggable app's private data directory.
-        #[arg(long, requires = "run_as")]
+        #[arg(long, alias = "package", requires = "run_as")]
         app: Option<String>,
         /// Access the destination through Android run-as.
         #[arg(long)]
@@ -562,7 +562,7 @@ pub enum FilesCmd {
     /// Pull a device file to the host.
     Pull {
         /// Resolve the source inside this debuggable app's private data directory.
-        #[arg(long, requires = "run_as")]
+        #[arg(long, alias = "package", requires = "run_as")]
         app: Option<String>,
         /// Access the source through Android run-as.
         #[arg(long)]
@@ -7498,6 +7498,36 @@ mod tests {
         }
         .into();
         assert!(error_retryable_of(&interaction));
+    }
+
+    #[test]
+    fn the_app_flag_accepts_either_spelling() {
+        // Commands name the app under test `--app` or `--package`; each
+        // accepts the other spelling so a guess from a sibling command works.
+        for args in [
+            &["layout", "recompositions", "--package", "p"][..],
+            &["log", "--package", "p"],
+            &["watch", "--package", "p"],
+            &["debug", "snapshot", "--package", "p"],
+            &[
+                "app",
+                "state",
+                "snapshot",
+                "--package",
+                "p",
+                "--out",
+                "o",
+                "--include",
+                "f",
+            ],
+            &["debug", "attach", "--app", "p"],
+            &["debug", "clients", "--app", "p"],
+        ] {
+            let argv = std::iter::once("shadowdroid").chain(args.iter().copied());
+            if let Err(error) = Cli::try_parse_from(argv) {
+                panic!("{args:?}: {error}");
+            }
+        }
     }
 
     #[test]

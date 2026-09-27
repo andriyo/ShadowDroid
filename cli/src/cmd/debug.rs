@@ -121,7 +121,7 @@ pub struct AutoArgs {
 #[derive(Args, Clone)]
 pub struct SnapshotArgs {
     /// App package used for log/debugger filtering where possible.
-    #[arg(long)]
+    #[arg(long, alias = "package")]
     pub app: Option<String>,
     /// Write the snapshot JSON to a file instead of stdout.
     #[arg(short = 'o', long)]
@@ -152,7 +152,7 @@ pub struct RecordArgs {
     #[arg(long, default_value_t = 500)]
     pub poll_ms: u64,
     /// App package used for annotations and debugger filtering where possible.
-    #[arg(long)]
+    #[arg(long, alias = "package")]
     pub app: Option<String>,
     /// Directory for screenshot artifacts. Defaults beside --out.
     #[arg(long)]
@@ -203,7 +203,7 @@ pub struct StudioWaitArgs {
     #[arg(long, default_value_t = 100)]
     pub poll_ms: u64,
     /// App package used for the final snapshot.
-    #[arg(long)]
+    #[arg(long, alias = "package")]
     pub app: Option<String>,
     /// Include expanded top-frame variables in the final snapshot.
     #[arg(long, default_value_t = 1)]
@@ -228,7 +228,7 @@ pub struct RunUntilCrashArgs {
     #[arg(long, default_value_t = 30000)]
     pub timeout_ms: u64,
     /// App package used for the final snapshot.
-    #[arg(long)]
+    #[arg(long, alias = "package")]
     pub app: Option<String>,
     /// Number of recent logcat lines to include in the final snapshot/bundle.
     #[arg(long, default_value_t = 120)]
@@ -281,7 +281,7 @@ pub enum TombstonesCmd {
 #[derive(Args, Clone)]
 pub struct TombstoneListArgs {
     /// App alias/package label for output context.
-    #[arg(long)]
+    #[arg(long, alias = "package")]
     pub app: Option<String>,
 }
 
@@ -291,7 +291,7 @@ pub struct TombstonePullArgs {
     #[arg(short = 'o', long)]
     pub out: PathBuf,
     /// App alias/package label for output context.
-    #[arg(long)]
+    #[arg(long, alias = "package")]
     pub app: Option<String>,
 }
 

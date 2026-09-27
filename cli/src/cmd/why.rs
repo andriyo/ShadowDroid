@@ -29,7 +29,7 @@ use crate::watch::logcat::LogLine;
 #[derive(clap::Args)]
 pub struct WhyArgs {
     /// App package or config alias to focus on (default: the configured app).
-    #[arg(long)]
+    #[arg(long, alias = "package")]
     pub app: Option<String>,
     /// How far back to look, e.g. 120s, 5m (default 120s).
     #[arg(long, default_value = "120s")]

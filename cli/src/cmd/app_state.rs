@@ -47,7 +47,7 @@ pub enum StateCmd {
     /// Snapshot selected private debuggable-app paths into a protected host directory.
     Snapshot {
         /// App package or configured app alias. Defaults through normal app resolution.
-        #[arg(long)]
+        #[arg(long, alias = "package")]
         app: Option<String>,
         /// New snapshot directory. Existing paths are refused.
         #[arg(long)]
@@ -59,7 +59,7 @@ pub enum StateCmd {
     /// Restore a snapshot transactionally, retaining private rollback data until verification.
     Restore {
         /// Target app package or configured app alias. Defaults to the manifest package.
-        #[arg(long)]
+        #[arg(long, alias = "package")]
         app: Option<String>,
         /// Snapshot directory containing manifest.json and data/.
         #[arg(long = "from")]
@@ -71,7 +71,7 @@ pub enum StateCmd {
     /// Resolve an interrupted restore by rolling back unverified state or finalizing verified state.
     Recover {
         /// App package or configured app alias. Defaults through normal app resolution.
-        #[arg(long)]
+        #[arg(long, alias = "package")]
         app: Option<String>,
     },
     /// Best-effort overwrite and delete of a protected host snapshot directory.
