@@ -1088,6 +1088,8 @@ struct PendingFlow {
     original_url: Mutex<Option<String>>,
     /// The HTTP version of the app's request.
     http_version: Option<String>,
+    /// The HTTP version the upstream server answered with.
+    upstream_http_version: Mutex<Option<String>>,
 }
 
 /// Where a request was redirected to by `net resume --set-url`: every flow
@@ -1112,6 +1114,19 @@ fn note_redirect(original_url: &str, scheme: &str, host: &str, port: u16, path: 
 fn pending_http_version() -> Option<String> {
     PENDING_FLOW
         .try_with(|pending| pending.http_version.clone())
+        .ok()
+        .flatten()
+}
+
+fn note_upstream_version(version: http::Version) {
+    let _ = PENDING_FLOW.try_with(|pending| {
+        *pending.upstream_http_version.lock().unwrap() = Some(format!("{version:?}"));
+    });
+}
+
+fn pending_upstream_http_version() -> Option<String> {
+    PENDING_FLOW
+        .try_with(|pending| pending.upstream_http_version.lock().unwrap().clone())
         .ok()
         .flatten()
 }
@@ -1572,6 +1587,7 @@ async fn proxy_request_inner(
         }
     };
 
+    note_upstream_version(resp.version());
     let status_code = resp.status().as_u16();
     let mut resp_headers = header_pairs(resp.headers());
     let original_response_length = content_length(&resp_headers);
@@ -2310,6 +2326,7 @@ fn make_flow(p: FlowParts<'_>) -> FlowRecord {
         request_body_modified: p.request_body_modified,
         original_url: pending_original_url(),
         http_version: pending_http_version(),
+        upstream_http_version: pending_upstream_http_version(),
         upstream_bypassed: false,
         error: p.error,
         error_redacted: false,
@@ -4575,8 +4592,10 @@ mod tests {
             if held_response {
                 assert_eq!(captured.status, Some(200));
                 assert_eq!(captured.resp_body.as_deref(), Some("answer"));
+                assert_eq!(captured.upstream_http_version.as_deref(), Some("HTTP/1.1"));
             } else {
                 assert_eq!(captured.status, None);
+                assert_eq!(captured.upstream_http_version, None);
             }
             upstream_task.abort();
             proxy_task.abort();

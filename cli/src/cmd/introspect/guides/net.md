@@ -32,6 +32,8 @@ and WSS upstream certificates. Captured bodies are bounded; honor
 response (SSE or larger than the 8 MiB buffer) is recorded when streaming starts:
 its body is at most the part buffered before that, and `resp_len_unknown` means
 `resp_len` counts only those bytes.
+`http_version` is what the app spoke to the proxy; `upstream_http_version` is
+what the server answered (the proxy talks HTTP/1.x upstream).
 
 On a `watch` stream, completed `http`, held `http_intercept`, and `tls_error`
 events carry exact device-scoped `next_actions`; act on a held flow before its

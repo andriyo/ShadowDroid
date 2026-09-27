@@ -188,6 +188,7 @@ fn har_entry(f: &FlowRecord) -> Value {
         },
         "cache": {},
         "timings": {"send": 0, "wait": f.dur_ms.unwrap_or(0), "receive": 0},
+        "_upstreamHttpVersion": f.upstream_http_version,
     })
 }
 
@@ -627,9 +628,11 @@ mod tests {
         let mut flow = sample();
         assert_eq!(har_entry(&flow)["request"]["httpVersion"], "HTTP/1.1");
         flow.http_version = Some("HTTP/2.0".into());
+        flow.upstream_http_version = Some("HTTP/1.1".into());
         let entry = har_entry(&flow);
         assert_eq!(entry["request"]["httpVersion"], "HTTP/2.0");
         assert_eq!(entry["response"]["httpVersion"], "HTTP/2.0");
+        assert_eq!(entry["_upstreamHttpVersion"], "HTTP/1.1");
     }
 
     fn sample() -> FlowRecord {
@@ -668,6 +671,7 @@ mod tests {
             request_body_modified: false,
             original_url: None,
             http_version: None,
+            upstream_http_version: None,
             upstream_bypassed: false,
             error: None,
             error_redacted: false,

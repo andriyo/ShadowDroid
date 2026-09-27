@@ -97,6 +97,10 @@ pub struct FlowRecord {
     /// which its response came back on too. Absent in captures that predate it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_version: Option<String>,
+    /// The HTTP version the upstream server answered the proxy with. Absent
+    /// when no upstream response arrived (replay, errors, older captures).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_http_version: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub upstream_bypassed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -212,6 +216,7 @@ impl FlowRecord {
             "request_body_modified": self.request_body_modified,
             "original_url": self.original_url,
             "http_version": self.http_version,
+            "upstream_http_version": self.upstream_http_version,
             "upstream_bypassed": self.upstream_bypassed,
             "error": self.error,
             "error_redacted": self.error_redacted,
@@ -459,6 +464,7 @@ mod tests {
             request_body_modified: false,
             original_url: None,
             http_version: None,
+            upstream_http_version: None,
             upstream_bypassed: false,
             error: None,
             error_redacted: false,
