@@ -2055,7 +2055,7 @@ impl BridgeClient {
         let read_only = READ_ONLY_ROUTES.contains(&path);
         let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
         let mut next_actions = vec![
-            "run `shadowdroid debug status` — it lists dialogs blocking Android Studio (blocked_dialogs)".to_string(),
+            "run `shadowdroid debug status` — it lists dialogs blocking Android Studio (modal_dialogs, blocked_dialogs)".to_string(),
         ];
         next_actions.push(if read_only {
             "dismiss any blocking dialog in Android Studio, then retry".to_string()
@@ -2153,7 +2153,7 @@ impl BridgeClient {
             .retryable(true)
             .detail(serde_json::json!({"route": path, "executed": false, "bridge_reply": value}))
             .next_actions([
-                "dismiss the open dialog in Android Studio (`shadowdroid debug status` lists blocked_dialogs), then retry",
+                "dismiss the open dialog in Android Studio (`shadowdroid debug status` lists modal_dialogs), then retry",
             ])
             .into());
         }

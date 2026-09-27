@@ -5,6 +5,8 @@ import com.intellij.debugger.engine.JavaDebugProcess
 import com.intellij.debugger.engine.events.DebuggerCommandImpl
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.xdebugger.XDebugSession
+import java.awt.Dialog
+import java.awt.Window
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -38,10 +40,21 @@ internal object StudioThreading {
         val handoff = CancellableHandoff { supplier.get() }
         app.invokeLater { handoff.run() }
         return handoff.await(IDEA_THREAD_START_TIMEOUT_MS, IDEA_THREAD_RUN_TIMEOUT_MS) {
-            val dialogs = BreakpointExpressionGuard.blockedDialogs()
+            val dialogs = (modalDialogs() + BreakpointExpressionGuard.blockedDialogs()).distinct()
             if (dialogs.isEmpty()) "" else " (${dialogs.joinToString()})"
         }
     }
+
+    /**
+     * Titles of the modal dialogs open in the IDE. While one shows, requests
+     * that need the UI thread cannot start. Safe to read from any thread.
+     */
+    @JvmStatic
+    fun modalDialogs(): List<String> =
+        Window.getWindows()
+            .filterIsInstance<Dialog>()
+            .filter { it.isModal && it.isShowing }
+            .map { dialog -> dialog.title?.takeIf { it.isNotBlank() } ?: dialog.javaClass.simpleName }
 
     @JvmStatic
     @Throws(Exception::class)

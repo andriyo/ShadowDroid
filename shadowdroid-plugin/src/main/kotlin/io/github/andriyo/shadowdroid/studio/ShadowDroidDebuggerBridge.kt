@@ -401,6 +401,8 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
             val sessions = allSessions()
             val sessionPayload = sessions.mapIndexed { index, session -> sessionInfo(index, session) }
             val blockedDialogs = BreakpointExpressionGuard.blockedDialogs()
+            val modalDialogs = StudioThreading.modalDialogs()
+            val open = (blockedDialogs + modalDialogs).distinct()
             return BridgeProtocol.ok(
                 "ok", true,
                 "api_version", API_VERSION,
@@ -410,11 +412,12 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                 "sessions", sessionPayload,
                 "breakpoint_errors", BreakpointExpressionGuard.recentErrors(),
                 "blocked_dialogs", blockedDialogs,
-                "warning", if (blockedDialogs.isEmpty()) {
+                "modal_dialogs", modalDialogs,
+                "warning", if (open.isEmpty()) {
                     null
                 } else {
-                    "Android Studio is showing a blocking dialog (${blockedDialogs.joinToString()}); " +
-                        "debugger requests will time out until it is dismissed in the IDE"
+                    "Android Studio is showing a modal dialog (${open.joinToString()}); requests that " +
+                        "need its UI thread fail with studio_ui_busy until it is dismissed in the IDE"
                 },
             )
         }
