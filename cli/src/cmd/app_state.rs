@@ -526,7 +526,9 @@ async fn private_stat(serial: &Serial, package: &str, path: &str) -> Result<Priv
 fn parse_private_stat(value: &str) -> Option<PrivateStat> {
     let mut fields = value.lines().last()?.split('|');
     let kind = match fields.next()?.trim() {
-        "regular file" => StatePathKind::File,
+        // toybox and GNU stat both report size-0 files as "regular empty file"
+        // (e.g. SQLite's truncated rollback journal after every commit).
+        "regular file" | "regular empty file" => StatePathKind::File,
         "directory" => StatePathKind::Directory,
         _ => return None,
     };
@@ -1709,17 +1711,24 @@ fn rollback_roots_script(
     backup_root: &str,
     failpoint: Option<&str>,
 ) -> String {
-    let mut commands = vec!["set -e".to_string()];
+    // Each root is restored independently: a root whose post-check fails
+    // records `failed` instead of short-circuiting the next root's restore,
+    // and the success marker is printed only when every root verified. (A
+    // single `&&` chain of `…; check` elements let a failed check silently
+    // skip the following root's rollback yet still print the marker.)
+    let mut commands = vec!["set -e".to_string(), "failed=0".to_string()];
     for (index, root) in roots.iter().rev().enumerate() {
         let target = shell_quote(&root.path);
         let backup = shell_quote(&format!("{backup_root}/{}", root.path));
         let parent = shell_quote(private_parent(&root.path));
         if root.existed {
             commands.push(format!(
-                "if [ -e {backup} ]; then rm -rf {target}; mkdir -p {parent}; mv {backup} {target}; fi; [ -e {target} ]"
+                "{{ if [ -e {backup} ]; then rm -rf {target} && mkdir -p {parent} && mv {backup} {target}; fi && [ -e {target} ]; }} || failed=1"
             ));
         } else {
-            commands.push(format!("rm -rf {target}; [ ! -e {target} ]"));
+            commands.push(format!(
+                "{{ rm -rf {target} && [ ! -e {target} ]; }} || failed=1"
+            ));
         }
         append_remote_test_failpoint(
             &mut commands,
@@ -1727,8 +1736,9 @@ fn rollback_roots_script(
             &format!("rollback_after_root_{index}"),
         );
     }
+    commands.push("[ \"$failed\" = 0 ]".to_string());
     commands.push(format!("echo {ROLLBACK_OK}"));
-    commands.join(" && ")
+    commands.join("; ")
 }
 
 async fn finalize_transaction(serial: &Serial, package: &str, transaction: &str) -> Result<bool> {
@@ -2737,6 +2747,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn rollback_restores_every_root_and_withholds_success_when_any_check_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let backup = ".shadowdroid_state/txn-1/backup";
+        std::fs::create_dir_all(temp.path().join(backup).join("files")).unwrap();
+        std::fs::create_dir_all(temp.path().join("files")).unwrap();
+        // files/a has a backup to restore; files/b existed before the restore
+        // but is now missing with no backup, so its post-check must fail.
+        std::fs::write(temp.path().join("files/a"), b"new-a").unwrap();
+        std::fs::write(temp.path().join(backup).join("files/a"), b"old-a").unwrap();
+        let roots = vec![
+            TransactionRoot {
+                path: "files/a".into(),
+                existed: true,
+            },
+            TransactionRoot {
+                path: "files/b".into(),
+                existed: true,
+            },
+        ];
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(rollback_roots_script(&roots, backup, None))
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        assert!(!has_output_marker(
+            &String::from_utf8(output.stdout).unwrap(),
+            ROLLBACK_OK
+        ));
+        // The failed check on files/b did not skip restoring files/a.
+        assert_eq!(
+            std::fs::read(temp.path().join("files/a")).unwrap(),
+            b"old-a"
+        );
+    }
+
+    #[test]
+    fn private_stat_accepts_empty_regular_files() {
+        let empty = parse_private_stat("regular empty file|0|600").unwrap();
+        assert_eq!(empty.kind, StatePathKind::File);
+        assert_eq!(empty.bytes, 0);
+        let file = parse_private_stat("regular file|4210|600").unwrap();
+        assert_eq!(file.kind, StatePathKind::File);
+        assert!(parse_private_stat("symbolic link|10|777").is_none());
     }
 
     #[test]
