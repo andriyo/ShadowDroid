@@ -1,5 +1,6 @@
 package io.github.andriyo.shadowdroid.studio
 
+import com.intellij.debugger.engine.JavaDebugProcess
 import com.intellij.debugger.ui.breakpoints.JavaExceptionBreakpointType
 import com.intellij.debugger.ui.breakpoints.JavaFieldBreakpointType
 import com.intellij.debugger.ui.breakpoints.JavaWildcardMethodBreakpointType
@@ -28,7 +29,9 @@ import java.util.Base64
 import java.util.Collections
 import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 
 internal object BreakpointBridge {
     // One physical hit can surface through more than one listener (pause
@@ -234,6 +237,49 @@ internal object BreakpointBridge {
     internal fun breakpointIdFor(project: Project, breakpoint: XBreakpoint<*>): String =
         breakpointId(project, breakpoint)
 
+    /**
+     * Wait until breakpoint changes reach the project's running debuggers.
+     * Adding or editing an XBreakpoint returns once the model changed; each
+     * Java debug process then applies it to its VM from its manager thread, so
+     * an app action right after the reply could run before the request exists
+     * and miss the breakpoint. A no-op queued on the UI thread and then on each
+     * manager thread, behind that work, is the barrier. Returns whether every
+     * session answered in time.
+     */
+    @JvmStatic
+    fun awaitAppliedToSessions(project: Project): Boolean {
+        runCatching { StudioThreading.onIdeaThread { null } }
+        // A changed Java breakpoint reloads on a single-threaded executor
+        // (Breakpoint.scheduleReload) before the debuggers update their VM
+        // requests; queue behind that too, then flush the UI thread again.
+        javaBreakpointReloadExecutor()?.let { executor ->
+            runCatching { executor.submit {}.get(APPLY_TIMEOUT_MS.toLong(), TimeUnit.MILLISECONDS) }
+            runCatching { StudioThreading.onIdeaThread { null } }
+        }
+        var applied = true
+        for (session in XDebuggerManager.getInstance(project).debugSessions) {
+            if (session.debugProcess !is JavaDebugProcess) continue
+            applied = runCatching {
+                StudioThreading.onDebuggerThread(session, APPLY_TIMEOUT_MS) { null }
+            }.isSuccess && applied
+        }
+        return applied
+    }
+
+    private const val APPLY_TIMEOUT_MS = 2_000
+
+    /** Studio's private `Breakpoint.RELOAD_EXECUTOR`, when this version has it. */
+    private val reloadExecutor: ExecutorService? by lazy {
+        runCatching {
+            val field = com.intellij.debugger.ui.breakpoints.Breakpoint::class.java
+                .getDeclaredField("RELOAD_EXECUTOR")
+            field.isAccessible = true
+            field.get(null) as? ExecutorService
+        }.getOrNull()
+    }
+
+    private fun javaBreakpointReloadExecutor(): ExecutorService? = reloadExecutor
+
     @JvmStatic
     fun addLine(query: Map<String, String>, project: Project?): Response {
         val file = query[BridgeQuery.FILE]
@@ -303,8 +349,10 @@ internal object BreakpointBridge {
                 }
                 null
             }
+            val applied = awaitAppliedToSessions(project)
             BridgeProtocol.ok(
                 "ok", true,
+                "applied_to_sessions", applied,
                 "breakpoint", breakpointInfo(project, prepared.breakpoint),
                 "warning", if (prepared.positionSupported) {
                     null
@@ -535,9 +583,11 @@ internal object BreakpointBridge {
                 throw t
             }
 
+            val applied = awaitAppliedToSessions(project)
             BridgeProtocol.ok(
                 "ok", true,
                 "created", configured.created,
+                "applied_to_sessions", applied,
                 "breakpoint", breakpointInfo(project, target),
                 "warning", if (configured.positionSupported) {
                     null
@@ -680,7 +730,12 @@ internal object BreakpointBridge {
                 target.setEnabled(BridgeProtocol.booleanParam(query, BridgeQuery.ENABLED, true))
                 target
             }
-            BridgeProtocol.ok("ok", true, "breakpoint", breakpointInfo(project, breakpoint))
+            val applied = awaitAppliedToSessions(project)
+            BridgeProtocol.ok(
+                "ok", true,
+                "applied_to_sessions", applied,
+                "breakpoint", breakpointInfo(project, breakpoint),
+            )
         } catch (t: Throwable) {
             BridgeProtocol.bad(t)
         }
@@ -713,7 +768,12 @@ internal object BreakpointBridge {
                 target.setEnabled(BridgeProtocol.booleanParam(query, BridgeQuery.ENABLED, true))
                 target
             }
-            BridgeProtocol.ok("ok", true, "breakpoint", breakpointInfo(project, breakpoint))
+            val applied = awaitAppliedToSessions(project)
+            BridgeProtocol.ok(
+                "ok", true,
+                "applied_to_sessions", applied,
+                "breakpoint", breakpointInfo(project, breakpoint),
+            )
         } catch (t: Throwable) {
             BridgeProtocol.bad(t)
         }
@@ -759,7 +819,12 @@ internal object BreakpointBridge {
                 breakpoint.setTemporary(temporary)
                 breakpoint
             }
-            BridgeProtocol.ok("ok", true, "breakpoint", breakpointInfo(project, target))
+            val applied = awaitAppliedToSessions(project)
+            BridgeProtocol.ok(
+                "ok", true,
+                "applied_to_sessions", applied,
+                "breakpoint", breakpointInfo(project, target),
+            )
         } catch (t: Throwable) {
             BridgeProtocol.bad(t)
         }
@@ -1043,7 +1108,12 @@ internal object BreakpointBridge {
                 }
                 null
             }
-            BridgeProtocol.ok("ok", true, "breakpoint", breakpointInfo(selected.project, breakpoint))
+            val applied = awaitAppliedToSessions(selected.project)
+            BridgeProtocol.ok(
+                "ok", true,
+                "applied_to_sessions", applied,
+                "breakpoint", breakpointInfo(selected.project, breakpoint),
+            )
         } catch (t: Throwable) {
             BridgeProtocol.bad(t)
         }
