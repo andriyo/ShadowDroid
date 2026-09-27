@@ -153,6 +153,12 @@ impl CertAuthority {
             )],
         };
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        // RFC 5280 requires an Authority Key Identifier on issued certificates;
+        // strict verifiers (Python 3.13's default context, `openssl verify
+        // -x509_strict`) reject leaves without one. ExplicitNoCa also makes
+        // rcgen emit a Subject Key Identifier and `basicConstraints CA:FALSE`.
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.use_authority_key_identifier_extension = true;
 
         let cert = params
             .signed_by(self.issuer.key(), &self.issuer)
@@ -1169,6 +1175,43 @@ mod tests {
         // A different host mints a distinct config.
         let cfg3 = ca.server_config("other.example.com").unwrap();
         assert!(!Arc::ptr_eq(&cfg1, &cfg3));
+    }
+
+    #[test]
+    fn leaves_carry_key_identifiers_for_strict_verifiers() {
+        use x509_parser::extensions::ParsedExtension;
+
+        let key = KeyPair::generate().unwrap();
+        let ca_cert = ca_params().self_signed(&key).unwrap();
+        let ca = CertAuthority::build(&ca_cert.pem(), key).unwrap();
+        let (_, ca_parsed) = x509_parser::parse_x509_certificate(ca_cert.der().as_ref()).unwrap();
+        let ca_ski = ca_parsed
+            .extensions()
+            .iter()
+            .find_map(|ext| match ext.parsed_extension() {
+                ParsedExtension::SubjectKeyIdentifier(id) => Some(id.0.to_vec()),
+                _ => None,
+            })
+            .expect("CA has a subject key identifier");
+
+        let der = ca.mint_leaf("api.example.com").unwrap();
+        let (_, leaf) = x509_parser::parse_x509_certificate(der.as_ref()).unwrap();
+        let mut ski = None;
+        let mut aki = None;
+        let mut is_ca = None;
+        for ext in leaf.extensions() {
+            match ext.parsed_extension() {
+                ParsedExtension::SubjectKeyIdentifier(id) => ski = Some(id.0.to_vec()),
+                ParsedExtension::AuthorityKeyIdentifier(id) => {
+                    aki = id.key_identifier.as_ref().map(|k| k.0.to_vec())
+                }
+                ParsedExtension::BasicConstraints(bc) => is_ca = Some(bc.ca),
+                _ => {}
+            }
+        }
+        assert!(ski.is_some_and(|ski| !ski.is_empty()));
+        assert_eq!(aki, Some(ca_ski), "leaf AKI must name the issuing CA's key");
+        assert_eq!(is_ca, Some(false));
     }
 
     #[test]
