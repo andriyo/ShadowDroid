@@ -12,6 +12,12 @@ use std::path::Path;
 use crate::net::flow::FlowRecord;
 
 /// A runnable `curl` command reproducing the request (textual body only).
+///
+/// The body is piped through the shell's builtin `printf` into
+/// `--data-binary @-`: `--data` reads a file when the value starts with `@`
+/// (a captured body could upload any local file to the captured URL) and drops
+/// line breaks, and a body passed as one argument hits the exec argument limit.
+/// A builtin never execs, so the body size is unbounded.
 pub fn curl_command(f: &FlowRecord) -> String {
     let url = crate::net::flow::url(&f.scheme, &f.host, f.port, &f.path);
     // Every captured field is attacker-influenced: the method is an HTTP token,
@@ -23,10 +29,13 @@ pub fn curl_command(f: &FlowRecord) -> String {
         }
         parts.push(format!("-H '{}: {}'", sh(k), sh(v)));
     }
-    if let Some(body) = &f.req_body {
-        parts.push(format!("--data '{}'", sh(body)));
+    match &f.req_body {
+        Some(body) => {
+            parts.push("--data-binary @-".into());
+            format!("printf '%s' '{}' | {}", sh(body), parts.join(" \\\n  "))
+        }
+        None => parts.join(" \\\n  "),
     }
-    parts.join(" \\\n  ")
 }
 
 /// HAR 1.2 archive for a set of flows.
@@ -325,6 +334,55 @@ mod tests {
         assert_eq!(args[0], "-X");
         assert_eq!(args[1], "`touch${IFS}m`");
         assert_eq!(args[2], "https://api.example.com/x'$(touch${IFS}p)'");
+    }
+
+    /// Runs `curl_command(flow)` under `sh` with `curl` replaced by a function
+    /// that prints its arguments, then the bytes it read from stdin.
+    #[cfg(unix)]
+    fn run_with_fake_curl(flow: &FlowRecord, dir: &std::path::Path) -> std::process::Output {
+        let script = format!(
+            "curl() {{ printf '%s\\n' \"$@\"; printf 'STDIN:'; cat; }}\n{}\n",
+            curl_command(flow)
+        );
+        let path = dir.join("replay.sh");
+        std::fs::write(&path, script).unwrap();
+        std::process::Command::new("sh")
+            .arg(&path)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn curl_export_sends_an_at_prefixed_body_literally() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("secret.txt"), "LOCAL-SECRET").unwrap();
+        let mut flow = sample();
+        flow.method = "POST".into();
+        flow.req_body = Some("@secret.txt".into());
+        let output = run_with_fake_curl(&flow, dir.path());
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("--data-binary\n@-\n"), "{stdout}");
+        assert!(stdout.ends_with("STDIN:@secret.txt"), "{stdout}");
+        assert!(!stdout.contains("LOCAL-SECRET"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn curl_export_keeps_large_multiline_bodies_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut flow = sample();
+        flow.method = "POST".into();
+        let body = "line with 'quotes' and $vars\r\n".repeat(80_000);
+        assert!(body.len() > 2_000_000);
+        flow.req_body = Some(body.clone());
+        let output = run_with_fake_curl(&flow, dir.path());
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let (_, sent) = stdout.split_once("STDIN:").unwrap();
+        assert_eq!(sent, body);
     }
 
     fn sample() -> FlowRecord {
