@@ -151,7 +151,9 @@ or `--expect-activity` postcondition implies observation; `--expect-exact`,
 condition fails with `postcondition_timeout`; a screen that never settles fails
 with `observation_unstable`. Both preserve the freshest screen under
 `detail.screen` as diagnostic evidence only, so start a new interaction cycle
-instead of reusing its element ids.
+instead of reusing its element ids. Both are `retryable: false` with
+`input_delivered: true`: observe what the action did before acting again,
+because repeating it can toggle a switch back or submit a form twice.
 
 `ui wait` also syncs on the foreground app, not just elements: `--pkg <package>`
 blocks until that app reaches the foreground (e.g. a Custom Tab or share sheet

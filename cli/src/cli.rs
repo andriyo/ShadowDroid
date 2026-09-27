@@ -4397,13 +4397,15 @@ pub fn report_error(err: &anyhow::Error) {
             "run",
             "screen_changed",
             &sc.to_string(),
-            json!({ "detail": {
+            // Nothing was delivered, so acting again is safe — but only on a
+            // target re-selected from the fresh screen, never blindly re-guarded.
+            json!({ "retryable": true, "detail": {
                 "expected": sc.expected,
                 "actual": sc.actual,
                 "screen": sc.screen,
             }, "next_actions": [
                 "re-plan from detail.screen instead of issuing another dump",
-                "retry the action with detail.actual as --if-screen"
+                "re-select the target from detail.screen, then act with detail.actual as --if-screen"
             ]}),
         );
     } else if let Some(stale) = err
@@ -4445,7 +4447,7 @@ pub fn report_error(err: &anyhow::Error) {
                 },
                 "next_actions": [
                     "re-plan from detail.screen instead of issuing another dump",
-                    "retry with detail.actual as --if-interaction"
+                    "re-select the target from detail.screen, then act with detail.actual as --if-interaction"
                 ]
             }),
         );
@@ -4460,13 +4462,16 @@ pub fn report_error(err: &anyhow::Error) {
             "observe",
             observation.code,
             &observation.message,
+            // The input WAS delivered; only its destination is unproven.
+            // Repeating it can toggle a switch back or submit a form twice.
             json!({
-                "retryable": true,
+                "retryable": false,
+                "input_delivered": true,
                 "detail": observation.detail,
                 "next_actions": [
-                    "inspect detail.screen as diagnostic evidence only; do not act from its element ids",
-                    "retry with the strongest available --expect-* postcondition and a longer --timeout-ms",
-                    "run `shadowdroid ui dump` to start a fresh interaction cycle"
+                    "run `shadowdroid ui dump` to observe what the delivered action did before acting again",
+                    "if the destination is merely slow, wait for it with `shadowdroid ui wait` instead of repeating the action",
+                    "inspect detail.screen as diagnostic evidence only; do not act from its element ids"
                 ]
             }),
         );
@@ -4863,11 +4868,15 @@ pub fn error_retryable_of(err: &anyhow::Error) -> bool {
         server_error_retryable(&server.code, server.status)
     } else if err.chain().any(|cause| {
         cause
+            .downcast_ref::<crate::fusion::ObservationFailure>()
+            .is_some()
+    }) {
+        // Delivered input must be observed, never blindly repeated.
+        false
+    } else if err.chain().any(|cause| {
+        cause
             .downcast_ref::<crate::fusion::ScreenChanged>()
             .is_some()
-            || cause
-                .downcast_ref::<crate::fusion::ObservationFailure>()
-                .is_some()
             || cause
                 .downcast_ref::<crate::fusion::StaleElement>()
                 .is_some()
@@ -7344,6 +7353,33 @@ mod tests {
             detail: None,
         });
         assert!(error_uses_fallback(&unknown_server));
+    }
+
+    #[test]
+    fn delivered_input_is_never_advertised_as_retryable() {
+        let delivered: anyhow::Error = crate::fusion::ObservationFailure {
+            code: "postcondition_timeout",
+            message: "action was delivered".into(),
+            detail: json!({}),
+        }
+        .into();
+        assert!(!error_retryable_of(&delivered));
+        // Guard refusals delivered nothing, so acting again (after
+        // re-selecting from the fresh screen) is safe.
+        let refused: anyhow::Error = crate::fusion::ScreenChanged {
+            expected: "a".into(),
+            actual: "b".into(),
+            screen: json!({}),
+        }
+        .into();
+        assert!(error_retryable_of(&refused));
+        let interaction: anyhow::Error = crate::fusion::InteractionChanged {
+            expected: "a".into(),
+            actual: "b".into(),
+            screen: json!({}),
+        }
+        .into();
+        assert!(error_retryable_of(&interaction));
     }
 
     #[test]

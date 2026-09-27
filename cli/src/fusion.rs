@@ -1144,7 +1144,8 @@ mod tests {
             });
             assert_eq!(crate::cli::error_code_of(&error), code);
             assert_eq!(crate::cli::error_stage_of(&error), "observe");
-            assert!(crate::cli::error_retryable_of(&error));
+            // The input was delivered: it must be observed, not repeated.
+            assert!(!crate::cli::error_retryable_of(&error));
             assert!(!crate::cli::error_uses_fallback(&error));
         }
     }
