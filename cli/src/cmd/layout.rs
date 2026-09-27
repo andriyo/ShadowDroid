@@ -820,12 +820,85 @@ async fn studio_layout_source(
     }
 }
 
+/// Give each screen element the app source location of its Layout Inspector
+/// node, so an agent can go from `elements[i]` to code without matching the
+/// two trees itself. A node sharing the element's bounds wins (the innermost
+/// one that resolved to a project file, not a library composable); otherwise
+/// the smallest project node containing the element's centre.
+fn link_elements_to_source(value: &mut Value, studio: &Value) {
+    let nodes: Vec<&Value> = studio
+        .get("windows")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|window| window.get("nodes").and_then(Value::as_array))
+        .flatten()
+        .filter(|node| {
+            node.pointer("/source/file")
+                .and_then(Value::as_str)
+                .is_some()
+        })
+        .collect();
+    if nodes.is_empty() {
+        return;
+    }
+    let bounds_of = |node: &Value| -> Option<[i64; 4]> {
+        let b = node.get("bounds")?;
+        Some([
+            b.get("left")?.as_i64()?,
+            b.get("top")?.as_i64()?,
+            b.get("right")?.as_i64()?,
+            b.get("bottom")?.as_i64()?,
+        ])
+    };
+    let Some(elements) = value.get_mut("elements").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for element in elements {
+        let Some(bounds) = element
+            .get("bounds")
+            .and_then(Value::as_array)
+            .and_then(|b| {
+                let b: Vec<i64> = b.iter().filter_map(Value::as_i64).collect();
+                <[i64; 4]>::try_from(b).ok()
+            })
+        else {
+            continue;
+        };
+        let (cx, cy) = ((bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2);
+        let node = nodes
+            .iter()
+            .find(|node| bounds_of(node) == Some(bounds))
+            .or_else(|| {
+                nodes
+                    .iter()
+                    .filter(|node| {
+                        bounds_of(node)
+                            .is_some_and(|[l, t, r, b]| l <= cx && cx <= r && t <= cy && cy <= b)
+                    })
+                    .min_by_key(|node| {
+                        bounds_of(node).map_or(i64::MAX, |[l, t, r, b]| (r - l) * (b - t))
+                    })
+            });
+        if let Some(node) = node {
+            element["source"] = json!({
+                "file": node.pointer("/source/file"),
+                "line": node.pointer("/source/line"),
+                "composable": node.get("qualified_name"),
+                "draw_id": node.get("draw_id"),
+                "exact_bounds": bounds_of(node) == Some(bounds),
+            });
+        }
+    }
+}
+
 fn merge_studio_layout(value: &mut Value, studio: Result<Value>) {
     match studio {
         Ok(studio) => {
             if let Some(features) = studio.get("features").cloned() {
                 value["features"] = features;
             }
+            link_elements_to_source(value, &studio);
             value["android_studio_layout"] = studio;
         }
         Err(err) => {
@@ -1244,6 +1317,38 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::proto::{AppRef, ImeState, Viewport};
+
+    #[test]
+    fn snapshot_elements_link_to_their_project_source() {
+        let node = |name: &str, bounds: [i64; 4], file: Option<&str>, line: u64| {
+            json!({
+                "qualified_name": name,
+                "draw_id": line,
+                "bounds": {"left": bounds[0], "top": bounds[1], "right": bounds[2], "bottom": bounds[3]},
+                "source": {"file": file, "line": line},
+            })
+        };
+        let studio = json!({"windows": [{"nodes": [
+            node("BasicText", [10, 10, 90, 30], None, 125),
+            node("Text", [10, 10, 90, 30], Some("/app/LabUi.kt"), 650),
+            node("Column", [0, 0, 400, 400], Some("/app/LabUi.kt"), 600),
+            node("Card", [0, 0, 800, 800], Some("/app/LabUi.kt"), 590),
+        ]}]});
+        let mut value = json!({"elements": [
+            {"id": 1, "bounds": [10, 10, 90, 30], "text": "0"},
+            {"id": 2, "bounds": [100, 100, 120, 120]},
+            {"id": 3, "bounds": [900, 900, 950, 950]},
+        ]});
+        link_elements_to_source(&mut value, &studio);
+        let elements = value["elements"].as_array().unwrap();
+        assert_eq!(elements[0]["source"]["line"], 650);
+        assert_eq!(elements[0]["source"]["composable"], "Text");
+        assert_eq!(elements[0]["source"]["exact_bounds"], true);
+        // No node with its bounds: the smallest project node around it.
+        assert_eq!(elements[1]["source"]["composable"], "Column");
+        assert_eq!(elements[1]["source"]["exact_bounds"], false);
+        assert!(elements[2].get("source").is_none());
+    }
 
     #[test]
     fn recomposition_filters_keep_the_most_recomposed_nodes() {
