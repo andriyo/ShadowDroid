@@ -4477,10 +4477,12 @@ pub fn report_error(err: &anyhow::Error) {
         );
     } else {
         let class = classify_generic_error(err);
+        // The whole context chain: the outermost context alone ("parse rules
+        // JSON array") hides the actual cause.
         emit_error(
             class.stage,
             class.code,
-            &err.to_string(),
+            &format!("{err:#}"),
             json!({
                 "retryable": class.retryable,
                 "detail": {
