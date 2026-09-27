@@ -146,8 +146,8 @@ fn har_entry(f: &FlowRecord) -> Value {
         "url": url,
         "httpVersion": "HTTP/1.1",
         "headers": har_headers(&f.req_headers),
-        "queryString": [],
-        "cookies": [],
+        "queryString": har_query_string(&f.path),
+        "cookies": har_request_cookies(&f.req_headers),
         "headersSize": -1,
         "bodySize": f.req_len,
     });
@@ -155,6 +155,19 @@ fn har_entry(f: &FlowRecord) -> Value {
         request["postData"] = json!({
             "mimeType": f.req_type.clone().unwrap_or_default(),
             "text": body,
+        });
+    }
+    let mut content = json!({
+        "size": f.resp_len,
+        "mimeType": f.resp_type.clone().unwrap_or_default(),
+        "text": f.resp_body.clone().unwrap_or_default(),
+    });
+    if f.resp_body.is_none() && f.resp_len > 0 {
+        // An empty text would read as an empty body.
+        content["comment"] = json!(if f.streamed {
+            "response body was streamed through the proxy and not captured"
+        } else {
+            "response body is binary or non-textual and was not captured"
         });
     }
     json!({
@@ -166,19 +179,97 @@ fn har_entry(f: &FlowRecord) -> Value {
             "statusText": "",
             "httpVersion": "HTTP/1.1",
             "headers": har_headers(&f.resp_headers),
-            "cookies": [],
-            "content": {
-                "size": f.resp_len,
-                "mimeType": f.resp_type.clone().unwrap_or_default(),
-                "text": f.resp_body.clone().unwrap_or_default(),
-            },
-            "redirectURL": "",
+            "cookies": har_response_cookies(&f.resp_headers),
+            "content": content,
+            "redirectURL": har_redirect_url(f),
             "headersSize": -1,
             "bodySize": f.resp_len,
         },
         "cache": {},
         "timings": {"send": 0, "wait": f.dur_ms.unwrap_or(0), "receive": 0},
     })
+}
+
+/// HAR `queryString`: the decoded `name=value` pairs of the request target.
+fn har_query_string(path: &str) -> Value {
+    let Some((_, query)) = path.split_once('?') else {
+        return json!([]);
+    };
+    let decode = |part: &str| {
+        urlencoding::decode(&part.replace('+', " "))
+            .map(|value| value.into_owned())
+            .unwrap_or_else(|_| part.to_string())
+    };
+    Value::Array(
+        query
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .map(|pair| {
+                let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+                json!({"name": decode(name), "value": decode(value)})
+            })
+            .collect(),
+    )
+}
+
+/// A redaction placeholder replaced the whole header value; nothing to parse.
+fn is_redacted(value: &str) -> bool {
+    value.trim_start().starts_with("<redacted")
+}
+
+/// HAR request `cookies` from the `Cookie` header(s).
+fn har_request_cookies(headers: &[(String, String)]) -> Value {
+    Value::Array(
+        headers
+            .iter()
+            .filter(|(name, value)| name.eq_ignore_ascii_case("cookie") && !is_redacted(value))
+            .flat_map(|(_, value)| value.split(';'))
+            .filter_map(|cookie| {
+                let (name, value) = cookie.trim().split_once('=')?;
+                Some(json!({"name": name.trim(), "value": value.trim()}))
+            })
+            .collect(),
+    )
+}
+
+/// HAR response `cookies`: one per `Set-Cookie` header, with its attributes.
+fn har_response_cookies(headers: &[(String, String)]) -> Value {
+    Value::Array(
+        headers
+            .iter()
+            .filter(|(name, value)| name.eq_ignore_ascii_case("set-cookie") && !is_redacted(value))
+            .filter_map(|(_, value)| {
+                let mut parts = value.split(';').map(str::trim);
+                let (name, cookie_value) = parts.next()?.split_once('=')?;
+                let mut cookie = json!({"name": name, "value": cookie_value});
+                for attribute in parts {
+                    let (key, attribute_value) =
+                        attribute.split_once('=').unwrap_or((attribute, ""));
+                    match key.to_ascii_lowercase().as_str() {
+                        "path" => cookie["path"] = json!(attribute_value),
+                        "domain" => cookie["domain"] = json!(attribute_value),
+                        "expires" => cookie["expires"] = json!(attribute_value),
+                        "httponly" => cookie["httpOnly"] = json!(true),
+                        "secure" => cookie["secure"] = json!(true),
+                        _ => {}
+                    }
+                }
+                Some(cookie)
+            })
+            .collect(),
+    )
+}
+
+/// HAR `redirectURL`: the `Location` of a redirect response.
+fn har_redirect_url(f: &FlowRecord) -> String {
+    if !f.status.is_some_and(|status| (300..400).contains(&status)) {
+        return String::new();
+    }
+    f.resp_headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+        .map(|(_, value)| value.clone())
+        .unwrap_or_default()
 }
 
 fn har_headers(h: &[(String, String)]) -> Value {
@@ -485,6 +576,49 @@ mod tests {
                 .code,
             "net_export_nothing_replayable"
         );
+    }
+
+    #[test]
+    fn har_fills_query_cookies_redirects_and_uncaptured_bodies() {
+        let mut flow = sample();
+        flow.path = "/search?q=a%20b&tag=x+y&flag".into();
+        flow.status = Some(302);
+        flow.req_headers = vec![("Cookie".into(), "sid=abc; theme=dark".into())];
+        flow.resp_headers = vec![
+            ("Location".into(), "https://api.example.com/next".into()),
+            (
+                "Set-Cookie".into(),
+                "sid=new; Path=/; HttpOnly; Secure".into(),
+            ),
+        ];
+        flow.resp_body = None;
+        flow.resp_len = 10;
+        let entry = har_entry(&flow);
+        assert_eq!(
+            entry["request"]["queryString"],
+            json!([{"name": "q", "value": "a b"}, {"name": "tag", "value": "x y"}, {"name": "flag", "value": ""}])
+        );
+        assert_eq!(
+            entry["request"]["cookies"][1],
+            json!({"name": "theme", "value": "dark"})
+        );
+        assert_eq!(
+            entry["response"]["cookies"][0],
+            json!({"name": "sid", "value": "new", "path": "/", "httpOnly": true, "secure": true})
+        );
+        assert_eq!(
+            entry["response"]["redirectURL"],
+            "https://api.example.com/next"
+        );
+        assert!(
+            entry["response"]["content"]["comment"]
+                .as_str()
+                .unwrap()
+                .contains("not captured")
+        );
+
+        flow.req_headers = vec![("Cookie".into(), "<redacted:cookie>".into())];
+        assert_eq!(har_entry(&flow)["request"]["cookies"], json!([]));
     }
 
     fn sample() -> FlowRecord {
