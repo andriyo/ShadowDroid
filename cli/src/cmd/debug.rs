@@ -615,7 +615,16 @@ async fn snapshot_value(
     studio_url: Option<&str>,
 ) -> Result<Value> {
     let state = client.state().await.context("reading server state")?;
-    let screen = client.screen().await.context("reading screen tree")?;
+    // A paused debuggee cannot answer UiAutomation: reading its tree blocks
+    // until the server gives up (~20 s) and then looks like an empty screen.
+    // Ask the debugger first and skip the tree while a session is suspended.
+    let debugger = debugger_snapshot(Some(serial.as_str()), studio_url, args.depth).await;
+    let suspended = debugger_suspended_on(&debugger, serial.as_str());
+    let screen = if suspended {
+        None
+    } else {
+        Some(client.screen().await.context("reading screen tree")?)
+    };
     let foreground_activity = adb::foreground_activity(serial).await;
     let device_info = match client.device().await {
         Ok(info) => serde_json::to_value(info).unwrap_or_else(|_| json!({})),
@@ -631,8 +640,14 @@ async fn snapshot_value(
     } else {
         adb::recent_logcat(serial, args.logs).await
     };
-    let debugger = debugger_snapshot(Some(serial.as_str()), studio_url, args.depth).await;
-    let sample = debug_sample_value(args, &screen, &debugger, &foreground_activity);
+    let sample = debug_sample_value(args, screen.as_ref(), &debugger, &foreground_activity);
+    let screen_value = match &screen {
+        Some(screen) => serde_json::to_value(screen).unwrap_or_else(|_| json!({})),
+        None => json!({
+            "skipped": "app_suspended_in_debugger",
+            "detail": "a debugger session on this device is suspended, so the screen tree was not read",
+        }),
+    };
 
     Ok(json!({
         "type": "debug_snapshot",
@@ -648,7 +663,7 @@ async fn snapshot_value(
             "requested": args.app.clone(),
             "foreground_activity": foreground_activity,
             "server_current": state.current_app,
-            "screen_current": screen.current_app,
+            "screen_current": screen.as_ref().map(|screen| &screen.current_app),
         },
         "server": {
             "version": state.server_version,
@@ -658,7 +673,7 @@ async fn snapshot_value(
             "android_release": state.android_release,
             "viewport": state.viewport,
         },
-        "screen": screen,
+        "screen": screen_value,
         "screenshot": screenshot,
         "debugger": debugger,
         "logs": {
@@ -1913,14 +1928,43 @@ async fn final_snapshot(
     .await
 }
 
+/// Whether a debugger session attached to `serial` is suspended.
+fn debugger_suspended_on(debugger: &Value, serial: &str) -> bool {
+    debugger
+        .pointer("/status/sessions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|session| {
+            session.get("suspended").and_then(Value::as_bool) == Some(true)
+                && session
+                    .pointer("/device/serial")
+                    .and_then(Value::as_str)
+                    .is_none_or(|device| device == serial)
+        })
+}
+
 fn debug_sample_value(
     args: &SnapshotArgs,
-    screen: &crate::proto::ScreenResponse,
+    screen: Option<&crate::proto::ScreenResponse>,
     debugger: &Value,
     foreground_activity: &Option<String>,
 ) -> Value {
     let mut reasons = Vec::<Value>::new();
     let mut next_commands = BTreeSet::<String>::new();
+    let Some(screen) = screen else {
+        return json!({
+            "valid": false,
+            "reasons": [{
+                "code": "app_suspended_in_debugger",
+                "detail": "the app is paused in the debugger, so it cannot report its UI; the screen tree was skipped",
+            }],
+            "requested_app": args.app.clone(),
+            "foreground_activity": foreground_activity.clone(),
+            "debugger_available": debugger.get("available").and_then(Value::as_bool).unwrap_or(false),
+            "next_actions": ["shadowdroid debug resume", "shadowdroid debug stack"],
+        });
+    };
     if screen.element_count == 0 {
         reasons.push(json!({
             "code": "empty_uiautomator_tree",
@@ -2432,6 +2476,33 @@ fn duration_millis(duration: Duration) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suspended_sessions_on_this_device_skip_the_screen_tree() {
+        let debugger = json!({"status": {"sessions": [
+            {"id": "s1", "suspended": true, "device": {"serial": "emulator-5554"}},
+            {"id": "s2", "suspended": false, "device": {"serial": "emulator-5556"}},
+        ]}});
+        assert!(debugger_suspended_on(&debugger, "emulator-5554"));
+        assert!(!debugger_suspended_on(&debugger, "emulator-5556"));
+        assert!(!debugger_suspended_on(
+            &json!({"available": false}),
+            "emulator-5554"
+        ));
+
+        let args = SnapshotArgs {
+            app: Some("com.example".into()),
+            out: None,
+            screenshot_dir: None,
+            no_screenshot: true,
+            logs: 0,
+            depth: 1,
+        };
+        let sample = debug_sample_value(&args, None, &json!({"available": true}), &None);
+        assert_eq!(sample["valid"], false);
+        assert_eq!(sample["reasons"][0]["code"], "app_suspended_in_debugger");
+        assert_eq!(sample["next_actions"][0], "shadowdroid debug resume");
+    }
 
     #[test]
     fn find_divergences_flags_steps_that_differ_across_runs() {
