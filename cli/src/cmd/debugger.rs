@@ -2357,10 +2357,10 @@ mod tests {
 
     #[tokio::test]
     async fn unanswered_bridge_requests_are_classified_by_delivery_and_route() {
-        // Refused: the request never reached Android Studio.
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let closed_url = format!("http://127.0.0.1:{}", closed.local_addr().unwrap().port());
-        drop(closed);
+        // Refused: the request never reached Android Studio. Port 1 needs root
+        // to bind, so unlike a released ephemeral port no parallel test can
+        // start listening on it.
+        let closed_url = "http://127.0.0.1:1".to_string();
         let bridge =
             BridgeClient::with_timeout(Some(&closed_url), Duration::from_millis(300)).unwrap();
         let error = bridge.get(route::SESSION_CONTROL, &[]).await.unwrap_err();
