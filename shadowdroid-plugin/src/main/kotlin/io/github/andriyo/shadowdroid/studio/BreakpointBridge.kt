@@ -834,10 +834,13 @@ internal object BreakpointBridge {
     fun list(projects: List<Project>): Response {
         val payload = mutableListOf<Any>()
         for (project in projects) {
-            for (breakpoint in XDebuggerManager.getInstance(project).breakpointManager.allBreakpoints) {
-                if (breakpoint is XLineBreakpoint<*>) {
-                    payload += breakpointInfo(project, breakpoint)
-                }
+            val manager = XDebuggerManager.getInstance(project).breakpointManager
+            // Line, method, exception, and field breakpoints alike (each is
+            // removable by its id); only Studio's built-in defaults, such as
+            // the "any exception" breakpoint, are left out.
+            for (breakpoint in manager.allBreakpoints) {
+                if (manager.isDefaultBreakpoint(breakpoint)) continue
+                payload += breakpointInfo(project, breakpoint)
             }
         }
         return BridgeProtocol.ok("ok", true, "breakpoints", payload)
