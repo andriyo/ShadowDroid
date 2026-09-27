@@ -593,12 +593,27 @@ pub fn write_stdout(args: fmt::Arguments<'_>, newline: bool) {
     let mut out = stdout.lock();
     let rendered = args.to_string();
     let rendered = crate::redaction::redact_text_if_active(&rendered);
-    if out.write_all(rendered.as_bytes()).is_err() {
-        return;
+    let written = out.write_all(rendered.as_bytes()).and_then(|()| {
+        if newline {
+            out.write_all(b"\n")
+        } else {
+            Ok(())
+        }
+    });
+    if let Err(error) = written
+        && error.kind() == std::io::ErrorKind::BrokenPipe
+    {
+        STDOUT_CLOSED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    if newline {
-        let _ = out.write_all(b"\n");
-    }
+}
+
+static STDOUT_CLOSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the stdout consumer has gone away (a write failed with
+/// `BrokenPipe`). Streaming commands stop instead of running, and holding the
+/// device, with nobody reading.
+pub fn stdout_closed() -> bool {
+    STDOUT_CLOSED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Redaction-aware, non-panicking stderr sink for direct operational messages.

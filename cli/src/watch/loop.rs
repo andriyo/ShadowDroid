@@ -134,18 +134,25 @@ pub async fn run(cfg: WatchConfig) -> Result<()> {
 
     let mut poll = interval(Duration::from_millis(cfg.poll_ms as u64));
     poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
+    let stop_signal = crate::hostenv::termination_signal();
+    tokio::pin!(stop_signal);
     let mut state = WatchState::default();
+    let mut stop_reason = "quit";
 
     loop {
         tokio::select! {
-            result = &mut ctrl_c => {
-                result.context("waiting for ctrl-c")?;
+            result = &mut stop_signal => {
+                stop_reason = result.context("waiting for a stop signal")?;
                 stopping.store(true, Ordering::Release);
                 break;
             }
             _ = poll.tick() => {
+                // Nobody is reading: stop rather than keep polling the device
+                // and holding its lock for every other client.
+                if crate::events::stdout_closed() {
+                    stop_reason = "stdout_closed";
+                    break;
+                }
                 if handle_screen_wake(&cfg, &watchers, &mut state, Wake::Poll, false, None).await {
                     break;
                 }
@@ -171,7 +178,10 @@ pub async fn run(cfg: WatchConfig) -> Result<()> {
     drop(wake_tx);
     drop(command_tx);
     shutdown_producers_and_drain(&stopping, producers, event_tx, event_emitter).await?;
-    emit_action("watch", &json!({"status": "stopped", "device": cfg.serial}));
+    emit_action(
+        "watch",
+        &json!({"status": "stopped", "reason": stop_reason, "device": cfg.serial}),
+    );
     Ok(())
 }
 

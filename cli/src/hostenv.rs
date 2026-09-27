@@ -7,6 +7,29 @@ use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
 
+/// Resolve when the process is asked to stop: Ctrl-C, or on Unix SIGTERM
+/// (harness timeouts, `kill`) or SIGHUP (closed terminal). Long-running
+/// commands select on this so they stop cleanly and record their completion
+/// instead of being killed mid-operation.
+pub async fn termination_signal() -> Result<&'static str> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut terminate = signal(SignalKind::terminate())?;
+        let mut hangup = signal(SignalKind::hangup())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => { result?; Ok("interrupt") }
+            _ = terminate.recv() => Ok("terminate"),
+            _ = hangup.recv() => Ok("hangup"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+        Ok("interrupt")
+    }
+}
+
 /// An environment variable's value, treating set-but-empty (`NAME=`, a common
 /// way to "unset" something in a shell) the same as unset.
 pub fn nonempty_env(name: &str) -> Option<std::ffi::OsString> {

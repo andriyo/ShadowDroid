@@ -344,9 +344,14 @@ async fn stop_value(serial: &Serial, reason: &str) -> Result<Value> {
 async fn wait_for_recording(serial: &Serial, duration: Option<Duration>) -> String {
     let started = tokio::time::Instant::now();
     let mut interval = tokio::time::interval(Duration::from_millis(500));
+    // One listener for the whole wait, so a signal between ticks is not lost.
+    let stop_signal = crate::hostenv::termination_signal();
+    tokio::pin!(stop_signal);
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => return "interrupt".into(),
+            signal = &mut stop_signal => {
+                return signal.unwrap_or("interrupt").into();
+            }
             _ = interval.tick() => {
                 if duration.is_some_and(|duration| started.elapsed() >= duration) {
                     return "duration".into();
