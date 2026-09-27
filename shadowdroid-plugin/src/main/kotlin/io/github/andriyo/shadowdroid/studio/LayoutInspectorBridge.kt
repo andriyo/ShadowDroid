@@ -199,7 +199,8 @@ internal object LayoutInspectorBridge {
                 runCatching { StudioThreading.onIdeaThread { enableEmbeddedInspector(project, device) } }
                     .getOrElse { "error: ${it.message}" }
             }
-            var activation = StudioThreading.onIdeaThread { activateLayoutInspector(project, query, refresh) }
+            val attempt = ActivationAttempt()
+            var activation = StudioThreading.onIdeaThread { activateLayoutInspector(project, query, refresh, attempt) }
 
             while (
                 activation["requested"] == true &&
@@ -208,7 +209,7 @@ internal object LayoutInspectorBridge {
                 BridgeProtocol.nowMs() < deadline
             ) {
                 Thread.sleep(min(LAYOUT_POLL_MS, (deadline - BridgeProtocol.nowMs()).coerceAtLeast(1)))
-                activation = StudioThreading.onIdeaThread { activateLayoutInspector(project, query, refresh) }
+                activation = StudioThreading.onIdeaThread { activateLayoutInspector(project, query, refresh, attempt) }
             }
 
             var state = StudioThreading.onIdeaThread { layoutState(project) }
@@ -318,10 +319,21 @@ internal object LayoutInspectorBridge {
         )
     }
 
+    /**
+     * What one request already asked Studio to do. Repeating these on every
+     * poll restarts Studio's foreground-process handshake each time, so it
+     * never finishes connecting while the request waits.
+     */
+    private class ActivationAttempt {
+        var detectionStarted = false
+        var selectionRequested = false
+    }
+
     private fun activateLayoutInspector(
         project: Project,
         query: Map<String, String>,
         refresh: LayoutRefreshObserver,
+        attempt: ActivationAttempt,
     ): MutableMap<String, Any?> {
         val inspector = LayoutInspectorProjectService.getInstance(project).getLayoutInspector()
         val target = LayoutTarget.from(query)
@@ -351,18 +363,21 @@ internal object LayoutInspectorBridge {
             return payload
         }
 
-        if (!target.device.isNullOrBlank()) {
-            // The query's device may be a serial or a model name (deviceMatches
-            // accepts both); the forced-serial API needs the actual serial.
-            val serial = processModel.processes
-                .map { it.device }
-                .firstOrNull { target.device == it.serial || target.device == it.model }
-                ?.serial ?: target.device
-            inspector.deviceModel?.forcedDeviceSerialNumber = serial
-            inspector.foregroundProcessDetection?.start(serial)
+        if (!attempt.detectionStarted) {
+            attempt.detectionStarted = true
+            if (!target.device.isNullOrBlank()) {
+                // The query's device may be a serial or a model name (deviceMatches
+                // accepts both); the forced-serial API needs the actual serial.
+                val serial = processModel.processes
+                    .map { it.device }
+                    .firstOrNull { target.device == it.serial || target.device == it.model }
+                    ?.serial ?: target.device
+                inspector.deviceModel?.forcedDeviceSerialNumber = serial
+                inspector.foregroundProcessDetection?.start(serial)
+            }
+            launcher.enabled = true
+            inspector.inspectorClientSettings.inLiveMode = true
         }
-        launcher.enabled = true
-        inspector.inspectorClientSettings.inLiveMode = true
 
         if (target.matches(currentProcess) && currentClient.isConnected) {
             refresh.startLiveFetch(inspector, currentClient)
@@ -393,17 +408,18 @@ internal object LayoutInspectorBridge {
         }
 
         val selected = candidates.first()
-        inspector.deviceModel?.setSelectedDevice(selected.device)
         val selectedProcessMatches =
             processModel.selectedProcess?.let(target::matches) == true
-        if (!selectedProcessMatches) {
+        if (!selectedProcessMatches && !attempt.selectionRequested) {
+            attempt.selectionRequested = true
+            inspector.deviceModel?.setSelectedDevice(selected.device)
             processModel.setLayoutInspectorSelectedProcess(selected)
         }
 
         payload["ok"] = false
         payload["selected"] = processInfo(selected)
         payload["candidate_count"] = candidates.size
-        payload["selection_requested"] = !selectedProcessMatches
+        payload["selection_requested"] = attempt.selectionRequested
         payload["reason"] = "waiting for Android Studio Layout Inspector to connect to the selected process"
         return payload
     }
