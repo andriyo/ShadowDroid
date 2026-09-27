@@ -448,6 +448,14 @@ impl Policy {
                             total.merge(self.redact_value(entry));
                             continue;
                         }
+                        if matches!(entry, Value::Array(_)) {
+                            // Keep a list a list (a HAR `cookies` array must stay an
+                            // array) and mask every scalar inside it instead. Objects
+                            // are still replaced whole: evidence projections report a
+                            // pointer below one as `source_redacted`.
+                            total.values += mask_leaves(entry, kind);
+                            continue;
+                        }
                         if !is_placeholder(entry) {
                             let hint = entry.as_str();
                             *entry = Value::String(placeholder(kind, hint).to_string());
@@ -795,6 +803,22 @@ fn sensitive_kind<'a>(key: &str, custom: &BTreeSet<String>) -> Option<&'a str> {
     None
 }
 
+/// Replace every string/number leaf under a sensitive key with its placeholder,
+/// keeping arrays and objects intact. Returns how many leaves were masked.
+fn mask_leaves(value: &mut Value, kind: &str) -> usize {
+    match value {
+        Value::Object(map) => map.values_mut().map(|v| mask_leaves(v, kind)).sum(),
+        Value::Array(values) => values.iter_mut().map(|v| mask_leaves(v, kind)).sum(),
+        Value::String(text) if is_redaction_placeholder(text) => 0,
+        Value::String(_) | Value::Number(_) => {
+            let hint = value.as_str();
+            *value = Value::String(placeholder(kind, hint).to_string());
+            1
+        }
+        Value::Null | Value::Bool(_) => 0,
+    }
+}
+
 fn placeholder(kind: &str, value: Option<&str>) -> &'static str {
     if matches!(kind, "token") && value.is_some_and(|value| JWT.is_match(value)) {
         return "<redacted:jwt>";
@@ -1081,6 +1105,25 @@ mod tests {
             prop_assert_eq!(twice, once);
             prop_assert!(!changed_again);
         }
+    }
+
+    #[test]
+    fn sensitive_containers_keep_their_shape() {
+        let policy = Policy::builtin();
+        let output = policy.redact_output(json!({
+            "request": {
+                "cookies": [],
+                "set_cookies": [{"name": "sid", "value": "SECRETSESSION", "expires": 3600}],
+                "session_cookie": {"value": "SECRETOBJECT"},
+            },
+        }));
+        assert_eq!(output["request"]["session_cookie"], "<redacted:cookie>");
+        assert_eq!(output["request"]["cookies"], json!([]));
+        let cookie = &output["request"]["set_cookies"][0];
+        assert_eq!(cookie["value"], "<redacted:cookie>");
+        assert_eq!(cookie["expires"], "<redacted:cookie>");
+        assert!(!output.to_string().contains("SECRETSESSION"));
+        assert!(!output.to_string().contains("SECRETOBJECT"));
     }
 
     #[test]

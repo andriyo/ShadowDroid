@@ -2164,7 +2164,7 @@ pub async fn show(serial: &Serial, id: &str, opts: ShowOpts) -> Result<()> {
                 "format": "har",
                 "id": id,
                 "held": false,
-                "har": crate::net::export::to_har(&[flow]),
+                "har": crate::net::export::to_har(&[redacted_for_output(flow)]),
             }));
             return Ok(());
         }
@@ -2213,7 +2213,7 @@ pub async fn show(serial: &Serial, id: &str, opts: ShowOpts) -> Result<()> {
                         "id": id,
                         "held": true,
                         "lifecycle": daemon_lifecycle,
-                        "har": crate::net::export::to_har(&[flow]),
+                        "har": crate::net::export::to_har(&[redacted_for_output(flow)]),
                     }));
                     return Ok(());
                 }
@@ -3737,6 +3737,17 @@ pub async fn replay(serial: &Serial, from: &Path, host: Option<String>) -> Resul
         }),
     );
     Ok(())
+}
+
+/// Apply the active `--redact` policy to a flow before it is rendered as HAR.
+/// HAR headers are name/value pairs, which the generic output redactor cannot
+/// recognise, so a HAR must be built from an already-redacted record (as
+/// `net export har` does).
+fn redacted_for_output(mut flow: crate::net::flow::FlowRecord) -> crate::net::flow::FlowRecord {
+    if let Some(policy) = crate::redaction::active_policy() {
+        policy.redact_flow_record(&mut flow);
+    }
+    flow
 }
 
 #[cfg(test)]
