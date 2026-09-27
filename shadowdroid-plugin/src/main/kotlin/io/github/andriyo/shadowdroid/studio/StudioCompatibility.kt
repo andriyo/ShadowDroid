@@ -23,6 +23,10 @@ internal object StudioCompatibility {
             "layout commands cannot turn Layout Inspector on; enable it in Running Devices by hand",
         ) { LayoutInspectorBridge.canReadRunningDevicesTabs() },
         Check(
+            "running_devices_mirroring",
+            "layout commands cannot open a device in Running Devices; open it there by hand",
+        ) { LayoutInspectorBridge.canShowDevicesInRunningDevices() },
+        Check(
             "kotlin_line_breakpoints",
             "breakpoints in Kotlin files fall back to Java line breakpoints, which can miss lambdas and inlined code",
         ) { BreakpointBridge.hasKotlinLineType() },

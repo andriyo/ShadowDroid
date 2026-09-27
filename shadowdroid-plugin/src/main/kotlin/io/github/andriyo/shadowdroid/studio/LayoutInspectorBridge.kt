@@ -14,7 +14,10 @@ import com.android.tools.idea.layoutinspector.pipeline.appinspection.AppInspecti
 import com.android.tools.idea.layoutinspector.runningdevices.LayoutInspectorManager
 import com.android.tools.idea.layoutinspector.runningdevices.RunningDevicesStateObserver
 import com.android.tools.idea.layoutinspector.setLayoutInspectorSelectedProcess
+import com.android.tools.idea.streaming.MirroringManager
+import com.android.tools.idea.streaming.MirroringState
 import com.android.tools.idea.streaming.core.StreamingDeviceId
+import com.intellij.openapi.components.service
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.editor.Document
 import com.intellij.openapi.fileEditor.FileDocumentManager
@@ -196,7 +199,7 @@ internal object LayoutInspectorBridge {
             // tab; turn it on there rather than waiting for someone to click
             // the toggle.
             val embedded = target.device?.takeIf { it.isNotBlank() }?.let { device ->
-                runCatching { StudioThreading.onIdeaThread { enableEmbeddedInspector(project, device) } }
+                runCatching { enableEmbeddedInspectorShowingDevice(project, device, deadline) }
                     .getOrElse { "error: ${it.message}" }
             }
             val attempt = ActivationAttempt()
@@ -237,9 +240,14 @@ internal object LayoutInspectorBridge {
             val finalReason =
                 when {
                     modelReady -> null
+                    embedded == EMBEDDED_DEVICE_NOT_SHOWN_AFTER_MIRRORING ->
+                        "Android Studio started mirroring ${target.device} but its Running Devices tab " +
+                            "did not appear in time (a physical device may be waiting for a mirroring " +
+                            "confirmation in Studio); retry once it shows"
                     embedded == EMBEDDED_DEVICE_NOT_SHOWN ->
-                        "Layout Inspector runs inside Running Devices, and ${target.device} is not shown " +
-                            "there; open it in Running Devices (the + menu) and retry"
+                        "Layout Inspector runs inside Running Devices, and Android Studio could not show " +
+                            "${target.device} there (an emulator started outside Studio can't be embedded); " +
+                            "start it from Studio's Device Manager or Running Devices + menu and retry"
                     refresh.fetchError.get() != null ->
                         "Android Studio Layout Inspector live fetch failed: ${refresh.fetchError.get()}"
                     !state.available -> state.reason
@@ -263,6 +271,45 @@ internal object LayoutInspectorBridge {
     }
 
     private const val EMBEDDED_DEVICE_NOT_SHOWN = "device_not_in_running_devices"
+    private const val EMBEDDED_DEVICE_NOT_SHOWN_AFTER_MIRRORING = "device_not_shown_after_mirroring"
+    private const val SHOW_DEVICE_WAIT_MS = 10_000L
+
+    /**
+     * [enableEmbeddedInspector], first asking Studio to show [device] in
+     * Running Devices when it isn't there, the way Device Manager's mirror
+     * button does. Waits (off the UI thread) for the tab to appear.
+     */
+    private fun enableEmbeddedInspectorShowingDevice(project: Project, device: String, deadline: Long): String {
+        val first = StudioThreading.onIdeaThread { enableEmbeddedInspector(project, device) }
+        if (first != EMBEDDED_DEVICE_NOT_SHOWN) return first
+        val shown = StudioThreading.onIdeaThread { showInRunningDevices(project, device) }
+        if (!shown) return first
+        val showDeadline = min(deadline, BridgeProtocol.nowMs() + SHOW_DEVICE_WAIT_MS)
+        while (BridgeProtocol.nowMs() < showDeadline) {
+            Thread.sleep(LAYOUT_POLL_MS)
+            val result = StudioThreading.onIdeaThread { enableEmbeddedInspector(project, device) }
+            if (result != EMBEDDED_DEVICE_NOT_SHOWN) return "${result}_after_showing_device"
+        }
+        return EMBEDDED_DEVICE_NOT_SHOWN_AFTER_MIRRORING
+    }
+
+    /** Start mirroring [device] into Running Devices; false when Studio can't show it. */
+    private fun showInRunningDevices(project: Project, device: String): Boolean {
+        val handle = project.service<MirroringManager>().mirroringHandles.value.entries
+            .firstOrNull { (deviceHandle, _) ->
+                deviceHandle.state.connectedDevice?.deviceInfoFlow?.value?.serialNumber == device
+            }
+            ?.value
+            ?: return false
+        if (handle.mirroringState == MirroringState.INACTIVE) handle.toggleMirroring()
+        return true
+    }
+
+    /** Whether this Studio has the mirroring API [showInRunningDevices] uses. */
+    internal fun canShowDevicesInRunningDevices(): Boolean = runCatching {
+        MirroringManager::class.java.getMethod("getMirroringHandles")
+        true
+    }.getOrDefault(false)
 
     /**
      * Enable Layout Inspector in the Running Devices tab of [device] (a
