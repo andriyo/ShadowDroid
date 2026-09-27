@@ -44,7 +44,9 @@ import java.util.Base64
 import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
 class ShadowDroidDebuggerBridge : ProjectActivity {
@@ -508,6 +510,46 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
             val action = query[BridgeQuery.ACTION] ?: return BridgeProtocol.bad("missing action")
             val session = selectSession(query, requireExplicitTarget = true)
                 ?: return BridgeProtocol.bad("no debugger session")
+            val stepping = action == BridgeValues.ACTION_STEP_OVER ||
+                action == BridgeValues.ACTION_STEP_INTO ||
+                action == BridgeValues.ACTION_STEP_OUT
+            // XDebugSession ignores a step on a running session and a resume
+            // or pause that is already in effect; say so instead of "ok".
+            if (stepping && !session.isSuspended) {
+                return Response(
+                    HttpURLConnection.HTTP_CONFLICT,
+                    BridgeProtocol.obj(
+                        "ok", false,
+                        "error", "the session is running; a step needs a paused session and would be ignored",
+                        "error_code", "debug_session_running",
+                        "executed", false,
+                        "session", sessionInfo(sessionIndex(session), session),
+                    ),
+                )
+            }
+            if (action == BridgeValues.ACTION_RESUME && !session.isSuspended) {
+                return BridgeProtocol.ok(
+                    "ok", true, "action", action, "already_running", true,
+                    "session", sessionInfo(sessionIndex(session), session),
+                )
+            }
+            if (action == BridgeValues.ACTION_PAUSE && session.isSuspended) {
+                return BridgeProtocol.ok(
+                    "ok", true, "action", action, "already_suspended", true,
+                    "session", sessionInfo(sessionIndex(session), session),
+                )
+            }
+            // A step resumes the VM and completes at the next pause; wait for it
+            // so the reply says where the step landed and back-to-back steps
+            // never reach a running session.
+            val landed = CountDownLatch(1)
+            val listening = Disposer.newDisposable("ShadowDroid step")
+            if (stepping) {
+                session.addSessionListener(object : XDebugSessionListener {
+                    override fun sessionPaused() = landed.countDown()
+                    override fun sessionStopped() = landed.countDown()
+                }, listening)
+            }
             return try {
                 StudioThreading.onIdeaThread {
                     when (action) {
@@ -521,12 +563,26 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                     }
                     null
                 }
-                if (action == BridgeValues.ACTION_RESUME || action == BridgeValues.ACTION_STOP) {
+                if (action == BridgeValues.ACTION_RESUME || action == BridgeValues.ACTION_STOP || stepping) {
                     advanceHandleEpoch(session)
+                }
+                if (stepping) {
+                    val waitMs = BridgeProtocol.intParam(query, BridgeQuery.TIMEOUT_MS, 5_000, 50, 30_000)
+                    val completed = landed.await(waitMs.toLong(), TimeUnit.MILLISECONDS) && session.isSuspended
+                    return BridgeProtocol.ok(
+                        "ok", true,
+                        "action", action,
+                        // false: the app is still running (the step is inside a
+                        // long call or waiting on another thread); pause or wait.
+                        "completed", completed,
+                        "session", sessionInfo(sessionIndex(session), session),
+                    )
                 }
                 BridgeProtocol.ok("ok", true, "action", action, "session", sessionInfo(sessionIndex(session), session))
             } catch (t: Throwable) {
                 BridgeProtocol.bad(t)
+            } finally {
+                Disposer.dispose(listening)
             }
         }
 

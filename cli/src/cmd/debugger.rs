@@ -2157,6 +2157,27 @@ impl BridgeClient {
             ])
             .into());
         }
+        if bridge_error_code(&value) == Some("debug_session_running") {
+            // The step was refused, not queued: nothing happened.
+            return Err(crate::diagnostic::DiagnosticError::new(
+                "debug_session_running",
+                "debugger",
+                value
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("the debug session is running"),
+            )
+            .detail(serde_json::json!({
+                "route": path,
+                "executed": false,
+                "session": value.get("session"),
+            }))
+            .next_actions([
+                "stop the app first: `shadowdroid debug pause`, or trigger a breakpoint and check `shadowdroid debug sessions`",
+                "then step again",
+            ])
+            .into());
+        }
         if bridge_error_code(&value) == Some("layout_debugger_conflict") {
             return Err(layout_debugger_conflict_diagnostic(
                 value,
@@ -2794,6 +2815,45 @@ mod tests {
             }
         });
         (format!("http://{address}"), seen)
+    }
+
+    #[tokio::test]
+    async fn a_step_on_a_running_session_is_a_typed_refusal() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let reply = json!({
+            "ok": false,
+            "error": "the session is running; a step needs a paused session and would be ignored",
+            "error_code": "debug_session_running",
+            "executed": false,
+            "session": {"id": "session_1", "suspended": false},
+        })
+        .to_string();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                reply.len(),
+                reply
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let bridge = BridgeClient::new(Some(&format!("http://{address}"))).unwrap();
+        let error = bridge
+            .get(
+                route::SESSION_CONTROL,
+                &[(query::ACTION, Some("step_over"))],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(crate::cli::error_code_of(&error), "debug_session_running");
+        assert!(!crate::cli::error_retryable_of(&error));
     }
 
     #[tokio::test]
