@@ -134,6 +134,13 @@ pub struct RecompositionArgs {
     /// How long to wait for Android Studio Layout Inspector to produce a model.
     #[arg(long, default_value_t = DEFAULT_LAYOUT_STUDIO_WAIT_MS)]
     pub studio_wait_ms: u64,
+    /// Only return nodes recomposed at least this many times (the full tree of
+    /// a real screen is hundreds of nodes; `--min-count 1` keeps what changed).
+    #[arg(long, default_value_t = 0)]
+    pub min_count: u64,
+    /// Return at most this many nodes, most recomposed first.
+    #[arg(long)]
+    pub limit: Option<usize>,
 }
 
 #[derive(Args)]
@@ -420,8 +427,38 @@ async fn recompositions_cmd(
         ])
         .into());
     }
+    filter_recomposition_nodes(&mut value, args.min_count, args.limit);
     crate::events::emit_result(&value);
     Ok(())
+}
+
+/// Keep nodes recomposed at least `min_count` times; with `limit`, the most
+/// recomposed first. The summary still describes the whole tree.
+fn filter_recomposition_nodes(value: &mut Value, min_count: u64, limit: Option<usize>) {
+    if min_count == 0 && limit.is_none() {
+        return;
+    }
+    let Some(nodes) = value.get_mut("nodes").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let total = nodes.len();
+    let count_of = |node: &Value| {
+        node.pointer("/recomposition/count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    nodes.retain(|node| count_of(node) >= min_count);
+    if let Some(limit) = limit {
+        nodes.sort_by_key(|node| std::cmp::Reverse(count_of(node)));
+        nodes.truncate(limit);
+    }
+    let returned = nodes.len();
+    value["filter"] = json!({
+        "min_count": min_count,
+        "limit": limit,
+        "total_nodes": total,
+        "returned_nodes": returned,
+    });
 }
 
 async fn source_cmd(serial: &Serial, client: &ServerClient, args: LayoutSourceArgs) -> Result<()> {
@@ -1207,6 +1244,27 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::proto::{AppRef, ImeState, Viewport};
+
+    #[test]
+    fn recomposition_filters_keep_the_most_recomposed_nodes() {
+        let node = |id: u64, count: u64| json!({"draw_id": id, "recomposition": {"count": count}});
+        let mut value = json!({"summary": {"nodes": 4}, "nodes": [node(1, 0), node(2, 15), node(3, 2), node(4, 7)]});
+        filter_recomposition_nodes(&mut value, 1, Some(2));
+        let ids: Vec<u64> = value["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["draw_id"].as_u64().unwrap())
+            .collect();
+        assert_eq!(ids, [2, 4]);
+        assert_eq!(value["filter"]["total_nodes"], 4);
+        assert_eq!(value["filter"]["returned_nodes"], 2);
+        assert_eq!(value["summary"]["nodes"], 4);
+
+        let mut untouched = json!({"nodes": [node(1, 0)]});
+        filter_recomposition_nodes(&mut untouched, 0, None);
+        assert!(untouched.get("filter").is_none());
+    }
 
     fn screen(package: &str, pid: i32, element_count: u32) -> ScreenResponse {
         ScreenResponse {
