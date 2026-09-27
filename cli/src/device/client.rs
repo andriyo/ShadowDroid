@@ -735,9 +735,9 @@ mod tests {
             .unwrap();
 
         // Connection refused: the request never reached the device server.
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let closed_port = closed.local_addr().unwrap().port();
-        drop(closed);
+        // Port 1 needs root to bind, so no parallel test can listen on it (a
+        // freshly released ephemeral port can be taken by another test).
+        let closed_port = 1;
         let refused = http
             .post(format!("http://127.0.0.1:{closed_port}/v1/tap"))
             .send()
