@@ -66,11 +66,12 @@ fn main() {
     // stdout stays clean JSON even under `2>&1`. It's read here, ahead of clap,
     // because tracing is initialized before argument dispatch. An explicit
     // `RUST_LOG` (via the default env filter) still takes precedence.
-    let quiet = std::env::args()
+    // `args_os`: `args()` panics on a non-UTF-8 argument before clap can
+    // report it as a structured usage error.
+    let quiet = std::env::args_os()
         .skip(1)
         .any(|a| a == "-q" || a == "--quiet")
-        || std::env::var_os("SHADOWDROID_QUIET")
-            .is_some_and(|v| !matches!(v.to_str(), Some("") | Some("0") | Some("false")));
+        || hostenv::env_truthy("SHADOWDROID_QUIET");
     let default_filter = if quiet { "off" } else { "shadowdroid=info" };
     tracing_subscriber::fmt()
         .with_env_filter(

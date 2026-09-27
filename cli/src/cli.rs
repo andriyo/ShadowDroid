@@ -1606,6 +1606,26 @@ fn json_compatibility(mut command: clap::Command, path: &[String]) -> clap::Comm
     })
 }
 
+/// clap treats a set-but-empty env var as a supplied empty value, so an
+/// `SHADOWDROID_AUTHORITY_DIR=` meant to unset the variable failed every
+/// command, and `SHADOWDROID_DEVICE=` selected the device "". Treat empty
+/// env-backed values as unset, like the direct env reads in [crate::hostenv].
+fn drop_empty_env(mut command: clap::Command) -> clap::Command {
+    let empty: Vec<clap::Id> = command
+        .get_arguments()
+        .filter(|arg| {
+            arg.get_env()
+                .and_then(std::env::var_os)
+                .is_some_and(|value| value.is_empty())
+        })
+        .map(|arg| arg.get_id().clone())
+        .collect();
+    for id in empty {
+        command = command.mut_arg(id, |arg| arg.env(None::<&str>));
+    }
+    command.mut_subcommands(drop_empty_env)
+}
+
 /// Parse argv, converting clap's plaintext usage errors into the same
 /// `{"type":"error",…}` contract as runtime failures (item: agents shouldn't
 /// have to special-case a `try '--help'` plaintext line). `--help`/`--version`
@@ -1618,7 +1638,7 @@ fn parse_cli() -> Cli {
     if std::env::args_os().any(|arg| arg == "--redact") {
         crate::redaction::activate_builtin();
     }
-    let matches = match Cli::command().try_get_matches_from(std::env::args_os()) {
+    let matches = match drop_empty_env(Cli::command()).try_get_matches_from(std::env::args_os()) {
         Ok(matches) => matches,
         Err(err) => {
             let partial_path = crate::cmd::usage::verb_from_argv();

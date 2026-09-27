@@ -511,11 +511,11 @@ fn form_factor_name(value: TargetFormFactor) -> &'static str {
 }
 
 fn emulator_program() -> PathBuf {
-    if let Some(explicit) = std::env::var_os("SHADOWDROID_EMULATOR") {
+    if let Some(explicit) = crate::hostenv::nonempty_env("SHADOWDROID_EMULATOR") {
         return PathBuf::from(explicit);
     }
     for variable in ["ANDROID_SDK_ROOT", "ANDROID_HOME"] {
-        if let Some(root) = std::env::var_os(variable) {
+        if let Some(root) = crate::hostenv::nonempty_env(variable) {
             let candidate = PathBuf::from(root).join("emulator").join(if cfg!(windows) {
                 "emulator.exe"
             } else {
@@ -550,11 +550,11 @@ fn emulator_program() -> PathBuf {
 }
 
 fn adb_program() -> PathBuf {
-    if let Some(explicit) = std::env::var_os("SHADOWDROID_ADB") {
+    if let Some(explicit) = crate::hostenv::nonempty_env("SHADOWDROID_ADB") {
         return PathBuf::from(explicit);
     }
     for variable in ["ANDROID_SDK_ROOT", "ANDROID_HOME"] {
-        if let Some(root) = std::env::var_os(variable) {
+        if let Some(root) = crate::hostenv::nonempty_env(variable) {
             let candidate = PathBuf::from(root)
                 .join("platform-tools")
                 .join(if cfg!(windows) { "adb.exe" } else { "adb" });

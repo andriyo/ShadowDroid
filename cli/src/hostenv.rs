@@ -7,10 +7,16 @@ use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
 
+/// An environment variable's value, treating set-but-empty (`NAME=`, a common
+/// way to "unset" something in a shell) the same as unset.
+pub fn nonempty_env(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(name).filter(|value| !value.is_empty())
+}
+
 /// The user's home directory: `$HOME`, then `%USERPROFILE%` (Windows).
 pub fn home_dir() -> Result<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
+    nonempty_env("HOME")
+        .or_else(|| nonempty_env("USERPROFILE"))
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("cannot determine home directory ($HOME/%USERPROFILE% unset)"))
 }

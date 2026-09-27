@@ -587,3 +587,37 @@ fn net_daemon_help_exposes_ca_flags() {
         "net daemon should accept --ca-key:\n{out}"
     );
 }
+
+#[test]
+fn empty_env_backed_flags_are_treated_as_unset() {
+    // `NAME=` is a common way to unset a variable; clap used to read it as a
+    // supplied empty value and reject every command.
+    let out = Command::new(env!("CARGO_BIN_EXE_shadowdroid"))
+        .args(["config", "paths", "--json"])
+        .env("SHADOWDROID_QUIET", "1")
+        .env("SHADOWDROID_AUTHORITY_DIR", "")
+        .env("SHADOWDROID_DEVICE", "")
+        .env("SHADOWDROID_TARGET", "")
+        .env("SHADOWDROID_SESSION", "")
+        .env("SHADOWDROID_APK", "")
+        .output()
+        .expect("spawn shadowdroid");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    one_json_line(&stdout);
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_argument_is_a_structured_usage_error() {
+    use std::os::unix::ffi::OsStrExt;
+    let out = Command::new(env!("CARGO_BIN_EXE_shadowdroid"))
+        .args(["commands", "--json", "--describe"])
+        .arg(std::ffi::OsStr::from_bytes(b"ui\xff"))
+        .env("SHADOWDROID_QUIET", "1")
+        .output()
+        .expect("spawn shadowdroid");
+    let value = one_json_line(&String::from_utf8_lossy(&out.stdout));
+    assert_eq!(value["type"], "error", "{value}");
+    assert_ne!(out.status.code(), Some(101), "must not panic");
+}

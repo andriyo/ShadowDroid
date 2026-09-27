@@ -97,8 +97,9 @@ async fn check_latest() -> Result<UpdateCheck> {
 }
 
 async fn latest_release() -> Result<LatestRelease> {
-    let url = std::env::var("SHADOWDROID_UPDATE_LATEST_URL")
-        .unwrap_or_else(|_| DEFAULT_LATEST_RELEASE_URL.to_string());
+    let url = crate::hostenv::nonempty_env("SHADOWDROID_UPDATE_LATEST_URL")
+        .and_then(|url| url.into_string().ok())
+        .unwrap_or_else(|| DEFAULT_LATEST_RELEASE_URL.to_string());
     let client = crate::release::http_client(std::time::Duration::from_secs(30))?;
     let bytes = crate::release::download_small_bytes(&client, &url, 1024 * 1024).await?;
     serde_json::from_slice(&bytes).with_context(|| format!("parse latest release JSON from {url}"))
