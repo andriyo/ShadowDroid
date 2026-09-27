@@ -733,7 +733,7 @@ pub async fn run(serial: &Serial, args: &SessionArgs) -> Result<()> {
             write_state(&path, &state)?;
             crate::events::emit_action(
                 "session_open",
-                &json!({"session":owner.token,"ownership":public_state(&state),"next_actions":["pass --session <session> to each driver command; advisers use session observe --subscription <unique-id>"]}),
+                &json!({"session":owner.token,"ownership":public_state(&state),"next_actions":["pass --session <session> before the subcommand (or set SHADOWDROID_SESSION) on each driver command; advisers use session observe --subscription <unique-id>"]}),
             );
         }
         SessionCmd::Recover {

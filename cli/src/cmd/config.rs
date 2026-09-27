@@ -64,9 +64,6 @@ pub struct ConfigInitArgs {
     /// Package for --app, e.g. com.example.app.
     #[arg(long)]
     pub package: Option<String>,
-    /// Default ADB serial.
-    #[arg(long)]
-    pub device: Option<String>,
     /// Default named target used when --device/--target are absent.
     #[arg(long, value_name = "NAME")]
     pub default_target: Option<String>,
@@ -143,12 +140,14 @@ pub struct ConfigInitArgs {
     pub json: bool,
 }
 
-pub fn run(args: &ConfigArgs) -> Result<()> {
+/// `device` is the global `-d/--device` value: `config init --device X`
+/// records X as the default ADB serial.
+pub fn run(args: &ConfigArgs, device: Option<&str>) -> Result<()> {
     match &args.cmd {
         ConfigCmd::Paths { json: as_json } => print_value(paths_value()?, *as_json),
         ConfigCmd::Schema { json: as_json } => print_value(schema_value(), *as_json),
         ConfigCmd::Explain { json: as_json } => print_value(explain_value()?, *as_json),
-        ConfigCmd::Init(args) => init_config(args),
+        ConfigCmd::Init(args) => init_config(args, device),
         ConfigCmd::Validate { json: as_json } => {
             let report = validate_value()?;
             if report.get("ok").and_then(Value::as_bool) != Some(true) {
@@ -169,7 +168,7 @@ pub fn run(args: &ConfigArgs) -> Result<()> {
     }
 }
 
-fn init_config(args: &ConfigInitArgs) -> Result<()> {
+fn init_config(args: &ConfigInitArgs, device: Option<&str>) -> Result<()> {
     let scope = if args.user { "user" } else { "project" };
     let path = if args.user {
         cfg::user_config_path()?
@@ -183,7 +182,12 @@ fn init_config(args: &ConfigInitArgs) -> Result<()> {
     };
     let mut changed = Vec::new();
 
-    apply_top_level(&mut config.device, &args.device, "device", &mut changed);
+    apply_top_level(
+        &mut config.device,
+        &device.map(str::to_string),
+        "device",
+        &mut changed,
+    );
     apply_top_level(
         &mut config.default_target,
         &args.default_target,

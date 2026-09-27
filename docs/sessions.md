@@ -4,7 +4,7 @@ Use one driver per device. Advisers can read immutable artifacts or use `session
 
 ## Reserve, observe, act, release
 
-Select an already running device. Open a reservation with an agent label, then pass the returned opaque `session` value through the global `--session` flag or `SHADOWDROID_SESSION` environment variable on every driver command.
+Select an already running device. Open a reservation with an agent label, then pass the returned opaque `session` value through the root `--session` flag (placed before the subcommand) or the `SHADOWDROID_SESSION` environment variable on every driver command. Subcommand-level `--session` flags, such as `net log --session` and `debug stack --session`, name capture and debugger sessions instead.
 
 ```bash
 shadowdroid -d emulator-5554 session open --agent implementer

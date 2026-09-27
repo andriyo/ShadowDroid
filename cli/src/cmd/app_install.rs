@@ -30,6 +30,8 @@ use crate::events::emit_action;
 #[derive(clap::Args)]
 pub struct AppInstallArgs {
     /// Path to the APK to install.
+    // Distinct id: the root `--apk` (server APK override, $SHADOWDROID_APK) is global.
+    #[arg(id = "app_apk", value_name = "APK")]
     pub apk: PathBuf,
     /// Override the package name (otherwise read from the APK via aapt2).
     #[arg(long)]

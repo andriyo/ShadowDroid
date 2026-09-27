@@ -76,8 +76,13 @@ Plus app & device control, permissions, display profiles, diagnostics (`doctor`)
 )]
 pub struct Cli {
     /// Driver token returned by session open or handoff; required for a reserved device.
-    #[arg(long, global = true, env = "SHADOWDROID_SESSION")]
-    pub session: Option<String>,
+    /// Pass it before the subcommand (`shadowdroid --session TOKEN ui dump`).
+    // Deliberately NOT `global = true`: subcommands own their own `--session`
+    // (net capture sessions, debugger sessions). A global arg sharing that id
+    // silently copies values between the two meanings; see
+    // `global_args_never_share_ids_with_subcommand_args`.
+    #[arg(long = "session", id = "session_token", env = "SHADOWDROID_SESSION")]
+    pub session_token: Option<String>,
 
     /// Shared same-host ownership directory. All cooperating clients must use the same authority.
     #[arg(long, global = true, env = "SHADOWDROID_AUTHORITY_DIR")]
@@ -1543,7 +1548,8 @@ pub struct NetDaemonArgs {
     #[arg(long)]
     pub verify_upstream: bool,
     /// Redact captures (internal daemon handoff).
-    #[arg(long = "capture-redact")]
+    // Distinct id: the global `--redact` controls this process's own output.
+    #[arg(long = "capture-redact", id = "capture_redact")]
     pub redact: bool,
     /// Additional JSON key to redact (internal daemon handoff; repeatable).
     #[arg(long = "redaction-json-key")]
@@ -1934,7 +1940,7 @@ async fn run_inner() -> Result<()> {
         }) => {
             crate::redaction::configure(redact_requested, Default::default())?;
             crate::runtime::configure(
-                cli.session.clone(),
+                cli.session_token.clone(),
                 cli.authority_dir.clone(),
                 cli.lock_timeout_ms,
             )?;
@@ -1944,7 +1950,7 @@ async fn run_inner() -> Result<()> {
             crate::redaction::configure(redact_requested, Default::default())?;
             return crate::verify::run(args);
         }
-        Cmd::Config(args) => return crate::cmd::config::run(args),
+        Cmd::Config(args) => return crate::cmd::config::run(args, cli.device.as_deref()),
         Cmd::Skill(args) => return crate::cmd::skill::run(args),
         Cmd::Usage(args) => return crate::cmd::usage::run(args),
         Cmd::Update { check, json } => return crate::update::cmd_update(*check, *json).await,
@@ -1965,7 +1971,7 @@ async fn run_inner() -> Result<()> {
     )?;
     crate::device::installer::set_lifecycle_wait_ms(u64::from(cli.lock_timeout_ms));
     crate::runtime::configure(
-        cli.session.clone(),
+        cli.session_token.clone(),
         cli.authority_dir.clone(),
         cli.lock_timeout_ms,
     )?;
@@ -3028,14 +3034,12 @@ fn apply_debugger_config(cmd: &mut DebuggerCmd, config: &ShadowDroidConfig) {
                     .default_app()
                     .and_then(|app| config.configured_package_for(&app));
             }
-            if filter.device.is_none() {
-                filter.device = config.device.clone();
-            }
+            // The device scope comes from the global -d/--device, the selected
+            // target, or config.device (see `DeviceSelection::debugger_filter`).
         }
         DebuggerCmd::Attach {
             project,
             package,
-            device,
             debugger,
             mode,
             configuration,
@@ -3051,9 +3055,6 @@ fn apply_debugger_config(cmd: &mut DebuggerCmd, config: &ShadowDroidConfig) {
                     .as_deref()
                     .and_then(|app| config.default_project_for(Some(app)))
                     .or_else(|| config.project.clone());
-            }
-            if device.is_none() {
-                *device = config.device.clone();
             }
             if debugger.is_none() {
                 *debugger = package
@@ -7316,6 +7317,109 @@ mod tests {
             detail: None,
         });
         assert!(error_uses_fallback(&unknown_server));
+    }
+
+    #[test]
+    fn global_args_never_share_ids_with_subcommand_args() {
+        // clap skips propagating a global into a subcommand that already has an
+        // arg with that id, then copies values between the two in BOTH
+        // directions. Same-typed collisions neither panic nor trip
+        // debug_assert, so they must be caught structurally.
+        fn walk(
+            cmd: &clap::Command,
+            path: &mut Vec<String>,
+            globals: &[&clap::Arg],
+            clashes: &mut Vec<String>,
+        ) {
+            for sub in cmd.get_subcommands() {
+                path.push(sub.get_name().to_string());
+                for arg in sub.get_arguments() {
+                    for global in globals {
+                        let same_long =
+                            arg.get_long().is_some() && arg.get_long() == global.get_long();
+                        let same_short =
+                            arg.get_short().is_some() && arg.get_short() == global.get_short();
+                        if arg.get_id() == global.get_id() || same_long || same_short {
+                            clashes.push(format!(
+                                "`{}` arg `{}` collides with global `{}`",
+                                path.join(" "),
+                                arg.get_id(),
+                                global.get_id()
+                            ));
+                        }
+                    }
+                }
+                walk(sub, path, globals, clashes);
+                path.pop();
+            }
+        }
+        let root = Cli::command();
+        let globals: Vec<&clap::Arg> = root.get_arguments().filter(|a| a.is_global_set()).collect();
+        assert!(globals.iter().any(|a| a.get_id() == "device"));
+        let mut clashes = Vec::new();
+        walk(&root, &mut Vec::new(), &globals, &mut clashes);
+        assert!(clashes.is_empty(), "{clashes:#?}");
+    }
+
+    #[test]
+    fn subcommand_session_and_target_values_stay_local() {
+        let sub = |m: &clap::ArgMatches, name: &str| m.subcommand_matches(name).unwrap().clone();
+
+        // A net capture-session filter is not a runtime driver token.
+        let m = Cli::command()
+            .try_get_matches_from(["shadowdroid", "net", "log", "--session", "cap1"])
+            .unwrap();
+        assert_eq!(m.get_one::<String>("session_token"), None);
+        let log = sub(&sub(&m, "net"), "log");
+        assert_eq!(
+            log.get_one::<String>("session").map(String::as_str),
+            Some("cap1")
+        );
+
+        // The driver token goes before the subcommand and stays at the root.
+        let m = Cli::command()
+            .try_get_matches_from(["shadowdroid", "--session", "tok", "net", "log"])
+            .unwrap();
+        assert_eq!(
+            m.get_one::<String>("session_token").map(String::as_str),
+            Some("tok")
+        );
+        assert_eq!(
+            sub(&sub(&m, "net"), "log").get_one::<String>("session"),
+            None
+        );
+
+        // `net inject <SESSION>` no longer poisons the driver token.
+        let m = Cli::command()
+            .try_get_matches_from([
+                "shadowdroid",
+                "net",
+                "inject",
+                "w1",
+                "--dir",
+                "s2c",
+                "--text",
+                "x",
+            ])
+            .unwrap();
+        assert_eq!(m.get_one::<String>("session_token"), None);
+
+        // `debug auto <app>` names an app, not a device target.
+        let m = Cli::command()
+            .try_get_matches_from(["shadowdroid", "debug", "auto", "com.example"])
+            .unwrap();
+        assert_eq!(m.get_one::<String>("target"), None);
+        let auto = sub(&sub(&m, "debug"), "auto");
+        assert_eq!(
+            auto.get_one::<String>("app_target").map(String::as_str),
+            Some("com.example")
+        );
+
+        // `app install <APK>` is not the server-APK override.
+        let m = Cli::command()
+            .try_get_matches_from(["shadowdroid", "app", "install", "/tmp/app.apk"])
+            .unwrap();
+        assert_eq!(m.get_one::<std::path::PathBuf>("apk"), None);
     }
 
     #[test]

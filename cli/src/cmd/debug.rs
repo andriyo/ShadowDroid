@@ -73,6 +73,8 @@ pub enum DebugCmd {
 #[derive(Args, Clone)]
 pub struct AutoArgs {
     /// App alias, package, or installed app name. Defaults to config, then foreground app.
+    // Distinct id: the root `--target` (device target) is global.
+    #[arg(id = "app_target", value_name = "TARGET")]
     pub target: Option<String>,
     /// App alias or installed app name. Useful when the target would be parsed as an option.
     #[arg(long)]
@@ -253,6 +255,8 @@ pub enum NativeCmd {
 #[derive(Args, Clone)]
 pub struct NativeStatusArgs {
     /// App alias, package, or installed app name. Defaults to config, then foreground app.
+    // Distinct id: the root `--target` (device target) is global.
+    #[arg(id = "app_target", value_name = "TARGET")]
     pub target: Option<String>,
     /// App alias or installed app name.
     #[arg(long)]

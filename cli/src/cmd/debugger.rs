@@ -68,9 +68,6 @@ pub enum DebuggerCmd {
         /// Process id to attach to.
         #[arg(long)]
         pid: Option<i32>,
-        /// Device serial to prefer when Studio has several devices.
-        #[arg(long)]
-        device: Option<String>,
         /// Android debugger id/display name. Defaults to Studio's Java Android debugger.
         #[arg(long)]
         debugger: Option<String>,
@@ -758,9 +755,6 @@ pub struct AndroidClientArgs {
     /// Filter by process id.
     #[arg(long)]
     pub pid: Option<i32>,
-    /// Filter by device serial.
-    #[arg(long)]
-    pub device: Option<String>,
 }
 
 pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&str>) -> Result<()> {
@@ -774,7 +768,8 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
                 (query::PROJECT, filter.project.as_deref()),
                 (query::PACKAGE, filter.package.as_deref()),
                 (query::PID, pid_s.as_deref()),
-                (query::DEVICE, filter.device.as_deref()),
+                // The global -d/--device (or selected target) scopes the listing.
+                (query::DEVICE, device),
             ];
             bridge.get(route::CLIENTS, &params).await?
         }
@@ -782,7 +777,6 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
             project,
             package,
             pid,
-            device,
             debugger,
             mode,
             configuration,
@@ -795,7 +789,8 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
                 (query::PROJECT, project.as_deref()),
                 (query::PACKAGE, package.as_deref()),
                 (query::PID, pid_s.as_deref()),
-                (query::DEVICE, device.as_deref()),
+                // The global -d/--device (or selected target) picks the device.
+                (query::DEVICE, device),
                 (query::DEBUGGER, debugger.as_deref()),
                 (query::MODE, mode_s),
                 (query::CONFIGURATION, configuration.as_deref()),
