@@ -1690,13 +1690,7 @@ fn parse_cli() -> Cli {
             // A genuine usage error → structured JSON that *names* the bad flag
             // (and clap's spelling suggestion) instead of a `try '--help'` line.
             let ctx_str = |kind| clap_context_string(&err, kind);
-            let msg = err
-                .to_string()
-                .lines()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("invalid command-line arguments")
-                .trim_start_matches("error: ")
-                .to_string();
+            let msg = clap_error_summary(&err.to_string());
             let mut extra = serde_json::Map::new();
             extra.insert("kind".into(), json!(format!("{kind:?}")));
             if let Some(a) = ctx_str(ContextKind::InvalidArg) {
@@ -1766,6 +1760,25 @@ fn clap_context_string(err: &clap::Error, kind: ContextKind) -> Option<String> {
         ),
         _ => None,
     })
+}
+
+/// clap's first paragraph as one line. A missing-argument error lists the
+/// arguments on the lines after "…were not provided:", so the first line
+/// alone would name none of them.
+fn clap_error_summary(rendered: &str) -> String {
+    let summary = rendered
+        .lines()
+        .skip_while(|line| line.trim().is_empty())
+        .take_while(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let summary = summary.trim_start_matches("error: ").trim();
+    if summary.is_empty() {
+        "invalid command-line arguments".to_string()
+    } else {
+        summary.to_string()
+    }
 }
 
 fn actionable_clap_suggestion(err: &clap::Error) -> Option<(&'static str, String)> {
@@ -7374,6 +7387,23 @@ mod tests {
             );
         }
         assert!(server_error_next_actions("new_unmapped_code", None).is_none());
+    }
+
+    #[test]
+    fn usage_messages_keep_the_names_clap_lists_after_the_first_line() {
+        assert_eq!(
+            clap_error_summary(
+                "error: the following required arguments were not provided:\n  --agent <AGENT>\n\nUsage: shadowdroid session open --agent <AGENT>\n"
+            ),
+            "the following required arguments were not provided: --agent <AGENT>"
+        );
+        assert_eq!(
+            clap_error_summary(
+                "error: unexpected argument '--x' found\n\n  tip: to pass '--x' as a value, use '-- --x'\n"
+            ),
+            "unexpected argument '--x' found"
+        );
+        assert_eq!(clap_error_summary("\n\n"), "invalid command-line arguments");
     }
 
     #[test]
