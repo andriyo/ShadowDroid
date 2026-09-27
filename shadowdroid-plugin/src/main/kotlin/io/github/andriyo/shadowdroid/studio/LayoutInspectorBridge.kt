@@ -1,17 +1,20 @@
 package io.github.andriyo.shadowdroid.studio
 
 import com.android.ide.common.rendering.api.ResourceReference
+import com.android.tools.idea.appinspection.inspector.api.process.ProcessDescriptor
 import com.android.tools.idea.layoutinspector.LayoutInspector
 import com.android.tools.idea.layoutinspector.LayoutInspectorProjectService
-import com.android.tools.idea.layoutinspector.setLayoutInspectorSelectedProcess
-import com.android.tools.idea.layoutinspector.pipeline.appinspection.AppInspectionInspectorClient
-import com.android.tools.idea.appinspection.inspector.api.process.ProcessDescriptor
 import com.android.tools.idea.layoutinspector.model.AndroidWindow
 import com.android.tools.idea.layoutinspector.model.ComposeViewNode
 import com.android.tools.idea.layoutinspector.model.InspectorModel
 import com.android.tools.idea.layoutinspector.model.RecompositionData
 import com.android.tools.idea.layoutinspector.model.ViewNode
 import com.android.tools.idea.layoutinspector.pipeline.InspectorClient
+import com.android.tools.idea.layoutinspector.pipeline.appinspection.AppInspectionInspectorClient
+import com.android.tools.idea.layoutinspector.runningdevices.LayoutInspectorManager
+import com.android.tools.idea.layoutinspector.runningdevices.RunningDevicesStateObserver
+import com.android.tools.idea.layoutinspector.setLayoutInspectorSelectedProcess
+import com.android.tools.idea.streaming.core.StreamingDeviceId
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.editor.Document
 import com.intellij.openapi.fileEditor.FileDocumentManager
@@ -24,8 +27,8 @@ import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
-import kotlinx.coroutines.launch
 import kotlin.math.min
+import kotlinx.coroutines.launch
 
 internal object LayoutInspectorBridge {
     private const val DEFAULT_LAYOUT_WAIT_MS = 5_000
@@ -189,6 +192,13 @@ internal object LayoutInspectorBridge {
         val target = LayoutTarget.from(query)
         val refresh = StudioThreading.onIdeaThread { LayoutRefreshObserver.install(project) }
         try {
+            // Studio runs Layout Inspector inside the device's Running Devices
+            // tab; turn it on there rather than waiting for someone to click
+            // the toggle.
+            val embedded = target.device?.takeIf { it.isNotBlank() }?.let { device ->
+                runCatching { StudioThreading.onIdeaThread { enableEmbeddedInspector(project, device) } }
+                    .getOrElse { "error: ${it.message}" }
+            }
             var activation = StudioThreading.onIdeaThread { activateLayoutInspector(project, query, refresh) }
 
             while (
@@ -212,6 +222,7 @@ internal object LayoutInspectorBridge {
             val targetMatches = state.client?.process?.let(target::matches) == true
             val generationAfter = state.model?.lastGeneration
             activation["timeout_ms"] = timeoutMs
+            activation["embedded_inspector"] = embedded
             activation["model_ready"] = modelReady
             activation["target_matches_client"] = !target.requested || targetMatches
             activation["live_fetch_requested"] = refresh.fetchStarted.get()
@@ -225,6 +236,9 @@ internal object LayoutInspectorBridge {
             val finalReason =
                 when {
                     modelReady -> null
+                    embedded == EMBEDDED_DEVICE_NOT_SHOWN ->
+                        "Layout Inspector runs inside Running Devices, and ${target.device} is not shown " +
+                            "there; open it in Running Devices (the + menu) and retry"
                     refresh.fetchError.get() != null ->
                         "Android Studio Layout Inspector live fetch failed: ${refresh.fetchError.get()}"
                     !state.available -> state.reason
@@ -245,6 +259,43 @@ internal object LayoutInspectorBridge {
                 StudioThreading.onIdeaThread { refresh.close() }
             }
         }
+    }
+
+    private const val EMBEDDED_DEVICE_NOT_SHOWN = "device_not_in_running_devices"
+
+    /**
+     * Enable Layout Inspector in the Running Devices tab of [device] (a
+     * serial). Returns what happened: `enabled`, `already_enabled`,
+     * `unsupported`, or [EMBEDDED_DEVICE_NOT_SHOWN]. Call on the UI thread.
+     */
+    private fun enableEmbeddedInspector(project: Project, device: String): String {
+        val observer = RunningDevicesStateObserver.getInstance(project)
+        val tab = runningDevicesTabs(observer).firstOrNull { it.serialNumber == device }
+            ?: return EMBEDDED_DEVICE_NOT_SHOWN
+        val manager = LayoutInspectorManager.getInstance(project)
+        return when {
+            !manager.isSupported(tab) -> "unsupported"
+            manager.isEnabled(tab) -> "already_enabled"
+            else -> {
+                manager.enableLayoutInspector(tab, true)
+                "enabled"
+            }
+        }
+    }
+
+    /** The device tabs Running Devices shows (the observer keeps them private). */
+    private fun runningDevicesTabs(observer: RunningDevicesStateObserver): List<StreamingDeviceId> {
+        val fromField = runCatching {
+            val field = RunningDevicesStateObserver::class.java.getDeclaredField("existingTabs")
+            field.isAccessible = true
+            (field.get(observer) as? List<*>)?.filterIsInstance<StreamingDeviceId>()
+        }.getOrNull()
+        if (!fromField.isNullOrEmpty()) return fromField
+        return runCatching {
+            val method = RunningDevicesStateObserver::class.java.getDeclaredMethod("getAllTabsDeviceIds")
+            method.isAccessible = true
+            (method.invoke(observer) as? List<*>)?.filterIsInstance<StreamingDeviceId>()
+        }.getOrNull().orEmpty()
     }
 
     private fun layoutModelReady(
