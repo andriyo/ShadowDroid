@@ -30,16 +30,35 @@ fn checked_control_reply(op: &str, reply: serde_json::Value) -> Result<serde_jso
                 .get("error")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("network daemon rejected the operation");
+            let code = reply
+                .get("error_code")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("net_daemon_rejected")
+                .to_string();
+            let next_actions: Vec<String> = reply
+                .get("next_actions")
+                .and_then(serde_json::Value::as_array)
+                .map(|actions| {
+                    actions
+                        .iter()
+                        .filter_map(|action| action.as_str().map(str::to_string))
+                        .collect()
+                })
+                .filter(|actions: &Vec<String>| !actions.is_empty())
+                .unwrap_or_else(|| {
+                    vec![
+                        "inspect detail.reply and correct the flow id, rule, or daemon state"
+                            .to_string(),
+                        "run `shadowdroid net status` before retrying".to_string(),
+                    ]
+                });
             Err(crate::diagnostic::DiagnosticError::new(
-                "net_daemon_rejected",
+                code,
                 "net",
                 format!("net daemon rejected `{op}`: {message}"),
             )
             .detail(json!({"operation": op, "reply": reply}))
-            .next_actions([
-                "inspect detail.reply and correct the flow id, rule, or daemon state",
-                "run `shadowdroid net status` before retrying",
-            ])
+            .next_actions(next_actions)
             .into())
         }
         None => Err(crate::diagnostic::DiagnosticError::new(

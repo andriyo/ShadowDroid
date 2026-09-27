@@ -2434,6 +2434,9 @@ pub struct WsHeldFrame {
     pub dir: String,
     pub opcode: String,
     pub host: String,
+    /// Whether a drop or payload edit can be applied (see
+    /// [`managed_reencode_safe`]); otherwise only a byte-exact resume can.
+    pub editable: bool,
 }
 
 /// Outcome of applying declarative `ws-*` rules to one frame.
@@ -2783,6 +2786,7 @@ async fn ws_hold(
     id: &str,
 ) -> WsHoldDecision {
     let held_at = events_now();
+    let editable = managed_reencode_safe(meta.deflate, direction);
     let preview = std::str::from_utf8(&frame.payload)
         .ok()
         .map(|text| collapse_ws(text, PREVIEW_CAP))
@@ -2803,6 +2807,7 @@ async fn ws_hold(
                 dir: direction.as_str().to_string(),
                 opcode: opcode.to_string(),
                 host: meta.host.clone(),
+                editable,
             },
         );
     }
@@ -2816,6 +2821,7 @@ async fn ws_hold(
         opcode: opcode.to_string(),
         len: frame.payload.len() as u64,
         hold_deadline_ms: cfg.hold_ms,
+        editable,
         preview,
         next_actions: crate::net::ws_intercept_next_actions(&ctx.serial, id),
     }));
@@ -2907,6 +2913,7 @@ where
         direction,
         &opcode,
     );
+    let mut held_seq = None;
     // Intercept only if no rule already decided this frame.
     if matches!(action, WsRuleAction::Forward) {
         let cfg = ctx
@@ -2917,7 +2924,9 @@ where
             .clone()
             .filter(|cfg| cfg.matches(&meta.host, direction, &opcode));
         if let Some(cfg) = cfg {
+            // The held id is the id the frame is recorded under below.
             let seq = counter.fetch_add(1, Ordering::Relaxed);
+            held_seq = Some(seq);
             let id = format!("{}.{}", meta.id, seq);
             action = match ws_hold(ctx, meta, direction, &frame, &opcode, &cfg, &id).await {
                 WsHoldDecision::Forward => WsRuleAction::Forward,
@@ -2993,7 +3002,7 @@ where
     };
     if let Some(message) = record_message {
         stats.record(direction, &message);
-        let seq = counter.fetch_add(1, Ordering::Relaxed);
+        let seq = held_seq.unwrap_or_else(|| counter.fetch_add(1, Ordering::Relaxed));
         let mut record = build_message_record(
             meta,
             direction,
@@ -4707,6 +4716,93 @@ mod tests {
         );
         assert_eq!(violations[0].action, "observed_incomplete");
         assert_eq!(violations[0].detail["frame_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn held_frames_refuse_unsafe_drops_and_keep_their_recorded_id() {
+        let ctx = pump_test_context();
+        *ctx.shared.ws_intercept.write().unwrap() = Some(WsInterceptCfg {
+            host: None,
+            dir: Some(Direction::ClientToServer),
+            opcode: None,
+            hold_ms: 5_000,
+            on_timeout_drop: false,
+        });
+        // permessage-deflate with context takeover: re-encoding or dropping a
+        // frame would desync the server's inflate window.
+        let meta = Arc::new(WsSessionMeta {
+            id: "w7".to_string(),
+            capture_session_id: "n-test".to_string(),
+            host: "ws.example.com".to_string(),
+            started_ts: events_now(),
+            deflate: DeflateParams {
+                enabled: true,
+                client_no_context_takeover: false,
+                server_no_context_takeover: false,
+            },
+        });
+        let (observed_tx, mut observed_rx) = mpsc::channel(16);
+        let (mut input, reader) = tokio::io::duplex(256);
+        let (writer, mut output) = tokio::io::duplex(256);
+        let (_inject_tx, inject_rx) = mpsc::channel(1);
+        let pump = tokio::spawn(pump(
+            ctx.clone(),
+            meta.clone(),
+            Direction::ClientToServer,
+            reader,
+            writer,
+            MessageAssembler::new(Direction::ClientToServer, meta.deflate),
+            Arc::new(WsStats::default()),
+            Arc::new(AtomicU64::new(1)),
+            observed_tx,
+            inject_rx,
+        ));
+
+        let wire = frame(true, false, 0x1, b"held-msg", Some([1, 2, 3, 4]));
+        input.write_all(&wire).await.unwrap();
+        let held_id = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some((id, frame)) = ctx.shared.ws_held.lock().unwrap().iter().next() {
+                    return (id.clone(), frame.editable);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("frame is held");
+        assert_eq!(held_id, ("w7.1".to_string(), false));
+
+        let refused =
+            crate::net::control::ws_release(&ctx.shared, &held_id.0, WsHoldDecision::Drop, "drop")
+                .unwrap();
+        assert_eq!(refused["ok"], false);
+        assert_eq!(refused["error_code"], "net_ws_frame_not_editable");
+        assert!(ctx.shared.ws_held.lock().unwrap().contains_key(&held_id.0));
+
+        let released = crate::net::control::ws_release(
+            &ctx.shared,
+            &held_id.0,
+            WsHoldDecision::Forward,
+            "resume",
+        )
+        .unwrap();
+        assert_eq!(released["ok"], true);
+        let mut forwarded = vec![0; wire.len()];
+        output.read_exact(&mut forwarded).await.unwrap();
+        assert_eq!(forwarded, wire);
+
+        let record = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(WsObservedRecord::Message(record)) = observed_rx.recv().await {
+                    return record;
+                }
+            }
+        })
+        .await
+        .expect("held frame is recorded");
+        assert_eq!(record.id, "w7.1");
+        drop(input);
+        pump.abort();
     }
 
     #[tokio::test]

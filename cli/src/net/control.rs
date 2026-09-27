@@ -345,6 +345,7 @@ pub async fn serve_client(
                             "dir": frame.dir,
                             "opcode": frame.opcode,
                             "state": "held",
+                            "editable": frame.editable,
                         })
                     })
                     .collect()
@@ -1146,7 +1147,7 @@ fn release(
 
 /// Deliver a decision to a held WebSocket frame. Returns `None` if `id` isn't a
 /// currently-held WS frame (so the caller falls back to the HTTP-flow path).
-fn ws_release(
+pub(crate) fn ws_release(
     shared: &SharedState,
     id: &str,
     decision: crate::net::ws::WsHoldDecision,
@@ -1155,6 +1156,26 @@ fn ws_release(
     let (tx, host, dir, opcode) = {
         let mut held = shared.ws_held.lock().unwrap();
         let entry = held.get_mut(id)?;
+        let mutates = !matches!(decision, crate::net::ws::WsHoldDecision::Forward);
+        if mutates && !entry.editable {
+            // Refuse instead of silently forwarding the original frame; the
+            // frame stays held so a byte-exact `net resume` can still release it.
+            return Some(json!({
+                "ok": false,
+                "error_code": "net_ws_frame_not_editable",
+                "error": format!(
+                    "WebSocket frame `{id}` cannot be {} under permessage-deflate context \
+                     takeover without desyncing the peer; it is still held",
+                    if action == "drop" { "dropped" } else { "edited" }
+                ),
+                "id": id,
+                "editable": false,
+                "next_actions": [
+                    format!("run `shadowdroid net resume {id}` to forward it unchanged"),
+                    "restart the proxy with `net start --anticomp` to negotiate uncompressed WebSocket sessions, then reconnect",
+                ],
+            }));
+        }
         (
             entry.tx.take(),
             entry.host.clone(),

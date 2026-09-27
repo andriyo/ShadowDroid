@@ -127,8 +127,11 @@ shadowdroid net intercept --dir c2s --clear        # disarm
 Modified/dropped/injected frames appear in `net ws` marked `injected` /
 `disposition: modified|dropped` / `rule_id`. **Two limits to plan around:**
 (1) drop/modify re-encode a frame, which is unsafe under `permessage-deflate`
-**context takeover** — such frames are forwarded unchanged and marked
-`disposition: refused_deflate`. Start the proxy with `net start --anticomp` to
+**context takeover** — rule matches are forwarded unchanged and marked
+`disposition: refused_deflate`, and a held frame reports `editable: false`
+(in the `ws_intercept` event and `net status`), where `net drop` and
+`net resume --text/--binary` fail with `net_ws_frame_not_editable` and leave
+the frame held for a plain `net resume`. Start the proxy with `net start --anticomp` to
 negotiate an uncompressed session where drop/modify/intercept fully apply.
 (2) A held frame pauses its whole direction, so act within the app's keepalive
 window (OkHttp defaults to a 5 s ping timeout) or the socket may drop.

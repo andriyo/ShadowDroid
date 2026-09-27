@@ -320,6 +320,10 @@ pub enum Event {
         opcode: String,
         len: u64,
         hold_deadline_ms: u32,
+        /// `net resume --text/--binary` and `net drop` can act on this frame.
+        /// False under permessage-deflate context takeover, where re-encoding or
+        /// dropping a frame would desync the peer's inflate window.
+        editable: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         preview: Option<String>,
         next_actions: Vec<String>,
