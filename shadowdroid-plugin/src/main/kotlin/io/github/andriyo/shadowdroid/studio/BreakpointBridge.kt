@@ -44,6 +44,7 @@ internal object BreakpointBridge {
 
     private const val JAVA_LINE_TYPE_ID = "java-line"
     private const val KOTLIN_LINE_TYPE_ID = "kotlin-line"
+    private const val KOTLIN_FIELD_TYPE_ID = "kotlin-field"
 
     private val LOG = Logger.getInstance(BreakpointBridge::class.java)
 
@@ -793,10 +794,23 @@ internal object BreakpointBridge {
         if (project == null) return BridgeProtocol.bad("no project")
         return try {
             val target = StudioThreading.onIdeaThread {
-                val type = breakpointType(JavaFieldBreakpointType::class.java)
-                    ?: throw IllegalStateException("Java field breakpoint type is not available")
                 val virtualFile = LocalFileSystem.getInstance().refreshAndFindFileByIoFile(File(file))
                     ?: throw IllegalArgumentException("file not found in IDE VFS: $file")
+                // A Java field watchpoint never binds to a Kotlin property: the
+                // Kotlin plugin's own type resolves the backing field.
+                val extension = virtualFile.extension?.lowercase()
+                val kotlinType = if (extension == "kt" || extension == "kts") {
+                    lineBreakpointTypeById(KOTLIN_FIELD_TYPE_ID)
+                } else {
+                    null
+                }
+                if (kotlinType != null) {
+                    return@onIdeaThread addKotlinFieldBreakpoint(
+                        project, kotlinType, virtualFile, line - 1, className, field, temporary, query,
+                    )
+                }
+                val type = breakpointType(JavaFieldBreakpointType::class.java)
+                    ?: throw IllegalStateException("Java field breakpoint type is not available")
                 // Constructor order is (fieldName, className) — passing them
                 // swapped stores the class in myFieldName and the watchpoint
                 // never matches a real field.
@@ -1182,6 +1196,52 @@ internal object BreakpointBridge {
         return ChosenLineType(javaType, canPutAt(javaType, file, zeroBasedLine, project))
     }
 
+    private fun addKotlinFieldBreakpoint(
+        project: Project,
+        type: XLineBreakpointType<*>,
+        file: VirtualFile,
+        zeroBasedLine: Int,
+        className: String,
+        field: String,
+        temporary: Boolean,
+        query: Map<String, String>,
+    ): XLineBreakpoint<*> {
+        @Suppress("UNCHECKED_CAST")
+        val kotlinType = type as XLineBreakpointType<XBreakpointProperties<*>>
+        var breakpoint = findFieldBreakpoint(project, file.url, zeroBasedLine, type.id, field)
+        val properties = breakpoint?.properties
+            ?: kotlinType.createBreakpointProperties(file, zeroBasedLine)
+            ?: throw IllegalStateException("the Kotlin field breakpoint type made no properties")
+        setKotlinFieldProperty(properties, "MyFieldName", field, String::class.java)
+        setKotlinFieldProperty(properties, "MyClassName", className, String::class.java)
+        setKotlinFieldProperty(
+            properties, "WatchAccess",
+            BridgeProtocol.booleanParam(query, BridgeQuery.ACCESS, false), Boolean::class.javaPrimitiveType!!,
+        )
+        setKotlinFieldProperty(
+            properties, "WatchModification",
+            BridgeProtocol.booleanParam(query, BridgeQuery.MODIFICATION, true), Boolean::class.javaPrimitiveType!!,
+        )
+        if (breakpoint == null) {
+            breakpoint = XDebuggerManager.getInstance(project).breakpointManager
+                .addLineBreakpoint(kotlinType, file.url, zeroBasedLine, properties, temporary)
+        }
+        breakpoint.setEnabled(BridgeProtocol.booleanParam(query, BridgeQuery.ENABLED, true))
+        breakpoint.setTemporary(temporary)
+        return breakpoint
+    }
+
+    /** Kotlin plugin properties are reached by name: the Kotlin plugin is optional. */
+    private fun kotlinFieldProperty(props: Any?, name: String): Any? =
+        props?.let { runCatching { it.javaClass.getMethod("get$name").invoke(it) }.getOrNull() }
+
+    private fun setKotlinFieldProperty(props: Any, name: String, value: Any, type: Class<*>) {
+        props.javaClass.getMethod("set$name", type).invoke(props, value)
+    }
+
+    private fun isKotlinFieldProperties(props: Any?): Boolean =
+        props?.javaClass?.simpleName == "KotlinPropertyBreakpointProperties"
+
     private fun lineBreakpointTypeById(id: String): XLineBreakpointType<*>? =
         XBreakpointType.EXTENSION_POINT_NAME.extensionList
             .filterIsInstance<XLineBreakpointType<*>>()
@@ -1202,7 +1262,8 @@ internal object BreakpointBridge {
             .filterIsInstance<XLineBreakpoint<*>>()
             .firstOrNull {
                 it.fileUrl == fileUrl && it.line == zeroBasedLine && it.type.id == typeId &&
-                    (it.properties as? JavaFieldBreakpointProperties)?.myFieldName == field
+                    ((it.properties as? JavaFieldBreakpointProperties)?.myFieldName == field ||
+                        kotlinFieldProperty(it.properties, "MyFieldName") == field)
             }
 
     private fun findExceptionBreakpoint(project: Project, typeId: String, exception: String): XBreakpoint<*>? =
@@ -1277,10 +1338,12 @@ internal object BreakpointBridge {
             .encodeToString(raw.toByteArray(StandardCharsets.UTF_8))
     }
 
-    private fun breakpointIdentityDetails(props: Any?): String = when (props) {
-        is JavaExceptionBreakpointProperties -> "exception:${props.myQualifiedName}"
-        is JavaMethodBreakpointProperties -> "method:${props.myClassPattern}#${props.myMethodName}"
-        is JavaFieldBreakpointProperties -> "field:${props.myClassName}#${props.myFieldName}"
+    private fun breakpointIdentityDetails(props: Any?): String = when {
+        props is JavaExceptionBreakpointProperties -> "exception:${props.myQualifiedName}"
+        props is JavaMethodBreakpointProperties -> "method:${props.myClassPattern}#${props.myMethodName}"
+        props is JavaFieldBreakpointProperties -> "field:${props.myClassName}#${props.myFieldName}"
+        isKotlinFieldProperties(props) ->
+            "field:${kotlinFieldProperty(props, "MyClassName")}#${kotlinFieldProperty(props, "MyFieldName")}"
         else -> ""
     }
 
@@ -1305,7 +1368,17 @@ internal object BreakpointBridge {
             "access", props.WATCH_ACCESS,
             "modification", props.WATCH_MODIFICATION,
         )
-        else -> null
+        else -> if (isKotlinFieldProperties(props)) {
+            BridgeProtocol.map(
+                "kind", "field",
+                "class", kotlinFieldProperty(props, "MyClassName"),
+                "field", kotlinFieldProperty(props, "MyFieldName"),
+                "access", kotlinFieldProperty(props, "WatchAccess"),
+                "modification", kotlinFieldProperty(props, "WatchModification"),
+            )
+        } else {
+            null
+        }
     }
 
     private fun isLogpoint(breakpoint: XBreakpoint<*>): Boolean =
