@@ -171,6 +171,10 @@ struct PrivateStat {
 struct TransactionRoot {
     path: String,
     existed: bool,
+    /// Backed up and removed, but nothing is published in its place: a SQLite
+    /// sidecar present on the device but absent from the snapshot. Rollback
+    /// uses only `path`/`existed`, so this is not persisted.
+    remove_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1059,6 +1063,23 @@ fn is_same_or_descendant(path: &str, root: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
+/// Sidecar paths of every restored database file that the snapshot itself
+/// does not contain.
+fn stale_sqlite_sidecars(roots: &[SnapshotRoot]) -> Vec<String> {
+    let captured: std::collections::BTreeSet<&str> =
+        roots.iter().map(|root| root.path.as_str()).collect();
+    roots
+        .iter()
+        .filter(|root| {
+            root.kind == StatePathKind::File
+                && root.path.starts_with("databases/")
+                && !is_sqlite_sidecar(&root.path)
+        })
+        .flat_map(|root| sqlite_sidecar_candidates(&root.path))
+        .filter(|sidecar| !captured.contains(sidecar.as_str()))
+        .collect()
+}
+
 fn is_sqlite_sidecar(path: &str) -> bool {
     ["-wal", "-shm", "-journal"]
         .iter()
@@ -1155,7 +1176,20 @@ async fn restore(
         roots.push(TransactionRoot {
             path: root.path.clone(),
             existed: private_exists(serial, &package, &root.path).await?,
+            remove_only: false,
         });
+    }
+    // A `-wal`/`-shm`/`-journal` on the device that the snapshot does not have
+    // belongs to the database being replaced. Left beside the restored file,
+    // SQLite would replay it onto the restored database and corrupt it.
+    for path in stale_sqlite_sidecars(&manifest.roots) {
+        if private_exists(serial, &package, &path).await? {
+            roots.push(TransactionRoot {
+                path,
+                existed: true,
+                remove_only: true,
+            });
+        }
     }
     write_transaction_roots(serial, &package, &transaction_root, &roots).await?;
     maybe_test_failpoint("after_roots")?;
@@ -1504,6 +1538,10 @@ fn commit_script(
                 failpoint,
                 &format!("commit_after_backup_{index}"),
             );
+        }
+        if root.remove_only {
+            commands.push(format!("[ ! -e {target} ]"));
+            continue;
         }
         commands.push(format!(
             "mkdir -p {}",
@@ -2084,6 +2122,8 @@ fn parse_transaction_roots(value: &str) -> Result<Vec<TransactionRoot>> {
                         .into());
                     }
                 },
+                // Rollback needs only path and existence.
+                remove_only: false,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -2468,6 +2508,7 @@ mod tests {
                 .map(|(name, existed)| TransactionRoot {
                     path: format!("files/{name}"),
                     existed,
+                    remove_only: false,
                 })
                 .collect::<Vec<_>>();
             let encoded = expected
@@ -2641,10 +2682,12 @@ mod tests {
             TransactionRoot {
                 path: "files/existing".into(),
                 existed: true,
+                remove_only: false,
             },
             TransactionRoot {
                 path: "files/new".into(),
                 existed: false,
+                remove_only: false,
             },
         ];
         let commit = commit_script(
@@ -2711,6 +2754,7 @@ mod tests {
             let roots = vec![TransactionRoot {
                 path: "files/state".into(),
                 existed: true,
+                remove_only: false,
             }];
 
             let output = std::process::Command::new("sh")
@@ -2750,6 +2794,84 @@ mod tests {
     }
 
     #[test]
+    fn device_only_sqlite_sidecars_are_removed_on_restore_and_rolled_back() {
+        let roots = vec![
+            SnapshotRoot {
+                path: "databases/app.db".into(),
+                kind: StatePathKind::File,
+                implicit_sqlite_sidecar: false,
+            },
+            SnapshotRoot {
+                path: "databases/app.db-journal".into(),
+                kind: StatePathKind::File,
+                implicit_sqlite_sidecar: true,
+            },
+        ];
+        assert_eq!(
+            stale_sqlite_sidecars(&roots),
+            vec!["databases/app.db-wal", "databases/app.db-shm"]
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let stage = ".shadowdroid_state/txn-1/stage";
+        let backup = ".shadowdroid_state/txn-1/backup";
+        std::fs::create_dir_all(temp.path().join(stage).join("databases")).unwrap();
+        std::fs::create_dir_all(temp.path().join("databases")).unwrap();
+        std::fs::write(temp.path().join("databases/app.db"), b"current-db").unwrap();
+        std::fs::write(temp.path().join("databases/app.db-wal"), b"current-wal").unwrap();
+        std::fs::write(
+            temp.path().join(stage).join("databases/app.db"),
+            b"snapshot-db",
+        )
+        .unwrap();
+        let roots = vec![
+            TransactionRoot {
+                path: "databases/app.db".into(),
+                existed: true,
+                remove_only: false,
+            },
+            TransactionRoot {
+                path: "databases/app.db-wal".into(),
+                existed: true,
+                remove_only: true,
+            },
+        ];
+        let run = |script: String| {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .current_dir(temp.path())
+                .output()
+                .unwrap()
+        };
+        let commit = run(commit_script(&roots, stage, backup, None));
+        assert!(has_output_marker(
+            &String::from_utf8(commit.stdout).unwrap(),
+            COMMIT_OK
+        ));
+        assert_eq!(
+            std::fs::read(temp.path().join("databases/app.db")).unwrap(),
+            b"snapshot-db"
+        );
+        // The replaced database's WAL is gone, so SQLite cannot replay it.
+        assert!(!temp.path().join("databases/app.db-wal").exists());
+
+        let rollback = run(rollback_roots_script(&roots, backup, None));
+        assert!(has_output_marker(
+            &String::from_utf8(rollback.stdout).unwrap(),
+            ROLLBACK_OK
+        ));
+        assert_eq!(
+            std::fs::read(temp.path().join("databases/app.db")).unwrap(),
+            b"current-db"
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("databases/app.db-wal")).unwrap(),
+            b"current-wal"
+        );
+    }
+
+    #[test]
     fn rollback_restores_every_root_and_withholds_success_when_any_check_fails() {
         let temp = tempfile::tempdir().unwrap();
         let backup = ".shadowdroid_state/txn-1/backup";
@@ -2763,10 +2885,12 @@ mod tests {
             TransactionRoot {
                 path: "files/a".into(),
                 existed: true,
+                remove_only: false,
             },
             TransactionRoot {
                 path: "files/b".into(),
                 existed: true,
+                remove_only: false,
             },
         ];
         let output = std::process::Command::new("sh")
@@ -2816,10 +2940,12 @@ mod tests {
             TransactionRoot {
                 path: "files/a".into(),
                 existed: true,
+                remove_only: false,
             },
             TransactionRoot {
                 path: "files/b".into(),
                 existed: true,
+                remove_only: false,
             },
         ];
         let commit = std::process::Command::new("sh")
