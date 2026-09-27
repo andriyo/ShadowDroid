@@ -70,7 +70,7 @@ A timeout or interruption retains partial evidence and marks the outcome unknown
 shadowdroid verify recover /tmp/verification-attempt-1 --external-workers-stopped
 ```
 
-This releases source/build ownership without changing the old results or replaying actions. Device recovery remains a separate `session recover` operation requiring a changed boot identity. A known test failure permits a new run; an unknown execution does not. Evidence failure or incomplete cleanup never becomes a passing result.
+This releases source/build ownership without changing the old results or replaying actions. Device recovery remains a separate `session recover` operation requiring a changed boot identity. A known failure permits a new run; an unknown execution does not. Failures are known unless the check was interrupted, timed out, left an external worker holding its output, or dispatched a device mutation that never answered: a command that cannot launch, a missing working directory, a rejected install, an unreadable report or a configuration readback mismatch is a known, blocked result. Evidence failure or incomplete cleanup never becomes a passing result.
 
 External commands run with the user's permissions; this is coordination, not a sandbox. They receive `ANDROID_SERIAL` and `SHADOWDROID_DEVICE` but must themselves honor that selection. Isolate source roots, Gradle output directories, ports, app accounts and backend data when running independent agents. The authority cannot stop an IDE or direct ADB client from changing inputs. Artifacts are private local files and may contain application data. `--redact` applies configured output/log redaction, but the plan and source identity are retained for reproducibility; avoid secrets in task text and argv.
 

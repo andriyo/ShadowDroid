@@ -321,6 +321,7 @@ pub async fn run(
             continue;
         }
         let started = crate::runtime::now_ms();
+        let mark = crate::runtime::DeliveryMark::now();
         let execution = tokio::select! {
             result=execute(step,journey,&client,serial,out,&mut journal,&journal_path,&mut memories)=>result,
             _=tokio::signal::ctrl_c()=> {interrupted=true; Err(anyhow::anyhow!("interrupted with action outcome unknown"))},
@@ -340,17 +341,13 @@ pub async fn run(
                 } else {
                     Status::Blocked
                 };
-                unknown = interrupted
-                    || (!terminal_server_error
-                        && matches!(
-                            step,
-                            Step::Start { .. }
-                                | Step::Tap { .. }
-                                | Step::Text { .. }
-                                | Step::Key { .. }
-                                | Step::Configure { .. }
-                                | Step::Lifecycle { .. }
-                        ));
+                // Unknown only when the step was interrupted, a mutation it
+                // dispatched is unanswered (including one abandoned by the
+                // deadline), or the error carries evidence of an unknown
+                // effect. Readback mismatches, settle timeouts and missing
+                // targets are known outcomes, so the configuration journal
+                // is still restored below.
+                unknown = interrupted || mark.uncertain(&e);
                 json!({"error":format!("{e:#}"),"outcome_unknown":unknown})
             }
         };

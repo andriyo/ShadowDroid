@@ -110,12 +110,19 @@ where
         .await
         .map_err(|_| adb_timeout_error(label, ADB_TIMEOUT, "waiting_for_worker"))?
         .map_err(|_| anyhow!("ADB blocking worker pool is closed"))?;
-    spawn_blocking(move || {
+    // Once started, the native call runs to completion even if this future is
+    // dropped (a deadline or Ctrl-C in the caller). The pending mutation is
+    // settled only when its result is observed here, so a dropped caller
+    // leaves the outcome recorded as unknown.
+    let pending = crate::runtime::begin_mutation();
+    let result = spawn_blocking(move || {
         let _permit = permit;
         f()
     })
     .await
-    .with_context(|| format!("{label} task panicked"))?
+    .with_context(|| format!("{label} task panicked"));
+    pending.settle();
+    result?
 }
 
 fn adb_timeout_error(label: &'static str, timeout: Duration, stage: &'static str) -> anyhow::Error {

@@ -357,3 +357,50 @@ fn newly_copied_but_backdated_reports_remain_stale() {
     let (_, report) = run(&source, &["verify", "report", out.to_str().unwrap()]);
     assert_eq!(report["check_statuses"]["unit"], "stale", "{report}");
 }
+
+#[test]
+fn a_command_that_cannot_launch_is_a_known_failure_without_recovery() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    let mut plan = host_plan(&source, "write");
+    plan["requirements"].as_array_mut().unwrap().pop();
+    let working_argv = plan["checks"][0]["adapter"]["argv"].clone();
+    plan["checks"][0]["adapter"]["argv"] = json!(["/nonexistent/shadowdroid-missing-runner"]);
+    std::fs::write(source.join("plan.json"), serde_json::to_vec(&plan).unwrap()).unwrap();
+    let failed = temp.path().join("failed");
+    let (code, value) = run(
+        &source,
+        &[
+            "verify",
+            "run",
+            "plan.json",
+            "--host-only",
+            "--out",
+            failed.to_str().unwrap(),
+        ],
+    );
+    assert_ne!(code, 0, "{value}");
+    assert_eq!(value["code"], "verification_unresolved", "{value}");
+    let (_, report) = run(&source, &["verify", "report", failed.to_str().unwrap()]);
+    assert_eq!(report["check_statuses"]["unit"], "blocked", "{report}");
+    assert_eq!(report["execution_complete"], true, "{report}");
+
+    // The failed run released source/build ownership: a fixed plan runs
+    // without `verify recover`.
+    plan["checks"][0]["adapter"]["argv"] = working_argv;
+    std::fs::write(source.join("plan.json"), serde_json::to_vec(&plan).unwrap()).unwrap();
+    let next = temp.path().join("next");
+    let (code, value) = run(
+        &source,
+        &[
+            "verify",
+            "run",
+            "plan.json",
+            "--host-only",
+            "--out",
+            next.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, 0, "{value}");
+}

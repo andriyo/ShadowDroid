@@ -39,6 +39,48 @@ fn unsettled_mutations() -> usize {
     UNSETTLED_MUTATIONS.load(Ordering::SeqCst)
 }
 
+/// An operation whose effect may have happened, or may still happen, without
+/// being observed — for example an external worker that kept running after
+/// its command was stopped. Raise it only when the outcome is truly unknown.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct OutcomeUnknown(pub String);
+
+/// The delivery-accounting position before a unit of work, such as one
+/// verification check or journey step. A later error leaves that work's
+/// outcome unknown only if a mutation dispatched since the mark is still
+/// unanswered, or the error itself carries evidence of an unknown effect.
+#[derive(Clone, Copy)]
+pub struct DeliveryMark(usize);
+
+impl DeliveryMark {
+    pub fn now() -> Self {
+        Self(unsettled_mutations())
+    }
+
+    pub fn uncertain(self, error: &anyhow::Error) -> bool {
+        uncertain_since(self.0, unsettled_mutations(), error)
+    }
+}
+
+fn uncertain_since(before: usize, now: usize, error: &anyhow::Error) -> bool {
+    now > before || delivery_unknown(error)
+}
+
+/// Error-level evidence of an unknown device effect: an explicit
+/// [OutcomeUnknown], or a native ADB call that timed out while running (it may
+/// still complete later; one that timed out waiting for a worker never started).
+fn delivery_unknown(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.is::<OutcomeUnknown>()
+            || cause
+                .downcast_ref::<crate::diagnostic::DiagnosticError>()
+                .is_some_and(|d| {
+                    d.code == "adb_timeout" && d.detail["stage"] != json!("waiting_for_worker")
+                })
+    })
+}
+
 /// Whether a failed operation may have left a device effect in an unknown
 /// state. Only then must the journal stay quarantined. Errors raised before any
 /// mutation was dispatched (guard refusals, selector ambiguity, host I/O, input
@@ -59,14 +101,7 @@ fn outcome_uncertain(error: &anyhow::Error, changes_device: bool, unsettled: usi
     if !changes_device {
         return false;
     }
-    if unsettled > 0 {
-        return true;
-    }
-    // A timed-out native ADB call may still complete later. One that timed out
-    // while waiting for a worker slot never started.
-    diagnostic.is_some_and(|d| {
-        d.code == "adb_timeout" && d.detail["stage"] != json!("waiting_for_worker")
-    })
+    unsettled > 0 || delivery_unknown(error)
 }
 
 pub fn defer_terminal(value: &Value) -> bool {
@@ -989,6 +1024,23 @@ mod tests {
             ),
             true,
             0
+        ));
+    }
+
+    #[test]
+    fn verification_work_is_unknown_only_with_evidence() {
+        let spawn = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .context("launching verification command");
+        assert!(!uncertain_since(2, 2, &spawn));
+        // A mutation dispatched after the mark is still unanswered.
+        assert!(uncertain_since(2, 3, &spawn));
+        let escaped = anyhow::Error::new(OutcomeUnknown("worker kept the pipe".into()))
+            .context("capturing verification output");
+        assert!(uncertain_since(0, 0, &escaped));
+        assert!(uncertain_since(
+            0,
+            0,
+            &diagnostic("adb_timeout", json!({"stage": "running"}))
         ));
     }
 

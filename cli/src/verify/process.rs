@@ -141,7 +141,11 @@ pub async fn run(
         let _ = child.start_kill();
         tokio::time::timeout(Duration::from_secs(5), child.wait())
             .await
-            .context("verification child did not stop; outcome unknown")?
+            .map_err(|_| {
+                anyhow::Error::new(crate::runtime::OutcomeUnknown(
+                    "verification child did not stop; outcome unknown".into(),
+                ))
+            })?
             .context("reaping verification child")?
     };
     // A detached worker may inherit a pipe after its parent exits. Bound the
@@ -169,9 +173,10 @@ async fn drain(mut task: tokio::task::JoinHandle<Result<u64>>) -> Result<u64> {
         Err(_) => {
             task.abort();
             let _ = task.await;
-            anyhow::bail!(
+            Err(anyhow::Error::new(crate::runtime::OutcomeUnknown(
                 "child exited but an external worker retained its output pipe; execution outcome is unknown"
-            )
+                    .into(),
+            )))
         }
     }
 }

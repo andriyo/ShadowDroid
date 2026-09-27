@@ -152,6 +152,10 @@ pub async fn run(plan_path: &Path, out: &Path, serial: Option<&crate::ids::Seria
     for index in manifest.plan.execution_order()? {
         let check = &manifest.plan.checks[index];
         let start = crate::runtime::now_ms();
+        // An adapter error leaves this check's outcome unknown only when a
+        // device mutation it dispatched is unanswered or the error says so;
+        // spawn, input, precondition and evidence failures are known outcomes.
+        let mark = crate::runtime::DeliveryMark::now();
         manifest.active_check = Some(check.id.clone());
         save_manifest(&out, &manifest)?;
         event(
@@ -210,11 +214,11 @@ pub async fn run(plan_path: &Path, out: &Path, serial: Option<&crate::ids::Seria
                         &mut manifest.cleanup_errors,
                     )
                     .await;
-                    from_execution(&check.id, start, execution, &mut interrupted)
+                    from_execution(&check.id, start, mark, execution, &mut interrupted)
                 }
                 Adapter::VisualComparison { comparison } => {
                     let execution=super::visual::run(&root,&out,&dir,comparison).or_else(|e|Ok((Status::Blocked,json!({"reason":"visual_evidence_unavailable","error":format!("{e:#}")}),false,false)));
-                    from_execution(&check.id, start, execution, &mut interrupted)
+                    from_execution(&check.id, start, mark, execution, &mut interrupted)
                 }
                 Adapter::Connect { server_apk } => {
                     let apk = server_apk.as_deref().map(|p| root.join(p));
@@ -223,7 +227,7 @@ pub async fn run(plan_path: &Path, out: &Path, serial: Option<&crate::ids::Seria
                         apk.as_deref(),
                     )
                     .await;
-                    from_execution(&check.id, start, execution, &mut interrupted)
+                    from_execution(&check.id, start, mark, execution, &mut interrupted)
                 }
                 Adapter::BuildInstall { build } => {
                     let execution = super::build::run(
@@ -233,16 +237,16 @@ pub async fn run(plan_path: &Path, out: &Path, serial: Option<&crate::ids::Seria
                         &dir,
                     )
                     .await;
-                    from_execution(&check.id, start, execution, &mut interrupted)
+                    from_execution(&check.id, start, mark, execution, &mut interrupted)
                 }
                 Adapter::SourceConstraints { rules } => {
                     let execution=super::constraints::source(&root,rules).or_else(|e|Ok((Status::Blocked,json!({"reason":"source_constraint_unavailable","error":format!("{e:#}")}),false,false)));
-                    from_execution(&check.id, start, execution, &mut interrupted)
+                    from_execution(&check.id, start, mark, execution, &mut interrupted)
                 }
                 Adapter::ResolvedDependencies { dependencies } => {
                     let execution =
                         super::constraints::dependencies(&root, dependencies, &dir).await;
-                    from_execution(&check.id, start, execution, &mut interrupted)
+                    from_execution(&check.id, start, mark, execution, &mut interrupted)
                 }
                 Adapter::Matrix {
                     journey,
@@ -258,7 +262,7 @@ pub async fn run(plan_path: &Path, out: &Path, serial: Option<&crate::ids::Seria
                         &mut manifest.cleanup_errors,
                     )
                     .await;
-                    from_execution(&check.id, start, execution, &mut interrupted)
+                    from_execution(&check.id, start, mark, execution, &mut interrupted)
                 }
                 Adapter::Sqlite {
                     package,
@@ -273,7 +277,7 @@ pub async fn run(plan_path: &Path, out: &Path, serial: Option<&crate::ids::Seria
                         &dir,
                     )
                     .await;
-                    from_execution(&check.id, start, execution, &mut interrupted)
+                    from_execution(&check.id, start, mark, execution, &mut interrupted)
                 }
                 Adapter::Journey { journey } => {
                     let execution = super::journey::run(
@@ -301,7 +305,7 @@ pub async fn run(plan_path: &Path, out: &Path, serial: Option<&crate::ids::Seria
                             status: Status::Blocked,
                             started_ms: start,
                             finished_ms: crate::runtime::now_ms(),
-                            outcome_unknown: true,
+                            outcome_unknown: mark.uncertain(&e),
                             evidence: json!({"reason":"journey_error","error":format!("{e:#}")}),
                             artifacts: BTreeMap::new(),
                         },
@@ -348,7 +352,7 @@ pub async fn run(plan_path: &Path, out: &Path, serial: Option<&crate::ids::Seria
                             status: Status::Blocked,
                             started_ms: start,
                             finished_ms: crate::runtime::now_ms(),
-                            outcome_unknown: true,
+                            outcome_unknown: mark.uncertain(&e),
                             evidence: json!({"reason":"execution_or_evidence_error","error":format!("{e:#}")}),
                             artifacts: BTreeMap::new(),
                         },
@@ -811,6 +815,7 @@ pub(super) fn reduce(statuses: impl IntoIterator<Item = Status>) -> Status {
 fn from_execution(
     id: &str,
     start: u64,
+    mark: crate::runtime::DeliveryMark,
     execution: Result<(Status, Value, bool, bool)>,
     interrupted: &mut bool,
 ) -> CheckResult {
@@ -832,7 +837,7 @@ fn from_execution(
             status: Status::Blocked,
             started_ms: start,
             finished_ms: crate::runtime::now_ms(),
-            outcome_unknown: true,
+            outcome_unknown: mark.uncertain(&e),
             evidence: json!({"reason":"adapter_error","error":format!("{e:#}")}),
             artifacts: BTreeMap::new(),
         },
