@@ -171,18 +171,32 @@ impl Journal {
     }
     pub async fn restore(&mut self, serial: &Serial, path: &Path) -> Vec<String> {
         let mut errors = vec![];
+        // Restoring the night mode makes Android rewrite `secure ui_night_mode`
+        // to match. That value is the journal's own doing, not another owner's.
+        let restored_night = self
+            .changes
+            .iter()
+            .find(|change| matches!(change.field, Field::Night))
+            .and_then(|change| change.before.clone());
         for index in (0..self.changes.len()).rev() {
             if self.changes[index].restored {
                 continue;
             }
             let change = &self.changes[index];
+            let implied = implied_raw_night_setting(&change.field, restored_night.as_deref());
             let result = async {
                 let current = read(serial,&change.field).await?;
                 if equivalent(&change.field,current.as_deref(),change.before.as_deref()) {
                     if matches!(&change.field,Field::Setting{key,..} if key=="font_scale") {write(serial,&change.field,change.before.as_deref()).await?;}
                     return Ok(());
                 }
-                anyhow::ensure!(equivalent(&change.field,current.as_deref(),change.owned.as_deref()), "configuration ownership conflict for {:?}: current={current:?}, last_owned={:?}",change.field,change.owned);
+                anyhow::ensure!(
+                    equivalent(&change.field, current.as_deref(), change.owned.as_deref())
+                        || (implied.is_some() && current.as_deref() == implied),
+                    "configuration ownership conflict for {:?}: current={current:?}, last_owned={:?}",
+                    change.field,
+                    change.owned
+                );
                 if matches!(&change.field,Field::Setting{key,..} if key=="font_scale") {
                     // A cancelled settings write can still have queued framework
                     // configuration updates. Let that owned value settle before
@@ -204,6 +218,23 @@ impl Journal {
             }
         }
         errors
+    }
+}
+
+/// For the raw `secure ui_night_mode` entry: the value Android writes when the
+/// journal restores night mode `mode` (UiModeManager: auto=0, no=1, yes=2,
+/// custom=3). `None` for any other field or an unknown mode.
+fn implied_raw_night_setting(field: &Field, mode: Option<&str>) -> Option<&'static str> {
+    if !matches!(field, Field::Setting { namespace, key } if namespace == "secure" && key == "ui_night_mode")
+    {
+        return None;
+    }
+    match mode? {
+        "auto" => Some("0"),
+        "no" => Some("1"),
+        "yes" => Some("2"),
+        "custom" | "custom_schedule" | "custom_bedtime" => Some("3"),
+        _ => None,
     }
 }
 
@@ -416,6 +447,29 @@ pub async fn metadata(serial: &Serial) -> Result<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_night_setting_written_by_restoring_the_mode_is_owned() {
+        let raw = Field::Setting {
+            namespace: "secure".into(),
+            key: "ui_night_mode".into(),
+        };
+        // Fresh AVD: ui_night_mode unset, mode "no"; the journal set "yes".
+        // Restoring the mode makes Android write "1" — ours, not a conflict.
+        assert_eq!(implied_raw_night_setting(&raw, Some("no")), Some("1"));
+        assert_eq!(implied_raw_night_setting(&raw, Some("yes")), Some("2"));
+        assert_eq!(
+            implied_raw_night_setting(&raw, Some("custom_bedtime")),
+            Some("3")
+        );
+        assert_eq!(implied_raw_night_setting(&raw, None), None);
+        assert_eq!(implied_raw_night_setting(&Field::Night, Some("no")), None);
+        let font = Field::Setting {
+            namespace: "system".into(),
+            key: "font_scale".into(),
+        };
+        assert_eq!(implied_raw_night_setting(&font, Some("no")), None);
+    }
     #[test]
     fn custom_night_modes_remain_distinct_restorable_values() {
         for mode in [
