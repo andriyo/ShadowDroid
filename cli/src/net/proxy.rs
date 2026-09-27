@@ -1075,9 +1075,69 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
     }
 }
 
+tokio::task_local! {
+    /// The flow the running [`proxy_request`] would lose if its client hung up.
+    static PENDING_FLOW: Arc<PendingFlow>;
+}
+
+/// What is known about an in-flight flow that has not been captured yet.
+#[derive(Default)]
+struct PendingFlow {
+    record: Mutex<Option<(FlowRecord, std::time::Instant)>>,
+}
+
+/// Why a flow was recorded without the proxy finishing the exchange.
+const CLIENT_CANCELED: &str =
+    "client_canceled: the client closed the connection before the proxy finished the exchange";
+
+/// Remember the current request's best-known record, to be captured if the
+/// client disconnects (hyper then drops the request future mid-await).
+fn note_pending(record: &FlowRecord, started: std::time::Instant) {
+    let _ = PENDING_FLOW.try_with(|pending| {
+        *pending.record.lock().unwrap() = Some((record.clone(), started));
+    });
+}
+
+/// Captures the pending flow when the request future is dropped before it
+/// captured one itself — an app-side timeout would otherwise leave no trace.
+struct ClientCancelGuard {
+    ctx: Arc<ProxyContext>,
+    pending: Arc<PendingFlow>,
+}
+
+impl Drop for ClientCancelGuard {
+    fn drop(&mut self) {
+        let Some((mut record, started)) = self.pending.record.lock().unwrap().take() else {
+            return;
+        };
+        record.error = Some(CLIENT_CANCELED.to_string());
+        record.dur_ms = Some(started.elapsed().as_millis() as u64);
+        record.ts = events::now_ts();
+        finish_capture(&self.ctx, record);
+    }
+}
+
 /// Forward one (decrypted or plaintext) request upstream, applying any active
 /// interception at the request and/or response phase, and capture the flow.
 async fn proxy_request(
+    ctx: Arc<ProxyContext>,
+    req: Request<Incoming>,
+    tunnel: Option<(Scheme, Authority)>,
+) -> Result<Response<ProxyBody>> {
+    let pending = Arc::new(PendingFlow::default());
+    let guard = ClientCancelGuard {
+        ctx: ctx.clone(),
+        pending: pending.clone(),
+    };
+    let result = PENDING_FLOW
+        .scope(pending, proxy_request_inner(ctx, req, tunnel))
+        .await;
+    // Completed: every path that should record a flow already did.
+    guard.pending.record.lock().unwrap().take();
+    result
+}
+
+async fn proxy_request_inner(
     ctx: Arc<ProxyContext>,
     req: Request<Incoming>,
     tunnel: Option<(Scheme, Authority)>,
@@ -1119,6 +1179,31 @@ async fn proxy_request(
 
     let id = flow::new_id();
     let in_scope = ctx.shared.host_in_scope(&host);
+    if in_scope {
+        note_pending(
+            &make_flow(FlowParts {
+                id: &id,
+                method: method.as_str(),
+                scheme: &scheme,
+                host: &host,
+                port,
+                path: &path,
+                req_headers: &req_headers,
+                req_bytes: &req_bytes,
+                req_streamed: req_streaming,
+                status: None,
+                resp_headers: &[],
+                resp_bytes: &[],
+                dur_ms: 0,
+                error: None,
+                matched: None,
+                modified: false,
+                request_body_modified: false,
+                rule_ids: &[],
+            }),
+            std::time::Instant::now(),
+        );
+    }
     let mut matched: Option<String> = None;
     let mut rule_ids = Vec::<String>::new();
     let mut modified = false;
@@ -1630,6 +1715,9 @@ async fn proxy_request(
             snap.resp_body = None;
             snap.resp_len = u64::try_from(resp_bytes.len()).unwrap_or(u64::MAX);
         }
+        // Upstream already answered: keep that answer if the client hangs up
+        // while the response is held.
+        note_pending(&snap, started);
         if let Some(decision) = hold(&ctx, snap, "response", &method).await {
             match decision {
                 HoldDecision::Drop(s) => return Ok(drop_response(&method, s)),
@@ -2246,6 +2334,16 @@ fn stamp_capture_context(ctx: &ProxyContext, rec: &mut FlowRecord) {
 }
 
 fn enqueue_flow(ctx: &ProxyContext, rec: FlowRecord) {
+    // Captured: nothing is pending for this request any more.
+    let _ = PENDING_FLOW.try_with(|pending| {
+        let mut record = pending.record.lock().unwrap();
+        if record
+            .as_ref()
+            .is_some_and(|(pending, _)| pending.id == rec.id)
+        {
+            *record = None;
+        }
+    });
     if ctx.flow_tx.try_send(rec).is_err() {
         let dropped = ctx.shared.dropped_flows.fetch_add(1, Ordering::Relaxed) + 1;
         // Log sparsely under sustained overload while keeping the exact count
@@ -4126,6 +4224,116 @@ mod tests {
 
     fn fail_open() -> HoldDecision {
         HoldDecision::Resume(Mutation::default())
+    }
+
+    #[tokio::test]
+    async fn client_hangups_still_capture_the_flow() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // held_response: upstream answered and the response is held when the
+        // client gives up; otherwise the upstream never answers in time.
+        for held_response in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::default();
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            let cert = params.self_signed(&key).unwrap();
+            let cert_path = dir.path().join("root.crt");
+            let key_path = dir.path().join("root.key");
+            std::fs::write(&cert_path, cert.pem()).unwrap();
+            std::fs::write(&key_path, key.serialize_pem()).unwrap();
+            let ca = crate::net::ca::CertAuthority::load_from_files(&cert_path, &key_path).unwrap();
+            let (flow_tx, mut flow_rx) = tokio::sync::mpsc::channel(4);
+            let shared = Arc::new(shared_with_rules(vec![]));
+            if held_response {
+                *shared.intercept.write().unwrap() = Some(super::InterceptCfg {
+                    matcher: crate::net::Matcher::default(),
+                    at_request: false,
+                    at_response: true,
+                    hold_ms: 30_000,
+                    on_timeout_drop: false,
+                });
+            }
+            let ctx = Arc::new(super::ProxyContext {
+                ca,
+                client: super::build_upstream_client(false),
+                flow_tx,
+                shared: shared.clone(),
+                serial: "cancel-test".into(),
+                capture_session_id: "cancel-test".into(),
+                verify_upstream: false,
+                tasks: tokio_util::task::TaskTracker::new(),
+                shutdown: tokio_util::sync::CancellationToken::new(),
+            });
+            let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let upstream_addr = upstream.local_addr().unwrap();
+            let (answered_tx, answered_rx) = oneshot::channel();
+            let upstream_task = tokio::spawn(async move {
+                let (mut socket, _) = upstream.accept().await.unwrap();
+                let mut request = vec![];
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") {
+                    socket.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                }
+                if held_response {
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 6\r\n\r\nanswer").await.unwrap();
+                }
+                let _ = answered_tx.send(());
+                // Keep the upstream connection open past the client's timeout.
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            });
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let proxy_addr = listener.local_addr().unwrap();
+            let (_stop_tx, stop_rx) = oneshot::channel();
+            let proxy_task = tokio::spawn(super::serve(ctx.clone(), listener, stop_rx));
+            let mut downstream = TcpStream::connect(proxy_addr).await.unwrap();
+            downstream
+                .write_all(
+                    format!(
+                        "GET http://{upstream_addr}/slow HTTP/1.1\r\nHost: {upstream_addr}\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            answered_rx.await.unwrap();
+            if held_response {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while shared.held.lock().unwrap().is_empty() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+            } else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            // The app times out and closes the connection.
+            drop(downstream);
+            let captured = tokio::time::timeout(Duration::from_secs(3), flow_rx.recv())
+                .await
+                .expect("a flow the client gave up on must still be captured")
+                .unwrap();
+            assert!(
+                captured
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("client_canceled"),
+                "{captured:?}"
+            );
+            assert_eq!(captured.path, "/slow");
+            assert_eq!(captured.capture_session_id, "cancel-test");
+            if held_response {
+                assert_eq!(captured.status, Some(200));
+                assert_eq!(captured.resp_body.as_deref(), Some("answer"));
+            } else {
+                assert_eq!(captured.status, None);
+            }
+            upstream_task.abort();
+            proxy_task.abort();
+        }
     }
 
     #[tokio::test]
