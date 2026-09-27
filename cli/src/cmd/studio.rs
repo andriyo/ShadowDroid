@@ -104,6 +104,8 @@ pub struct StudioInfo {
     pub data_directory_name: String,
     pub plugins_dir: String,
     pub shadowdroid_plugin_installed: bool,
+    /// Version of the plugin installed in this Studio's plugins directory.
+    pub shadowdroid_plugin_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -120,6 +122,8 @@ pub struct BridgeInfo {
     pub running: bool,
     pub url: Option<String>,
     pub pid: Option<u64>,
+    /// Version of the plugin the running Studio loaded (older plugins omit it).
+    pub plugin_version: Option<String>,
     pub projects: Vec<serde_json::Value>,
 }
 
@@ -155,6 +159,8 @@ struct ProductInfo {
 struct BridgeRegistry {
     url: Option<String>,
     pid: Option<u64>,
+    #[serde(default)]
+    plugin_version: Option<String>,
     #[serde(default)]
     projects: Vec<serde_json::Value>,
 }
@@ -387,6 +393,27 @@ pub fn status_report(explicit_studio: Option<&Path>) -> Result<StudioReport> {
     } else if !bridge.running {
         guidance.push("Restart Android Studio and open an Android project; the plugin registers the debugger bridge on project startup.".into());
     }
+    for studio in &studios {
+        if let Some(installed) = &studio.shadowdroid_plugin_version
+            && installed != EXPECTED_PLUGIN_VERSION
+        {
+            guidance.push(format!(
+                "{} has ShadowDroid plugin {installed}, but this CLI is {EXPECTED_PLUGIN_VERSION}; run `shadowdroid studio install`, then restart Android Studio.",
+                studio.path
+            ));
+        }
+    }
+    if bridge.running {
+        match &bridge.plugin_version {
+            Some(running) if running != EXPECTED_PLUGIN_VERSION => guidance.push(format!(
+                "the running Android Studio loaded ShadowDroid plugin {running}, but this CLI is {EXPECTED_PLUGIN_VERSION}; restart Android Studio after updating the plugin."
+            )),
+            None => guidance.push(format!(
+                "the running Android Studio loaded a ShadowDroid plugin older than this CLI ({EXPECTED_PLUGIN_VERSION}); run `shadowdroid studio install`, then restart Android Studio."
+            )),
+            _ => {}
+        }
+    }
 
     let report = StudioReport {
         android_studios: studios,
@@ -515,7 +542,40 @@ fn studio_info_from_product_info(root: &Path, product_info_path: &Path) -> Resul
         data_directory_name,
         plugins_dir: plugins_dir.display().to_string(),
         shadowdroid_plugin_installed: installed_dir.is_dir(),
+        shadowdroid_plugin_version: installed_plugin_version(&installed_dir),
     })
+}
+
+/// The `<version>` of an installed plugin, read from the `META-INF/plugin.xml`
+/// inside one of its `lib/*.jar` files.
+fn installed_plugin_version(installed_dir: &Path) -> Option<String> {
+    let jars = fs::read_dir(installed_dir.join("lib")).ok()?;
+    for jar in jars.flatten() {
+        let path = jar.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jar") {
+            continue;
+        }
+        let Ok(file) = fs::File::open(&path) else {
+            continue;
+        };
+        let Ok(mut archive) = ZipArchive::new(file) else {
+            continue;
+        };
+        let Ok(mut entry) = archive.by_name("META-INF/plugin.xml") else {
+            continue;
+        };
+        let mut xml = String::new();
+        if std::io::Read::read_to_string(&mut entry, &mut xml).is_ok() {
+            return plugin_xml_version(&xml);
+        }
+    }
+    None
+}
+
+fn plugin_xml_version(xml: &str) -> Option<String> {
+    let start = xml.find("<version>")? + "<version>".len();
+    let end = start + xml[start..].find("</version>")?;
+    Some(xml[start..end].trim().to_string()).filter(|version| !version.is_empty())
 }
 
 fn find_product_info(path: &Path) -> Option<(PathBuf, PathBuf)> {
@@ -1017,6 +1077,7 @@ fn bridge_status() -> Result<BridgeInfo> {
             running: false,
             url: None,
             pid: None,
+            plugin_version: None,
             projects: Vec::new(),
         });
     }
@@ -1031,6 +1092,7 @@ fn bridge_status() -> Result<BridgeInfo> {
         running,
         url: parsed.url,
         pid: parsed.pid,
+        plugin_version: parsed.plugin_version,
         projects: parsed.projects,
     })
 }
@@ -1188,6 +1250,14 @@ fn print_skill_install_human(value: &serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_xml_version_reads_the_declared_version() {
+        let xml = "<idea-plugin>\n  <id>io.github.andriyo.shadowdroid.studio</id>\n  <version> 1.2.0 </version>\n</idea-plugin>";
+        assert_eq!(plugin_xml_version(xml).as_deref(), Some("1.2.0"));
+        assert_eq!(plugin_xml_version("<idea-plugin/>"), None);
+        assert_eq!(plugin_xml_version("<version></version>"), None);
+    }
 
     #[test]
     fn install_plugin_zip_extracts_nested_entries() {

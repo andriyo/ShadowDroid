@@ -7,9 +7,11 @@ import com.intellij.debugger.engine.JavaDebugProcess
 import com.intellij.debugger.engine.JavaStackFrame
 import com.intellij.debugger.jdi.LocalVariableProxyImpl
 import com.intellij.debugger.jdi.StackFrameProxyImpl
+import com.intellij.ide.plugins.PluginManagerCore
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.diagnostic.Logger
+import com.intellij.openapi.extensions.PluginId
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.startup.ProjectActivity
 import com.intellij.openapi.util.Disposer
@@ -58,6 +60,12 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
         private val LOG = Logger.getInstance(ShadowDroidDebuggerBridge::class.java)
         private const val DEFAULT_PORT = 50576
         private const val API_VERSION = 2
+        private const val PLUGIN_ID = "io.github.andriyo.shadowdroid.studio"
+
+        /** The running plugin's version, so the CLI can spot a stale Studio install. */
+        private val pluginVersion: String? by lazy {
+            PluginManagerCore.getPlugin(PluginId.getId(PLUGIN_ID))?.version
+        }
 
         private val projects = CopyOnWriteArrayList<Project>()
         private val watches = CopyOnWriteArrayList<WatchSpec>()
@@ -406,6 +414,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
             return BridgeProtocol.ok(
                 "ok", true,
                 "api_version", API_VERSION,
+                "plugin_version", pluginVersion,
                 "capabilities", bridgeCapabilities(),
                 "url", serverUrl,
                 "projects", projectPayload(),
@@ -1551,6 +1560,7 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                 Files.createDirectories(dir.toPath())
                 val body = BridgeProtocol.obj(
                     "api_version", API_VERSION,
+                    "plugin_version", pluginVersion,
                     "capabilities", bridgeCapabilities(),
                     "url", url,
                     "pid", ProcessHandle.current().pid(),
