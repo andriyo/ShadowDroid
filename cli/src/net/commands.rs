@@ -2363,6 +2363,7 @@ pub async fn ca_import(
     } else {
         Vec::new()
     };
+    let backup = crate::net::ca::pending_backup(dir);
     let (info, warnings) = crate::net::ca::import_into(dir, cert, key)?;
     // A new CA invalidates any cached "trusted" verdict for this device.
     crate::net::trust::clear_trust_cache(serial);
@@ -2388,11 +2389,23 @@ pub async fn ca_import(
             "ca": info,
             "warnings": warnings,
             "gitignore_added": gitignore_added,
-            "backup": "the previous CA (if any) was saved alongside as ca.crt.bak / ca.key.bak",
+            "backup": backup_report(backup),
             "next": next,
         }),
     );
     Ok(())
+}
+
+/// The previous CA's backup paths, verified on disk, or `null` when there was
+/// no previous CA to back up.
+fn backup_report(backup: Option<(PathBuf, PathBuf)>) -> serde_json::Value {
+    match backup {
+        Some((cert, key)) if cert.exists() => json!({
+            "cert": cert.display().to_string(),
+            "key": key.exists().then(|| key.display().to_string()),
+        }),
+        _ => serde_json::Value::Null,
+    }
 }
 
 /// `net ca info [--project|--global]` — describe the CA in the resolved scope.
@@ -2415,6 +2428,7 @@ pub async fn ca_reset(serial: &Serial, dir: &Path, origin: &str) -> Result<()> {
     } else {
         Vec::new()
     };
+    let backup = crate::net::ca::pending_backup(dir);
     let info = crate::net::ca::reset_in(dir)?;
     crate::net::trust::clear_trust_cache(serial);
     let mut next = vec!["re-run `shadowdroid net trust` to install the regenerated CA".to_string()];
@@ -2431,7 +2445,7 @@ pub async fn ca_reset(serial: &Serial, dir: &Path, origin: &str) -> Result<()> {
             "dir": dir.display().to_string(),
             "ca": info,
             "gitignore_added": gitignore_added,
-            "backup": "the previous CA was saved alongside as ca.crt.bak / ca.key.bak",
+            "backup": backup_report(backup),
             "next": next,
         }),
     );

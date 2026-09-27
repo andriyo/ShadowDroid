@@ -954,6 +954,17 @@ fn sync_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Where replacing the CA in `net_dir` moves the previous certificate and key,
+/// or `None` when there is no CA to back up.
+pub fn pending_backup(net_dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    ca_cert_in(net_dir).exists().then(|| {
+        (
+            bak_path(&ca_cert_in(net_dir)),
+            bak_path(&ca_key_in(net_dir)),
+        )
+    })
+}
+
 fn bak_path(p: &Path) -> PathBuf {
     let name = p
         .file_name()
@@ -1605,6 +1616,17 @@ mod tests {
 
     /// PKCS#1/SEC1 keys (openssl's legacy defaults) must be converted to PKCS#8;
     /// gated on openssl since CI images vary.
+    #[test]
+    fn pending_backup_names_only_a_ca_that_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(pending_backup(dir.path()), None);
+        reset_in(dir.path()).unwrap();
+        let (cert_bak, key_bak) = pending_backup(dir.path()).unwrap();
+        assert!(!cert_bak.exists());
+        reset_in(dir.path()).unwrap();
+        assert!(cert_bak.exists() && key_bak.exists());
+    }
+
     #[test]
     fn normalize_key_converts_legacy_via_openssl() {
         if std::process::Command::new("openssl")
