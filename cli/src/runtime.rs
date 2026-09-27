@@ -464,6 +464,35 @@ fn verify_owner(state: &State, token: Option<&str>) -> Result<()> {
         (None, None) => Ok(()),
     }
 }
+/// Clear an unfinished operation left by a process that has exited, when no
+/// session owns the device. The caller already holds the device's OS lock,
+/// which a quarantining process keeps until it exits, so the journal's writer
+/// is gone. Without a reservation there is no ownership to fence, so the
+/// strict reboot-based `session recover` would only lock the device out; the
+/// outcome is still reported as unknown so the next driver observes first.
+/// Reserved devices keep the strict recovery.
+fn clear_stale_unowned_operation(state: &mut State, serial: &Serial) -> Option<Value> {
+    if state.owner.is_some() {
+        return None;
+    }
+    let stale = state.in_flight.take()?;
+    let request = serde_json::to_value(&stale).unwrap_or(Value::Null);
+    state.last_completion = Some(json!({
+        "request": request,
+        "outcome": "unknown",
+        "cleared_ms": now_ms(),
+        "reason": "stale_unowned_operation",
+    }));
+    Some(json!({
+        "type": "stale_operation_cleared",
+        "device": serial.as_str(),
+        "outcome": "unknown",
+        "command": stale.command,
+        "started_ms": stale.started_ms,
+        "hint": "a previous command on this device ended without a recorded outcome; observe the device (for example `ui dump`) before repeating it",
+    }))
+}
+
 fn require_idle(state: &State) -> Result<()> {
     if state.in_flight.is_some() {
         return Err(fail(
@@ -502,6 +531,10 @@ pub async fn admit(serial: &Serial) -> Result<()> {
     let path = state_path(&options.root, serial);
     let mut state = read_state(&path, serial)?;
     verify_owner(&state, options.token.as_deref())?;
+    if let Some(notice) = clear_stale_unowned_operation(&mut state, serial) {
+        tracing::warn!("cleared an unfinished operation with an unknown outcome on {serial}");
+        crate::events::stash_events(vec![notice]);
+    }
     let command = crate::events::current_command_path().unwrap_or("unknown");
     let recovery_cleanup = state.in_flight.is_some()
         && matches!(
@@ -819,6 +852,55 @@ pub async fn run(serial: &Serial, args: &SessionArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stale_in_flight() -> InFlight {
+        InFlight {
+            request_id: "r".into(),
+            command: "ui tap".into(),
+            pid: 1,
+            started_ms: 5,
+            boot_id: "b".into(),
+        }
+    }
+
+    #[test]
+    fn stale_unowned_operations_are_cleared_with_an_unknown_outcome() {
+        let serial = Serial::new("emulator-5554");
+        let mut state = State {
+            in_flight: Some(stale_in_flight()),
+            ..Default::default()
+        };
+        let notice = clear_stale_unowned_operation(&mut state, &serial).unwrap();
+        assert!(state.in_flight.is_none());
+        require_idle(&state).unwrap();
+        assert_eq!(notice["type"], "stale_operation_cleared");
+        assert_eq!(notice["command"], "ui tap");
+        let completion = state.last_completion.unwrap();
+        assert_eq!(completion["outcome"], "unknown");
+        assert_eq!(completion["request"]["request_id"], "r");
+        // Nothing to clear the second time.
+        let mut clean = State::default();
+        assert!(clear_stale_unowned_operation(&mut clean, &serial).is_none());
+    }
+
+    #[test]
+    fn reserved_devices_keep_strict_recovery() {
+        let serial = Serial::new("emulator-5554");
+        let mut state = State {
+            owner: Some(Owner {
+                token: "t".into(),
+                agent: "a".into(),
+                opened_ms: 0,
+                boot_id: "b".into(),
+                generation: 1,
+                needs_observation: false,
+            }),
+            in_flight: Some(stale_in_flight()),
+            ..Default::default()
+        };
+        assert!(clear_stale_unowned_operation(&mut state, &serial).is_none());
+        assert!(require_idle(&state).is_err());
+    }
 
     fn diagnostic(code: &str, detail: Value) -> anyhow::Error {
         crate::diagnostic::DiagnosticError::new(code, "test", "failure")

@@ -39,7 +39,7 @@ shadowdroid -d emulator-5554 session status
 
 Handoff returns a new token, invalidates the previous token, retains the context and its hash, and requires the recipient to observe again. The caller is responsible for declaring application/backend starting state correctly; the context itself is not proof of cleanup.
 
-Reservations never expire automatically. A killed CLI or ambiguous transport failure leaves its operation journal unresolved. Neither elapsed time nor a missing PID authorizes reassignment. `session status` retains the request, command, start time and prior boot identity. No action is replayed automatically.
+Reservations never expire automatically. A killed CLI or a mutation whose delivery is unknown (for example a request that timed out after it was sent) leaves its operation journal unresolved. Failures with a known outcome, such as a stale `--if-screen` guard or an unmet `--expect-*` postcondition, complete normally. On a reserved device, neither elapsed time nor a missing PID authorizes reassignment, and `session status` retains the request, command, start time and prior boot identity. Without a reservation, the next command clears the unresolved entry once the process that wrote it has exited, and its response carries a `stale_operation_cleared` event with outcome `unknown`: observe the device before repeating the command. No action is replayed automatically.
 
 While an operation is quarantined, the current owner may still run `net stop`, `video stop`, or `disconnect` for cleanup. These commands retain the original unknown request.
 

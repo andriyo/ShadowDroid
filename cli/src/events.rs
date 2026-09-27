@@ -624,13 +624,15 @@ pub fn write_stderr(args: fmt::Arguments<'_>, newline: bool) {
 static PENDING_EVENTS: std::sync::Mutex<Option<Vec<serde_json::Value>>> =
     std::sync::Mutex::new(None);
 
-/// Stage probe results for the next emitted envelope. Empty input is a no-op.
+/// Stage events for the next emitted envelope, after any already staged (for
+/// example a runtime notice staged at admission, then the crash probe's
+/// results). Empty input is a no-op.
 pub fn stash_events(events: Vec<serde_json::Value>) {
     if events.is_empty() {
         return;
     }
     if let Ok(mut slot) = PENDING_EVENTS.lock() {
-        *slot = Some(events);
+        slot.get_or_insert_with(Vec::new).extend(events);
     }
 }
 
@@ -1707,6 +1709,16 @@ mod tests {
         // Drained: the next envelope is clean.
         let v2 = action_envelope("tap", &serde_json::json!({"x": 1}));
         assert!(v2.get("events").is_none(), "{v2}");
+    }
+
+    #[test]
+    fn separately_stashed_events_all_ride_the_envelope() {
+        let _guard = ENVELOPE_TEST_LOCK.lock().unwrap();
+        stash_events(vec![serde_json::json!({"type":"stale_operation_cleared"})]);
+        stash_events(vec![serde_json::json!({"type":"crash","kind":"java"})]);
+        let v = action_envelope("tap", &serde_json::json!({}));
+        assert_eq!(v["events"][0]["type"], "stale_operation_cleared", "{v}");
+        assert_eq!(v["events"][1]["kind"], "java", "{v}");
     }
 
     #[test]
