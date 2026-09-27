@@ -626,20 +626,6 @@ fn reverse_transition_required(
     }
 }
 
-/// Remove a previously-set reverse rule by the device-side port.
-pub async fn reverse_remove(serial: impl Into<String>, device_port: u16) -> Result<()> {
-    let serial = serial.into();
-    bounded_blocking("remove reverse", ADB_TIMEOUT, move || {
-        let mut stream = adb_server_transport(&serial)?;
-        adb_server_request(
-            &mut stream,
-            &format!("reverse:killforward:tcp:{device_port}"),
-        )
-        .with_context(|| format!("adb reverse --remove tcp:{device_port}"))
-    })
-    .await
-}
-
 /// One `adb reverse --list` entry. The ADB server prefixes each line with an
 /// internal transport name; callers only care about the device and host socket
 /// endpoints that follow it.
@@ -900,13 +886,19 @@ pub async fn kill_instrument_zombies(serial: impl Into<String>) -> Result<()> {
 
 /// Explicit takeover used only by `doctor --fix --force`. Unlike normal
 /// lifecycle cleanup this may stop foreign shell-hosted UiAutomation tooling.
-pub async fn kill_all_ui_automation_owners(serial: impl Into<String>) -> Result<()> {
+/// Kill exactly these processes (PIDs from [ps_ui_automation_owners] lines
+/// already classified as foreign UiAutomation holders).
+pub async fn kill_processes(serial: impl Into<String>, pids: &[u32]) -> Result<()> {
+    if pids.is_empty() {
+        return Ok(());
+    }
     let serial = serial.into();
-    let _ = shell_mutating(
-        &serial,
-        "ps -A -o PID,ARGS | grep -E 'app_process|uiautomator|com.wetest.uia2.Main|atx' | grep -v grep | awk '{print $1}' | xargs -r kill -9 2>/dev/null",
-    )
-    .await;
+    let pids = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let _ = shell_mutating(&serial, format!("kill -9 {pids} 2>/dev/null")).await;
     tokio::time::sleep(std::time::Duration::from_millis(800)).await;
     Ok(())
 }

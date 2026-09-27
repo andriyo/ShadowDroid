@@ -987,12 +987,8 @@ pub async fn start(serial: &Serial, opts: StartOpts) -> Result<()> {
 
     // A dead daemon can leave its state file and wiring behind. Restore it
     // before starting a genuinely new session so the new snapshot is truthful.
-    if let Some(stale) = load_device_network_state(serial)? {
-        let outcome = restore_network_state(serial, &stale).await?;
-        for warning in outcome.warnings {
-            tracing::warn!(warning);
-        }
-        remove_device_network_state(serial)?;
+    for warning in recover_recorded_wiring(serial).await? {
+        tracing::warn!(warning);
     }
 
     // Host loopback port is per-serial so concurrent daemons for different
@@ -1657,6 +1653,23 @@ fn remove_device_network_state_if_owned(serial: &Serial, startup_id: &str) -> Re
     }
     remove_device_network_state(serial)?;
     Ok(true)
+}
+
+/// Whether a ShadowDroid proxy session recorded device wiring (the prior
+/// `http_proxy` and `adb reverse`) that no running daemon owns anymore.
+pub(crate) fn has_recorded_wiring(serial: &Serial) -> Result<bool> {
+    Ok(load_device_network_state(serial)?.is_some())
+}
+
+/// Restore the device network state a stopped or crashed session recorded,
+/// touching only wiring still proven to be ShadowDroid's. Returns warnings.
+pub(crate) async fn recover_recorded_wiring(serial: &Serial) -> Result<Vec<String>> {
+    let Some(stale) = load_device_network_state(serial)? else {
+        return Ok(Vec::new());
+    };
+    let outcome = restore_network_state(serial, &stale).await?;
+    remove_device_network_state(serial)?;
+    Ok(outcome.warnings)
 }
 
 fn load_device_network_state(serial: &Serial) -> Result<Option<DeviceNetworkState>> {

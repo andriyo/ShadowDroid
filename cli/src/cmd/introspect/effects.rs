@@ -1479,7 +1479,6 @@ mod tests {
                 &[("cli.rs", 2), ("cmd/agent.rs", 1)],
             ),
             ("adb::reverse_replace(", &[("net/commands.rs", 4)]),
-            ("adb::reverse_remove(", &[("cmd/doctor.rs", 1)]),
             (
                 "adb::install(",
                 &[("cmd/app_install.rs", 1), ("verify/build.rs", 1)],

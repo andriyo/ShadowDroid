@@ -239,7 +239,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         "doctor" => Some(serde_json::json!({
             "use_when": ["ShadowDroid cannot connect, screen reads fail, adb/device state is unclear, or networking may be miswired."],
             "output": "healthy diagnostic report; unhealthy state exits non-zero as doctor_unhealthy with the full report in detail; use --json for machine-readable status",
-            "side_effects": ["--fix may reinstall the server, recreate forwards, restart components, and clear dangling device proxy state"],
+            "side_effects": ["--fix may reinstall the server, recreate forwards, restart components, and restore device proxy wiring left by a stopped ShadowDroid proxy (never a proxy ShadowDroid did not set); --fix --force kills foreign UiAutomation holders only"],
             "next_actions": ["app current", "ui dump", "watch", "collect"]
         })),
         "collect" => Some(serde_json::json!({

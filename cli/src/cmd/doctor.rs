@@ -87,6 +87,9 @@ const ADVISORY_CODES: &[&str] = &[
     "debugger_bridge",
     "net_app",
     "agent",
+    // Clock drift matters for TLS and tokens but not for the pipe, and
+    // `--fix` cannot repair it.
+    "clock",
 ];
 
 /// `healthy` iff every non-advisory check is `ok`. Single source of truth so the
@@ -145,6 +148,14 @@ pub async fn gather(device: Option<&str>) -> DoctorReport {
         .filter(|(_, st)| st != "device")
         .map(|(s, st)| format!("{s} ({st})"))
         .collect();
+    let target = resolve_target(device, &devices);
+    // Another phone left unauthorized on the bus does not break the pipe to
+    // the selected device; only the target's own state gates health.
+    let target_usable = target.as_ref().is_some_and(|serial| {
+        devices
+            .iter()
+            .any(|(s, st)| s == serial.as_str() && st == "device")
+    });
     let inventory = devices
         .iter()
         .map(|(s, st)| format!("{s} [{st}]"))
@@ -152,7 +163,7 @@ pub async fn gather(device: Option<&str>) -> DoctorReport {
         .join(", ");
     checks.push(Check {
         code: "device",
-        status: if unhealthy.is_empty() {
+        status: if unhealthy.is_empty() || target_usable {
             Status::Ok
         } else {
             Status::Warn
@@ -169,7 +180,6 @@ pub async fn gather(device: Option<&str>) -> DoctorReport {
     });
 
     // ── Resolve the target serial for device-specific checks ────────────────
-    let target = resolve_target(device, &devices);
     let Some(serial) = target.clone() else {
         checks.push(Check {
             code: "apk",
@@ -340,7 +350,7 @@ async fn owners_check(serial: &Serial, reachable: bool) -> Check {
             status: Status::Fail,
             detail: format!(
                 "a non-ShadowDroid UiAutomation owner is holding the slot:\n{}",
-                indent(&owners)
+                indent(&holder_lines(&owners).collect::<Vec<_>>().join("\n"))
             ),
             remedy: Some(
                 "--fix --force kills it and reclaims the slot (without --force we won't kill a process we didn't spawn)".into(),
@@ -349,12 +359,34 @@ async fn owners_check(serial: &Serial, reachable: bool) -> Check {
     }
 }
 
-/// Classify `ps` output (from [adb::ps_ui_automation_owners]). Every matched
-/// line contains one of `app_process|uiautomator|shadowdroid|wetest|atx`; our
-/// own instrumentation lines always mention `shadowdroid`, so any line without
-/// it is foreign.
+/// Signatures of processes that hold (or launch a holder of) the UiAutomation
+/// slot: instrumentation runs and UI Automator-based agents. `ps` also lists
+/// every other `app_process` tool — scrcpy (`com.genymobile.scrcpy.Server`),
+/// Android Studio's device mirroring (`com.android.tools.screensharing`),
+/// short-lived `am`/`pm`/`cmd` invocations — which never hold the slot.
+const UI_AUTOMATION_HOLDER_SIGNATURES: &[&str] = &[
+    "instrument",
+    "uiautomator",
+    "androidx.test",
+    "wetest",
+    "atx",
+];
+
+/// `ps` lines (from [adb::ps_ui_automation_owners]) that can hold the slot.
+fn holder_lines(owners: &str) -> impl Iterator<Item = &str> {
+    owners.lines().filter(|line| {
+        let line = line.to_ascii_lowercase();
+        line.contains("shadowdroid")
+            || UI_AUTOMATION_HOLDER_SIGNATURES
+                .iter()
+                .any(|signature| line.contains(signature))
+    })
+}
+
+/// Classify `ps` output. Our own instrumentation lines always mention
+/// `shadowdroid`; any other holder line is foreign.
 fn classify_owners(owners: &str) -> OwnerClass {
-    let lines: Vec<&str> = owners.lines().filter(|l| !l.trim().is_empty()).collect();
+    let lines: Vec<&str> = holder_lines(owners).collect();
     if lines.is_empty() {
         return OwnerClass::None;
     }
@@ -363,6 +395,14 @@ fn classify_owners(owners: &str) -> OwnerClass {
     } else {
         OwnerClass::OursOnly
     }
+}
+
+/// PIDs of foreign holders (`ps -o USER,PID,…`: PID is the second column).
+fn foreign_holder_pids(owners: &str) -> Vec<u32> {
+    holder_lines(owners)
+        .filter(|line| !line.contains("shadowdroid"))
+        .filter_map(|line| line.split_whitespace().nth(1)?.parse().ok())
+        .collect()
 }
 
 fn indent(s: &str) -> String {
@@ -566,15 +606,19 @@ async fn apply_fix(device: Option<&str>, report: DoctorReport, force: bool) -> D
         return r;
     };
 
-    // Net: a dangling `http_proxy` (set, but no daemon) silently kills the
-    // device's networking. Clearing it is independent of the UiAutomation slot,
-    // so do it first — even if the owner/apk fixes below get gated.
-    if report
-        .checks
-        .iter()
-        .any(|c| c.code == "net" && c.status != Status::Ok)
-    {
-        clear_dangling_proxy(&serial).await;
+    // Net: wiring left by a stopped ShadowDroid proxy silently breaks the
+    // device's networking. Restore the state that session recorded — never a
+    // proxy or `adb reverse` ShadowDroid did not set up. Independent of the
+    // UiAutomation slot, so do it first even if the fixes below get gated.
+    if !crate::net::control::is_running(&serial).await {
+        match crate::net::commands::recover_recorded_wiring(&serial).await {
+            Ok(warnings) => {
+                for warning in warnings {
+                    eprintln!("doctor --fix: {warning}");
+                }
+            }
+            Err(error) => eprintln!("doctor --fix: could not restore proxy wiring: {error:#}"),
+        }
     }
 
     // Re-read owners fresh: refuse to clobber a foreign owner without --force.
@@ -593,7 +637,7 @@ async fn apply_fix(device: Option<&str>, report: DoctorReport, force: bool) -> D
     }
     if classify_owners(&owners) == OwnerClass::Foreign && force {
         eprintln!("doctor --fix --force: stopping foreign UiAutomation owners…");
-        let _ = adb::kill_all_ui_automation_owners(&serial).await;
+        let _ = adb::kill_processes(&serial, &foreign_holder_pids(&owners)).await;
     }
 
     // If the APK itself is wrong or missing, a still-running server pins the
@@ -634,51 +678,57 @@ fn is_fixable(code: &str) -> bool {
     matches!(code, "apk" | "server" | "owners" | "net")
 }
 
-/// Package-agnostic `net` proxy state. The headline value is catching a
-/// **dangling** `http_proxy` (set, but no daemon listening) — that silently
-/// breaks the device's networking, and `--fix` clears it. A clean no-proxy state
-/// is `Ok` ("inactive"), so this never nags people who don't use `net`.
+/// Package-agnostic `net` proxy state. The headline value is catching wiring
+/// left by a stopped ShadowDroid proxy session (the device still points at a
+/// proxy nobody runs), which silently breaks networking; `--fix` restores the
+/// state that session recorded. A proxy ShadowDroid did not set up — Charles,
+/// a corporate proxy — is reported but never flagged or touched.
 async fn net_check(serial: &Serial) -> Check {
     let running = crate::net::control::is_running(serial).await;
+    let recorded = crate::net::commands::has_recorded_wiring(serial).unwrap_or(false);
     let http_proxy = adb::shell(serial, "settings get global http_proxy")
         .await
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty() && s != "null" && s != ":0");
-    match (http_proxy, running) {
-        (Some(hp), true) => Check {
+    net_check_from(http_proxy, running, recorded)
+}
+
+fn net_check_from(http_proxy: Option<String>, running: bool, recorded: bool) -> Check {
+    match (http_proxy, running, recorded) {
+        (Some(hp), true, _) => Check {
             code: "net",
             status: Status::Ok,
             detail: format!("proxy active; device http_proxy={hp}"),
             remedy: None,
         },
-        (Some(hp), false) => Check {
+        (Some(hp), false, true) => Check {
             code: "net",
             status: Status::Warn,
             detail: format!(
-                "dangling http_proxy={hp} but no proxy daemon is running — this silently breaks the device's networking."
+                "a stopped ShadowDroid proxy left the device pointed at http_proxy={hp} — this silently breaks the device's networking."
             ),
-            remedy: Some("clear it with `shadowdroid net stop` (or `doctor --fix`)".into()),
+            remedy: Some("restore it with `shadowdroid net stop` (or `doctor --fix`)".into()),
         },
-        (None, true) => Check {
+        (Some(hp), false, false) => Check {
+            code: "net",
+            status: Status::Ok,
+            detail: format!("device http_proxy={hp} was not set by ShadowDroid; left unchanged."),
+            remedy: None,
+        },
+        (None, true, _) => Check {
             code: "net",
             status: Status::Warn,
             detail: "a net proxy daemon is running but the device isn't pointed at it.".into(),
             remedy: Some("`net start` to wire it up, or `net stop` to shut the daemon down".into()),
         },
-        (None, false) => Check {
+        (None, false, _) => Check {
             code: "net",
             status: Status::Ok,
             detail: "inactive.".into(),
             remedy: None,
         },
     }
-}
-
-/// Clear a dangling system proxy (and any leftover reverse on the default port).
-async fn clear_dangling_proxy(serial: &Serial) {
-    let _ = adb::shell(serial, "settings put global http_proxy :0").await;
-    let _ = adb::reverse_remove(serial, crate::net::DEFAULT_PROXY_PORT).await;
 }
 
 fn studio_checks() -> Vec<Check> {
@@ -813,6 +863,51 @@ mod tests {
             detail: String::new(),
             remedy: None,
         }
+    }
+
+    const SCRCPY: &str = "shell 4100 1 app_process /system/bin com.genymobile.scrcpy.Server 3.1";
+    const MIRRORING: &str =
+        "shell 4200 1 app_process /system/bin com.android.tools.screensharing.Main --socket=screen";
+    const APPIUM: &str =
+        "u0_a150 4300 1 io.appium.uiautomator2.server.test io.appium.uiautomator2.server.test";
+    const ESPRESSO: &str = "shell 4400 1 app_process /system/bin com.android.commands.am.Am instrument -w com.example.test/androidx.test.runner.AndroidJUnitRunner";
+    const OURS: &str = "shell 4500 1 app_process io.github.andriyo.shadowdroid.test/androidx.test.runner.AndroidJUnitRunner";
+
+    #[test]
+    fn screen_mirroring_tools_are_not_ui_automation_owners() {
+        let tools = [SCRCPY, MIRRORING].join("\n");
+        assert_eq!(classify_owners(&tools), OwnerClass::None);
+        assert!(foreign_holder_pids(&tools).is_empty());
+        assert_eq!(
+            classify_owners(&[SCRCPY, OURS].join("\n")),
+            OwnerClass::OursOnly
+        );
+        let mixed = [SCRCPY, APPIUM, ESPRESSO, MIRRORING, OURS].join("\n");
+        assert_eq!(classify_owners(&mixed), OwnerClass::Foreign);
+        // --fix --force kills only the foreign holders.
+        assert_eq!(foreign_holder_pids(&mixed), vec![4300, 4400]);
+    }
+
+    #[test]
+    fn only_proxy_wiring_recorded_by_shadowdroid_is_flagged() {
+        let foreign = net_check_from(Some("10.0.2.2:8888".into()), false, false);
+        assert_eq!(foreign.status, Status::Ok, "{}", foreign.detail);
+        let leftover = net_check_from(Some("localhost:8080".into()), false, true);
+        assert_eq!(leftover.status, Status::Warn);
+        assert_eq!(
+            net_check_from(Some("localhost:8080".into()), true, true).status,
+            Status::Ok
+        );
+        assert_eq!(net_check_from(None, false, false).status, Status::Ok);
+    }
+
+    #[test]
+    fn clock_drift_is_advisory() {
+        assert!(is_healthy(&[
+            check("device", Status::Ok),
+            check("server", Status::Ok),
+            check("clock", Status::Warn),
+        ]));
     }
 
     #[test]
