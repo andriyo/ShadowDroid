@@ -730,6 +730,50 @@ pub async fn finish(result: &Result<()>) -> Result<()> {
     Ok(())
 }
 
+/// End this command's device admission early, for a command that goes on to
+/// wait passively — only reading logcat or polling Android Studio — such as
+/// `debug run-until-crash` waiting for the app to crash. The journal records a
+/// completed operation and the device lock (and a session-less anchor) is
+/// released, so the agent can drive the app, for example to trigger the crash,
+/// while this command waits. Returns false when nothing was released: not
+/// admitted, or a device mutation is still unsettled.
+pub async fn release_for_passive_wait() -> Result<bool> {
+    if unsettled_mutations() > 0 {
+        return Ok(false);
+    }
+    let Some(mut operation) = ACTIVE.lock().unwrap().take() else {
+        return Ok(false);
+    };
+    if operation.recovery_cleanup {
+        *ACTIVE.lock().unwrap() = Some(operation);
+        return Ok(false);
+    }
+    if let Err(error) = record_passive_release(&mut operation) {
+        *ACTIVE.lock().unwrap() = Some(operation);
+        return Err(error);
+    }
+    let release_anchor_after = operation.release_anchor;
+    let serial = Serial::new(&operation.state.serial);
+    // Dropping the operation closes the OS lock.
+    drop(operation);
+    if release_anchor_after {
+        release_anchor(&serial, &options()?.root).await?;
+    }
+    Ok(true)
+}
+
+/// Journal an operation as completed ahead of its process exit.
+fn record_passive_release(operation: &mut Operation) -> Result<()> {
+    operation.state.last_completion = Some(json!({
+        "request": operation.state.in_flight.take(),
+        "completed_ms": now_ms(),
+        "ok": true,
+        "released_for_passive_wait": true,
+    }));
+    write_state(&operation.path, &operation.state)
+        .context("could not persist the early release of the device")
+}
+
 pub fn has_reservations() -> Result<bool> {
     let root = &options()?.root;
     if !root.exists() {
@@ -1169,6 +1213,39 @@ mod tests {
         });
         assert!(require_idle(&state).is_err());
     }
+    #[test]
+    fn a_passive_release_completes_the_journal_and_frees_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let serial = Serial::new("emulator-5554");
+        let path = state_path(dir.path(), &serial);
+        let mut state = read_state(&path, &serial).unwrap();
+        state.in_flight = Some(InFlight {
+            request_id: "r1".into(),
+            command: "debug run-until-crash".into(),
+            pid: std::process::id(),
+            started_ms: now_ms(),
+            boot_id: "boot".into(),
+        });
+        let mut operation = Operation {
+            _lock: lock_at(dir.path(), &serial, 0).unwrap(),
+            release_anchor: false,
+            changes_device: true,
+            recovery_cleanup: false,
+            path: path.clone(),
+            state,
+        };
+        assert!(lock_at(dir.path(), &serial, 0).is_err());
+        record_passive_release(&mut operation).unwrap();
+        drop(operation);
+
+        let journal = read_state(&path, &serial).unwrap();
+        assert!(journal.in_flight.is_none());
+        let completion = journal.last_completion.unwrap();
+        assert_eq!(completion["released_for_passive_wait"], true);
+        assert_eq!(completion["request"]["command"], "debug run-until-crash");
+        lock_at(dir.path(), &serial, 2_000).unwrap();
+    }
+
     #[test]
     fn locks_share_one_inode_and_independent_devices_do_not_block() {
         let dir = tempfile::tempdir().unwrap();

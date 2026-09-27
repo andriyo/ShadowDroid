@@ -61,6 +61,7 @@ pub enum DebugCmd {
     /// Step over until logcat emits a matching line, then return a final snapshot.
     StepUntilLog(StepUntilLogArgs),
     /// Resume and wait for a Java/native crash or ANR, then return a final snapshot.
+    /// The device is released while waiting, so other commands can trigger it.
     RunUntilCrash(RunUntilCrashArgs),
     /// Native/mixed-mode readiness and artifact helpers.
     #[command(subcommand)]
@@ -1626,6 +1627,9 @@ async fn run_until_crash(
     } else {
         json!({"attempted": false, "ok": false, "error": bridge_error})
     };
+    // From here on this command only watches logcat for the crash; hand the
+    // device back so the agent can trigger the crash with other commands.
+    let device_released = crate::runtime::release_for_passive_wait().await?;
     let deadline = Instant::now() + Duration::from_millis(args.timeout_ms);
 
     loop {
@@ -1641,6 +1645,7 @@ async fn run_until_crash(
                 "ok": false,
                 "timeout": true,
                 "elapsed_ms": elapsed_ms,
+                "device_released_while_waiting": device_released,
                 "studio": {
                     "resume": resume,
                 },
@@ -1700,6 +1705,7 @@ async fn run_until_crash(
                     "ok": true,
                     "timeout": false,
                     "elapsed_ms": elapsed_ms,
+                    "device_released_while_waiting": device_released,
                     "app": {
                         "requested": args.app.clone(),
                         "package": crash.package.clone(),

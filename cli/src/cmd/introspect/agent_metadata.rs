@@ -811,7 +811,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         "debug run-until-crash" => Some(serde_json::json!({
             "use_when": ["Need to resume the app and capture the next Java/native crash or ANR with debugger/logcat context."],
             "output": "crash/ANR result JSON plus final debug snapshot",
-            "side_effects": ["resumes the selected debug session", "waits for crash/ANR/logcat signals"],
+            "side_effects": ["resumes the selected debug session", "waits for crash/ANR/logcat signals; releases the device while waiting (device_released_while_waiting), so other commands such as `ui tap` can trigger the crash"],
             "next_actions": ["debug snapshot", "collect", "debug tombstones list"]
         })),
         "debug step-until-screen-change" => Some(serde_json::json!({
