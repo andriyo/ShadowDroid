@@ -1569,6 +1569,7 @@ fn find_ws_session_from(
                 ts,
                 scheme: String::new(),
                 host,
+                port: None,
                 path: String::new(),
                 host_redacted: false,
                 path_redacted: false,

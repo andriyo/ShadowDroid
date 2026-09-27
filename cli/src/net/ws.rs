@@ -1565,6 +1565,9 @@ pub struct WsSessionRecord {
     pub ts: f64,
     pub scheme: String,
     pub host: String,
+    /// Upstream port; absent in records captured before it was stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
     pub path: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub host_redacted: bool,
@@ -1587,7 +1590,7 @@ pub struct WsSessionRecord {
 
 impl WsSessionRecord {
     pub fn url(&self) -> String {
-        format!("{}://{}{}", self.scheme, self.host, self.path)
+        crate::net::flow::url(&self.scheme, &self.host, self.port, &self.path)
     }
 
     /// Redact persisted handshake metadata. Forwarded traffic is untouched.
@@ -5573,6 +5576,7 @@ mod tests {
             ts: 1.0,
             scheme: "wss".to_string(),
             host: "10.2.3.4".to_string(),
+            port: Some(8443),
             path: "/socket?access_token=ws-secret&safe=visible".to_string(),
             host_redacted: false,
             path_redacted: false,

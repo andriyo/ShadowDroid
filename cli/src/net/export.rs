@@ -13,7 +13,7 @@ use crate::net::flow::FlowRecord;
 
 /// A runnable `curl` command reproducing the request (textual body only).
 pub fn curl_command(f: &FlowRecord) -> String {
-    let url = format!("{}://{}{}", f.scheme, f.host, f.path);
+    let url = crate::net::flow::url(&f.scheme, &f.host, f.port, &f.path);
     // Every captured field is attacker-influenced: the method is an HTTP token,
     // and tokens may contain shell metacharacters such as `` ` ``, `$`, `|`, `&`.
     let mut parts = vec![format!("curl -X '{}' '{}'", sh(&f.method), sh(&url))];
@@ -116,7 +116,7 @@ fn ws_har_entry(session: &crate::net::store::WsHarSession) -> Value {
 }
 
 fn har_entry(f: &FlowRecord) -> Value {
-    let url = format!("{}://{}{}", f.scheme, f.host, f.path);
+    let url = crate::net::flow::url(&f.scheme, &f.host, f.port, &f.path);
     let mut request = json!({
         "method": f.method,
         "url": url,
@@ -276,6 +276,25 @@ mod tests {
             None
         );
         assert_eq!(graphql_operation_name(&None), None);
+    }
+
+    #[test]
+    fn exports_keep_non_default_ports() {
+        let mut flow = sample();
+        flow.scheme = "http".into();
+        flow.host = "127.0.0.1".into();
+        flow.port = Some(8080);
+        assert!(curl_command(&flow).contains("'http://127.0.0.1:8080/v1/me'"));
+        assert_eq!(
+            har_entry(&flow)["request"]["url"],
+            "http://127.0.0.1:8080/v1/me"
+        );
+        flow.port = Some(80);
+        assert!(curl_command(&flow).contains("'http://127.0.0.1/v1/me'"));
+        flow.scheme = "https".into();
+        flow.host = "::1".into();
+        flow.port = Some(8443);
+        assert!(curl_command(&flow).contains("'https://[::1]:8443/v1/me'"));
     }
 
     #[cfg(unix)]

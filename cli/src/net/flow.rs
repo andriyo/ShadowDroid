@@ -137,7 +137,7 @@ impl FlowRecord {
             scheme: self.scheme.clone(),
             host: self.host.clone(),
             path: self.path.clone(),
-            url: format!("{}://{}{}", self.scheme, self.host, self.path),
+            url: url(&self.scheme, &self.host, self.port, &self.path),
             host_redacted: self.host_redacted,
             path_redacted: self.path_redacted,
             status: self.status,
@@ -176,7 +176,7 @@ impl FlowRecord {
             "host": self.host,
             "port": self.port,
             "path": self.path,
-            "url": format!("{}://{}{}", self.scheme, self.host, self.path),
+            "url": url(&self.scheme, &self.host, self.port, &self.path),
             "host_redacted": self.host_redacted,
             "path_redacted": self.path_redacted,
             "status": self.status,
@@ -324,6 +324,26 @@ fn headers_to_map(headers: &[(String, String)]) -> serde_json::Value {
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// `scheme://host[:port]path` for a captured flow. The scheme's default port is
+/// omitted and IPv6 literals are bracketed, so exported commands and HAR entries
+/// target the same origin the app contacted.
+pub fn url(scheme: &str, host: &str, port: Option<u16>, path: &str) -> String {
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let default_port = match scheme {
+        "http" | "ws" => Some(80),
+        "https" | "wss" => Some(443),
+        _ => None,
+    };
+    match port {
+        Some(port) if Some(port) != default_port => format!("{scheme}://{host}:{port}{path}"),
+        _ => format!("{scheme}://{host}{path}"),
+    }
 }
 
 #[cfg(test)]

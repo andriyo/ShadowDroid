@@ -804,6 +804,7 @@ async fn proxy_websocket(
         ts: events::now_ts(),
         scheme: ws_scheme.to_string(),
         host: host.clone(),
+        port: Some(port),
         path: path.clone(),
         host_redacted: false,
         path_redacted: false,
