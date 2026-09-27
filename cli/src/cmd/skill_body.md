@@ -49,26 +49,11 @@ Treat stdout as data and the process exit code as authoritative:
   (HAR, curl, fixtures) write an artifact and return a small JSON summary; a
   few setup/report commands default to human output — request `--json`.
 
-For one-shot batches, preserve every child's output and exit status:
-
-```python
-import subprocess
-import sys
-
-def checked_run(argv):
-    r = subprocess.run(argv, capture_output=True, text=True)
-    sys.stdout.write(r.stdout)
-    sys.stderr.write(r.stderr)
-    if r.returncode:
-        raise SystemExit(r.returncode if r.returncode > 0 else 128 - r.returncode)
-    return r.stdout
-```
-
-Use `pipefail` and `&&` for dependencies; `set -e` alone is insufficient.
-Keep error/detail, events, and input/postcondition evidence. Serialize
-lifecycle mutations. Reserve multi-step work with a driver session; observers
-remain passive. Named-target operations also lock: the default wait is 2000 ms
-(`--lock-timeout-ms 0` fails immediately). Never delete an active lock.
+In batches, preserve every child's output and exit status (`pipefail`, `&&`;
+`set -e` alone is insufficient). `commands --guide workflow` has a checked
+Python runner and the lock-wait rules. Keep error/detail, events, and
+input/postcondition evidence. Serialize lifecycle mutations. Reserve multi-step
+work with a driver session; observers remain passive. Never delete an active lock.
 
 Branch on `ok`/`code`, inspect `detail`, follow `next_actions`;
 never parse `msg` to recover state. Inside a `watch`
@@ -113,9 +98,8 @@ Check-act-observe (full flag semantics: `commands --describe 'ui tap'`):
 - `ui wait` timeouts are typed non-zero `wait_timeout` failures; never treat
   one as successful polling.
 
-After guard rejection, reobserve, require consistency, reselect, and use a fresh
-guard. Check input delivery before retrying. See `commands --guide workflow`
-for interaction hashes, handles, and recovery examples.
+Never repeat delivered input (`retryable:false`) without observing first.
+`commands --guide workflow` covers interaction hashes, handles, and recovery.
 
 `--redact` covers structured output; screenshot pixel masking requires
 `--redact-pixels`/`--redact-screenshots`. On TV use `ui focus` and `ui key dpad_*`.

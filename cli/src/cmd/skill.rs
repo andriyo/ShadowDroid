@@ -242,10 +242,28 @@ fn wrap_for_agent(agent: &str, body: &str) -> Result<String> {
     }
 }
 
+/// A YAML double-quoted scalar. The description contains `: ` (e.g.
+/// "JSON: deploy"), which a strict YAML parser rejects in a plain scalar, so
+/// skill loaders that parse frontmatter properly would drop the skill.
+fn yaml_quoted(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\n' => quoted.push_str("\\n"),
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
 fn wrap_skill_md(body: &str) -> String {
     format!(
         "---\nname: shadowdroid\ndescription: {desc}\n---\n\n# ShadowDroid\n\n{body}\n",
-        desc = DESCRIPTION,
+        desc = yaml_quoted(DESCRIPTION),
     )
 }
 
@@ -637,7 +655,7 @@ fn command_reference() -> String {
                 tail.push(name.to_string());
                 continue;
             }
-            let about = first_sentence(c["about"].as_str().unwrap_or(""));
+            let about = reference_line(c["about"].as_str().unwrap_or(""));
             core.push_str(&format!("- **`{name}`** — {about}\n"));
         }
     }
@@ -661,6 +679,29 @@ fn command_reference() -> String {
 /// A group's routing one-liner: its `about` up to the first sentence end.
 /// Multi-sentence abouts belong to `--help` and the catalog; the reference
 /// only routes.
+/// A group's first sentence, capped for the always-loaded reference; the full
+/// text stays one `commands --describe` away.
+fn reference_line(about: &str) -> String {
+    const MAX: usize = 90;
+    let sentence = first_sentence(about).trim_end_matches('.');
+    if sentence.chars().count() <= MAX {
+        return sentence.to_string();
+    }
+    // Prefer the lead phrase before an elaboration: "Structured, bounded
+    // logcat: app-scoped …" → "Structured, bounded logcat".
+    if let Some(end) = [": ", " ("]
+        .iter()
+        .filter_map(|separator| sentence.find(separator))
+        .filter(|&end| end >= 20)
+        .min()
+    {
+        return sentence[..end].to_string();
+    }
+    let cut: String = sentence.chars().take(MAX).collect();
+    let cut = cut.rsplit_once(' ').map_or(cut.as_str(), |(head, _)| head);
+    format!("{}…", cut.trim_end_matches([',', ';', ':', ' ']))
+}
+
 fn first_sentence(about: &str) -> &str {
     let mut end = about.len();
     for terminator in [". ", "? ", "! "] {
@@ -715,8 +756,63 @@ mod tests {
     /// installed SKILL.md is loaded in full on every invocation. Tighten this
     /// constant when the skill shrinks; never raise it to make room.
     #[test]
+    fn frontmatter_description_is_a_valid_yaml_double_quoted_scalar() {
+        let content = generated_content("claude-code").unwrap();
+        let line = content
+            .lines()
+            .find(|line| line.starts_with("description: "))
+            .unwrap();
+        let scalar = line.strip_prefix("description: ").unwrap();
+        // A plain scalar containing ": " (as in "JSON: deploy") is rejected
+        // by strict YAML parsers; the value must be double-quoted.
+        assert!(scalar.starts_with('"') && scalar.ends_with('"'), "{line}");
+        let inner = &scalar[1..scalar.len() - 1];
+        let mut unescaped = String::new();
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => match chars.next() {
+                    Some('"') => unescaped.push('"'),
+                    Some('\\') => unescaped.push('\\'),
+                    Some('n') => unescaped.push('\n'),
+                    other => panic!("unexpected escape {other:?} in {line}"),
+                },
+                '"' => panic!("unescaped quote in {line}"),
+                c => unescaped.push(c),
+            }
+        }
+        assert_eq!(unescaped, DESCRIPTION);
+        assert_eq!(yaml_quoted("a \"b\" \\ c"), r#""a \"b\" \\ c""#);
+    }
+
+    #[test]
+    fn reference_lines_keep_the_lead_phrase_of_long_descriptions() {
+        assert_eq!(
+            reference_line(
+                "Structured, bounded logcat: app-scoped JSON log lines with crash/ANR blocks parsed out, windowed and deduplicated."
+            ),
+            "Structured, bounded logcat"
+        );
+        assert_eq!(
+            reference_line(
+                "Gather a self-contained diagnostic bundle (doctor report, device info, recent logcat) into a directory that is quite long"
+            ),
+            "Gather a self-contained diagnostic bundle"
+        );
+        assert_eq!(
+            reference_line("Runtime permission grants"),
+            "Runtime permission grants"
+        );
+        let long = reference_line(&"word ".repeat(40));
+        assert!(long.ends_with('…') && long.chars().count() <= 91, "{long}");
+    }
+
+    #[test]
     fn generated_skill_stays_within_size_budget() {
-        const BUDGET_BYTES: usize = 10_000;
+        // Ratcheted down from 10,000 after moving duplicated prose behind
+        // `commands --guide workflow` (9,980 → ~9,100 bytes). Trim or move
+        // depth into a guide rather than raising this.
+        const BUDGET_BYTES: usize = 9_500;
         let content = generated_content("claude-code").unwrap();
         assert!(
             content.len() < BUDGET_BYTES,
