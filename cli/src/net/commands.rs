@@ -280,6 +280,15 @@ fn inspect_daemon_process(pid: u32, serial: &Serial, startup_id: &str) -> Daemon
     }
 }
 
+/// Whether no process has `pid` any more: the daemon behind a pidfile crashed
+/// or was killed. Only presence is inspected, so any startup id serves.
+fn pid_exited(pid: u32, serial: &Serial) -> bool {
+    matches!(
+        inspect_daemon_process(pid, serial, "presence-probe"),
+        DaemonProcessIdentity::Missing
+    )
+}
+
 /// Send a termination signal only after [`inspect_daemon_process`] proves the
 /// pid still belongs to the expected daemon. The caller must subsequently
 /// verify that the process exited; command success alone is not sufficient.
@@ -1242,16 +1251,27 @@ async fn stop_inner(
     } else {
         false
     };
+    let mut daemon_exited = false;
     if daemon_evidence {
         if !stop_requested && expected_daemon.force_identity().is_none() {
-            return Err(daemon_termination_error(
-                serial,
-                &expected_daemon,
-                None,
-                "the network daemon is unreachable and its pid/startup ownership cannot be proven safely",
-            ));
+            // A daemon that crashed or was killed leaves unreachable markers and
+            // a pidfile naming no process: nothing can be signalled, so the
+            // markers are stale and the device wiring still needs restoring.
+            if pid.is_some_and(|pid| pid_exited(pid, serial)) {
+                remove_owned_marker(paths::ctl_path(serial)?)?;
+                remove_owned_marker(paths::pid_path(serial)?)?;
+                daemon_exited = true;
+            } else {
+                return Err(daemon_termination_error(
+                    serial,
+                    &expected_daemon,
+                    None,
+                    "the network daemon is unreachable and its pid/startup ownership cannot be proven safely",
+                ));
+            }
+        } else {
+            complete_daemon_teardown(serial, &expected_daemon, stop_requested).await?;
         }
-        complete_daemon_teardown(serial, &expected_daemon, stop_requested).await?;
     }
     let stopped = daemon_evidence;
 
@@ -1364,6 +1384,7 @@ async fn stop_inner(
             "device": serial,
             "stopped": stopped,
             "already_stopped": already_stopped,
+            "daemon_exited_earlier": daemon_exited,
             "http_proxy_restored": http_proxy_restored,
             "prior_http_proxy": prior_http_proxy,
             "initial_http_proxy": initial_http_proxy,
@@ -1395,6 +1416,7 @@ pub async fn status(serial: &Serial, ca_cert: Option<&Path>) -> Result<()> {
     // unknown observation, not proof that the daemon has stopped.
     let has_markers =
         paths::ctl_path(serial)?.try_exists()? || paths::pid_path(serial)?.try_exists()?;
+    let mut daemon_exited = false;
     let (daemon, daemon_error) = if has_markers {
         match control::request(serial, json!({"op": "status"})).await {
             Ok(value)
@@ -1412,6 +1434,13 @@ pub async fn status(serial: &Serial, ca_cert: Option<&Path>) -> Result<()> {
                     json!({"code": "net_daemon_identity_mismatch", "stage": "net", "retryable": false}),
                 ),
             ),
+            // The pidfile names no process: the daemon exited (crashed or was
+            // killed) without cleaning up, a known state rather than an
+            // unobservable one.
+            Err(_) if control::daemon_pid(serial).is_some_and(|pid| pid_exited(pid, serial)) => {
+                daemon_exited = true;
+                (None, None)
+            }
             Err(error) => (None, Some(observation_error(&error))),
         }
     } else {
@@ -1448,7 +1477,13 @@ pub async fn status(serial: &Serial, ca_cert: Option<&Path>) -> Result<()> {
         "complete": complete,
         "running": running,
         "daemon": daemon,
-        "daemon_state": if daemon_error.is_none() { "known" } else { "unknown" },
+        "daemon_state": if daemon_exited {
+            "exited"
+        } else if daemon_error.is_none() {
+            "known"
+        } else {
+            "unknown"
+        },
         "daemon_error": daemon_error,
         "http_proxy": http_proxy,
         "http_proxy_state": if http_proxy_error.is_none() { "known" } else { "unknown" },
@@ -1475,6 +1510,17 @@ pub async fn status(serial: &Serial, ca_cert: Option<&Path>) -> Result<()> {
             "run `shadowdroid devices` and retry `shadowdroid net status` for the same device",
         ])
         .into());
+    }
+    let mut body = body;
+    if daemon_exited {
+        let wiring_left = body["http_proxy"].is_string();
+        body["warning"] = json!(if wiring_left {
+            "the proxy daemon exited without restoring the device; its http_proxy still routes \
+             device traffic to a proxy that is gone"
+        } else {
+            "the proxy daemon exited without cleaning up its control files"
+        });
+        body["next_actions"] = json!([super::scoped_action(serial, "stop")]);
     }
     emit("net_status", body);
     Ok(())
@@ -4260,6 +4306,17 @@ mod tests {
 
         // Other rule kinds never warn.
         assert!(map_remote_path_warning(&spec("delay", "1")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_exited_distinguishes_a_crashed_daemon_from_a_live_process() {
+        let serial = Serial::from("emulator-5554");
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(pid_exited(pid, &serial));
+        assert!(!pid_exited(std::process::id(), &serial));
     }
 
     #[test]
