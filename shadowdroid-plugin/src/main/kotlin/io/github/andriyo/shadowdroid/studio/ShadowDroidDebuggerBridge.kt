@@ -295,11 +295,8 @@ class ShadowDroidDebuggerBridge : ProjectActivity {
                 val response = dispatch(path, query)
                 BridgeProtocol.send(exchange, response.status, response.body)
             } catch (t: Throwable) {
-                BridgeProtocol.send(
-                    exchange,
-                    HttpURLConnection.HTTP_INTERNAL_ERROR,
-                    BridgeProtocol.obj("ok", false, "error", t.message ?: t.javaClass.name),
-                )
+                val failure = BridgeProtocol.failure(t, HttpURLConnection.HTTP_INTERNAL_ERROR)
+                BridgeProtocol.send(exchange, failure.status, failure.body)
             }
         }
 

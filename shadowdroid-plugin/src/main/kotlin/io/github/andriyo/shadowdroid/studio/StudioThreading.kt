@@ -17,25 +17,30 @@ internal object StudioThreading {
         Thread(runnable, "ShadowDroid debugger request").apply { isDaemon = true }
     }
 
+    /** How long a bridge request waits for the UI thread to start it. */
+    private const val IDEA_THREAD_START_TIMEOUT_MS = 5_000L
+
+    /** How long started UI-thread work is awaited before its outcome is unknown. */
+    private const val IDEA_THREAD_RUN_TIMEOUT_MS = 30_000L
+
+    /**
+     * Run [supplier] on the UI thread. A modal dialog blocks the UI queue, and
+     * `invokeAndWait` used to wait for it indefinitely, then run the request —
+     * a step or resume — after the CLI had timed out and possibly retried. Now
+     * the request is cancelled if it has not started within
+     * [IDEA_THREAD_START_TIMEOUT_MS] and fails with [StudioUiBusyException].
+     */
     @JvmStatic
     @Throws(Exception::class)
     fun <T> onIdeaThread(supplier: ThrowingSupplier<T>): T {
         val app = ApplicationManager.getApplication()
         if (app.isDispatchThread) return supplier.get()
-        val value = AtomicReference<T>()
-        // Capture Throwable, not just Exception: an Error escaping into the
-        // EDT event handler would leave value null and surface to the caller
-        // as an unrelated NPE instead of the real failure.
-        val error = AtomicReference<Throwable>()
-        app.invokeAndWait {
-            try {
-                value.set(supplier.get())
-            } catch (t: Throwable) {
-                error.set(t)
-            }
+        val handoff = CancellableHandoff { supplier.get() }
+        app.invokeLater { handoff.run() }
+        return handoff.await(IDEA_THREAD_START_TIMEOUT_MS, IDEA_THREAD_RUN_TIMEOUT_MS) {
+            val dialogs = BreakpointExpressionGuard.blockedDialogs()
+            if (dialogs.isEmpty()) "" else " (${dialogs.joinToString()})"
         }
-        error.get()?.let { throw it }
-        return value.get()
     }
 
     @JvmStatic

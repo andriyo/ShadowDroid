@@ -13,6 +13,33 @@ use crate::cmd::studio_contract::{self, query, route, session_action};
 use crate::hostenv::shadowdroid_home;
 
 pub(crate) const DEFAULT_BRIDGE_TIMEOUT_MS: u64 = 10_000;
+/// Added to a request's own `timeout_ms` so the plugin's typed timeout reply
+/// (which may name a blocking dialog) arrives before the HTTP deadline.
+const BRIDGE_TIMEOUT_HEADROOM_MS: u64 = 5_000;
+
+/// Bridge routes that only read IDE/debugger state. Any other route can change
+/// it, so an unanswered request to it must not be retried blindly: the IDE may
+/// still execute it, and a repeated step or resume skips code.
+const READ_ONLY_ROUTES: &[&str] = &[
+    route::STATUS,
+    route::SESSIONS,
+    route::SESSION_STACK,
+    route::SESSION_THREADS,
+    route::SESSION_VARIABLES,
+    route::SESSION_EVALUATE,
+    route::SESSION_INSPECT,
+    route::SESSION_COROUTINES,
+    route::SESSION_COROUTINES_THREADS,
+    route::SESSION_COROUTINES_CONTINUATION,
+    route::SESSION_COROUTINES_FLOW,
+    route::WATCHES,
+    route::CLIENTS,
+    route::BREAKPOINTS,
+    route::LOGPOINTS,
+    route::LOGPOINT_EVENTS,
+    route::LAYOUT_SNAPSHOT,
+    route::LAYOUT_SOURCE,
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum DebugMode {
@@ -1075,7 +1102,9 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
                 (query::TIMEOUT_MS, Some(timeout_ms_s.as_str())),
             ];
             match tokio::time::timeout(
-                std::time::Duration::from_millis(u64::from(args.timeout_ms)),
+                std::time::Duration::from_millis(
+                    u64::from(args.timeout_ms) + BRIDGE_TIMEOUT_HEADROOM_MS + 1_000,
+                ),
                 bridge.get(route::SESSION_EVALUATE, &params),
             )
             .await
@@ -1131,7 +1160,9 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
                 (query::TIMEOUT_MS, Some(timeout_ms_s.as_str())),
             ];
             match tokio::time::timeout(
-                std::time::Duration::from_millis(u64::from(args.timeout_ms)),
+                std::time::Duration::from_millis(
+                    u64::from(args.timeout_ms) + BRIDGE_TIMEOUT_HEADROOM_MS + 1_000,
+                ),
                 bridge.get(route::SESSION_INSPECT, &params),
             )
             .await
@@ -1774,6 +1805,18 @@ fn read_error_json(kind: &str, err: anyhow::Error) -> Value {
 
 /// Machine-readable failure code a bridge error reply may carry alongside the
 /// human `error` string (e.g. `invalid_expression` from breakpoint routes).
+/// A request's HTTP deadline: the client default, or the request's own
+/// `timeout_ms` plus headroom when that is longer, so `--timeout-ms` above the
+/// default is honoured instead of being cut off by the transport.
+fn request_timeout(default: Duration, params: &[(&str, Option<&str>)]) -> Duration {
+    params
+        .iter()
+        .find(|(name, _)| *name == query::TIMEOUT_MS)
+        .and_then(|(_, value)| value.and_then(|value| value.parse::<u64>().ok()))
+        .map(|ms| Duration::from_millis(ms.saturating_add(BRIDGE_TIMEOUT_HEADROOM_MS)))
+        .map_or(default, |requested| requested.max(default))
+}
+
 fn bridge_error_code(reply: &Value) -> Option<&str> {
     reply.get("error_code").and_then(Value::as_str)
 }
@@ -1852,6 +1895,7 @@ fn canonicalize_for_bridge(path: &Path) -> Result<String> {
 pub(crate) struct BridgeClient {
     base_url: String,
     http: reqwest::Client,
+    request_timeout: Duration,
     /// The target device serial, if known. Auto-appended to session-scoped
     /// routes so the global `--device` picks the matching debug session when
     /// several devices are debugged in one Studio. `None` for host-only callers.
@@ -1892,12 +1936,63 @@ impl BridgeClient {
         Ok(Self {
             base_url,
             http,
+            request_timeout,
             device: device.map(str::to_string),
         })
     }
 
     pub(crate) fn device(&self) -> Option<&str> {
         self.device.as_deref()
+    }
+
+    /// Classify a request that got no HTTP answer. A connect failure means it
+    /// never reached Android Studio. Anything later (a timeout, a dropped
+    /// connection) may still execute in the IDE — typically once a blocking
+    /// dialog closes — so a mutating request must not be repeated blindly.
+    fn send_error(&self, path: &str, error: &reqwest::Error, timeout: Duration) -> anyhow::Error {
+        if error.is_connect() {
+            return crate::diagnostic::DiagnosticError::new(
+                "studio_bridge_unreachable",
+                "debugger",
+                format!(
+                    "cannot reach the Android Studio debugger bridge at {}: {error}",
+                    self.base_url
+                ),
+            )
+            .retryable(true)
+            .detail(serde_json::json!({"base_url": self.base_url, "route": path}))
+            .next_actions([
+                "run `shadowdroid studio status --json`",
+                "start Android Studio with the plugin installed, or pass --studio-url, then retry",
+            ])
+            .into();
+        }
+        let read_only = READ_ONLY_ROUTES.contains(&path);
+        let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        let mut next_actions = vec![
+            "run `shadowdroid debug status` — it lists dialogs blocking Android Studio (blocked_dialogs)".to_string(),
+        ];
+        next_actions.push(if read_only {
+            "dismiss any blocking dialog in Android Studio, then retry".to_string()
+        } else {
+            "do not repeat this command: it may still run once Android Studio is free; check `shadowdroid debug stack` or `debug breakpoints` for its effect first".to_string()
+        });
+        crate::diagnostic::DiagnosticError::new(
+            "studio_bridge_timeout",
+            "debugger",
+            format!(
+                "the Android Studio debugger bridge did not answer {path} within {timeout_ms}ms: {error}"
+            ),
+        )
+        .retryable(read_only)
+        .detail(serde_json::json!({
+            "base_url": self.base_url,
+            "route": path,
+            "timeout_ms": timeout_ms,
+            "delivery": "unknown",
+        }))
+        .next_actions(next_actions)
+        .into()
     }
 
     pub(crate) async fn read_logpoint_events(
@@ -1924,22 +2019,14 @@ impl BridgeClient {
 
     pub(crate) async fn get(&self, path: &str, params: &[(&str, Option<&str>)]) -> Result<Value> {
         let url = self.url(path, params);
-        let response = self.http.get(&url).send().await.map_err(|error| {
-            crate::diagnostic::DiagnosticError::new(
-                "studio_bridge_unreachable",
-                "debugger",
-                format!(
-                    "cannot reach the Android Studio debugger bridge at {}: {error}",
-                    self.base_url
-                ),
-            )
-            .retryable(true)
-            .detail(serde_json::json!({"base_url": self.base_url, "route": path}))
-            .next_actions([
-                "run `shadowdroid studio status --json`",
-                "start Android Studio with the plugin installed, or pass --studio-url, then retry",
-            ])
-        })?;
+        let timeout = request_timeout(self.request_timeout, params);
+        let response = self
+            .http
+            .get(&url)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|error| self.send_error(path, &error, timeout))?;
         let status = response.status();
         let body = response.text().await.map_err(|error| {
             crate::diagnostic::DiagnosticError::new(
@@ -1967,6 +2054,24 @@ impl BridgeClient {
                 "restart Android Studio after updating the plugin, then retry",
             ])
         })?;
+        if bridge_error_code(&value) == Some("studio_ui_busy") {
+            // The plugin cancelled the request before it ran: safe to retry
+            // once the blocking dialog is gone.
+            return Err(crate::diagnostic::DiagnosticError::new(
+                "studio_ui_busy",
+                "debugger",
+                value
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Android Studio's UI thread is busy"),
+            )
+            .retryable(true)
+            .detail(serde_json::json!({"route": path, "executed": false, "bridge_reply": value}))
+            .next_actions([
+                "dismiss the open dialog in Android Studio (`shadowdroid debug status` lists blocked_dialogs), then retry",
+            ])
+            .into());
+        }
         if bridge_error_code(&value) == Some("layout_debugger_conflict") {
             return Err(layout_debugger_conflict_diagnostic(
                 value,
@@ -2156,6 +2261,88 @@ fn registry_url() -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn code_and_retryable(error: &anyhow::Error) -> (String, bool) {
+        let diagnostic = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<crate::diagnostic::DiagnosticError>())
+            .expect("typed bridge error");
+        (diagnostic.code.clone(), diagnostic.retryable)
+    }
+
+    #[tokio::test]
+    async fn unanswered_bridge_requests_are_classified_by_delivery_and_route() {
+        // Refused: the request never reached Android Studio.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_url = format!("http://127.0.0.1:{}", closed.local_addr().unwrap().port());
+        drop(closed);
+        let bridge =
+            BridgeClient::with_timeout(Some(&closed_url), Duration::from_millis(300)).unwrap();
+        let error = bridge.get(route::SESSION_CONTROL, &[]).await.unwrap_err();
+        assert_eq!(
+            code_and_retryable(&error),
+            ("studio_bridge_unreachable".into(), true)
+        );
+
+        // Accepted but never answered (e.g. Studio blocked by a modal dialog).
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent_url = format!("http://127.0.0.1:{}", silent.local_addr().unwrap().port());
+        let hold = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (socket, _) = silent.accept().await.unwrap();
+                held.push(socket);
+            }
+        });
+        let bridge =
+            BridgeClient::with_timeout(Some(&silent_url), Duration::from_millis(300)).unwrap();
+        let error = bridge.get(route::SESSION_CONTROL, &[]).await.unwrap_err();
+        assert_eq!(
+            code_and_retryable(&error),
+            ("studio_bridge_timeout".into(), false)
+        );
+        let error = bridge.get(route::SESSION_STACK, &[]).await.unwrap_err();
+        assert_eq!(
+            code_and_retryable(&error),
+            ("studio_bridge_timeout".into(), true)
+        );
+        hold.abort();
+    }
+
+    #[tokio::test]
+    async fn cancelled_ui_thread_requests_are_retryable() {
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://127.0.0.1:{}", server.local_addr().unwrap().port());
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = server.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            let body = r#"{"ok":false,"error":"Android Studio's UI thread did not start the request","error_code":"studio_ui_busy","executed":false}"#;
+            let reply = format!(
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(reply.as_bytes()).await;
+        });
+        let bridge = BridgeClient::with_timeout(Some(&url), Duration::from_secs(5)).unwrap();
+        let error = bridge.get(route::SESSION_CONTROL, &[]).await.unwrap_err();
+        assert_eq!(code_and_retryable(&error), ("studio_ui_busy".into(), true));
+    }
+
+    #[test]
+    fn requested_timeouts_extend_the_http_deadline() {
+        let default = Duration::from_millis(DEFAULT_BRIDGE_TIMEOUT_MS);
+        assert_eq!(request_timeout(default, &[]), default);
+        assert_eq!(
+            request_timeout(default, &[(query::TIMEOUT_MS, Some("1000"))]),
+            default
+        );
+        assert_eq!(
+            request_timeout(default, &[(query::TIMEOUT_MS, Some("20000"))]),
+            Duration::from_millis(25_000)
+        );
+    }
     use serde_json::json;
 
     const URL: &str = "http://127.0.0.1:50576";

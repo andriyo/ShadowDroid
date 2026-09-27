@@ -19,7 +19,24 @@ internal object BridgeProtocol {
         Response(HttpURLConnection.HTTP_BAD_REQUEST, obj("ok", false, "error", message))
 
     @JvmStatic
-    fun bad(t: Throwable): Response = bad(t.message ?: t.javaClass.simpleName)
+    fun bad(t: Throwable): Response = failure(t, HttpURLConnection.HTTP_BAD_REQUEST)
+
+    /**
+     * An error reply for [t]. A request cancelled because the UI thread was busy
+     * is a distinct, retryable `studio_ui_busy` (it provably did not run), so the
+     * CLI can tell it apart from failures and from requests that never answered.
+     */
+    @JvmStatic
+    fun failure(t: Throwable, status: Int): Response {
+        val busy = generateSequence(t) { it.cause }.firstOrNull { it is StudioUiBusyException }
+        if (busy != null) {
+            return Response(
+                HttpURLConnection.HTTP_UNAVAILABLE,
+                obj("ok", false, "error", busy.message, "error_code", "studio_ui_busy", "executed", false),
+            )
+        }
+        return Response(status, obj("ok", false, "error", t.message ?: t.javaClass.simpleName))
+    }
 
     @JvmStatic
     fun send(exchange: HttpExchange, status: Int, body: String) {
