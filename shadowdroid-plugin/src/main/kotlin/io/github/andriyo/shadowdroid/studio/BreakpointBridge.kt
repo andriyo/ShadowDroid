@@ -357,15 +357,27 @@ internal object BreakpointBridge {
                 null
             }
             val applied = awaitAppliedToSessions(project)
-            BridgeProtocol.ok(
-                "ok", true,
-                "applied_to_sessions", applied,
-                "breakpoint", breakpointInfo(project, prepared.breakpoint),
-                "warning", if (prepared.positionSupported) {
+            val neighbours = StudioThreading.onIdeaThread { lineNeighbours(project, prepared.breakpoint) }
+            val warnings = listOfNotNull(
+                if (prepared.positionSupported) {
                     null
                 } else {
                     "no line breakpoint type accepts this position (blank or comment line?); the breakpoint may never bind"
                 },
+                if (prepared.created) {
+                    null
+                } else {
+                    "reused the breakpoint already at this line, so its previous settings were replaced"
+                },
+                neighbours.warning,
+            )
+            BridgeProtocol.ok(
+                "ok", true,
+                "applied_to_sessions", applied,
+                "created", prepared.created,
+                "breakpoint", breakpointInfo(project, prepared.breakpoint),
+                "other_breakpoints_at_line", neighbours.others,
+                "warning", warnings.joinToString("; ").ifEmpty { null },
             )
         } catch (t: Throwable) {
             BridgeProtocol.bad(t)
@@ -1130,10 +1142,13 @@ internal object BreakpointBridge {
                 null
             }
             val applied = awaitAppliedToSessions(selected.project)
+            val neighbours = StudioThreading.onIdeaThread { lineNeighbours(selected.project, breakpoint) }
             BridgeProtocol.ok(
                 "ok", true,
                 "applied_to_sessions", applied,
                 "breakpoint", breakpointInfo(selected.project, breakpoint),
+                "other_breakpoints_at_line", neighbours.others,
+                "warning", neighbours.warning,
             )
         } catch (t: Throwable) {
             BridgeProtocol.bad(t)
@@ -1169,6 +1184,44 @@ internal object BreakpointBridge {
             }
         }
         return null
+    }
+
+    private class LineNeighbours(val others: List<Map<String, Any?>>, val warning: String?)
+
+    /**
+     * The other breakpoints at [target]'s line. Another line breakpoint that is
+     * enabled, suspends and has no condition stops the app there whatever
+     * [target]'s condition says, which reads as the condition not working.
+     */
+    private fun lineNeighbours(project: Project, target: XBreakpoint<*>): LineNeighbours {
+        val line = target as? XLineBreakpoint<*> ?: return LineNeighbours(emptyList(), null)
+        val others = XDebuggerManager.getInstance(project).breakpointManager.allBreakpoints
+            .filterIsInstance<XLineBreakpoint<*>>()
+            .filter { it !== line && it.fileUrl == line.fileUrl && it.line == line.line }
+        // Only line breakpoints stop on reaching the line (Kotlin can keep one
+        // per lambda there); field and method breakpoints are listed only.
+        val alwaysStops = others.filter {
+            it.type.id in LINE_TYPE_IDS && it.isEnabled &&
+                it.suspendPolicy != SuspendPolicy.NONE && it.conditionExpression == null
+        }
+        val warning = if (alwaysStops.isEmpty()) {
+            null
+        } else {
+            "breakpoint ${alwaysStops.joinToString { breakpointId(project, it) }} at the same line is enabled " +
+                "and unconditional, so the app stops there whatever this breakpoint's condition says"
+        }
+        return LineNeighbours(
+            others.map {
+                BridgeProtocol.map(
+                    "id", breakpointId(project, it),
+                    "type", it.type.id,
+                    "enabled", it.isEnabled,
+                    "suspends", it.suspendPolicy != SuspendPolicy.NONE,
+                    "condition", it.conditionExpression?.expression,
+                )
+            },
+            warning,
+        )
     }
 
     private fun findLineBreakpoint(project: Project, fileUrl: String, zeroBasedLine: Int): XLineBreakpoint<*>? =
