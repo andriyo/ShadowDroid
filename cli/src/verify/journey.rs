@@ -394,6 +394,20 @@ pub async fn run(
     ))
 }
 
+/// Guarded steps re-read the screen and try again this many times when the
+/// server refuses the guard.
+const GUARDED_ATTEMPTS: u32 = 3;
+
+/// The server refused a guarded action because the screen or interaction
+/// state moved since the read: it injected nothing, so acting again on a
+/// fresh read is not a replay. The screen often keeps settling right after
+/// text entry (the field updates, the keyboard slides in).
+fn guard_refused(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::device::client::ServerError>()
+        .is_some_and(|e| matches!(e.code.as_str(), "screen_changed" | "interaction_changed"))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute(
     step: &Step,
@@ -420,56 +434,75 @@ async fn execute(
             ))
         }
         Step::Tap { target } | Step::Text { target, .. } => {
-            let stable = client.stable_screen(150, 3000).await?;
-            if !stable.stable || stable.screen.snapshot_state != SnapshotState::Consistent {
-                return Ok((Status::Blocked, json!({"reason":"screen_not_stable"})));
-            }
-            let matches = stable
-                .screen
-                .elements
-                .iter()
-                .filter(|e| target.matches(e))
-                .collect::<Vec<_>>();
-            if matches.len() != 1 {
-                return Ok((
-                    Status::Failed,
-                    json!({"reason":"target_not_unique","matches":matches.len()}),
-                ));
-            }
-            let guard = client.with_action_guard(ActionGuard {
-                if_screen: Some(stable.screen.screen_hash),
-                if_interaction: None,
-                element_handle: matches[0].handle.clone(),
-            });
-            if let Step::Text { value, .. } = step {
-                guard
-                    .text_with_target(value, true, Some(&target.query()))
-                    .await?;
-            } else {
-                let response = guard.find_tap(&target.query()).await?;
-                if response.input_delivered == Some(false) {
-                    return Ok((Status::Failed, json!({"reason":"input_not_delivered"})));
+            let mut attempt = 1;
+            loop {
+                let stable = client.stable_screen(150, 3000).await?;
+                if !stable.stable || stable.screen.snapshot_state != SnapshotState::Consistent {
+                    return Ok((Status::Blocked, json!({"reason":"screen_not_stable"})));
+                }
+                let matches = stable
+                    .screen
+                    .elements
+                    .iter()
+                    .filter(|e| target.matches(e))
+                    .collect::<Vec<_>>();
+                if matches.len() != 1 {
+                    return Ok((
+                        Status::Failed,
+                        json!({"reason":"target_not_unique","matches":matches.len()}),
+                    ));
+                }
+                let guard = client.with_action_guard(ActionGuard {
+                    if_screen: Some(stable.screen.screen_hash),
+                    if_interaction: None,
+                    element_handle: matches[0].handle.clone(),
+                });
+                let acted = if let Step::Text { value, .. } = step {
+                    guard
+                        .text_with_target(value, true, Some(&target.query()))
+                        .await
+                        .map(|_| None)
+                } else {
+                    guard.find_tap(&target.query()).await.map(Some)
+                };
+                match acted {
+                    Err(e) if guard_refused(&e) && attempt < GUARDED_ATTEMPTS => attempt += 1,
+                    Err(e) => return Err(e),
+                    Ok(Some(response)) if response.input_delivered == Some(false) => {
+                        return Ok((Status::Failed, json!({"reason":"input_not_delivered"})));
+                    }
+                    Ok(_) => {
+                        return pass(json!({"target":target,"guarded":true,"attempts":attempt}));
+                    }
                 }
             }
-            pass(json!({"target":target,"guarded":true}))
         }
         Step::Key { name } => {
-            let stable = client.stable_screen(150, 3000).await?;
-            if !stable.stable || stable.screen.snapshot_state != SnapshotState::Consistent {
-                return Ok((Status::Blocked, json!({"reason":"screen_not_stable"})));
+            let mut attempt = 1;
+            loop {
+                let stable = client.stable_screen(150, 3000).await?;
+                if !stable.stable || stable.screen.snapshot_state != SnapshotState::Consistent {
+                    return Ok((Status::Blocked, json!({"reason":"screen_not_stable"})));
+                }
+                let guard = client.with_action_guard(ActionGuard {
+                    if_screen: Some(stable.screen.screen_hash),
+                    if_interaction: None,
+                    element_handle: None,
+                });
+                let injected = match guard.key(name).await {
+                    Err(e) if guard_refused(&e) && attempt < GUARDED_ATTEMPTS => {
+                        attempt += 1;
+                        continue;
+                    }
+                    result => result?,
+                };
+                // Android can report false even when the key changed the UI. Do
+                // not repeat it or infer delivery from this advisory bit. Validation
+                // requires the very next step to establish the requested outcome.
+                return pass(
+                    json!({"injected":injected,"injection_result":"advisory","guarded":true,"outcome_validation":"following_assert_or_compare","replayed":false,"attempts":attempt}),
+                );
             }
-            let guard = client.with_action_guard(ActionGuard {
-                if_screen: Some(stable.screen.screen_hash),
-                if_interaction: None,
-                element_handle: None,
-            });
-            let injected = guard.key(name).await?;
-            // Android can report false even when the key changed the UI. Do
-            // not repeat it or infer delivery from this advisory bit. Validation
-            // requires the very next step to establish the requested outcome.
-            pass(
-                json!({"injected":injected,"injection_result":"advisory","guarded":true,"outcome_validation":"following_assert_or_compare","replayed":false}),
-            )
         }
         Step::Assert {
             target,
@@ -876,5 +909,125 @@ mod tests {
             }
             server.await.unwrap();
         }
+    }
+
+    /// Serve `replies` (status, body) to consecutive requests, one per connection.
+    async fn scripted_server(
+        replies: Vec<(u16, Value)>,
+    ) -> (ServerClient, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = ServerClient::new(listener.local_addr().unwrap().port()).unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (status, reply) in replies {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut request = String::new();
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                    request.push_str(&line);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).await.unwrap();
+                requests.push(request.lines().next().unwrap_or_default().to_string());
+                let reply = reply.to_string();
+                socket
+                    .get_mut()
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                            reply.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                socket.get_mut().shutdown().await.unwrap();
+            }
+            requests
+        });
+        (client, server)
+    }
+
+    fn stable_reply(hash: &str) -> (u16, Value) {
+        (
+            200,
+            json!({"stable":true,"settle_ms":0,"quiet_period_ms":150,"screen":{
+                "screen_hash":hash,"snapshot_state":"consistent",
+                "viewport":{"w":320,"h":640},"current_app":{"package":"example.app"},
+                "element_count":1,"elements":[{"id":0,"rid":"label","text":"x"}]
+            }}),
+        )
+    }
+
+    fn screen_changed_reply() -> (u16, Value) {
+        (
+            412,
+            json!({"error":{"code":"screen_changed","message":"screen changed since the guarded read; no input was injected"}}),
+        )
+    }
+
+    async fn run_key(replies: Vec<(u16, Value)>) -> (Result<(Status, Value)>, Vec<String>) {
+        let (client, server) = scripted_server(replies).await;
+        let journey = key_journey();
+        let out = tempfile::tempdir().unwrap();
+        let mut journal = Journal::default();
+        let mut memories = BTreeMap::new();
+        let result = execute(
+            &journey.steps[1],
+            &journey,
+            &client,
+            &Serial::new("fixture"),
+            out.path(),
+            &mut journal,
+            &out.path().join("journal.json"),
+            &mut memories,
+        )
+        .await;
+        (result, server.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_refused_guard_is_retried_on_a_fresh_read() {
+        let (result, requests) = run_key(vec![
+            stable_reply("before"),
+            screen_changed_reply(),
+            stable_reply("settled"),
+            (200, json!({"ok":true})),
+        ])
+        .await;
+        let (status, evidence) = result.unwrap();
+        assert_eq!(status, Status::Passed);
+        assert_eq!(evidence["attempts"], 2);
+        assert!(
+            requests[1].starts_with("POST /v1/guarded/key"),
+            "{requests:?}"
+        );
+        assert!(
+            requests[2].starts_with("GET /v1/screen/stable"),
+            "{requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_guard_refused_every_time_fails_after_bounded_attempts() {
+        let mut replies = Vec::new();
+        for _ in 0..GUARDED_ATTEMPTS {
+            replies.push(stable_reply("moving"));
+            replies.push(screen_changed_reply());
+        }
+        let (result, requests) = run_key(replies).await;
+        let error = result.unwrap_err();
+        assert!(guard_refused(&error), "{error:#}");
+        assert_eq!(requests.len(), 2 * GUARDED_ATTEMPTS as usize);
     }
 }
