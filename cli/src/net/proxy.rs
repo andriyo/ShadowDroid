@@ -2085,7 +2085,26 @@ async fn send_upstream(
     if let Some(b) = body {
         rb = rb.body(b);
     }
-    rb.send().await.map_err(|e| anyhow!("upstream: {e}"))
+    rb.send()
+        .await
+        .map_err(|e| anyhow!("upstream: {}", error_with_causes(&e)))
+}
+
+/// An error with its whole cause chain. reqwest's own message is only
+/// "error sending request for url (…)"; the refused connection, failed DNS
+/// lookup or rejected certificate is in its sources.
+fn error_with_causes(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        if !text.contains(&cause_text) {
+            text.push_str(": ");
+            text.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    text
 }
 
 fn upstream_headers(
