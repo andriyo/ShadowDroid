@@ -65,6 +65,19 @@ pub fn catalog(root: &Command) -> serde_json::Value {
     catalog_with_depth(root, None)
 }
 
+/// Root flags that are not global: they must come before the subcommand
+/// (`shadowdroid --session TOKEN ui dump`).
+fn root_args(root: &Command) -> Vec<serde_json::Value> {
+    args(root)
+        .into_iter()
+        .filter(|arg| arg["global"] != true)
+        .map(|mut arg| {
+            arg["position"] = serde_json::json!("before_subcommand");
+            arg
+        })
+        .collect()
+}
+
 fn catalog_with_depth(root: &Command, depth: Option<usize>) -> serde_json::Value {
     serde_json::json!({
         "schema_version": 3,
@@ -73,6 +86,7 @@ fn catalog_with_depth(root: &Command, depth: Option<usize>) -> serde_json::Value
         "about": root.get_about().map(|s| s.to_string()),
         "effect_model": effect_model_json(),
         "global_args": args(root).into_iter().filter(|arg| arg["global"] == true).collect::<Vec<_>>(),
+        "root_args": root_args(root),
         "commands": subcommands(root, &[], depth),
         "next_actions": next_actions_for_path("commands"),
     })
@@ -101,6 +115,7 @@ fn describe_catalog(root: &Command, raw_path: &str) -> Option<serde_json::Value>
         "version": root.get_version().unwrap_or(""),
         "effect_model": effect_model_json(),
         "global_args": args(root).into_iter().filter(|arg| arg["global"] == true).collect::<Vec<_>>(),
+        "root_args": root_args(root),
         // Include one level of child names/contracts for namespace queries such
         // as `commands net`; leaf queries remain a single bounded command.
         "command": command_json(command, &parent, Some(1)),
@@ -271,6 +286,7 @@ fn compact_catalog(catalog: &mut serde_json::Value) {
     });
     if let Some(object) = catalog.as_object_mut() {
         object.remove("global_args");
+        object.remove("root_args");
         object.remove("effect_model");
     }
     if let Some(command) = catalog.get_mut("command") {
