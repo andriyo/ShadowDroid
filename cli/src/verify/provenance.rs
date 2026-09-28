@@ -16,6 +16,18 @@ pub struct Inputs {
     pub files: BTreeMap<PathBuf, String>,
 }
 
+impl Inputs {
+    /// Whether [other] has the same source content. `git_head` is recorded
+    /// provenance, not identity: `files` already holds every tracked, dirty
+    /// and untracked source in scope, so committing those bytes, or anything
+    /// outside the source root, leaves the sources unchanged.
+    pub fn same_sources(&self, other: &Inputs) -> bool {
+        self.root == other.root
+            && self.source_scope == other.source_scope
+            && self.files == other.files
+    }
+}
+
 pub fn hash(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }

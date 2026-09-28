@@ -405,7 +405,8 @@ pub async fn run(plan_path: &Path, out: &Path, serial: Option<&crate::ids::Seria
         save_manifest(&out, &manifest)?;
     }
     manifest.source_changed_during_run =
-        provenance::snapshot(&root, &manifest.plan.tracked_inputs())? != manifest.inputs;
+        !provenance::snapshot(&root, &manifest.plan.tracked_inputs())?
+            .same_sources(&manifest.inputs);
     manifest.finished_ms = Some(crate::runtime::now_ms());
     manifest.execution_complete = !unknown && !interrupted;
     save_manifest(&out, &manifest)?;
@@ -759,7 +760,7 @@ fn report_value(out: &Path, manifest: &Manifest, at_run: bool) -> Result<Value> 
     let stale = manifest.source_changed_during_run
         || current
             .as_ref()
-            .map_or(true, |inputs| inputs != &manifest.inputs)
+            .map_or(true, |inputs| !inputs.same_sources(&manifest.inputs))
         || current_plan
             .as_ref()
             .map_or(true, |hash| hash != &manifest.plan_hash);

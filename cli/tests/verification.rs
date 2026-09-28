@@ -202,6 +202,60 @@ fn executable_ledger_preserves_omitted_requirements_and_detects_staleness_and_ta
     assert!(!report["evidence_issues"].as_array().unwrap().is_empty());
 }
 
+/// Committing, whether the verified sources themselves or anything outside the
+/// source root, changes no source bytes and must not make results stale.
+#[test]
+fn a_commit_without_source_changes_keeps_results_current() {
+    let temp = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .current_dir(temp.path())
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    let source = temp.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(temp.path().join(".gitignore"), "run/\nsource/tests.xml\n").unwrap();
+    let plan = host_plan(&source, "write");
+    std::fs::write(source.join("plan.json"), serde_json::to_vec(&plan).unwrap()).unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "sources"]);
+    let output = temp.path().join("run");
+    run(
+        &source,
+        &[
+            "verify",
+            "run",
+            "plan.json",
+            "--host-only",
+            "--out",
+            output.to_str().unwrap(),
+        ],
+    );
+    let current = |label: &str| {
+        let (_, report) = run(&source, &["verify", "report", output.to_str().unwrap()]);
+        assert_eq!(report["source_inputs_current"], true, "{label}: {report}");
+    };
+    current("right after the run");
+    std::fs::create_dir(temp.path().join("other")).unwrap();
+    std::fs::write(temp.path().join("other/notes.txt"), "unrelated").unwrap();
+    git(&["add", "-A"]);
+    git(&[
+        "commit",
+        "-q",
+        "-m",
+        "commit the run's sources and an unrelated file",
+    ]);
+    current("after a commit");
+    std::fs::write(source.join("input.txt"), "edited").unwrap();
+    let (_, report) = run(&source, &["verify", "report", output.to_str().unwrap()]);
+    assert_eq!(report["source_inputs_current"], false, "{report}");
+}
+
 #[test]
 fn zero_exit_cannot_reuse_old_xml_and_failed_prerequisites_block_dependents() {
     let temp = tempfile::tempdir().unwrap();
