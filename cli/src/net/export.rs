@@ -672,6 +672,7 @@ mod tests {
             original_url: None,
             http_version: None,
             upstream_http_version: None,
+            fault_ids: Vec::new(),
             upstream_bypassed: false,
             error: None,
             error_redacted: false,

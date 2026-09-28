@@ -3611,6 +3611,7 @@ mod tests {
             terminal_holds: Mutex::new(crate::net::proxy::TerminalHoldHistory::default()),
             events,
             rules: std::sync::RwLock::new(Vec::new()),
+            faults: std::sync::RwLock::new(Vec::new()),
             replay: std::sync::RwLock::new(None),
             tls_errors_seen: Mutex::new(std::collections::HashSet::new()),
             dropped_flows: AtomicU64::new(0),

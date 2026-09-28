@@ -157,6 +157,9 @@ pub enum Event {
         rule_id: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         rule_ids: Vec<String>,
+        /// Injected faults (`fault inject http-errors …`) that hit the request.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        fault_ids: Vec<String>,
         #[serde(default, skip_serializing_if = "is_false")]
         modified: bool,
         #[serde(default, skip_serializing_if = "is_false")]

@@ -368,10 +368,18 @@ pub async fn serve_client(
                         "replay_atomic_replace": true,
                         "http_transport_abort": true,
                         "http_intercept_clear": true,
+                        "traffic_faults": true,
                     },
                     "capture_redaction": capture_redaction_status(shared.redaction.as_ref()),
                     "replay": replay_status(&shared.replay),
                     "flows": state.flow_count.load(Ordering::Relaxed),
+                    "faults": shared
+                        .faults
+                        .read()
+                        .unwrap()
+                        .iter()
+                        .map(|fault| fault.status())
+                        .collect::<Vec<_>>(),
                     "dropped_flows": shared.dropped_flows.load(Ordering::Relaxed),
                     "persistence_errors": shared.persistence_errors.load(Ordering::Relaxed),
                     "held": held_flows.len(),
@@ -805,6 +813,53 @@ pub async fn serve_client(
                 n
             };
             write_json(&mut wr, &json!({"ok": true, "cleared": n})).await?;
+        }
+        "fault_add" => {
+            let spec = req
+                .get("spec")
+                .cloned()
+                .ok_or_else(|| "missing fault spec".to_string())
+                .and_then(|value| {
+                    serde_json::from_value::<crate::net::fault::NetFaultSpec>(value)
+                        .map_err(|e| format!("invalid fault spec: {e}"))
+                })
+                .and_then(|spec| spec.validate().map(|()| spec));
+            let reply = match spec {
+                Err(error) => json!({"ok": false, "error": error}),
+                Ok(spec) => {
+                    let mut faults = shared.faults.write().unwrap();
+                    if faults.iter().any(|fault| fault.spec.id == spec.id) {
+                        json!({"ok": false, "error": format!("fault {} is already installed", spec.id)})
+                    } else {
+                        let active =
+                            std::sync::Arc::new(crate::net::fault::ActiveNetFault::new(spec));
+                        let reply = json!({"ok": true, "fault": active.status()});
+                        faults.push(active);
+                        reply
+                    }
+                }
+            };
+            write_json(&mut wr, &reply).await?;
+        }
+        "fault_remove" => {
+            let id = req.get("id").and_then(Value::as_str).unwrap_or("");
+            let removed = {
+                let mut faults = shared.faults.write().unwrap();
+                let before = faults.len();
+                faults.retain(|fault| fault.spec.id != id);
+                before != faults.len()
+            };
+            write_json(&mut wr, &json!({"ok": true, "removed": removed})).await?;
+        }
+        "fault_list" => {
+            let faults: Vec<Value> = shared
+                .faults
+                .read()
+                .unwrap()
+                .iter()
+                .map(|fault| fault.status())
+                .collect();
+            write_json(&mut wr, &json!({"ok": true, "faults": faults})).await?;
         }
         "replay_clear" => {
             let previous = shared.replay.write().unwrap().take();

@@ -25,6 +25,7 @@ pub mod commands;
 pub mod control;
 pub mod daemon;
 pub mod export;
+pub mod fault;
 pub mod flow;
 pub mod paths;
 pub mod proxy;

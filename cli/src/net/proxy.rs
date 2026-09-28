@@ -122,6 +122,9 @@ pub struct SharedState {
     /// Declarative rules (`net rule`), applied in order. Every entry is fully
     /// validated/compiled before the vector is atomically published.
     pub rules: RwLock<Vec<(String, CompiledRule)>>,
+    /// Injected traffic faults (`shadowdroid fault inject http-errors …`), in
+    /// installation order.
+    pub faults: RwLock<Vec<Arc<crate::net::fault::ActiveNetFault>>>,
     /// Fully validated immutable response set (`net replay`), or `None`.
     pub replay: RwLock<Option<Arc<ActiveReplay>>>,
     /// Hosts we've already reported a `tls_error` for, so a client that keeps
@@ -493,6 +496,18 @@ fn process_connect(ctx: Arc<ProxyContext>, req: Request<Incoming>) -> Response<P
             Ok(n) => n,
         };
         let is_tls = peek[0] == 0x16;
+        if is_tls {
+            let active = ctx.shared.faults.read().unwrap().clone();
+            if let Some(id) = crate::net::fault::tls_failure_for(&active, &host) {
+                use tokio::io::AsyncWriteExt;
+                tracing::debug!("fault {id}: failing the TLS handshake for {host}");
+                let _ = io
+                    .write_all(&crate::net::fault::TLS_HANDSHAKE_FAILURE_ALERT)
+                    .await;
+                let _ = io.shutdown().await;
+                return;
+            }
+        }
         let stream = Rewind::new(io, peek[..n].to_vec());
 
         if is_tls && ctx.shared.host_in_scope(&host) {
@@ -1090,6 +1105,8 @@ struct PendingFlow {
     http_version: Option<String>,
     /// The HTTP version the upstream server answered with.
     upstream_http_version: Mutex<Option<String>>,
+    /// Injected faults that hit this request.
+    fault_ids: Mutex<Vec<String>>,
 }
 
 /// Where a request was redirected to by `net resume --set-url`: every flow
@@ -1122,6 +1139,22 @@ fn note_upstream_version(version: http::Version) {
     let _ = PENDING_FLOW.try_with(|pending| {
         *pending.upstream_http_version.lock().unwrap() = Some(format!("{version:?}"));
     });
+}
+
+fn note_faults(ids: &[String]) {
+    let _ = PENDING_FLOW.try_with(|pending| {
+        pending
+            .fault_ids
+            .lock()
+            .unwrap()
+            .extend(ids.iter().cloned());
+    });
+}
+
+fn pending_fault_ids() -> Vec<String> {
+    PENDING_FLOW
+        .try_with(|pending| pending.fault_ids.lock().unwrap().clone())
+        .unwrap_or_default()
 }
 
 fn pending_upstream_http_version() -> Option<String> {
@@ -1421,6 +1454,63 @@ async fn proxy_request_inner(
         }
     }
 
+    // ── injected faults: latency, error answers, and (later) body sabotage ──
+    let request_faults = if in_scope {
+        let active = ctx.shared.faults.read().unwrap().clone();
+        crate::net::fault::for_request(&active, &host, &path)
+    } else {
+        crate::net::fault::RequestFaults::default()
+    };
+    if !request_faults.ids.is_empty() {
+        note_faults(&request_faults.ids);
+        if matched.is_none() {
+            matched = Some("fault".into());
+        }
+    }
+    if request_faults.delay_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(request_faults.delay_ms)).await;
+    }
+    if let Some(status) = request_faults.error_status {
+        let mut headers = vec![(
+            "content-type".to_string(),
+            "text/plain; charset=utf-8".to_string(),
+        )];
+        let body = Bytes::from(format!(
+            "shadowdroid fault {}: injected HTTP {status}",
+            request_faults.ids.join(",")
+        ));
+        replace_content_length(&mut headers, synthetic_response_length(status, body.len()));
+        let wire_body = if response_allows_body(&method, status) {
+            body.clone()
+        } else {
+            Bytes::new()
+        };
+        capture_bypassed(
+            &ctx,
+            FlowParts {
+                id: &id,
+                method: method.as_str(),
+                scheme: &scheme,
+                host: &host,
+                port,
+                path: &path,
+                req_headers: &req_headers,
+                req_bytes: &req_bytes,
+                req_streamed: req_streaming,
+                status: Some(status),
+                resp_headers: &headers,
+                resp_bytes: &wire_body,
+                dur_ms: 0,
+                error: None,
+                matched: Some("fault".into()),
+                modified: true,
+                request_body_modified: false,
+                rule_ids: &rule_ids,
+            },
+        );
+        return Ok(build_client_response_for(&method, status, &headers, body));
+    }
+
     // ── request-phase interception ── (skipped for streamed uploads: no buffered
     //    body to preview or mutate, like a streamed response skips response intercept)
     if in_scope && !req_streaming {
@@ -1678,6 +1768,12 @@ async fn proxy_request_inner(
                 } else {
                     None
                 };
+            let (response_body, response_length) = match request_faults.body {
+                Some(fault) if body_allowed => {
+                    crate::net::fault::sabotage(response_body, fault, response_length)
+                }
+                _ => (response_body, response_length),
+            };
             return Ok(response_with_body(
                 final_status,
                 &resp_headers,
@@ -1920,7 +2016,14 @@ async fn proxy_request_inner(
             } else {
                 Some(u64::try_from(resp_bytes.len()).unwrap_or(u64::MAX))
             };
-            response_with_body(status, &resp_headers, full_body(resp_bytes), length)
+            match request_faults.body {
+                Some(fault) if response_allows_body(&method, status) => {
+                    let (body, length) =
+                        crate::net::fault::sabotage(full_body(resp_bytes), fault, length);
+                    response_with_body(status, &resp_headers, body, length)
+                }
+                _ => response_with_body(status, &resp_headers, full_body(resp_bytes), length),
+            }
         }
         None => error_response_for(
             &method,
@@ -2327,6 +2430,7 @@ fn make_flow(p: FlowParts<'_>) -> FlowRecord {
         original_url: pending_original_url(),
         http_version: pending_http_version(),
         upstream_http_version: pending_upstream_http_version(),
+        fault_ids: pending_fault_ids(),
         upstream_bypassed: false,
         error: p.error,
         error_redacted: false,
@@ -3473,6 +3577,7 @@ fn shared_with_rules(rules: Vec<(String, CompiledRule)>) -> SharedState {
         terminal_holds: Mutex::new(TerminalHoldHistory::default()),
         events,
         rules: RwLock::new(rules),
+        faults: RwLock::new(Vec::new()),
         replay: RwLock::new(None),
         tls_errors_seen: Mutex::new(HashSet::new()),
         dropped_flows: AtomicU64::new(0),
@@ -4487,6 +4592,122 @@ mod tests {
         );
         assert!(crate::net::replay::validate_source_flow(&captured).is_err());
         proxy_task.abort();
+    }
+
+    #[tokio::test]
+    async fn injected_traffic_faults_reach_the_app_and_are_recorded() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::default();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&key).unwrap();
+        let cert_path = dir.path().join("root.crt");
+        let key_path = dir.path().join("root.key");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        let ca = crate::net::ca::CertAuthority::load_from_files(&cert_path, &key_path).unwrap();
+        let (flow_tx, mut flow_rx) = tokio::sync::mpsc::channel(16);
+        let shared = Arc::new(shared_with_rules(vec![]));
+        let ctx = Arc::new(super::ProxyContext {
+            ca,
+            client: super::build_upstream_client(false),
+            flow_tx,
+            shared: shared.clone(),
+            serial: "fault-test".into(),
+            capture_session_id: "fault-test".into(),
+            verify_upstream: false,
+            tasks: tokio_util::task::TaskTracker::new(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        });
+        // Upstream: answers every request with a 20-byte body.
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = upstream.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut request = vec![];
+                    let mut byte = [0];
+                    while !request.ends_with(b"\r\n\r\n") {
+                        if socket.read_exact(&mut byte).await.is_err() {
+                            return;
+                        }
+                        request.push(byte[0]);
+                    }
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 20\r\nConnection: close\r\n\r\n01234567890123456789")
+                        .await;
+                });
+            }
+        });
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let (_stop_tx, stop_rx) = oneshot::channel();
+        let proxy_task = tokio::spawn(super::serve(ctx.clone(), listener, stop_rx));
+
+        let install = |effect| {
+            *shared.faults.write().unwrap() = vec![Arc::new(
+                crate::net::fault::ActiveNetFault::new(crate::net::fault::NetFaultSpec {
+                    id: "flt_test".into(),
+                    host: None,
+                    path: Some("/api".into()),
+                    percent: 100,
+                    seed: 0,
+                    effect,
+                }),
+            )];
+        };
+        // Raw HTTP/1.1 through the proxy: what the app would read.
+        let fetch = |path: &'static str| async move {
+            let mut app = TcpStream::connect(proxy_addr).await.unwrap();
+            app.write_all(
+                format!("GET http://{upstream_addr}{path} HTTP/1.1\r\nHost: {upstream_addr}\r\nConnection: close\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+            let mut raw = Vec::new();
+            let _ = app.read_to_end(&mut raw).await;
+            String::from_utf8_lossy(&raw).to_string()
+        };
+        let body_of = |raw: &str| raw.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+
+        install(crate::net::fault::NetFaultEffect::ErrorStatus { status: 503 });
+        let raw = fetch("/api/x").await;
+        assert!(raw.starts_with("HTTP/1.1 503"), "{raw}");
+        let flow = flow_rx.recv().await.unwrap();
+        assert_eq!(flow.fault_ids, vec!["flt_test".to_string()]);
+        assert_eq!(flow.status, Some(503));
+        assert!(flow.upstream_bypassed);
+
+        // Out of scope (path): untouched.
+        let raw = fetch("/other").await;
+        assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
+        assert!(flow_rx.recv().await.unwrap().fault_ids.is_empty());
+
+        install(crate::net::fault::NetFaultEffect::Truncate { keep_bytes: 5 });
+        let raw = fetch("/api/x").await;
+        assert!(raw.contains("content-length: 5"), "{raw}");
+        assert_eq!(body_of(&raw), "01234");
+        assert_eq!(flow_rx.recv().await.unwrap().fault_ids.len(), 1);
+
+        install(crate::net::fault::NetFaultEffect::ConnectionReset { after_bytes: 4 });
+        let raw = fetch("/api/x").await;
+        assert!(raw.contains("content-length: 20"), "{raw}");
+        assert_eq!(body_of(&raw), "0123", "raw: {raw:?}");
+        flow_rx.recv().await.unwrap();
+
+        install(crate::net::fault::NetFaultEffect::Latency {
+            delay_ms: 300,
+            jitter_ms: 0,
+        });
+        let started = std::time::Instant::now();
+        assert!(fetch("/api/x").await.starts_with("HTTP/1.1 200"));
+        assert!(started.elapsed() >= Duration::from_millis(300));
+
+        proxy_task.abort();
+        upstream_task.abort();
     }
 
     #[tokio::test]

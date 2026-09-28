@@ -101,6 +101,9 @@ pub struct FlowRecord {
     /// when no upstream response arrived (replay, errors, older captures).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_http_version: Option<String>,
+    /// Injected faults (`fault inject http-errors …`) that hit this request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fault_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub upstream_bypassed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -167,6 +170,7 @@ impl FlowRecord {
             matched: self.matched.clone(),
             rule_id: self.rule_id.clone(),
             rule_ids: self.rule_ids.clone(),
+            fault_ids: self.fault_ids.clone(),
             modified: self.modified,
             upstream_bypassed: self.upstream_bypassed,
             error: self.error.clone(),
@@ -217,6 +221,7 @@ impl FlowRecord {
             "original_url": self.original_url,
             "http_version": self.http_version,
             "upstream_http_version": self.upstream_http_version,
+            "fault_ids": self.fault_ids,
             "upstream_bypassed": self.upstream_bypassed,
             "error": self.error,
             "error_redacted": self.error_redacted,
@@ -465,6 +470,7 @@ mod tests {
             original_url: None,
             http_version: None,
             upstream_http_version: None,
+            fault_ids: Vec::new(),
             upstream_bypassed: false,
             error: None,
             error_redacted: false,

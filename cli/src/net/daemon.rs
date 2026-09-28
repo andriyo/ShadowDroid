@@ -137,6 +137,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         terminal_holds: Mutex::new(proxy::TerminalHoldHistory::default()),
         events: event_tx.clone(),
         rules: RwLock::new(Vec::new()),
+        faults: RwLock::new(Vec::new()),
         replay: RwLock::new(None),
         tls_errors_seen: Mutex::new(HashSet::new()),
         dropped_flows: AtomicU64::new(0),
