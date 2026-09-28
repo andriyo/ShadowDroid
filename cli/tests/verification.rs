@@ -142,6 +142,22 @@ fn external_test_fixture() {
     }
 }
 
+/// Every file a run writes is owner-only, like the evidence it holds.
+#[cfg(unix)]
+fn assert_private_files(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        let meta = entry.metadata().unwrap();
+        if meta.is_dir() {
+            assert_private_files(&entry.path());
+        } else {
+            let mode = meta.permissions().mode() & 0o777;
+            assert_eq!(mode & 0o077, 0, "{} is {mode:o}", entry.path().display());
+        }
+    }
+}
+
 fn host_plan(source: &Path, mode: &str) -> Value {
     std::fs::write(source.join("input.txt"), "candidate").unwrap();
     std::fs::write(source.join("fixture-mode.txt"), mode).unwrap();
@@ -171,6 +187,8 @@ fn executable_ledger_preserves_omitted_requirements_and_detects_staleness_and_ta
     );
     assert_ne!(code, 0, "omitted route must not pass: {value}");
     assert_eq!(value["code"], "verification_unresolved", "{value}");
+    #[cfg(unix)]
+    assert_private_files(&output);
     let (_, report) = run(&source, &["verify", "report", output.to_str().unwrap()]);
     assert_eq!(report["check_statuses"]["unit"], "passed", "{report}");
     assert_eq!(report["requirements"][1]["status"], "untested");

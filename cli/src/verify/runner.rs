@@ -68,10 +68,15 @@ fn immutable_json(path: &Path, value: &impl Serialize) -> Result<String> {
 
 fn event(out: &Path, value: Value) -> Result<()> {
     use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(out.join("events.jsonl"))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    // Private like every other file in the run directory.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(out.join("events.jsonl"))?;
     serde_json::to_writer(&mut file, &value)?;
     file.write_all(b"\n")?;
     file.sync_all()?;
