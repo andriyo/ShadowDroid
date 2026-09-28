@@ -459,7 +459,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "ui wait" => Some(serde_json::json!({
             "use_when": ["Need to block until an element, activity, or package appears or disappears."],
-            "output": "wait action with matched element/app on success; non-zero retryable wait_timeout with current app, screen hash/version, visible texts, and next actions on deadline",
+            "output": "wait action with matched element/app and snapshot_state on success (it decides on a consistent snapshot while time remains; snapshot_state transitioning plus warning means the deadline arrived mid-transition); non-zero retryable wait_timeout with current app, screen hash/version, visible texts, and next actions on deadline",
             "side_effects": ["polls current UI/app state"],
             "next_actions": ["ui dump", "ui tap", "watch"]
         })),

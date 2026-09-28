@@ -6164,6 +6164,15 @@ async fn cmd_wait(
         };
         let outcome = wait_query_matches(&query, &screen.current_app, &screen.elements);
         let matched = outcome.matched;
+        // A mid-transition tree can show the new activity before Android's
+        // foreground metadata agrees, or miss elements that are still there:
+        // decide on a consistent snapshot while time remains.
+        let settled = screen.snapshot_state != crate::proto::SnapshotState::Transitioning;
+        if matched != gone && !settled && tokio::time::Instant::now() < deadline {
+            let sleep = std::time::Duration::from_millis(poll_ms.max(1) as u64);
+            tokio::time::sleep_until((tokio::time::Instant::now() + sleep).min(deadline)).await;
+            continue;
+        }
         let content_hash = screen.content_hash.clone();
         let interaction_hash = screen.interaction_hash.clone();
         let interaction_hash_version = screen.interaction_hash_version;
@@ -6183,7 +6192,11 @@ async fn cmd_wait(
                 "interaction_hash": interaction_hash,
                 "interaction_hash_version": interaction_hash_version,
                 "current_app": current_app,
+                "snapshot_state": screen.snapshot_state,
             });
+            if !settled {
+                body["warning"] = json!(screen.warning);
+            }
             if let Some(el) = outcome.element {
                 body["element"] = json!(CompactElement::from(el));
             }
