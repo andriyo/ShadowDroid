@@ -310,10 +310,7 @@ fn bundle_lock(out: &Path) -> Result<std::fs::File> {
             &json!({"schema_version":1,"type":"shadowdroid_evidence"}),
         )?;
     }
-    let marker: Value = serde_json::from_slice(&std::fs::read(out.join("evidence.json"))?)?;
-    if marker["type"] != "shadowdroid_evidence" || marker["schema_version"] != 1 {
-        bail!("not an evidence bundle");
-    }
+    ensure_bundle(out)?;
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -325,6 +322,33 @@ fn bundle_lock(out: &Path) -> Result<std::fs::File> {
     lock.try_lock()
         .map_err(|_| anyhow::anyhow!("another checkpoint is writing this bundle"))?;
     Ok(lock)
+}
+
+/// Refuse a directory without a valid `evidence.json` marker, so neither a
+/// checkpoint nor a timeline treats an arbitrary directory as a bundle.
+fn ensure_bundle(bundle: &Path) -> Result<()> {
+    let marker = std::fs::read(bundle.join("evidence.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    if marker.as_ref().is_some_and(|marker| {
+        marker["type"] == "shadowdroid_evidence" && marker["schema_version"] == 1
+    }) {
+        return Ok(());
+    }
+    Err(crate::diagnostic::DiagnosticError::new(
+        "evidence_not_a_bundle",
+        "input",
+        format!(
+            "{} is not an evidence bundle (no valid evidence.json)",
+            bundle.display()
+        ),
+    )
+    .detail(json!({"bundle": bundle}))
+    .next_actions([
+        "pass the --out directory of an earlier `shadowdroid evidence checkpoint`",
+        "run `shadowdroid evidence checkpoint --out <new-dir>` to start a bundle",
+    ])
+    .into())
 }
 
 fn probe_result(result: Result<Value>, name: &str, errors: &mut Vec<Value>) -> Value {
@@ -520,6 +544,7 @@ pub async fn checkpoint(serial: &Serial, args: &EvidenceCmd) -> Result<()> {
 }
 
 pub fn timeline(bundle: &Path) -> Result<()> {
+    ensure_bundle(bundle)?;
     let mut checkpoints = Vec::new();
     for entry in std::fs::read_dir(bundle)? {
         let path = entry?.path();
@@ -550,7 +575,12 @@ fn merge_records(checkpoints: &[Value]) -> Vec<Value> {
         .iter()
         .filter_map(|c| c["records"].as_array())
         .flatten()
-        .filter(|r| seen.insert(r["record_id"].as_str().unwrap_or_default().to_owned()))
+        // Only records with an id repeat across checkpoints; keep every id-less one.
+        .filter(|r| {
+            r["record_id"]
+                .as_str()
+                .is_none_or(|id| seen.insert(id.to_owned()))
+        })
         .cloned()
         .collect();
     for checkpoint in checkpoints {
@@ -754,6 +784,30 @@ mod tests {
         assert_eq!(records[0]["kind"], "checkpoint");
         assert_eq!(records[0]["screen_hash"], "abc");
         assert_eq!(records[0]["checkpoint_file"], "checkpoint-cp-test.json");
+    }
+
+    #[test]
+    fn records_without_an_id_are_all_kept() {
+        let checkpoint = json!({"records":[{"kind":"field","value":"A","observed_at_ms":1},
+            {"kind":"field","value":"B","observed_at_ms":2}]});
+        let records = merge_records(&[checkpoint]);
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn a_directory_without_the_marker_is_not_a_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = ensure_bundle(dir.path()).unwrap_err();
+        let err = err
+            .downcast_ref::<crate::diagnostic::DiagnosticError>()
+            .unwrap();
+        assert_eq!(err.code, "evidence_not_a_bundle");
+        std::fs::write(
+            dir.path().join("evidence.json"),
+            r#"{"schema_version":1,"type":"shadowdroid_evidence"}"#,
+        )
+        .unwrap();
+        assert!(ensure_bundle(dir.path()).is_ok());
     }
 
     #[test]
