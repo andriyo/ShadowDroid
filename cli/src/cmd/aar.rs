@@ -337,8 +337,19 @@ async fn install(args: &InstallArgs, root: &Path) -> Result<()> {
     };
     let module_gradle = module_build_gradle(root, &module)?;
 
-    // Resolve the AAR (dev → cache → release) and place it in the app.
+    // Everything that can refuse the install runs before the project changes,
+    // so a refusal never leaves it half-wired.
+    if args.coroutine_probes {
+        ensure_probes_supported(&module_gradle)?;
+    }
+    // Resolve the AARs (dev → cache → release) before placing either.
     let resolved = resolve_aar(args.from.as_deref()).await?;
+    let companion = if args.okhttp {
+        Some(resolve_okhttp_aar(args.okhttp_from.as_deref()).await?)
+    } else {
+        None
+    };
+
     let dest = root.join(APP_AAR_RELPATH);
     copy_atomic(&resolved.path, &dest)?;
 
@@ -346,8 +357,7 @@ async fn install(args: &InstallArgs, root: &Path) -> Result<()> {
 
     let mut okhttp_source = None;
     let mut okhttp_dependency_added = false;
-    if args.okhttp {
-        let companion = resolve_okhttp_aar(args.okhttp_from.as_deref()).await?;
+    if let Some(companion) = companion {
         let companion_dest = root.join(APP_OKHTTP_AAR_RELPATH);
         copy_atomic(&companion.path, &companion_dest)?;
         okhttp_dependency_added =
@@ -945,17 +955,27 @@ fn write_build_file(path: &Path, text: &str) -> Result<()> {
 /// Append the managed coroutine-probes block to the module build file.
 /// Idempotent. Kotlin DSL only: the block declares a Kotlin class against
 /// AGP/ASM APIs, which a Groovy build file cannot host.
-fn wire_probes_block(build_gradle: &Path) -> Result<bool> {
+fn ensure_probes_supported(build_gradle: &Path) -> Result<()> {
     if !build_gradle
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("kts"))
     {
-        bail!(
-            "--coroutine-probes requires a Kotlin DSL build file (build.gradle.kts); \
-             `{}` is Groovy. Convert the module or wire the probes manually.",
-            build_gradle.display()
-        );
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "aar_probes_need_kotlin_dsl",
+            "aar_install",
+            format!(
+                "--coroutine-probes requires a Kotlin DSL build file (build.gradle.kts); `{}` is Groovy. Convert the module or wire the probes manually.",
+                build_gradle.display()
+            ),
+        )
+        .next_actions(["shadowdroid aar install (without --coroutine-probes)"])
+        .into());
     }
+    Ok(())
+}
+
+fn wire_probes_block(build_gradle: &Path) -> Result<bool> {
+    ensure_probes_supported(build_gradle)?;
     let content = fs::read_to_string(build_gradle)
         .with_context(|| format!("read {}", build_gradle.display()))?;
     if content.contains(PROBES_MARKER) {
@@ -1118,6 +1138,30 @@ async fn resolve_okhttp_aar(explicit: Option<&Path>) -> Result<ResolvedAar> {
     .await
 }
 
+/// An Android library archive: a zip with the manifest and compiled classes.
+/// Anything else would be copied in and wired, then fail the app's build.
+fn validate_aar(path: &Path, flag: &str) -> Result<()> {
+    let invalid = |why: String| -> anyhow::Error {
+        crate::diagnostic::DiagnosticError::new(
+            "aar_invalid",
+            "aar_install",
+            format!("{flag} {} is not an Android library (AAR): {why}", path.display()),
+        )
+        .detail(serde_json::json!({"path": path.display().to_string()}))
+        .next_actions(["pass the .aar that `./gradlew :shadowdroid-agent:assembleRelease` builds, or omit the flag"])
+        .into()
+    };
+    let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|error| invalid(format!("not a zip archive ({error})")))?;
+    for required in ["AndroidManifest.xml", "classes.jar"] {
+        if archive.by_name(required).is_err() {
+            return Err(invalid(format!("it has no {required}")));
+        }
+    }
+    Ok(())
+}
+
 async fn resolve_agent_asset(
     explicit: Option<&Path>,
     explicit_flag: &str,
@@ -1129,6 +1173,7 @@ async fn resolve_agent_asset(
         if !p.is_file() {
             bail!("{explicit_flag} AAR not found: {}", p.display());
         }
+        validate_aar(p, explicit_flag)?;
         return Ok(ResolvedAar {
             path: p.to_path_buf(),
             source: format!("explicit ({explicit_flag})"),
