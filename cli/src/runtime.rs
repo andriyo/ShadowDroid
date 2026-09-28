@@ -976,6 +976,8 @@ pub async fn run(serial: &Serial, args: &SessionArgs) -> Result<()> {
 mod tests {
     use super::*;
 
+    // Runs the device anchor script through the host sh: Unix only, like its tests.
+    #[cfg(unix)]
     fn run_anchor(anchor: &Path, boot_epoch: &'static str, claim: bool) -> String {
         let clocks = Clocks {
             boot_epoch,
