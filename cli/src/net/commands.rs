@@ -3478,10 +3478,18 @@ pub async fn rule_list(serial: &Serial) -> Result<()> {
 }
 
 pub async fn rule_rm(serial: &Serial, id: &str) -> Result<()> {
-    let reply = checked_control_reply(
-        "rule_rm",
-        control::request(serial, json!({"op": "rule_rm", "id": id})).await?,
-    )?;
+    let reply = control::request(serial, json!({"op": "rule_rm", "id": id})).await?;
+    if reply["ok"] != true && reply["removed"] == false {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "net_rule_not_found",
+            "net",
+            format!("no active rule `{id}`"),
+        )
+        .detail(json!({"id": id}))
+        .next_actions([super::scoped_action(serial, "rule list")])
+        .into());
+    }
+    let reply = checked_control_reply("rule_rm", reply)?;
     emit("net_rule_rm", reply);
     Ok(())
 }
