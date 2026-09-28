@@ -4732,6 +4732,17 @@ struct GenericErrorClass {
     retryable: bool,
 }
 
+/// "timeout" as a word of its own — not inside an identifier or flag such as
+/// `boot_timeout_seconds` or `--timeout-ms`, which name a setting.
+fn mentions_timeout_word(message: &str) -> bool {
+    let is_word_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    message.match_indices("timeout").any(|(at, word)| {
+        let before = message[..at].chars().next_back();
+        let after = message[at + word.len()..].chars().next();
+        !before.is_some_and(is_word_char) && !after.is_some_and(is_word_char)
+    })
+}
+
 fn classify_generic_error(err: &anyhow::Error) -> GenericErrorClass {
     let message = format!("{err:#}").to_ascii_lowercase();
     let io_kind = err
@@ -4761,9 +4772,25 @@ fn classify_generic_error(err: &anyhow::Error) -> GenericErrorClass {
             stage: "host",
             retryable: false,
         }
+    } else if message.starts_with("invalid duration")
+        || message.starts_with("duration `")
+        || message.contains("specify an agent (")
+        || message.starts_with("unknown agent ")
+        || message.contains("refusing to write invalid config")
+        || (message.starts_with("--")
+            && (message.contains(" requires ")
+                || message.contains(" expects ")
+                || message.contains(" must ")))
+    {
+        // Input problems first: their text can name a timeout setting.
+        GenericErrorClass {
+            code: "invalid_input",
+            stage: "input",
+            retryable: false,
+        }
     } else if io_kind == Some(std::io::ErrorKind::TimedOut)
         || message.contains("timed out")
-        || message.contains("timeout")
+        || mentions_timeout_word(&message)
     {
         GenericErrorClass {
             code: "transport_timeout",
@@ -4788,20 +4815,6 @@ fn classify_generic_error(err: &anyhow::Error) -> GenericErrorClass {
             code: "transport_error",
             stage: "transport",
             retryable: true,
-        }
-    } else if message.starts_with("invalid duration")
-        || message.starts_with("duration `")
-        || message.contains("specify an agent (")
-        || message.starts_with("unknown agent ")
-        || (message.starts_with("--")
-            && (message.contains(" requires ")
-                || message.contains(" expects ")
-                || message.contains(" must ")))
-    {
-        GenericErrorClass {
-            code: "invalid_input",
-            stage: "input",
-            retryable: false,
         }
     } else {
         GenericErrorClass {
@@ -7735,6 +7748,21 @@ mod tests {
         assert!(!server_addresses("/data/local/tmp/x"));
         assert!(!server_addresses("/sdcard"));
         assert!(!server_addresses("/system/etc/hosts"));
+    }
+
+    #[test]
+    fn a_timeout_setting_in_a_message_is_not_a_transport_timeout() {
+        let class = |text: &str| classify_generic_error(&anyhow::anyhow!("{text}")).code;
+        assert_eq!(
+            class(
+                "refusing to write invalid config:\nconfig.json: targets.tv.boot_timeout_seconds must be between 10 and 900"
+            ),
+            "invalid_input"
+        );
+        assert_eq!(class("--timeout-ms must be at least 100"), "invalid_input");
+        assert_eq!(class("request timed out after 5s"), "transport_timeout");
+        assert_eq!(class("server timeout"), "transport_timeout");
+        assert_eq!(class("wrote boot_timeout_seconds"), "runtime_error");
     }
 
     #[test]
