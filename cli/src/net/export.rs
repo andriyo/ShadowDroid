@@ -166,7 +166,8 @@ fn har_entry(f: &FlowRecord) -> Value {
         "queryString": har_query_string(&f.path),
         "cookies": har_request_cookies(&f.req_headers),
         "headersSize": -1,
-        "bodySize": f.req_len,
+        // HAR's -1: the size is unknown (a streamed chunked upload).
+        "bodySize": if f.req_len_unknown { -1 } else { f.req_len as i64 },
     });
     if let Some(body) = &f.req_body {
         request["postData"] = json!({
@@ -200,7 +201,7 @@ fn har_entry(f: &FlowRecord) -> Value {
             "content": content,
             "redirectURL": har_redirect_url(f),
             "headersSize": -1,
-            "bodySize": f.resp_len,
+            "bodySize": if f.resp_len_unknown { -1 } else { f.resp_len as i64 },
         },
         "cache": {},
         "timings": {"send": 0, "wait": f.dur_ms.unwrap_or(0), "receive": 0},
@@ -729,6 +730,7 @@ mod tests {
             streamed: false,
             resp_len_unknown: false,
             req_streamed: false,
+            req_len_unknown: false,
         }
     }
 }

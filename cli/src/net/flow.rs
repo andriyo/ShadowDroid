@@ -124,6 +124,10 @@ pub struct FlowRecord {
     /// `content-length` hint when the client sent one, else 0.
     #[serde(default, skip_serializing_if = "is_false")]
     pub req_streamed: bool,
+    /// A streamed request had no `content-length` (chunked upload), so its
+    /// size is unknown and `req_len` is 0.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub req_len_unknown: bool,
 }
 
 impl FlowRecord {
@@ -177,6 +181,7 @@ impl FlowRecord {
             error_redacted: self.error_redacted,
             streamed: self.streamed,
             req_streamed: self.req_streamed,
+            req_len_unknown: self.req_len_unknown,
             redaction_policy: self.redaction_policy.clone(),
             redaction_policy_version: self.redaction_policy_version,
             body_redacted: self.req_body_redacted || self.resp_body_redacted,
@@ -229,6 +234,8 @@ impl FlowRecord {
             "resp_len_unknown": self.resp_len_unknown,
             "req_streamed": self.req_streamed,
         });
+        // Set outside the literal: one more field exceeds json!'s recursion limit.
+        v["req_len_unknown"] = serde_json::json!(self.req_len_unknown);
         if body {
             v["req_body"] = serde_json::json!(self.req_body);
             v["resp_body"] = serde_json::json!(self.resp_body);
@@ -482,6 +489,7 @@ mod tests {
             streamed: false,
             resp_len_unknown: false,
             req_streamed: false,
+            req_len_unknown: false,
         };
         assert_eq!(
             content_type(&rec.req_headers).as_deref(),

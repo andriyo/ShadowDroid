@@ -180,6 +180,9 @@ pub enum Event {
         /// Request body was streamed upstream (oversized upload), not captured.
         #[serde(default, skip_serializing_if = "is_false")]
         req_streamed: bool,
+        /// A streamed request had no `content-length`: `req_len` is 0, size unknown.
+        #[serde(default, skip_serializing_if = "is_false")]
+        req_len_unknown: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         redaction_policy: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]

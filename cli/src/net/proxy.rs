@@ -2456,6 +2456,7 @@ fn make_flow(p: FlowParts<'_>) -> FlowRecord {
         streamed: false,
         resp_len_unknown: false,
         req_streamed: p.req_streamed,
+        req_len_unknown: p.req_streamed && content_length(p.req_headers).is_none(),
     }
 }
 
