@@ -191,17 +191,7 @@ private fun runShellViaSh(
     val stdoutFd = fds[0]
     val stdinFd = fds[1]
     val stderrFd = fds[2]
-    // Capture the command's own exit status before anything else runs, then
-    // emit it behind a marker on its own line. `exec 2>&1` folds stderr into the
-    // single stdout stream we drain (so there's no second pipe to deadlock on).
-    val script =
-        buildString {
-            append("exec 2>&1\n")
-            append(cmd)
-            append("\n__sd_rc=\$?\n")
-            append("echo \"\"\n")
-            append("echo \"$SHELL_RC_MARKER\${__sd_rc}__\"\n")
-        }
+    val script = shellScript(cmd)
 
     val out = arrayOfNulls<ByteArray>(1)
     val failure = arrayOfNulls<Throwable>(1)
@@ -232,6 +222,24 @@ private fun runShellViaSh(
     failure[0]?.let { throw it }
     return parseShellOutput(out[0]?.toString(Charsets.UTF_8) ?: "")
 }
+
+/**
+ * The script fed to `sh`: run [cmd], capture its exit status, then emit the
+ * status behind a marker on its own line. `exec 2>&1` folds stderr into the
+ * single stdout stream we drain (so there's no second pipe to deadlock on).
+ * The command runs in a subshell so its own `exit N` ends only the subshell:
+ * the status is still reported instead of the marker never being printed.
+ */
+internal fun shellScript(cmd: String): String =
+    buildString {
+        append("exec 2>&1\n")
+        append("(\n")
+        append(cmd)
+        append("\n)\n")
+        append("__sd_rc=\$?\n")
+        append("echo \"\"\n")
+        append("echo \"$SHELL_RC_MARKER\${__sd_rc}__\"\n")
+    }
 
 /** Split the trailing `\n__SD_RC__<code>__` marker off the captured output. */
 private fun parseShellOutput(raw: String): Pair<String, Int?> {
