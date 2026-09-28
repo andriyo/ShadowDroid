@@ -276,7 +276,9 @@ fn emit_summary(
 }
 
 fn is_signature_mismatch(e: &anyhow::Error) -> bool {
-    let s = e.to_string();
+    // The whole chain: `adb::install` wraps the device's `Failure [...]` reply
+    // in an `adb install <path>` context, which `to_string()` alone drops.
+    let s = format!("{e:#}");
     s.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE") || s.contains("signatures do not match")
 }
 

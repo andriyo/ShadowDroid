@@ -905,7 +905,9 @@ async fn test_apk_changed(serial: &Serial, local_test: &Path) -> Result<bool> {
 }
 
 fn is_signature_mismatch(e: &anyhow::Error) -> bool {
-    let s = e.to_string();
+    // The whole chain: `adb::install` wraps the device's `Failure [...]` reply
+    // in an `adb install <path>` context, which `to_string()` alone drops.
+    let s = format!("{e:#}");
     s.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE") || s.contains("signatures do not match")
 }
 
@@ -1027,6 +1029,19 @@ async fn ui_automation_failure_hint(serial: &Serial) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_signature_mismatch_is_seen_through_the_install_context() {
+        let error = anyhow::anyhow!(
+            "Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: Existing package x signatures do not match newer version; ignoring!]"
+        )
+        .context("adb install /tmp/main.apk");
+        assert!(is_signature_mismatch(&error));
+        assert!(!is_signature_mismatch(
+            &anyhow::anyhow!("Failure [INSTALL_FAILED_INSUFFICIENT_STORAGE]")
+                .context("adb install /tmp/main.apk")
+        ));
+    }
     use super::*;
 
     #[test]
