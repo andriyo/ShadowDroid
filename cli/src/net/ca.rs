@@ -763,11 +763,19 @@ fn info_in_locked(net_dir: &Path) -> Result<CaInfo> {
     let cert_path = ca_cert_in(net_dir);
     let key_path = ca_key_in(net_dir);
     if !cert_path.exists() {
-        bail!(
-            "no CA on disk yet at {} — one is created on the first `net start`/`net trust`, or \
-             import your own with `net ca import --cert <file>`.",
-            cert_path.display()
-        );
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "net_ca_missing",
+            "net",
+            format!(
+                "no CA on disk yet at {} — one is created on the first `net start`/`net trust`, or import your own with `net ca import --cert <file>`.",
+                cert_path.display()
+            ),
+        )
+        .next_actions([
+            "shadowdroid net start",
+            "shadowdroid net ca import --cert <ca.pem> --key <key.pem>",
+        ])
+        .into());
     }
     let cert_pem = std::fs::read_to_string(&cert_path)
         .with_context(|| format!("read {}", cert_path.display()))?;

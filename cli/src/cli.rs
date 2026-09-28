@@ -4757,6 +4757,7 @@ fn classify_generic_error(err: &anyhow::Error) -> GenericErrorClass {
             "--apk path does not exist:",
             "source file not found:",
             "app path does not exist:",
+            "override file does not exist",
         ]
         .iter()
         .any(|marker| message.contains(marker))
@@ -4777,6 +4778,12 @@ fn classify_generic_error(err: &anyhow::Error) -> GenericErrorClass {
         || message.contains("specify an agent (")
         || message.starts_with("unknown agent ")
         || message.contains("refusing to write invalid config")
+        || message.contains("choose exactly one of")
+        || message.contains("unknown rule kind")
+        || (message.starts_with("rule `") && message.contains(" needs exactly "))
+        || message.contains("parse rules json")
+        || message.contains("is not a gradle root")
+        || io_kind == Some(std::io::ErrorKind::NotADirectory)
         || (message.starts_with("--")
             && (message.contains(" requires ")
                 || message.contains(" expects ")
@@ -7763,6 +7770,19 @@ mod tests {
         assert_eq!(class("request timed out after 5s"), "transport_timeout");
         assert_eq!(class("server timeout"), "transport_timeout");
         assert_eq!(class("wrote boot_timeout_seconds"), "runtime_error");
+        for input in [
+            "rule `delay` needs exactly 1 arg(s), got 0",
+            "unknown rule kind \"frobnicate\"",
+            "choose exactly one of --text / --binary / --ping / --pong / --close",
+            "parse rules JSON array: unknown field `typo`",
+            "`/tmp` is not a Gradle root (no settings.gradle[.kts]). Pass --project-root <path>.",
+        ] {
+            assert_eq!(class(input), "invalid_input", "{input}");
+        }
+        assert_eq!(
+            class("override file does not exist or is not a file: /x"),
+            "input_not_found"
+        );
     }
 
     #[test]
