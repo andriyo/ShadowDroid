@@ -551,6 +551,7 @@ mod tests {
         assert_eq!(text.as_deref(), Some("caf\u{FFFD}"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn curl_export_sends_an_at_prefixed_body_literally() {
         let dir = tempfile::tempdir().unwrap();
