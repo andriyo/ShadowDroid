@@ -1434,8 +1434,13 @@ async fn record_published_segment(
         segment.path.clone()
     };
     if !video_info.playable() {
+        let cause = if video_info.sample_count <= 1 {
+            " (the display did not change while recording, and Android encodes a frame only when it does; record with --bugreport, whose overlay forces occasional frames, if a static screen must still produce video.mp4)"
+        } else {
+            ""
+        };
         state.manifest.warnings.push(format!(
-            "segment {index} contains {} video sample(s) and {} ms of media; it is preserved but excluded from video.mp4",
+            "segment {index} contains {} video sample(s) and {} ms of media; it is preserved but excluded from video.mp4{cause}",
             video_info.sample_count, video_info.duration_ms
         ));
     }
