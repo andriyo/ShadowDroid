@@ -274,10 +274,12 @@ pub enum Cmd {
             conflicts_with_all = ["depth", "describe", "path", "guide"]
         )]
         search: Option<String>,
-        /// Return the driving guide for a domain before first use: net,
-        /// debugger, or state. Covered command groups alias to their guide
-        /// (aar → net; studio/debug/layout → debugger; app/device/perm/
-        /// appops/profile/files → state).
+        /// Return the driving guide for a domain before first use: workflow,
+        /// verification, evidence, net, debugger, faults, or state. Covered
+        /// command groups alias to their guide (ui → workflow; verify/session →
+        /// verification; video → evidence; aar → net; studio/debug/layout →
+        /// debugger; fault → faults; app/device/perm/appops/profile/files →
+        /// state).
         #[arg(
             long,
             value_name = "TOPIC",
@@ -6827,6 +6829,19 @@ async fn resolve_online_serial(requested: &str) -> Result<Serial> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn commands_guide_help_names_every_guide_topic() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("commands")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        for topic in crate::cmd::introspect::guide_topics() {
+            assert!(help.contains(topic), "--guide help omits `{topic}`: {help}");
+        }
+    }
 
     #[test]
     fn net_intercept_refuses_filters_that_would_never_hold() {

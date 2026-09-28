@@ -55,7 +55,7 @@ These host-only commands remain available with malformed project configuration, 
 shadowdroid verify run verification.json --host-only --out /tmp/verification-attempt-1
 shadowdroid verify report /tmp/verification-attempt-1
 # For instrumentation, select the dedicated device and set instrumentation: true in its check:
-shadowdroid -s emulator-5556 verify run verification.json --out /tmp/verification-attempt-2
+shadowdroid -d emulator-5556 verify run verification.json --out /tmp/verification-attempt-2
 ```
 
 `source_root` defaults to the plan's directory. Run output must be a new directory outside that source root. Git inputs include tracked, dirty and untracked files; ignored build outputs are excluded. Explicit `inputs` add fixtures and references, or define the entire input scope outside Git. Missing inputs and symlinks are refused. Input snapshots are limited to 30,000 entries / 512 MiB. Include external references explicitly; no tool can infer every external build input.
