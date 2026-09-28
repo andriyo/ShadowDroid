@@ -3428,7 +3428,7 @@ fn header_pairs(h: &http::HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
-fn is_hop_by_hop(name_lower: &str) -> bool {
+pub(crate) fn is_hop_by_hop(name_lower: &str) -> bool {
     matches!(
         name_lower,
         "connection"

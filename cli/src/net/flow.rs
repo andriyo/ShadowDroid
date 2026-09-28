@@ -316,7 +316,12 @@ pub fn body_to_text(
     let slice = &bytes[..bytes.len().min(cap)];
     match std::str::from_utf8(slice) {
         Ok(s) => (Some(s.to_string()), truncated),
-        // Truncation may have split a multibyte char; fall back to lossy.
+        // The cap split a multibyte character: keep the valid prefix, so a
+        // replacement character only ever marks a body that wasn't UTF-8.
+        Err(error) if truncated && error.error_len().is_none() => (
+            Some(String::from_utf8_lossy(&slice[..error.valid_up_to()]).into_owned()),
+            truncated,
+        ),
         Err(_) => (Some(String::from_utf8_lossy(slice).into_owned()), truncated),
     }
 }

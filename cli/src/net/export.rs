@@ -22,9 +22,19 @@ pub fn curl_command(f: &FlowRecord) -> String {
     let url = crate::net::flow::url(&f.scheme, &f.host, f.port, &f.path);
     // Every captured field is attacker-influenced: the method is an HTTP token,
     // and tokens may contain shell metacharacters such as `` ` ``, `$`, `|`, `&`.
-    let mut parts = vec![format!("curl -X '{}' '{}'", sh(&f.method), sh(&url))];
+    // `-X HEAD` makes curl wait for a body a HEAD response never has.
+    let mut parts = vec![if f.method.eq_ignore_ascii_case("HEAD") {
+        format!("curl --head '{}'", sh(&url))
+    } else {
+        format!("curl -X '{}' '{}'", sh(&f.method), sh(&url))
+    }];
     for (k, v) in &f.req_headers {
-        if k.eq_ignore_ascii_case("content-length") || k.eq_ignore_ascii_case("host") {
+        // Hop-by-hop headers were for the app's connection to the proxy; the
+        // proxy never forwarded them, so a replay must not send them either.
+        if k.eq_ignore_ascii_case("content-length")
+            || k.eq_ignore_ascii_case("host")
+            || crate::net::proxy::is_hop_by_hop(&k.to_ascii_lowercase())
+        {
             continue;
         }
         parts.push(format!("-H '{}: {}'", sh(k), sh(v)));
@@ -48,6 +58,12 @@ pub fn curl_body_gap(f: &FlowRecord) -> Option<&'static str> {
         Some("the captured request body was truncated")
     } else if f.req_body.is_none() && f.req_len > 0 {
         Some("the request body is binary or non-textual and was not captured")
+    } else if f
+        .req_body
+        .as_deref()
+        .is_some_and(|body| body.contains('\u{FFFD}'))
+    {
+        Some("the request body was not valid UTF-8, so the captured text is not its original bytes")
     } else {
         None
     }
@@ -497,6 +513,40 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn curl_export_replays_head_without_hop_by_hop_headers_or_lossy_bodies() {
+        let mut flow = sample();
+        flow.method = "HEAD".into();
+        flow.req_body = None;
+        flow.req_headers = vec![
+            ("Proxy-Connection".into(), "keep-alive".into()),
+            ("Accept".into(), "*/*".into()),
+        ];
+        let command = curl_command(&flow);
+        assert!(command.starts_with("curl --head '"), "{command}");
+        assert!(
+            !command.to_ascii_lowercase().contains("proxy-connection"),
+            "{command}"
+        );
+        assert!(command.contains("-H 'Accept: */*'"));
+
+        let mut latin1 = sample();
+        latin1.req_body = Some("caf\u{FFFD} au lait".into());
+        assert!(curl_body_gap(&latin1).is_some_and(|gap| gap.contains("UTF-8")));
+    }
+
+    #[test]
+    fn a_truncated_body_keeps_its_valid_prefix() {
+        // "é" is two bytes; a cap of 2 splits it.
+        let (text, truncated) =
+            crate::net::flow::body_to_text(Some("text/plain"), "aé".as_bytes(), 2);
+        assert_eq!(text.as_deref(), Some("a"));
+        assert!(truncated);
+        // A body that is simply not UTF-8 is still shown lossily.
+        let (text, _) = crate::net::flow::body_to_text(Some("text/plain"), b"caf\xe9", 100);
+        assert_eq!(text.as_deref(), Some("caf\u{FFFD}"));
+    }
+
     #[test]
     fn curl_export_sends_an_at_prefixed_body_literally() {
         let dir = tempfile::tempdir().unwrap();
