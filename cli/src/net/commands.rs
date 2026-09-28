@@ -2358,7 +2358,8 @@ fn write_body_file(
     } else {
         b
     };
-    std::fs::write(path, b).with_context(|| format!("writing {}", path.display()))?;
+    // Private (0600) and atomic, like every other export of captured traffic.
+    crate::cmd::artifact::write_bytes(path, b.as_bytes())?;
     emit(
         "net_show",
         json!({
