@@ -549,7 +549,7 @@ fn emulator_program() -> PathBuf {
     })
 }
 
-fn adb_program() -> PathBuf {
+pub(crate) fn adb_program() -> PathBuf {
     if let Some(explicit) = crate::hostenv::nonempty_env("SHADOWDROID_ADB") {
         return PathBuf::from(explicit);
     }
@@ -648,6 +648,12 @@ fn parse_avd_list(output: &str) -> Vec<String> {
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// Start `avd` detached (it outlives this CLI) and return its log path.
+pub(crate) fn launch_avd(avd: &str, cold_boot: bool) -> Result<PathBuf> {
+    let (_child, log) = start_avd(&emulator_program(), avd, cold_boot)?;
+    Ok(log)
 }
 
 fn start_avd(emulator: &Path, avd: &str, cold_boot: bool) -> Result<(Child, PathBuf)> {

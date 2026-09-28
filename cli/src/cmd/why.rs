@@ -206,6 +206,7 @@ pub async fn run(
                         "id": v.get("id"),
                         "matched": v.get("matched"),
                         "modified": v.get("modified"),
+                        "fault_ids": v.get("fault_ids"),
                     }));
                     if net_failed.len() >= 5 {
                         break;
@@ -238,6 +239,16 @@ pub async fn run(
         checked.push("net_daemon_not_running");
     }
 
+    // ── injected faults (host-side history; read-only) ─────────────────
+    checked.push("faults");
+    let since_ms = crate::fault::journal::now_ms().saturating_sub((window_secs * 1000.0) as u64);
+    let faults = crate::fault::history(serial.as_str(), since_ms);
+    let active_faults = faults["active"].as_array().map(Vec::len).unwrap_or(0);
+    let recent_fault_events = faults["recent"].as_array().map(Vec::len).unwrap_or(0);
+    if active_faults > 0 || recent_fault_events > 0 {
+        evidence.insert("faults".into(), faults);
+    }
+
     // ── verdict ───────────────────────────────────────────────────────
     let app_left_foreground = match (&package, &foreground) {
         (Some(pkg), Some(fg)) => !fg.contains(pkg.as_str()),
@@ -256,6 +267,8 @@ pub async fn run(
         tls_errors: &tls_errors,
         app_left_foreground,
         has_log_errors: !log_errors.is_empty(),
+        active_faults,
+        recent_fault_events,
     });
     let primary = verdicts[0];
     let verdict = primary.code;
@@ -285,6 +298,10 @@ pub async fn run(
         "backend_errors" | "request_failures" => vec![
             "shadowdroid net log | jq -c 'select(.type==\"http\" and (.ok==false or .status>=400))'".into(),
             "shadowdroid net show <id> --body".into(),
+        ],
+        "injected_fault" => vec![
+            "shadowdroid fault list".into(),
+            "shadowdroid fault clear --all   # then retry to compare".into(),
         ],
         "app_not_foreground" => vec![
             "shadowdroid ui dump   # see what took over".into(),
@@ -333,6 +350,8 @@ struct VerdictInputs<'a> {
     tls_errors: &'a [Value],
     app_left_foreground: bool,
     has_log_errors: bool,
+    active_faults: usize,
+    recent_fault_events: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -382,6 +401,18 @@ fn rank_verdicts(inputs: VerdictInputs<'_>) -> Vec<RankedVerdict<'_>> {
             "the system reported an ANR — the main thread was blocked; see evidence.anr",
             0.99,
             None,
+        ));
+    }
+
+    if inputs.active_faults > 0 || inputs.recent_fault_events > 0 {
+        verdicts.push(finding(
+            "injected_fault",
+            "a ShadowDroid fault is active or was injected in this window — what you see may be the app's intended reaction; see evidence.faults",
+            0.95,
+            inputs
+                .net_failed
+                .iter()
+                .find(|flow| flow.get("fault_ids").and_then(Value::as_array).is_some_and(|ids| !ids.is_empty())),
         ));
     }
 
@@ -515,6 +546,8 @@ mod tests {
             tls_errors: &tls,
             app_left_foreground: false,
             has_log_errors: false,
+            active_faults: 0,
+            recent_fault_events: 0,
         });
         assert_eq!(ranked[0].code, "backend_errors");
         assert_eq!(
@@ -530,6 +563,39 @@ mod tests {
     }
 
     #[test]
+    fn an_injected_fault_explains_failures_after_crashes() {
+        let failures =
+            vec![json!({"id": "f7", "status": 503, "matched": "fault", "fault_ids": ["flt_1"]})];
+        let ranked = rank_verdicts(VerdictInputs {
+            crash_origin: None,
+            anr: false,
+            net_failed: &failures,
+            tls_errors: &[],
+            app_left_foreground: false,
+            has_log_errors: false,
+            active_faults: 1,
+            recent_fault_events: 1,
+        });
+        assert_eq!(ranked[0].code, "injected_fault");
+        assert_eq!(
+            ranked[0].flow.and_then(|flow| flow["id"].as_str()),
+            Some("f7")
+        );
+        let with_crash = rank_verdicts(VerdictInputs {
+            crash_origin: Some(CrashOrigin::Project),
+            anr: false,
+            net_failed: &failures,
+            tls_errors: &[],
+            app_left_foreground: false,
+            has_log_errors: false,
+            active_faults: 1,
+            recent_fault_events: 1,
+        });
+        assert_eq!(with_crash[0].code, "app_crashed");
+        assert_eq!(with_crash[1].code, "injected_fault");
+    }
+
+    #[test]
     fn crashes_and_anrs_keep_precedence() {
         let failures = vec![json!({"status": 500, "matched": "rule", "modified": true})];
         let ranked = rank_verdicts(VerdictInputs {
@@ -539,6 +605,8 @@ mod tests {
             tls_errors: &[],
             app_left_foreground: false,
             has_log_errors: false,
+            active_faults: 0,
+            recent_fault_events: 0,
         });
         assert_eq!(ranked[0].code, "app_crashed");
         assert_eq!(ranked[1].code, "app_not_responding");
@@ -556,6 +624,8 @@ mod tests {
             tls_errors: &tls,
             app_left_foreground: false,
             has_log_errors: false,
+            active_faults: 0,
+            recent_fault_events: 0,
         });
         assert_eq!(ranked[0].code, "tls_rejected");
         assert_eq!(ranked[1].code, "backend_errors");
@@ -578,6 +648,8 @@ mod tests {
             tls_errors: &[],
             app_left_foreground: false,
             has_log_errors: false,
+            active_faults: 0,
+            recent_fault_events: 0,
         });
 
         assert_eq!(classify_crash_origin(&crash), CrashOrigin::Project);
@@ -605,6 +677,8 @@ mod tests {
             tls_errors: &[],
             app_left_foreground: false,
             has_log_errors: false,
+            active_faults: 0,
+            recent_fault_events: 0,
         });
 
         assert_eq!(classify_crash_origin(&crash), CrashOrigin::InspectorTooling);
@@ -632,6 +706,8 @@ mod tests {
             tls_errors: &[],
             app_left_foreground: false,
             has_log_errors: false,
+            active_faults: 0,
+            recent_fault_events: 0,
         });
 
         assert_eq!(classify_crash_origin(&crash), CrashOrigin::Unresolved);

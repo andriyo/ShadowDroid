@@ -113,6 +113,12 @@ pub async fn run(cfg: WatchConfig) -> Result<()> {
         ));
     }
 
+    producers.push(spawn_fault_events(
+        cfg.serial.clone(),
+        event_tx.clone(),
+        stopping.clone(),
+    ));
+
     producers.push(spawn_wake_logcat(
         cfg.serial.clone(),
         wake_tx.clone(),
@@ -217,6 +223,44 @@ fn spawn_net_events(
                     ts: now_ts(),
                 })
                 .await;
+        }
+    })
+}
+
+/// Stream fault history events (`fault inject/clear`, expiries) that happen
+/// while watching, so an app's reaction lines up with its cause.
+fn spawn_fault_events(
+    serial: Serial,
+    event_tx: mpsc::Sender<Event>,
+    stopping: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let Ok(journal) = crate::fault::journal::Journal::for_device(serial.as_str()) else {
+            return;
+        };
+        let mut offset = journal.events_len();
+        while !stopping.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            // The --duration-ms timer can't take the device while watch holds
+            // it, so watch expires due faults itself.
+            crate::fault::clear_due(serial.as_str()).await;
+            let (events, next) = journal.events_after(offset);
+            offset = next;
+            for event in events {
+                let serde_json::Value::Object(mut fields) = event else {
+                    continue;
+                };
+                fields.remove("type");
+                let ts = fields
+                    .get("ts_ms")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|ms| ms as f64 / 1000.0)
+                    .unwrap_or_else(now_ts);
+                fields.insert("ts".into(), serde_json::json!(ts));
+                if event_tx.send(Event::Fault { fields }).await.is_err() {
+                    return;
+                }
+            }
         }
     })
 }
@@ -854,6 +898,23 @@ async fn dispatch_command(
                 "app_wait",
                 &json!({"package":package, "matched":r.matched, "current":r.current}),
             );
+        }
+        "fault" => {
+            // {"cmd":"fault","args":["inject","airplane-mode","--duration-ms","5000"]}:
+            // the same `fault` subcommands, run inside this watch because it
+            // holds the device while it streams.
+            let args: Vec<String> = cmd
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|args| {
+                    args.iter()
+                        .filter_map(|arg| arg.as_str().map(str::to_string))
+                        .collect()
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("fault needs \"args\": [\"inject\", \"<kind>\", …]")
+                })?;
+            crate::fault::run_in_watch(&cfg.serial, args).await?;
         }
         "app_info" => {
             let package = req_str(cmd, "package")?;

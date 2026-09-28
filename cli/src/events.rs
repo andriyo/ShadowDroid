@@ -122,6 +122,12 @@ pub enum Event {
         #[serde(flatten)]
         fields: serde_json::Map<String, serde_json::Value>,
     },
+    /// A fault was injected, cleared, expired, rolled back or completed
+    /// (`shadowdroid fault …`, from the device's fault history).
+    Fault {
+        #[serde(flatten)]
+        fields: serde_json::Map<String, serde_json::Value>,
+    },
     /// A completed HTTP(S) transaction through the `net` proxy. Compact by
     /// design — full headers/bodies are fetched on demand via `net show <id>`.
     /// Field shape mirrors the `net` capture wire format so the timeline can

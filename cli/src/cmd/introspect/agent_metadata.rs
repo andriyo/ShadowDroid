@@ -6,6 +6,9 @@
 
 pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
     let key = path.join(" ");
+    if key == "fault" || key.starts_with("fault ") {
+        return crate::fault::catalog::agent_metadata(&key);
+    }
     match key.as_str() {
         "session" | "session open" | "session close" | "session handoff" | "session observe"
         | "session status" | "session recover" => Some(serde_json::json!({
@@ -150,7 +153,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         "disconnect" => Some(serde_json::json!({
             "use_when": ["Need to release the device UiAutomation slot, stop ShadowDroid, or unblock instrumentation/Espresso/UIAutomator tests."],
             "output": "disconnected action JSON",
-            "side_effects": ["stops ShadowDroid server process", "removes adb forwards"],
+            "side_effects": ["stops ShadowDroid server process", "removes adb forwards", "clears faults injected with `fault inject` (reported under `faults`)"],
             "next_actions": ["test -- <command>", "connect"]
         })),
         "test" => Some(serde_json::json!({
@@ -255,7 +258,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
                 "Need to correlate UI state with network responses, app crashes, or watcher automation during a flow."
             ],
             "avoid_when": ["Need one immediate actionable element list; use ui dump instead.", "Need a saved layout/source artifact; use layout snapshot instead."],
-            "output": "jsonl event stream: ready, screen_compact/screen (with strict content and actionable interaction identities), crash, watcher_fired, http/http_intercept, tls_error, warning, and timestamped in-stream error events (not one-shot error envelopes)",
+            "output": "jsonl event stream: ready, screen_compact/screen (with strict content and actionable interaction identities), crash, watcher_fired, http/http_intercept, tls_error, fault (injected/cleared/expired/completed/rolled_back), warning, and timestamped in-stream error events (not one-shot error envelopes); stdin {\"cmd\":\"fault\",\"args\":[\"inject\",\"<kind>\",…]} injects a fault on the watched device",
             "side_effects": ["polls the screen", "tails logcat", "may run watcher actions", "auto-attaches to a running net proxy unless --no-net is passed"],
             "prerequisites": ["shadowdroid connect", "shadowdroid net start for HTTP(S) events"],
             "next_actions": ["ui tap", "ui text", "ui wait", "net start", "net show <id>", "debug snapshot"],

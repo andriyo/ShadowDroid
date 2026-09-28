@@ -16,8 +16,8 @@ shadowdroid commands --guide net
 Reuse syntax within one CLI/schema version.
 `--compact` references shared metadata; full JSON remains available.
 Before first use, read `--guide net` (proxy/AAR), `--guide debugger` (Studio/layout),
-`--guide state` (private files/app state), or `--guide evidence` (checkpoints
-and video coverage). Use `--guide verification` for coding-task checks and concurrent agents.
+`--guide state` (private files/app state), `--guide evidence` (checkpoints
+and video coverage), or `--guide faults` (failure injection). Use `--guide verification` for coding-task checks and concurrent agents.
 Aliases: `aar` → net, `video` → evidence.
 
 ## First contact and device selection

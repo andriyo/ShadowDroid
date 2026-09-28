@@ -207,9 +207,22 @@ it (and `ui key dpad_*`) over coordinate taps there.
 events plus `crash`, `toast`, `watcher_fired`, structured Android Studio
 `logpoint` hits, and `http` events when a `net` proxy is running (plus a
 `tls_error` when an app rejects the proxy CA, so a failed interception is
-visible instead of just missing). A missing Studio bridge or proxy produces a
+visible instead of just missing), and `fault` events when a fault is injected,
+cleared, expired or rolled back. A missing Studio bridge or proxy produces a
 structured warning while the other producers continue; use `--no-logpoints` or
-`--no-net` when that source is intentionally absent.
+`--no-net` when that source is intentionally absent. `watch` holds the device
+while it runs, so inject faults through its stdin
+(`{"cmd":"fault","args":["inject","airplane-mode","--duration-ms","5000"]}`);
+it also clears faults whose `--duration-ms` elapses while it watches.
+
+## Faults on purpose
+
+`fault` injects failure conditions and undoes them: process death, config
+changes, Doze, low battery, full storage, clock jumps, lost or flaky network,
+failing backend calls, calls/SMS and emulator crashes. Every state fault
+journals its restore plan before it changes the device and verifies it took
+effect; `fault clear` verifies each restore; `disconnect` clears whatever is
+left. `commands --guide faults` has the details.
 
 ## The command surface
 

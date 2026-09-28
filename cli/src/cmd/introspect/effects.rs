@@ -242,6 +242,20 @@ const DISCONNECT_EFFECTS: &[E] = &[
     E::DeviceMutate,
     E::ProcessStop,
     E::PortMappingMutate,
+    // Clearing leftover faults can drive the emulator console (`adb emu`).
+    E::UnboundedExternalCommand,
+];
+const DOCTOR_EFFECTS: &[E] = &[
+    E::HostRead,
+    E::HostWrite,
+    E::DeviceRead,
+    E::DeviceMutate,
+    E::PackageInstall,
+    E::ProcessStart,
+    E::ProcessStop,
+    E::PortMappingMutate,
+    E::NetworkDownload,
+    E::UnboundedExternalCommand,
 ];
 const TEST_EFFECTS: &[E] = &[
     E::HostRead,
@@ -307,6 +321,30 @@ const AAR_INSTALL_EFFECTS: &[E] = &[
     E::NetworkDownload,
     E::UnboundedExternalCommand,
 ];
+const FAULT_INJECT_EFFECTS: &[E] = &[
+    E::HostRead,
+    E::HostWrite,
+    E::DeviceRead,
+    E::DeviceMutate,
+    E::ProcessStart,
+    E::ProcessStop,
+    E::UnboundedExternalCommand,
+];
+const FAULT_CLEAR_EFFECTS: &[E] = &[
+    E::HostRead,
+    E::HostWrite,
+    E::DeviceRead,
+    E::DeviceMutate,
+    E::ProcessStop,
+    E::UnboundedExternalCommand,
+];
+const FAULT_SNAPSHOT_EFFECTS: &[E] = &[
+    E::HostRead,
+    E::HostWrite,
+    E::DeviceRead,
+    E::DeviceMutate,
+    E::UnboundedExternalCommand,
+];
 const NET_EXISTING_MUTATE: &[E] = &[E::HostRead, E::HostWrite, E::DeviceRead, E::DeviceMutate];
 
 const CONFIG: &[D] = &[D::ConfigLoad];
@@ -322,6 +360,12 @@ const SERVER: &[D] = &[
     D::ConfigLoad,
     D::TargetResolveMayStart,
     D::ServerEnsureReady,
+];
+const DOCTOR: &[D] = &[
+    D::ConfigLoad,
+    D::TargetResolveMayStart,
+    D::ServerEnsureReady,
+    D::ExternalCommand,
 ];
 
 pub(super) fn changes_device(path: &str) -> bool {
@@ -374,6 +418,43 @@ fn leaf_contract(path: &str) -> Option<LeafEffectContract> {
         "verify junit" => leaf(&[E::HostRead, E::HostWrite], &[D::ArtifactWriter]),
         // Introspection/recovery commands dispatched before normal config load.
         "commands" => leaf(HOST_READ, &[]),
+
+        // Faults: inject may boot the target, spawns an expiry timer, and
+        // drives the emulator console (an external `adb emu`); the rest act on
+        // an existing device only.
+        "fault kinds" => leaf(HOST_READ, &[]),
+        path if path.starts_with("fault inject ") => leaf(
+            FAULT_INJECT_EFFECTS,
+            &[
+                D::ConfigLoad,
+                D::TargetResolveMayStart,
+                D::ManagedProcessStart,
+                D::ManagedProcessStop,
+                D::ExternalCommand,
+            ],
+        ),
+        "fault list" => leaf(EXISTING_READ, EXISTING),
+        "fault clear" => leaf(
+            FAULT_CLEAR_EFFECTS,
+            &[
+                D::ConfigLoad,
+                D::TargetResolveExisting,
+                D::ManagedProcessStop,
+                D::ExternalCommand,
+            ],
+        ),
+        "fault snapshot save"
+        | "fault snapshot load"
+        | "fault snapshot list"
+        | "fault snapshot delete" => leaf(
+            FAULT_SNAPSHOT_EFFECTS,
+            &[D::ConfigLoad, D::TargetResolveExisting, D::ExternalCommand],
+        ),
+        // Every step is a child `shadowdroid` command with its own effects.
+        "fault run" => leaf(
+            FAULT_INJECT_EFFECTS,
+            &[D::ConfigLoad, D::TargetResolveOnline, D::ExternalCommand],
+        ),
         "usage status" | "config paths" | "config schema" | "config explain"
         | "config validate" => leaf(HOST_READ, &[]),
         // Reporting serializes with writers by opening the usage lock file.
@@ -388,7 +469,10 @@ fn leaf_contract(path: &str) -> Option<LeafEffectContract> {
 
         // Top-level lifecycle and diagnostics.
         "devices" => leaf(DEVICE_INVENTORY, INVENTORY),
-        "connect" | "doctor" => leaf(SERVER_EFFECTS, SERVER),
+        "connect" => leaf(SERVER_EFFECTS, SERVER),
+        // `doctor --fix` also clears leftover faults, which can drive the
+        // emulator console.
+        "doctor" => leaf(DOCTOR_EFFECTS, DOCTOR),
         "disconnect" => leaf(
             DISCONNECT_EFFECTS,
             &[
@@ -396,6 +480,7 @@ fn leaf_contract(path: &str) -> Option<LeafEffectContract> {
                 D::TargetResolveExisting,
                 D::ManagedProcessStop,
                 D::PortMappingMutation,
+                D::ExternalCommand,
             ],
         ),
         "test" => leaf(
@@ -529,7 +614,18 @@ fn leaf_contract(path: &str) -> Option<LeafEffectContract> {
                 D::ManagedProcessStop,
             ],
         ),
-        "watch" => leaf(SERVER_EFFECTS, SERVER),
+        // stdin `fault` commands can start an expiry timer and drive the
+        // emulator console.
+        "watch" => leaf(
+            DOCTOR_EFFECTS,
+            &[
+                D::ConfigLoad,
+                D::TargetResolveMayStart,
+                D::ServerEnsureReady,
+                D::ManagedProcessStart,
+                D::ExternalCommand,
+            ],
+        ),
 
         // App lifecycle. The read-looking leaves still inherit server bring-up.
         "app start" | "app stop" | "app clear" | "app info" | "app wait" | "app current" => {
@@ -1095,13 +1191,40 @@ mod tests {
             | "session handoff"
             | "session observe"
             | "session status"
-            | "session recover" => ResolverPolicy::Online,
-            "disconnect" | "video status" | "video mark" | "video stop" | "net ca import"
-            | "net ca info" | "net ca reset" | "net stop" | "net status" | "net log"
-            | "net checkpoint" | "net show" | "net export" | "net ws" | "net inject"
-            | "net intercept" | "net resume" | "net drop" | "net respond" | "net rule add"
-            | "net rule list" | "net rule rm" | "net rule clear" | "net override" | "net rules"
-            | "net replay" => ResolverPolicy::Existing,
+            | "session recover"
+            | "fault run" => ResolverPolicy::Online,
+            "disconnect"
+            | "video status"
+            | "video mark"
+            | "video stop"
+            | "net ca import"
+            | "net ca info"
+            | "net ca reset"
+            | "net stop"
+            | "net status"
+            | "net log"
+            | "net checkpoint"
+            | "net show"
+            | "net export"
+            | "net ws"
+            | "net inject"
+            | "net intercept"
+            | "net resume"
+            | "net drop"
+            | "net respond"
+            | "net rule add"
+            | "net rule list"
+            | "net rule rm"
+            | "net rule clear"
+            | "net override"
+            | "net rules"
+            | "net replay"
+            | "fault list"
+            | "fault clear"
+            | "fault snapshot save"
+            | "fault snapshot load"
+            | "fault snapshot list"
+            | "fault snapshot delete" => ResolverPolicy::Existing,
             "verify recover"
             | "verify report"
             | "verify plan validate"
@@ -1113,6 +1236,7 @@ mod tests {
             | "update"
             | "init"
             | "commands"
+            | "fault kinds"
             | "usage status"
             | "usage enable"
             | "usage disable"
@@ -1195,8 +1319,8 @@ mod tests {
 
         let cli_source = include_str!("../../cli.rs");
         for (call, expected_count) in [
-            ("selection.resolve(&config)", 15),
-            ("selection.resolve_existing(&config)", 3),
+            ("selection.resolve(&config)", 16),
+            ("selection.resolve_existing(&config)", 4),
             ("selection.resolve_online(&config)", 5),
         ] {
             assert_eq!(

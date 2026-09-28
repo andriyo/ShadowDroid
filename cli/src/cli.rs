@@ -385,6 +385,11 @@ pub enum Cmd {
     /// Live UI automation: dump, find, tap, type, and wait for screen state.
     #[command(subcommand)]
     Ui(UiCmd),
+    /// Put the device or app into a failure condition on purpose — process
+    /// death, no network, full storage, a moved clock, failing backend calls —
+    /// and undo it reliably. Start with `fault kinds`.
+    #[command(subcommand)]
+    Fault(crate::fault::args::FaultCmd),
     /// Agent-first layout snapshots and diffs.
     Layout(crate::cmd::layout::LayoutArgs),
     /// Install/manage the in-app debug AAR (the ShadowDroid agent) in an app you
@@ -2002,6 +2007,11 @@ async fn run_inner() -> Result<()> {
             return crate::verify::run(args);
         }
         Cmd::Config(args) => return crate::cmd::config::run(args, cli.device.as_deref()),
+        Cmd::Fault(crate::fault::args::FaultCmd::Kinds) => return crate::fault::kinds(),
+        // The detached --duration-ms timer: sleeps, then runs `fault clear`.
+        Cmd::Fault(crate::fault::args::FaultCmd::Expire(args)) => {
+            return crate::fault::run_expire(args.clone()).await;
+        }
         Cmd::Skill(args) => return crate::cmd::skill::run(args),
         Cmd::Usage(args) => return crate::cmd::usage::run(args),
         Cmd::Update { check, json } => return crate::update::cmd_update(*check, *json).await,
@@ -2252,6 +2262,34 @@ async fn run_inner() -> Result<()> {
             let serial = selection.resolve(&config).await?;
             return dispatch_profile(c, &serial).await;
         }
+        Cmd::Fault(c) => {
+            use crate::fault::args::FaultCmd;
+            let forward = crate::fault::Forward {
+                authority_dir: cli.authority_dir.clone(),
+            };
+            return match c {
+                // Scenario steps are child commands that take the device lock
+                // themselves; the runner must not hold it.
+                FaultCmd::Run(_) => {
+                    let serial = selection.resolve_online_raw(&config).await?;
+                    crate::fault::run(c.clone(), &serial, &forward).await
+                }
+                FaultCmd::Inject(inject) => {
+                    let serial = selection.resolve(&config).await?;
+                    let mut inject = inject.clone();
+                    if let Some(app) = inject.app_mut() {
+                        fill_app(app, &config);
+                        *app =
+                            resolve_app_package(&config, Some(serial.as_str()), app.take()).await?;
+                    }
+                    crate::fault::run(FaultCmd::Inject(inject), &serial, &forward).await
+                }
+                _ => {
+                    let serial = selection.resolve_existing(&config).await?;
+                    crate::fault::run(c.clone(), &serial, &forward).await
+                }
+            };
+        }
         Cmd::App(AppCmd::State(args)) => {
             if !args.needs_device() {
                 return crate::cmd::app_state::run(args, None, None).await;
@@ -2358,6 +2396,7 @@ async fn run_inner() -> Result<()> {
         | Cmd::Perm(_)
         | Cmd::Appops(_)
         | Cmd::Profile(_)
+        | Cmd::Fault(_)
         | Cmd::Net(_)
         | Cmd::Aar(_) => unreachable!("handled before ensure_ready"),
 
@@ -6317,6 +6356,10 @@ async fn cmd_disconnect(serial: &Serial) -> Result<()> {
     let _guard = installer::acquire_lifecycle_lock(serial)?;
     free_ui_automation_slot(serial).await?;
     let mut out = json!({"status": "disconnected", "device": serial});
+    // Faults are experiments on this session's device: leave it as found.
+    if let Some(faults) = crate::fault::clear_all_quietly(serial.as_str()).await {
+        out["faults"] = faults;
+    }
     if let Some(stylus) = crate::cmd::device_profile::restore_stylus_setting(serial).await {
         out["stylus_handwriting"] = stylus;
     }

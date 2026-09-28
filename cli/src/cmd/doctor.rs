@@ -90,6 +90,8 @@ const ADVISORY_CODES: &[&str] = &[
     // Clock drift matters for TLS and tokens but not for the pipe, and
     // `--fix` cannot repair it.
     "clock",
+    // Injected faults are deliberate; they change the device, not the pipe.
+    "faults",
 ];
 
 /// `healthy` iff every non-advisory check is `ok`. Single source of truth so the
@@ -205,6 +207,9 @@ pub async fn gather(device: Option<&str>) -> DoctorReport {
 
     // ── C6: net proxy state (a dangling http_proxy silently breaks networking)
     checks.push(net_check(&serial).await);
+
+    // ── C7: injected faults still changing the device ───────────────────────
+    checks.push(faults_check(&serial));
 
     DoctorReport::from_checks(Some(serial), checks)
 }
@@ -621,6 +626,12 @@ async fn apply_fix(device: Option<&str>, report: DoctorReport, force: bool) -> D
         }
     }
 
+    // Faults whose timer did not fire, or whose restore failed, are leftovers:
+    // clear them. Active faults within their time are deliberate and stay.
+    for line in crate::fault::clear_stale(&serial).await {
+        eprintln!("doctor --fix: {line}");
+    }
+
     // Re-read owners fresh: refuse to clobber a foreign owner without --force.
     let owners = adb::ps_ui_automation_owners(&serial)
         .await
@@ -675,7 +686,44 @@ async fn apply_fix(device: Option<&str>, report: DoctorReport, force: bool) -> D
 /// Checks `--fix` can actually repair. The rest (`device` offline/unauthorized,
 /// `clock` drift) are advisory — surfaced, but not something we auto-fix.
 fn is_fixable(code: &str) -> bool {
-    matches!(code, "apk" | "server" | "owners" | "net")
+    matches!(code, "apk" | "server" | "owners" | "net" | "faults")
+}
+
+/// Faults `fault inject` left on the device. Active ones are reported as
+/// deliberate; overdue (their --duration-ms timer never ran) or
+/// restore-failed ones are leftovers `--fix` clears.
+fn faults_check(serial: &Serial) -> Check {
+    let summary = crate::fault::summary(serial.as_str());
+    if summary.active.is_empty() && summary.stale.is_empty() {
+        return Check {
+            code: "faults",
+            status: Status::Ok,
+            detail: "no injected faults".into(),
+            remedy: None,
+        };
+    }
+    if !summary.stale.is_empty() {
+        return Check {
+            code: "faults",
+            status: Status::Warn,
+            detail: format!(
+                "{} injected fault(s) left behind (overdue or not restored): {}",
+                summary.stale.len(),
+                summary.stale.join(", ")
+            ),
+            remedy: Some("clear them with `fault clear <id>` (doctor --fix does)".into()),
+        };
+    }
+    Check {
+        code: "faults",
+        status: Status::Warn,
+        detail: format!(
+            "{} injected fault(s) active: {}",
+            summary.active.len(),
+            summary.active.join(", ")
+        ),
+        remedy: Some("`fault clear --all` when the experiment is done".into()),
+    }
 }
 
 /// Package-agnostic `net` proxy state. The headline value is catching wiring

@@ -46,6 +46,7 @@ mod device;
 mod device_ref;
 mod diagnostic;
 mod events;
+mod fault;
 mod fusion;
 mod hostenv;
 mod ids;

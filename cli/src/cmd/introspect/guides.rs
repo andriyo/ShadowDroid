@@ -42,6 +42,11 @@ pub(super) const GUIDES: &[Guide] = &[
         content: include_str!("guides/debugger.md"),
     },
     Guide {
+        topic: "faults",
+        covers: &["fault"],
+        content: include_str!("guides/faults.md"),
+    },
+    Guide {
         topic: "state",
         covers: &["app", "device", "perm", "appops", "profile", "files"],
         content: include_str!("guides/state.md"),
