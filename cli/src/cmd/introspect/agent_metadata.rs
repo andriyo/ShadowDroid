@@ -351,9 +351,9 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         })),
         "ui find" => Some(serde_json::json!({
             "use_when": ["Need to resolve a selector without tapping it."],
-            "output": "matching elements, compact by default",
+            "output": "matching elements, compact by default; nothing matching is a normal result (matched:false, exit 0) — use `ui wait` to require an element",
             "side_effects": ["none"],
-            "next_actions": ["ui tap --handle <handle>", "ui text <value> --handle <handle>"]
+            "next_actions": ["ui tap --handle <handle>", "ui text <value> --handle <handle>", "ui wait --rid <rid> --timeout-ms 3000"]
         })),
         "ui tap" => Some(serde_json::json!({
             "use_when": ["Need to activate a visible element by stable selector, screen-bound handle, fresh ui dump id, or coordinates."],
