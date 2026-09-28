@@ -137,7 +137,10 @@ fn run_inner(args: &VerifyArgs) -> Result<()> {
             }
             parsed.validate(*minimum_tests as usize);
             if let Some(path) = out {
-                crate::cmd::artifact::write_json(path, &serde_json::to_value(&parsed)?)?;
+                // The saved artifact follows --redact like stdout does.
+                let artifact =
+                    crate::redaction::redact_output_if_active(serde_json::to_value(&parsed)?);
+                crate::cmd::artifact::write_json(path, &artifact)?;
             }
             crate::events::emit_action(
                 "verify_junit",
