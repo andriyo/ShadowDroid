@@ -271,9 +271,19 @@ fn report(days: u32) -> Result<()> {
         .unwrap_or(0)
         .saturating_sub(u64::from(days) * 86_400_000);
 
-    // Read current + one rotated generation.
-    let mut text = std::fs::read_to_string(path.with_added_extension("1")).unwrap_or_default();
-    text.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+    // Read current + one rotated generation. A missing file is an empty log;
+    // any other read failure is reported rather than shown as zero usage.
+    let read_log =
+        |path: &std::path::Path| -> Result<String> {
+            match std::fs::read(path) {
+                Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+                Err(err) => Err(anyhow::Error::new(err)
+                    .context(format!("reading usage log {}", path.display()))),
+            }
+        };
+    let mut text = read_log(&path.with_added_extension("1"))?;
+    text.push_str(&read_log(&path)?);
 
     struct VerbStats {
         count: u64,
