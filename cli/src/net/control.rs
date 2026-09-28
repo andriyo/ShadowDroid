@@ -1373,12 +1373,30 @@ fn parse_daemon_pid(value: &str) -> Option<u32> {
 
 async fn connect(serial: &Serial) -> Result<TcpStream> {
     let port = read_ctl_port(serial).ok_or_else(|| {
-        anyhow!("no net proxy daemon for {serial}. Is `shadowdroid net start` running?")
+        crate::diagnostic::DiagnosticError::new(
+            "net_not_running",
+            "net",
+            format!("no ShadowDroid proxy is running for {serial}"),
+        )
+        .next_actions([
+            format!("shadowdroid -d {serial} net start"),
+            format!("shadowdroid -d {serial} net status"),
+        ])
     })?;
     TcpStream::connect(("127.0.0.1", port)).await.map_err(|e| {
-        anyhow!(
-            "cannot reach the net proxy daemon on 127.0.0.1:{port}: {e}. Is `net start` running?"
+        crate::diagnostic::DiagnosticError::new(
+            "net_daemon_unreachable",
+            "net",
+            format!("cannot reach the ShadowDroid proxy daemon on 127.0.0.1:{port}: {e}"),
         )
+        .retryable(true)
+        .detail(json!({"port": port}))
+        .next_actions([
+            format!("shadowdroid -d {serial} net status"),
+            format!("shadowdroid -d {serial} net stop"),
+            format!("shadowdroid -d {serial} net start"),
+        ])
+        .into()
     })
 }
 
