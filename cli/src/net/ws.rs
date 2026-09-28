@@ -2437,6 +2437,35 @@ pub struct WsHeldFrame {
     /// Whether a drop or payload edit can be applied (see
     /// [`managed_reencode_safe`]); otherwise only a byte-exact resume can.
     pub editable: bool,
+    pub session_id: String,
+    /// The frame as held, so `net show <id>` can reveal what is to be edited.
+    pub payload: Vec<u8>,
+}
+
+impl WsHeldFrame {
+    /// `net show` view of a held frame; `redact` withholds the payload.
+    pub fn show_value(&self, id: &str, redact: bool) -> serde_json::Value {
+        let mut value = serde_json::json!({
+            "type": "ws_msg",
+            "id": id,
+            "session_id": self.session_id,
+            "host": self.host,
+            "dir": self.dir,
+            "opcode": self.opcode,
+            "payload_len": self.payload.len(),
+            "held": true,
+            "editable": self.editable,
+        });
+        if redact {
+            value["payload_redacted"] = serde_json::json!(true);
+        } else {
+            match std::str::from_utf8(&self.payload) {
+                Ok(text) => value["text"] = serde_json::json!(text),
+                Err(_) => value["data_b64"] = serde_json::json!(b64_encode(&self.payload)),
+            }
+        }
+        value
+    }
 }
 
 /// Outcome of applying declarative `ws-*` rules to one frame.
@@ -2808,6 +2837,8 @@ async fn ws_hold(
                 opcode: opcode.to_string(),
                 host: meta.host.clone(),
                 editable,
+                session_id: meta.id.clone(),
+                payload: frame.payload.clone(),
             },
         );
     }

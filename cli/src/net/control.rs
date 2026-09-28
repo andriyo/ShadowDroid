@@ -625,6 +625,16 @@ pub async fn serve_client(
             )
             .await?;
         }
+        "ws_held_show" => {
+            let id = req.get("id").and_then(Value::as_str).unwrap_or("");
+            let frame = shared
+                .ws_held
+                .lock()
+                .unwrap()
+                .get(id)
+                .map(|frame| frame.show_value(id, shared.redaction.is_some()));
+            write_json(&mut wr, &json!({"ok": frame.is_some(), "frame": frame})).await?;
+        }
         "checkpoint" => {
             let sequence = flow::last_sequence();
             let checkpoint = format!(

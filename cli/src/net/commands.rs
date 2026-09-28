@@ -2123,8 +2123,20 @@ fn show_ws_session(serial: &Serial, id: &str) -> Result<()> {
     Ok(())
 }
 
-fn show_ws_message(serial: &Serial, id: &str, opts: &ShowOpts) -> Result<()> {
+async fn show_ws_message(serial: &Serial, id: &str, opts: &ShowOpts) -> Result<()> {
     let Some(record) = store::find_ws_message(serial, id)? else {
+        // A frame held by `net intercept --dir` is logged only once released;
+        // until then the daemon has it.
+        if control::is_running(serial).await
+            && let Ok(reply) =
+                control::request(serial, json!({"op": "ws_held_show", "id": id})).await
+            && let Some(frame) = reply.get("frame").filter(|frame| !frame.is_null())
+        {
+            let mut frame = frame.clone();
+            frame["next_actions"] = json!(crate::net::ws_intercept_next_actions(serial, id));
+            events::emit_result(&frame);
+            return Ok(());
+        }
         return Err(ws_not_found(id, "message"));
     };
     if let Some(path) = opts.body_file.as_deref() {
@@ -2210,7 +2222,7 @@ pub async fn show(serial: &Serial, id: &str, opts: ShowOpts) -> Result<()> {
                     "`--har` applies to HTTP flows; use `net export jsonl` for WebSocket messages"
                 );
             }
-            return show_ws_message(serial, id, &opts);
+            return show_ws_message(serial, id, &opts).await;
         }
         None => {}
     }
