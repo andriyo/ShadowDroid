@@ -547,6 +547,10 @@ pub enum FilesCmd {
         /// Access the path through Android run-as instead of shared/server storage.
         #[arg(long)]
         run_as: bool,
+        /// Device path. An absolute path is that path on the device (shared
+        /// storage through the ShadowDroid server, anything else through adb as
+        /// the shell user); a relative path is inside ShadowDroid's own app
+        /// storage. With --run-as, a path inside the app's data directory.
         remote: String,
     },
     /// Push a local file to the device.
@@ -558,6 +562,10 @@ pub enum FilesCmd {
         #[arg(long)]
         run_as: bool,
         local: String,
+        /// Device path. An absolute path is that path on the device (shared
+        /// storage through the ShadowDroid server, anything else through adb as
+        /// the shell user); a relative path is inside ShadowDroid's own app
+        /// storage. With --run-as, a path inside the app's data directory.
         remote: String,
         /// Require Unix permission bits after the push (octal, e.g. 644).
         /// Omit on shared/FUSE storage where Android controls the effective mode.
@@ -572,6 +580,10 @@ pub enum FilesCmd {
         /// Access the source through Android run-as.
         #[arg(long)]
         run_as: bool,
+        /// Device path. An absolute path is that path on the device (shared
+        /// storage through the ShadowDroid server, anything else through adb as
+        /// the shell user); a relative path is inside ShadowDroid's own app
+        /// storage. With --run-as, a path inside the app's data directory.
         remote: String,
         local: String,
     },
@@ -4195,8 +4207,67 @@ async fn dispatch_device(c: DeviceCmd, client: &ServerClient, serial: &Serial) -
     Ok(())
 }
 
+/// Whether the ShadowDroid server can address `remote` as the path the
+/// caller means. The server maps shared storage (`/sdcard/…`,
+/// `/storage/emulated/0/…`) and relative paths (its own app storage); it
+/// would put any other absolute path inside that app storage, so those go
+/// through adb, which reaches the real path as the shell user.
+fn server_addresses(remote: &str) -> bool {
+    !remote.starts_with('/')
+        || remote.starts_with("/sdcard/")
+        || remote.starts_with("/storage/emulated/0/")
+}
+
 async fn dispatch_files(c: FilesCmd, client: &ServerClient, serial: &Serial) -> Result<()> {
     match c {
+        FilesCmd::Ls {
+            app: _,
+            run_as: false,
+            remote,
+        } if !server_addresses(&remote) => {
+            let entries = adb::list_dir(serial, &remote).await?;
+            emit_action(
+                "ls",
+                &json!({"remote":remote,"entries":entries,"via":"adb"}),
+            );
+        }
+        FilesCmd::Push {
+            app: _,
+            run_as: false,
+            local,
+            remote,
+            mode,
+        } if !server_addresses(&remote) => {
+            let local_path = Path::new(&local);
+            let bytes_len = adb::push(serial, local_path, remote.clone()).await?;
+            let mode_applied = match mode {
+                Some(requested) => Some(chmod_via_adb(serial, requested, &remote).await),
+                None => None,
+            };
+            if mode_applied == Some(false) {
+                return Err(file_mode_postcondition_error(
+                    &local, &remote, mode, None, "adb",
+                ));
+            }
+            emit_action(
+                "push",
+                &json!({"local":local,"remote":remote,"bytes":bytes_len,"requested_mode":mode,"mode_applied":mode_applied,"via":"adb"}),
+            );
+        }
+        FilesCmd::Pull {
+            app: _,
+            run_as: false,
+            remote,
+            local,
+        } if !server_addresses(&remote) => {
+            let bytes = adb::pull_to_path(serial, remote.clone(), Path::new(&local))
+                .await
+                .map_err(|error| classify_adb_pull_error(&remote, error))?;
+            emit_action(
+                "pull",
+                &json!({"remote":remote,"local":local,"bytes":bytes,"via":"adb"}),
+            );
+        }
         FilesCmd::Ls {
             app: _,
             run_as: false,
@@ -4282,7 +4353,9 @@ async fn dispatch_files(c: FilesCmd, client: &ServerClient, serial: &Serial) -> 
             let (bytes, via) = match server_pull {
                 Ok(receipt) => (receipt.bytes, "server"),
                 Err(err) if should_pull_fall_back_to_adb(&err) => (
-                    adb::pull_to_path(serial, remote.clone(), local_path).await?,
+                    adb::pull_to_path(serial, remote.clone(), local_path)
+                        .await
+                        .map_err(|error| classify_adb_pull_error(&remote, error))?,
                     "adb",
                 ),
                 Err(err) => return Err(err),
@@ -4370,6 +4443,25 @@ fn parse_octal_mode(s: &str) -> Result<u32, String> {
 /// failures and server-side (5xx) errors — e.g. an unwritable scoped-storage
 /// path — fall back; structured client errors (4xx, e.g. `bad_mode`) are
 /// surfaced, since adb can't fix a rejected request.
+/// A missing device file is `file_not_found` whichever route read it.
+fn classify_adb_pull_error(remote: &str, error: anyhow::Error) -> anyhow::Error {
+    if format!("{error:#}").contains("No such file or directory") {
+        let parent = remote
+            .rsplit_once('/')
+            .map(|(parent, _)| if parent.is_empty() { "/" } else { parent })
+            .unwrap_or(".");
+        return crate::diagnostic::DiagnosticError::new(
+            "file_not_found",
+            "files",
+            format!("{remote} does not exist on the device"),
+        )
+        .detail(json!({"remote": remote}))
+        .next_actions([format!("shadowdroid files ls {parent}")])
+        .into();
+    }
+    error
+}
+
 fn should_fall_back_to_adb(err: &anyhow::Error) -> bool {
     match err.downcast_ref::<crate::device::client::ServerError>() {
         Some(server) => !server.status.is_client_error(),
@@ -7616,6 +7708,16 @@ mod tests {
                 panic!("{args:?}: {error}");
             }
         }
+    }
+
+    #[test]
+    fn only_paths_the_server_maps_go_to_the_server() {
+        assert!(server_addresses("/sdcard/Download/x"));
+        assert!(server_addresses("/storage/emulated/0/Download/x"));
+        assert!(server_addresses("notes/x.txt"));
+        assert!(!server_addresses("/data/local/tmp/x"));
+        assert!(!server_addresses("/sdcard"));
+        assert!(!server_addresses("/system/etc/hosts"));
     }
 
     #[test]
