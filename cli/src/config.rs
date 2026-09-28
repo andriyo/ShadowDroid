@@ -546,6 +546,21 @@ pub fn parse_config_file(path: &Path) -> Result<ShadowDroidConfig> {
             "check the config file permissions and retry",
         ])
     })?;
+    // serde maps a JSON array onto the struct's fields by position; a config
+    // is only ever an object.
+    if text.trim_start().starts_with('[') {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "config_parse",
+            "config",
+            format!(
+                "invalid ShadowDroid config {}: the top level must be a JSON object",
+                path.display()
+            ),
+        )
+        .detail(serde_json::json!({"path": path.display().to_string()}))
+        .next_actions(["shadowdroid config schema --json"])
+        .into());
+    }
     serde_json::from_str(&text).map_err(|error: serde_json::Error| {
         crate::diagnostic::DiagnosticError::new(
             "config_parse",

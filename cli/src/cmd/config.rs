@@ -403,7 +403,26 @@ fn init_config(args: &ConfigInitArgs, device: Option<&str>) -> Result<()> {
         );
     }
 
+    // Rules that span every config layer (a default_target that exists) can
+    // only be checked on the merged result: write, check, and put the old
+    // file back if the merge is invalid.
+    let previous = std::fs::read(&path).ok();
     cfg::write_config_file(&path, &config)?;
+    let mut merged_errors = Vec::new();
+    match ShadowDroidConfig::load() {
+        Ok(merged) => validate_target_references(&merged, &mut merged_errors),
+        Err(error) => merged_errors.push(format!("{error:#}")),
+    }
+    if !merged_errors.is_empty() {
+        match previous {
+            Some(bytes) => crate::cmd::artifact::write_bytes(&path, &bytes).map(|_| ())?,
+            None => std::fs::remove_file(&path)?,
+        }
+        bail!(
+            "refusing to write invalid config:\n{}",
+            merged_errors.join("\n")
+        );
+    }
 
     // For project scope the folder lives inside the repo, so keep the CA secrets
     // out of git. User scope is under $HOME (not a repo) — nothing to ignore.
