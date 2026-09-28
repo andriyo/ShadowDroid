@@ -1982,10 +1982,17 @@ pub async fn log(serial: &Serial, opts: LogOpts) -> Result<()> {
         attach_recalled_tls_actions(serial, v);
         events::emit(v);
     }
-    let ids = items
+    // Distinct ids in order: a WebSocket session's open and close records share
+    // one id, which the summary lists once.
+    let mut ids = Vec::new();
+    for id in items
         .iter()
         .filter_map(|item| item.get("id").and_then(serde_json::Value::as_str))
-        .collect::<Vec<_>>();
+    {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
     emit(
         "net_log",
         json!({
@@ -2837,6 +2844,19 @@ pub async fn export(
     }
     if format == "har" {
         return export_har(serial, id, out).await;
+    }
+    if let Some(ws_id) = id.as_deref().filter(|id| id.starts_with('w')) {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "invalid_input",
+            "net",
+            format!("`{ws_id}` is a WebSocket id; `{format}` exports HTTP flows only"),
+        )
+        .detail(json!({"id": ws_id, "format": format}))
+        .next_actions([
+            format!("shadowdroid net export har {ws_id}"),
+            "shadowdroid net export jsonl --protocol websocket".to_string(),
+        ])
+        .into());
     }
     let mut flows = match &id {
         Some(id) => store::find_by_id(serial, id)?
