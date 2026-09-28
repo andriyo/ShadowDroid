@@ -1181,8 +1181,11 @@ async fn dispatch_tap(
     cmd: &Value,
     action_cmd: &str,
 ) -> Result<TapOutcome> {
-    if let Some(id) = opt_u32(cmd, "id")? {
-        if let Some(expected_hash) = cmd.get("screen_hash").and_then(Value::as_str)
+    // An element id or any selector (text/rid/desc/klass/xpath), like `ui
+    // tap`; otherwise raw x/y coordinates.
+    if let Some(query) = selector_query_from_cmd(cmd)? {
+        if let Some(id) = query.id
+            && let Some(expected_hash) = cmd.get("screen_hash").and_then(Value::as_str)
             && state.last_hash.as_deref() != Some(expected_hash)
         {
             bail!(
@@ -1190,18 +1193,14 @@ async fn dispatch_tap(
                 state.last_hash
             );
         }
-        let r = cfg
-            .client
-            .find_tap(&SelectorQuery {
-                id: Some(id),
-                ..Default::default()
-            })
-            .await?;
+        let id = query.id;
+        let r = cfg.client.find_tap(&query).await?;
         let source = r.action.clone().unwrap_or_else(|| "server".to_string());
         emit_action(
             action_cmd,
             &json!({
                 "id":id,
+                "selector":query,
                 "x":r.x,
                 "y":r.y,
                 "source":source,
@@ -1213,13 +1212,16 @@ async fn dispatch_tap(
             }),
         );
         return Ok(TapOutcome {
-            id: Some(id),
+            id,
             x: r.x,
             y: r.y,
             source,
         });
     }
 
+    if cmd.get("x").is_none() && cmd.get("y").is_none() {
+        bail!("tap needs a selector (id, text, rid, desc, klass, xpath) or x and y coordinates");
+    }
     let x = req_i32(cmd, "x")?;
     let y = req_i32(cmd, "y")?;
     cfg.client.tap_xy(x, y).await?;
