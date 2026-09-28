@@ -4178,7 +4178,24 @@ async fn dispatch_device(c: DeviceCmd, client: &ServerClient, serial: &Serial) -
             ),
             Some(v) => {
                 client.orientation_set(&v).await?;
-                emit_action("set_orientation", &json!({"value":v}));
+                // The rotation is locked either way, but a foreground activity
+                // that fixes its orientation (most launchers) keeps the display
+                // where it is. Report what the display actually shows.
+                let mut effective = client.orientation_get().await?;
+                for _ in 0..8 {
+                    if effective == v {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    effective = client.orientation_get().await?;
+                }
+                let mut body = json!({"value": v, "effective": effective});
+                if effective != v {
+                    body["warnings"] = json!([format!(
+                        "the rotation is locked to {v}, but the display stays {effective}: the foreground activity fixes its orientation; it applies to apps that allow rotation"
+                    )]);
+                }
+                emit_action("set_orientation", &body);
             }
         },
         DeviceCmd::Clipboard { value } => match value {
