@@ -962,15 +962,29 @@ fn wire_probes_block(build_gradle: &Path) -> Result<bool> {
         return Ok(false);
     }
     let newline = newline_of(&content);
+    let had_final_newline = content.ends_with('\n');
     let mut out = content;
-    if !out.ends_with('\n') {
+    if !had_final_newline {
         out.push_str(newline);
     }
+    // One blank separator line, removed again by `unwire_probes`.
     out.push_str(newline);
-    out.push_str(&PROBES_BLOCK.replace('\n', newline));
+    let mut block = PROBES_BLOCK.replace('\n', newline);
+    if !had_final_newline {
+        // Recorded inside the managed block so removal restores the ending.
+        let first_line_end = block
+            .find(newline)
+            .map(|at| at + newline.len())
+            .unwrap_or(0);
+        block.insert_str(first_line_end, &format!("{NO_FINAL_NEWLINE_NOTE}{newline}"));
+    }
+    out.push_str(&block);
     write_build_file(build_gradle, &out)?;
     Ok(true)
 }
+
+/// Inside the probes block: the build file had no final newline before it.
+const NO_FINAL_NEWLINE_NOTE: &str = "// (shadowdroid: this file had no final newline)";
 
 /// Remove the managed coroutine-probes block (BEGIN through END marker line).
 fn unwire_probes(build_gradle: &Path) -> Result<bool> {
@@ -996,47 +1010,61 @@ fn unwire_probes(build_gradle: &Path) -> Result<bool> {
         }
         out.push(line);
     }
-    while out.last().is_some_and(|l| l.trim().is_empty()) {
+    // Drop only the blank separator `wire_probes_block` added.
+    if out.last().is_some_and(|l| l.trim().is_empty()) {
         out.pop();
     }
     let newline = newline_of(&content);
     let mut text = out.join(newline);
-    text.push_str(newline);
+    if !content.contains(NO_FINAL_NEWLINE_NOTE) {
+        text.push_str(newline);
+    }
     write_build_file(build_gradle, &text)?;
     Ok(true)
 }
 
-/// Remove the managed marker comment and the dependency line that follows it.
+/// Remove the managed marker comment and every line that declares a
+/// dependency on the managed AAR, wherever it sits: `aar remove` deletes the
+/// AAR file, so any line left pointing at it would break the build. Returns
+/// whether a dependency line was removed.
 fn unwire_dependency(build_gradle: &Path, marker: &str, asset_name: &str) -> Result<bool> {
     let content = match fs::read_to_string(build_gradle) {
         Ok(c) => c,
         Err(_) => return Ok(false),
     };
-    if !content.contains(marker) {
-        return Ok(false);
-    }
-
-    let mut out: Vec<String> = Vec::new();
-    let mut skip_next = false;
+    let declares = |line: &str| {
+        let code = line.split("//").next().unwrap_or("");
+        code.contains(asset_name)
+            && ["mplementation", "files(", "api(", "Api("]
+                .iter()
+                .any(|call| code.contains(call))
+    };
+    let mut out: Vec<&str> = Vec::new();
+    let mut removed_dependency = false;
+    let mut changed = false;
     for line in content.lines() {
         if line.contains(marker) {
-            skip_next = true; // drop the marker line; the dep line is next
+            changed = true;
             continue;
         }
-        if skip_next {
-            skip_next = false;
-            if line.contains(asset_name) {
-                continue; // drop the managed dependency line
-            }
+        if declares(line) {
+            removed_dependency = true;
+            changed = true;
+            continue;
         }
-        out.push(line.to_string());
+        out.push(line);
+    }
+    if !changed {
+        return Ok(false);
     }
 
     let newline = newline_of(&content);
     let mut text = out.join(newline);
-    text.push_str(newline);
+    if content.ends_with('\n') {
+        text.push_str(newline);
+    }
     write_build_file(build_gradle, &text)?;
-    Ok(true)
+    Ok(removed_dependency)
 }
 
 fn gradle_assemble_debug(root: &Path, module: &str) -> Result<bool> {
@@ -1337,6 +1365,45 @@ mod tests {
         )
         .unwrap();
         p
+    }
+
+    #[test]
+    fn probes_install_then_remove_restores_the_file_ending() {
+        let dir = tempfile::tempdir().unwrap();
+        let gradle = dir.path().join("build.gradle.kts");
+        for original in [
+            "plugins {}\ndependencies {\n}",
+            "plugins {}\n\n",
+            "plugins {}\r\n",
+        ] {
+            fs::write(&gradle, original).unwrap();
+            assert!(wire_probes_block(&gradle).unwrap());
+            assert!(unwire_probes(&gradle).unwrap());
+            assert_eq!(fs::read_to_string(&gradle).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn remove_drops_dependency_lines_separated_from_their_marker() {
+        // The sample app's layout: the marker, the user's explanatory
+        // comments, then both managed lines (the OkHttp one without a marker).
+        let dir = tempfile::tempdir().unwrap();
+        let gradle = dir.path().join("build.gradle.kts");
+        let original = format!(
+            "dependencies {{\n    // {DEP_MARKER} — debug agent.\n    // why we use it\n    debugImplementation(files(rootProject.file(\"shadowdroid/{AAR_ASSET}\")))\n    debugImplementation(files(rootProject.file(\"shadowdroid/{OKHTTP_AAR_ASSET}\")))\n    // mentions {AAR_ASSET} in a comment only\n    implementation(\"a:b:1\")\n}}"
+        );
+        fs::write(&gradle, &original).unwrap();
+        assert!(unwire_dependency(&gradle, DEP_MARKER, AAR_ASSET).unwrap());
+        assert!(unwire_dependency(&gradle, OKHTTP_DEP_MARKER, OKHTTP_AAR_ASSET).unwrap());
+        let after = fs::read_to_string(&gradle).unwrap();
+        assert!(!declares_aar(&after, AAR_ASSET), "{after}");
+        assert!(!declares_aar(&after, OKHTTP_AAR_ASSET), "{after}");
+        assert!(after.contains("// why we use it"));
+        assert!(after.contains(&format!("// mentions {AAR_ASSET} in a comment only")));
+        assert!(after.contains("implementation(\"a:b:1\")"));
+        // No trailing newline before, none after; a second remove is a no-op.
+        assert!(!after.ends_with('\n'));
+        assert!(!unwire_dependency(&gradle, DEP_MARKER, AAR_ASSET).unwrap());
     }
 
     #[test]
