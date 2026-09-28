@@ -322,7 +322,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "use_when": ["Need the current actionable UI state for selector choice before tapping, typing, or waiting.", "Need --deep fallback discovery when visible Compose content is missing from UIAutomator."],
             "avoid_when": ["Need a durable source/layout artifact; use layout snapshot."],
             "output": "compact screen JSON plus explicit accessibility_completeness; --full adds bounds/flags; --deep compares Android Studio Layout Inspector and returns missing Compose fallback elements with id, bounds, source, confidence, and stability metadata",
-            "side_effects": ["none"],
+            "side_effects": ["--deep turns on Android Studio Layout Inspector for the device and leaves it on; while it is on, Studio injects its inspector agent into the app every time it starts (turn Layout Inspector off in Studio before timing- or crash-sensitive runs)"],
             "prerequisites": ["--deep needs the Studio plugin and Layout Inspector attached to the foreground app"],
             "next_actions": ["ui tap --rid <resource-id> --if-interaction <hash>", "ui tap --handle <handle>", "ui tap --fallback-id cs:<draw-id> --if-screen <hash>", "ui text <value> --handle <handle>", "ui hide-keyboard", "ui wait"],
             "prefer_over": {
@@ -479,7 +479,7 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "use_when": ["Need a saved UI structure artifact, layout diff input, screenshot pairing, Compose semantics, or source mapping."],
             "avoid_when": ["Need to tap/type based on the current UI; use ui dump."],
             "output": "layout_snapshot JSON with sample_valid/sample diagnostics; --out writes it, --screenshot writes a sibling screenshot artifact",
-            "side_effects": ["optional file writes with --out/--screenshot"],
+            "side_effects": ["optional file writes with --out/--screenshot", "--compose/--semantics/--source-map turns on Android Studio Layout Inspector for the device and leaves it on; while it is on, Studio injects its inspector agent into the app every time it starts (turn Layout Inspector off in Studio before timing- or crash-sensitive runs)"],
             "prerequisites": ["Android Studio Layout Inspector bridge is needed for Compose/source enrichment; UIAutomator tree is still returned without it"],
             "next_actions": ["layout diff <before> <after>", "layout source --id <id>", "layout source --draw-id <id>"],
             "prefer_over": {
@@ -496,13 +496,13 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
         "layout source" => Some(serde_json::json!({
             "use_when": ["Need to map a current UIAutomator element or Studio Layout Inspector draw id back to source when available."],
             "output": "layout_source JSON with matched node, source availability, and sample_valid/sample diagnostics",
-            "side_effects": ["none"],
+            "side_effects": ["Turns on Android Studio Layout Inspector for the device and leaves it on; while it is on, Studio injects its inspector agent into the app every time it starts (turn Layout Inspector off in Studio before timing- or crash-sensitive runs)"],
             "next_actions": ["debug break line", "debug auto", "layout snapshot --source-map"]
         })),
         "layout recompositions" => Some(serde_json::json!({
             "use_when": ["Need Compose recomposition/skip counters for the current screen, or want to isolate recompositions caused by one interaction."],
             "output": "layout_recompositions JSON with sample_valid/sample diagnostics, summary totals, and source-mapped Compose nodes when Android Studio Layout Inspector is available",
-            "side_effects": ["--reset clears Android Studio Layout Inspector recomposition counters for the selected app/process"],
+            "side_effects": ["--reset clears Android Studio Layout Inspector recomposition counters for the selected app/process", "Turns on Android Studio Layout Inspector for the device and leaves it on; while it is on, Studio injects its inspector agent into the app every time it starts (turn Layout Inspector off in Studio before timing- or crash-sensitive runs)"],
             "prerequisites": ["Android Studio must be running with the ShadowDroid plugin and Layout Inspector model available", "Use --reset before the interaction, then run again after the interaction to rank changed nodes"],
             "next_actions": ["layout recompositions --reset", "layout source --draw-id <id>", "layout snapshot --compose --source-map", "debug snapshot"],
             "prefer_over": {

@@ -92,3 +92,8 @@ an id; do not act on an arbitrary session.
 Use `layout source` to map a UIAutomator id or Inspector draw id back to source.
 Use `layout recompositions --reset`, perform one interaction, then read
 `layout recompositions` to isolate Compose churn.
+
+These Layout Inspector commands (and `ui dump --deep`) turn Layout Inspector on
+for the device and leave it on. While it is on, Studio injects its inspector
+agent into the app every time it starts; turn Layout Inspector off in Studio
+before timing- or crash-sensitive runs such as instrumented tests.
