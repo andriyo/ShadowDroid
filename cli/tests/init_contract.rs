@@ -87,7 +87,7 @@ fn plugin_failure_is_one_nonzero_typed_error_with_recovery() {
         value["detail"]["steps"]["studio_plugin"]["error"]
             .as_str()
             .unwrap()
-            .contains("Android Studio was not detected")
+            .contains("missing-studio does not exist")
     );
     assert!(
         value["next_actions"]

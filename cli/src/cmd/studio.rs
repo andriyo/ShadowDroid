@@ -376,6 +376,9 @@ fn print_init_human(
 
 async fn status(explicit_studio: Option<&Path>, json: bool) -> Result<()> {
     let report = status_report(explicit_studio)?;
+    if let Some(problem) = explicit_studio_problem(explicit_studio, &report.android_studios) {
+        return Err(problem.into());
+    }
     if json {
         crate::events::emit_result(&report);
     } else {
@@ -389,7 +392,9 @@ pub fn status_report(explicit_studio: Option<&Path>) -> Result<StudioReport> {
     let bridge = bridge_status()?;
     let mut guidance = Vec::new();
 
-    if studios.is_empty() {
+    if let Some(problem) = explicit_studio_problem(explicit_studio, &studios) {
+        guidance.push(problem.to_string());
+    } else if studios.is_empty() {
         guidance.push("Android Studio was not detected. Pass --studio /path/to/Android Studio.app or install Android Studio first.".into());
     } else if studios.iter().any(|s| !s.shadowdroid_plugin_installed) {
         guidance.push(
@@ -449,6 +454,9 @@ async fn install_report(
     explicit_plugin: Option<&Path>,
 ) -> Result<InstallReport> {
     let mut studios = discover_android_studios(explicit_studio)?;
+    if let Some(problem) = explicit_studio_problem(explicit_studio, &studios) {
+        return Err(problem.into());
+    }
     if studios.is_empty() {
         bail!(
             "Android Studio was not detected. Pass --studio /path/to/Android Studio.app, \
@@ -526,6 +534,40 @@ fn discover_android_studios(explicit: Option<&Path>) -> Result<Vec<StudioInfo>> 
         }
     }
     Ok(by_product_info.into_values().collect())
+}
+
+/// An explicit `--studio` that found no Android Studio: say whether the path
+/// is missing or is something else, rather than "not detected".
+fn explicit_studio_problem(
+    explicit: Option<&Path>,
+    studios: &[StudioInfo],
+) -> Option<crate::diagnostic::DiagnosticError> {
+    let path = expand_home(explicit?);
+    if !studios.is_empty() {
+        return None;
+    }
+    let (code, msg) = if path.exists() {
+        (
+            "studio_path_not_android_studio",
+            format!(
+                "--studio {} is not an Android Studio installation (no Android Studio product-info.json found)",
+                path.display()
+            ),
+        )
+    } else {
+        (
+            "studio_path_not_found",
+            format!("--studio {} does not exist", path.display()),
+        )
+    };
+    Some(
+        crate::diagnostic::DiagnosticError::new(code, "input", msg)
+            .detail(serde_json::json!({"studio": path}))
+            .next_actions([
+                "pass the Android Studio .app bundle (macOS) or install directory, e.g. --studio '/Applications/Android Studio.app'",
+                "omit --studio to auto-detect installed Android Studio versions",
+            ]),
+    )
 }
 
 fn studio_info_from_product_info(root: &Path, product_info_path: &Path) -> Result<StudioInfo> {
@@ -1280,6 +1322,17 @@ fn print_skill_install_human(value: &serde_json::Value) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_explicit_studio_path_that_is_not_studio_is_an_error() {
+        let code = |path: &Path| {
+            let studios = discover_android_studios(Some(path)).unwrap();
+            explicit_studio_problem(Some(path), &studios).unwrap().code
+        };
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(code(&dir.path().join("missing")), "studio_path_not_found");
+        assert_eq!(code(dir.path()), "studio_path_not_android_studio");
+    }
     use super::*;
 
     #[test]
