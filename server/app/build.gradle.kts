@@ -24,7 +24,7 @@ plugins {
 val serverVersionName: String =
     (project.findProperty("version") as? String)
         ?.takeIf { it.isNotBlank() && it != "unspecified" }
-        ?: "1.2.0"
+        ?: "1.3.0"
 
 android {
     namespace = "io.github.andriyo.shadowdroid"
