@@ -311,6 +311,11 @@ internal object DebuggerValues {
     @Throws(Exception::class)
     private fun frameFromThread(thread: ThreadReferenceProxyImpl, threadIndex: Int, frameIndex: Int): SelectedFrame {
         val frames = thread.frames()
+        if (frames.isEmpty()) {
+            throw FramesNotReadyException(
+                "thread ${thread.name()} has no readable frames yet; Android Studio is still settling the pause",
+            )
+        }
         if (frameIndex >= frames.size) {
             throw IllegalArgumentException("frame index out of bounds: $frameIndex")
         }

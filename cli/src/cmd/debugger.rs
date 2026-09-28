@@ -2166,6 +2166,21 @@ impl BridgeClient {
             ])
             .into());
         }
+        if bridge_error_code(&value) == Some("debug_frames_not_ready") {
+            // Studio was still settling a fresh pause; the frame exists.
+            return Err(crate::diagnostic::DiagnosticError::new(
+                "debug_frames_not_ready",
+                "debugger",
+                value
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Android Studio is still settling the pause"),
+            )
+            .retryable(true)
+            .detail(serde_json::json!({"route": path, "bridge_reply": value}))
+            .next_actions(["retry the same command in a second; the session is still paused"])
+            .into());
+        }
         if bridge_error_code(&value) == Some("debug_session_running") {
             // The step was refused, not queued: nothing happened.
             return Err(crate::diagnostic::DiagnosticError::new(
@@ -2424,8 +2439,8 @@ mod tests {
         hold.abort();
     }
 
-    #[tokio::test]
-    async fn cancelled_ui_thread_requests_are_retryable() {
+    /// A bridge that answers every request with a 503 carrying [body].
+    async fn unavailable_bridge(body: &'static str) -> BridgeClient {
         let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://127.0.0.1:{}", server.local_addr().unwrap().port());
         tokio::spawn(async move {
@@ -2433,16 +2448,36 @@ mod tests {
             let (mut socket, _) = server.accept().await.unwrap();
             let mut buf = [0u8; 2048];
             let _ = socket.read(&mut buf).await;
-            let body = r#"{"ok":false,"error":"Android Studio's UI thread did not start the request","error_code":"studio_ui_busy","executed":false}"#;
             let reply = format!(
                 "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
                 body.len()
             );
             let _ = socket.write_all(reply.as_bytes()).await;
         });
-        let bridge = BridgeClient::with_timeout(Some(&url), Duration::from_secs(5)).unwrap();
+        BridgeClient::with_timeout(Some(&url), Duration::from_secs(5)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn cancelled_ui_thread_requests_are_retryable() {
+        let bridge = unavailable_bridge(
+            r#"{"ok":false,"error":"Android Studio's UI thread did not start the request","error_code":"studio_ui_busy","executed":false}"#,
+        )
+        .await;
         let error = bridge.get(route::SESSION_CONTROL, &[]).await.unwrap_err();
         assert_eq!(code_and_retryable(&error), ("studio_ui_busy".into(), true));
+    }
+
+    #[tokio::test]
+    async fn a_pause_still_settling_is_retryable() {
+        let bridge = unavailable_bridge(
+            r#"{"ok":false,"error":"thread main has no readable frames yet; Android Studio is still settling the pause","error_code":"debug_frames_not_ready"}"#,
+        )
+        .await;
+        let error = bridge.get(route::SESSION_CONTROL, &[]).await.unwrap_err();
+        assert_eq!(
+            code_and_retryable(&error),
+            ("debug_frames_not_ready".into(), true)
+        );
     }
 
     #[test]

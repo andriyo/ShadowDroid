@@ -35,6 +35,14 @@ internal object BridgeProtocol {
                 obj("ok", false, "error", busy.message, "error_code", "studio_ui_busy", "executed", false),
             )
         }
+        val settling = generateSequence(t) { it.cause }.firstOrNull { it is FramesNotReadyException }
+        if (settling != null) {
+            // The pause did not settle within the retry budget; a later retry reads it.
+            return Response(
+                HttpURLConnection.HTTP_UNAVAILABLE,
+                obj("ok", false, "error", settling.message, "error_code", "debug_frames_not_ready"),
+            )
+        }
         return Response(status, obj("ok", false, "error", t.message ?: t.javaClass.simpleName))
     }
 

@@ -2,6 +2,7 @@ package io.github.andriyo.shadowdroid.studio
 
 import com.intellij.debugger.engine.DebuggerManagerThreadImpl
 import com.intellij.debugger.engine.JavaDebugProcess
+import com.intellij.debugger.engine.SuspendContextImpl
 import com.intellij.debugger.engine.events.DebuggerCommandImpl
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.xdebugger.XDebugSession
@@ -65,6 +66,27 @@ internal object StudioThreading {
     @Throws(Exception::class)
     fun <T> onDebuggerThread(session: XDebugSession, timeoutMs: Int, supplier: ThrowingSupplier<T>): T {
         if (DebuggerManagerThreadImpl.isManagerThread()) return supplier.get()
+        // Right after a pause the thread's frames can briefly read as empty;
+        // retry from here, off the manager thread Studio needs to settle it.
+        return FrameSettle.retry {
+            onDebuggerThreadOnce(session, timeoutMs, supplier)
+        }
+    }
+
+    /**
+     * Studio reports "Couldn't evaluate expression after 'Pause Program'" for a
+     * moment after a breakpoint pause too, while it settles; only a pause with
+     * no breakpoint event is a real Pause Program.
+     */
+    private fun settlingOrSelf(t: Throwable, context: SuspendContextImpl?): Throwable =
+        if (context?.eventSet != null && t.message?.contains("after 'Pause Program'") == true) {
+            FramesNotReadyException(t.message!!)
+        } else {
+            t
+        }
+
+    @Throws(Exception::class)
+    private fun <T> onDebuggerThreadOnce(session: XDebugSession, timeoutMs: Int, supplier: ThrowingSupplier<T>): T {
         val javaProcess = session.debugProcess as? JavaDebugProcess ?: return supplier.get()
 
         val future = debuggerRequests.submit<T> {
@@ -73,10 +95,14 @@ internal object StudioThreading {
             val error = AtomicReference<Throwable>()
             managerThread.invokeAndWait(object : DebuggerCommandImpl() {
                 override fun action() {
+                    val context = session.suspendContext as? SuspendContextImpl
                     try {
+                        if (context?.isEvaluating == true) {
+                            throw FramesNotReadyException("Android Studio is evaluating in the paused thread; its frames are not readable yet")
+                        }
                         value.set(supplier.get())
                     } catch (t: Throwable) {
-                        error.set(t)
+                        error.set(settlingOrSelf(t, context))
                     }
                 }
             })
