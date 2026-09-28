@@ -1107,6 +1107,8 @@ struct PendingFlow {
     upstream_http_version: Mutex<Option<String>>,
     /// Injected faults that hit this request.
     fault_ids: Mutex<Vec<String>>,
+    /// The content-encoding and wire length of a response the proxy decoded.
+    upstream_encoding: Mutex<Option<(String, u64)>>,
 }
 
 /// Where a request was redirected to by `net resume --set-url`: every flow
@@ -1160,6 +1162,24 @@ fn pending_fault_ids() -> Vec<String> {
 fn pending_upstream_http_version() -> Option<String> {
     PENDING_FLOW
         .try_with(|pending| pending.upstream_http_version.lock().unwrap().clone())
+        .ok()
+        .flatten()
+}
+
+/// The origin sent the response encoded; the proxy decoded it for capture,
+/// rules and the app, so record what actually came over the wire.
+fn note_decoded(encoding: &str, wire_len: usize) {
+    let _ = PENDING_FLOW.try_with(|pending| {
+        *pending.upstream_encoding.lock().unwrap() = Some((
+            encoding.to_string(),
+            u64::try_from(wire_len).unwrap_or(u64::MAX),
+        ));
+    });
+}
+
+fn pending_upstream_encoding() -> Option<(String, u64)> {
+    PENDING_FLOW
+        .try_with(|pending| pending.upstream_encoding.lock().unwrap().clone())
         .ok()
         .flatten()
 }
@@ -1824,6 +1844,12 @@ async fn proxy_request_inner(
         match decompress_bounded(&resp_headers, &resp_bytes).await {
             DecodeOutcome::Identity => {}
             DecodeOutcome::Decoded(plain) => {
+                if let Some((_, encoding)) = resp_headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
+                {
+                    note_decoded(encoding.trim(), resp_bytes.len());
+                }
                 resp_bytes = Bytes::from(plain);
                 resp_headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-encoding"));
                 strip_body_validators(&mut resp_headers);
@@ -2413,6 +2439,7 @@ fn make_flow(p: FlowParts<'_>) -> FlowRecord {
     } else {
         p.req_bytes.len() as u64
     };
+    let upstream_encoding = pending_upstream_encoding();
     FlowRecord {
         id: p.id.to_string(),
         flow_sequence: flow::sequence_from_id(p.id).unwrap_or_default(),
@@ -2449,6 +2476,8 @@ fn make_flow(p: FlowParts<'_>) -> FlowRecord {
         original_url: pending_original_url(),
         http_version: pending_http_version(),
         upstream_http_version: pending_upstream_http_version(),
+        upstream_content_encoding: upstream_encoding.as_ref().map(|(e, _)| e.clone()),
+        upstream_resp_len: upstream_encoding.map(|(_, len)| len),
         fault_ids: pending_fault_ids(),
         upstream_bypassed: false,
         error: p.error,

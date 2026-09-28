@@ -206,6 +206,9 @@ fn har_entry(f: &FlowRecord) -> Value {
         "cache": {},
         "timings": {"send": 0, "wait": f.dur_ms.unwrap_or(0), "receive": 0},
         "_upstreamHttpVersion": f.upstream_http_version,
+        // The origin's encoding when the proxy decoded the body for the app.
+        "_upstreamContentEncoding": f.upstream_content_encoding,
+        "_upstreamBodySize": f.upstream_resp_len,
     })
 }
 
@@ -686,6 +689,17 @@ mod tests {
         assert_eq!(entry["_upstreamHttpVersion"], "HTTP/1.1");
     }
 
+    #[test]
+    fn har_names_the_encoding_the_proxy_decoded() {
+        let mut flow = sample();
+        assert!(har_entry(&flow)["_upstreamContentEncoding"].is_null());
+        flow.upstream_content_encoding = Some("gzip".into());
+        flow.upstream_resp_len = Some(162);
+        let entry = har_entry(&flow);
+        assert_eq!(entry["_upstreamContentEncoding"], "gzip");
+        assert_eq!(entry["_upstreamBodySize"], 162);
+    }
+
     fn sample() -> FlowRecord {
         FlowRecord {
             id: "f1".into(),
@@ -723,6 +737,8 @@ mod tests {
             original_url: None,
             http_version: None,
             upstream_http_version: None,
+            upstream_content_encoding: None,
+            upstream_resp_len: None,
             fault_ids: Vec::new(),
             upstream_bypassed: false,
             error: None,

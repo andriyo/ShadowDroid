@@ -101,6 +101,14 @@ pub struct FlowRecord {
     /// when no upstream response arrived (replay, errors, older captures).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_http_version: Option<String>,
+    /// The origin's `content-encoding` (gzip, br, zstd, deflate) when the proxy
+    /// decoded the response. `resp_headers`, `resp_body` and `resp_len` then
+    /// describe the decoded response the app received; the origin sent
+    /// `upstream_resp_len` encoded bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_content_encoding: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_resp_len: Option<u64>,
     /// Injected faults (`fault inject http-errors …`) that hit this request.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fault_ids: Vec<String>,
@@ -236,6 +244,8 @@ impl FlowRecord {
         });
         // Set outside the literal: one more field exceeds json!'s recursion limit.
         v["req_len_unknown"] = serde_json::json!(self.req_len_unknown);
+        v["upstream_content_encoding"] = serde_json::json!(self.upstream_content_encoding);
+        v["upstream_resp_len"] = serde_json::json!(self.upstream_resp_len);
         if body {
             v["req_body"] = serde_json::json!(self.req_body);
             v["resp_body"] = serde_json::json!(self.resp_body);
@@ -482,6 +492,8 @@ mod tests {
             original_url: None,
             http_version: None,
             upstream_http_version: None,
+            upstream_content_encoding: None,
+            upstream_resp_len: None,
             fault_ids: Vec::new(),
             upstream_bypassed: false,
             error: None,

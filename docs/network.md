@@ -138,7 +138,9 @@ unique URL, and the exact decrypted flow is captured.
 The decrypted leg negotiates **HTTP/2 or HTTP/1.1** (h2 apps aren't
 downgraded), streams **SSE / large bodies** through instead of buffering them —
 both response and request (a big upload streams chunked; marked
-`streamed`/`req_streamed` in the flow) — decodes `gzip`/`deflate`/`br`/`zstd`,
+`streamed`/`req_streamed` in the flow) — decodes `gzip`/`deflate`/`br`/`zstd`
+for capture, rules and the app (`upstream_content_encoding` and
+`upstream_resp_len` in the flow keep what the server actually sent),
 and **captures WebSocket (WS/WSS) frames**. `net start --verify-upstream`
 validates the real server certificate for both HTTPS and WSS (off by default
 for self-signed dev backends).
