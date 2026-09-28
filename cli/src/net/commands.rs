@@ -3371,17 +3371,28 @@ pub async fn respond(
     Ok(())
 }
 
+/// A rule with no matcher applies to every request; say so rather than let a
+/// forgotten `--host` quietly take over all of the app's traffic.
+const MATCHES_ALL_TRAFFIC: &str = "this rule has no matcher and applies to ALL traffic; add --host/--path (or a URL with a host) to narrow it";
+
 pub async fn rule_add(serial: &Serial, mut spec: RuleSpec) -> Result<()> {
     absolutize_map_local_path(&mut spec)?;
     let warning = map_remote_path_warning(&spec);
+    let mut warnings: Vec<String> = warning.iter().cloned().collect();
+    if crate::net::rule::matcher_matches_everything(&spec.matcher) {
+        warnings.push(MATCHES_ALL_TRAFFIC.to_string());
+    }
     let mut reply = checked_control_reply(
         "rule_add",
         control::request(serial, json!({"op": "rule_add", "spec": spec})).await?,
     )?;
-    if let Some(w) = warning
-        && let Some(obj) = reply.as_object_mut()
-    {
-        obj.insert("warning".into(), json!(w));
+    if let Some(obj) = reply.as_object_mut() {
+        if let Some(w) = warning {
+            obj.insert("warning".into(), json!(w));
+        }
+        if !warnings.is_empty() {
+            obj.insert("warnings".into(), json!(warnings));
+        }
     }
     emit("net_rule_add", reply);
     Ok(())
@@ -3394,7 +3405,10 @@ pub async fn override_local(serial: &Serial, url_glob: &str, file: &Path) -> Res
             file.display()
         );
     }
-    let (matcher, warnings) = matcher_from_url_glob(url_glob)?;
+    let (matcher, mut warnings) = matcher_from_url_glob(url_glob)?;
+    if matcher.host.is_none() && matcher.path.is_none() {
+        warnings.push(MATCHES_ALL_TRAFFIC.to_string());
+    }
     let mut spec = RuleSpec::from_legacy_parts(
         "map-local".into(),
         matcher.clone(),

@@ -1047,7 +1047,7 @@ pub fn lint_rules(specs: &[RuleSpec]) -> Vec<RuleLintIssue> {
     issues
 }
 
-fn matcher_matches_everything(matcher: &RuleMatcher) -> bool {
+pub(crate) fn matcher_matches_everything(matcher: &RuleMatcher) -> bool {
     matches!(matcher, RuleMatcher::All { matchers } if matchers.is_empty())
 }
 
