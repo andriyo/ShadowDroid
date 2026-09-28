@@ -67,26 +67,29 @@ pub fn catalog(root: &Command) -> serde_json::Value {
 
 /// Root flags that are not global: they must come before the subcommand
 /// (`shadowdroid --session TOKEN ui dump`).
-fn root_args(root: &Command) -> Vec<serde_json::Value> {
-    args(root)
+/// The root's global args and its root-only args (placed before the
+/// subcommand). Describing a root arg probes the whole command tree, so they
+/// are computed once and split.
+fn global_and_root_args(root: &Command) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let (global, mut local): (Vec<_>, Vec<_>) = args(root)
         .into_iter()
-        .filter(|arg| arg["global"] != true)
-        .map(|mut arg| {
-            arg["position"] = serde_json::json!("before_subcommand");
-            arg
-        })
-        .collect()
+        .partition(|arg| arg["global"] == true);
+    for arg in &mut local {
+        arg["position"] = serde_json::json!("before_subcommand");
+    }
+    (global, local)
 }
 
 fn catalog_with_depth(root: &Command, depth: Option<usize>) -> serde_json::Value {
+    let (global_args, root_args) = global_and_root_args(root);
     serde_json::json!({
         "schema_version": 3,
         "name": root.get_name(),
         "version": root.get_version().unwrap_or(""),
         "about": root.get_about().map(|s| s.to_string()),
         "effect_model": effect_model_json(),
-        "global_args": args(root).into_iter().filter(|arg| arg["global"] == true).collect::<Vec<_>>(),
-        "root_args": root_args(root),
+        "global_args": global_args,
+        "root_args": root_args,
         "commands": subcommands(root, &[], depth),
         "next_actions": next_actions_for_path("commands"),
     })
@@ -109,13 +112,14 @@ fn describe_catalog(root: &Command, raw_path: &str) -> Option<serde_json::Value>
     }
     let canonical_path = parent.join(" ");
     parent.pop();
+    let (global_args, root_args) = global_and_root_args(root);
     Some(serde_json::json!({
         "schema_version": 3,
         "path": canonical_path,
         "version": root.get_version().unwrap_or(""),
         "effect_model": effect_model_json(),
-        "global_args": args(root).into_iter().filter(|arg| arg["global"] == true).collect::<Vec<_>>(),
-        "root_args": root_args(root),
+        "global_args": global_args,
+        "root_args": root_args,
         // Include one level of child names/contracts for namespace queries such
         // as `commands net`; leaf queries remain a single bounded command.
         "command": command_json(command, &parent, Some(1)),
@@ -651,13 +655,17 @@ pub(crate) fn split_shell_words(command: &str) -> Option<Vec<String>> {
     (!words.is_empty()).then_some(words)
 }
 fn args(cmd: &Command) -> Vec<serde_json::Value> {
+    // Building a command builds its whole subtree; do it once per command,
+    // not once per argument probed.
+    let mut built = cmd.clone();
+    built.build();
     cmd.get_arguments()
         .filter(|a| !matches!(a.get_id().as_str(), "help" | "version"))
-        .map(|arg| arg_json(cmd, arg))
+        .map(|arg| arg_json(cmd, &built, arg))
         .collect()
 }
 
-fn arg_json(cmd: &Command, a: &Arg) -> serde_json::Value {
+fn arg_json(cmd: &Command, built: &Command, a: &Arg) -> serde_json::Value {
     let takes_value = !matches!(
         a.get_action(),
         ArgAction::SetTrue
@@ -690,7 +698,7 @@ fn arg_json(cmd: &Command, a: &Arg) -> serde_json::Value {
         .map(|other| other.get_id().as_str().to_string())
         .filter(|id| !matches!(id.as_str(), "help" | "version"))
         .collect::<std::collections::BTreeSet<_>>();
-    let requires = probe_requires(cmd, a);
+    let requires = probe_requires(built, a);
     serde_json::json!({
         "name": a.get_id().as_str(),
         "positional": a.is_positional(),
@@ -748,12 +756,12 @@ fn argument_groups(cmd: &Command) -> Vec<serde_json::Value> {
 /// command's unconditional required arguments, then map Clap's own
 /// MissingRequiredArgument context back to live argument ids. This keeps the
 /// catalog derived from the parser instead of a second hand-maintained table.
-fn probe_requires(cmd: &Command, arg: &Arg) -> Vec<String> {
+/// [built] is the command after `Command::build`, shared across its args.
+fn probe_requires(built: &Command, arg: &Arg) -> Vec<String> {
     if arg.is_required_set() || matches!(arg.get_id().as_str(), "help" | "version") {
         return Vec::new();
     }
-    let mut probe = cmd.clone();
-    probe.build();
+    let probe = built;
     let Some(probe_arg) = probe
         .get_arguments()
         .find(|candidate| candidate.get_id() == arg.get_id())
