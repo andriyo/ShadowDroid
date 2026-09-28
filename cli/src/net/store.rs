@@ -280,20 +280,22 @@ fn visit_records(path: &Path, mut visit: impl FnMut(StoredLine)) -> Result<()> {
     let files = open_generation_snapshot(path)?;
     for (candidate, file, length) in files {
         let mut reader = BufReader::new(file.take(length));
-        let mut line = String::new();
+        // Bytes, not `String`: a line torn inside a multi-byte character is
+        // invalid UTF-8 and would fail `read_line` for the whole log.
+        let mut line = Vec::new();
         loop {
             line.clear();
             let bytes = reader
-                .read_line(&mut line)
+                .read_until(b'\n', &mut line)
                 .with_context(|| format!("read {}", candidate.display()))?;
             if bytes == 0 {
                 break;
             }
-            let trimmed = line.trim();
+            let trimmed = line.trim_ascii();
             if trimmed.is_empty() {
                 continue;
             }
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(trimmed) else {
                 continue;
             };
             match value.get("type").and_then(serde_json::Value::as_str) {
@@ -1847,6 +1849,21 @@ mod tests {
             text.push('\n');
         }
         std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn a_line_torn_inside_a_multibyte_character_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.jsonl");
+        let mut bytes = line(flow("kept", 1.0, "api.example", "/")).into_bytes();
+        bytes.push(b'\n');
+        let torn = line(flow("torn", 2.0, "api.example", "/caf\u{e9}"));
+        let cut = torn.find('\u{e9}').unwrap() + 1; // inside the two-byte é
+        bytes.extend_from_slice(&torn.as_bytes()[..cut]);
+        std::fs::write(&path, bytes).unwrap();
+        let flows = read_all_from(&path).unwrap();
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].id, "kept");
     }
 
     #[test]
