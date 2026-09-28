@@ -3236,6 +3236,19 @@ pub async fn intercept(
     on_timeout: String,
     clear: bool,
 ) -> Result<()> {
+    if !clear && at == "request" && matcher.status.is_some() {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "invalid_input",
+            "net",
+            "--status matches the response, so with `--at request` it would never hold anything",
+        )
+        .detail(json!({"at": at, "status": matcher.status}))
+        .next_actions([
+            "use `--at response` (or `--at both`) with --status",
+            "drop --status to hold matching requests before they are sent",
+        ])
+        .into());
+    }
     let request = if clear {
         // Older daemons ignore `clear` and would arm an unrestricted matcher.
         // Check support before sending a mutation to a long-running daemon.

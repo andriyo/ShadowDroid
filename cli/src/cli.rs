@@ -1265,13 +1265,14 @@ pub enum NetCmd {
         #[arg(long)]
         host: Option<String>,
         /// Only intercept flows whose URL path contains this (substring).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "dir")]
         path: Option<String>,
         /// Only intercept flows with this HTTP method.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "dir")]
         method: Option<String>,
-        /// Only intercept flows with this response status (response phase).
-        #[arg(long)]
+        /// Only intercept flows with this response status (response phase;
+        /// refused with `--at request`, where no status exists yet).
+        #[arg(long, conflicts_with = "dir")]
         status: Option<u16>,
         /// Intercept WebSocket frames in this direction instead of HTTP flows:
         /// `s2c` (from the server) or `c2s` (from the app).
@@ -1288,7 +1289,7 @@ pub enum NetCmd {
         #[arg(long, value_parser = ["request", "response", "both"], default_value = "response")]
         at: String,
         /// Auto-act after this long if the agent doesn't (apps time out their own client).
-        #[arg(long, default_value_t = 30000)]
+        #[arg(long, default_value_t = 30000, value_parser = clap::value_parser!(u32).range(1..))]
         hold_ms: u32,
         /// What to do when the hold deadline passes (fail-open by default).
         #[arg(long, value_parser = ["resume", "drop"], default_value = "resume")]
@@ -6826,6 +6827,23 @@ async fn resolve_online_serial(requested: &str) -> Result<Serial> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn net_intercept_refuses_filters_that_would_never_hold() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(["shadowdroid", "net", "intercept"].iter().chain(args))
+        };
+        assert!(parse(&["--path", "/h", "--hold-ms", "0"]).is_err());
+        assert!(parse(&["--path", "/h", "--hold-ms", "1"]).is_ok());
+        for http_only in ["--path", "--method", "--status"] {
+            let value = if http_only == "--status" { "500" } else { "x" };
+            assert!(
+                parse(&["--dir", "s2c", http_only, value]).is_err(),
+                "{http_only}"
+            );
+        }
+        assert!(parse(&["--dir", "s2c", "--host", "x"]).is_ok());
+    }
     use super::*;
     use clap::CommandFactory;
 
