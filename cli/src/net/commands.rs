@@ -2813,6 +2813,19 @@ pub async fn export(
     protocol: Option<store::Protocol>,
     session: Option<String>,
 ) -> Result<()> {
+    if let Some(flag) = jsonl_only_flag(format, protocol.is_some(), session.is_some()) {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "invalid_input",
+            "net",
+            format!("{flag} only applies to `net export jsonl`, not `{format}`"),
+        )
+        .detail(json!({"format": format, "flag": flag}))
+        .next_actions([
+            format!("drop {flag}, or use `shadowdroid net export jsonl {flag} …`"),
+            "name one flow or WebSocket session id to export just that one".to_string(),
+        ])
+        .into());
+    }
     if format == "jsonl" {
         return export_jsonl(
             serial,
@@ -3064,6 +3077,17 @@ fn redact_raw_network_export(
 /// HAR 1.2 export including WebSocket sessions (Chrome `_webSocketMessages`).
 /// `id` selects one HTTP flow (`f…`) or one WS session (`w…`); omitted exports
 /// everything. Re-redacts under an active policy on the way out.
+/// The jsonl-only filter a non-jsonl export was given, if any: har, curl and
+/// fixtures would otherwise ignore it and export everything.
+fn jsonl_only_flag(format: &str, protocol: bool, session: bool) -> Option<&'static str> {
+    match (format, protocol, session) {
+        ("jsonl", ..) => None,
+        (_, true, _) => Some("--protocol"),
+        (_, _, true) => Some("--session"),
+        _ => None,
+    }
+}
+
 async fn export_har(serial: &Serial, id: Option<String>, out: Option<PathBuf>) -> Result<()> {
     let ws_id = id.as_deref().filter(|id| id.starts_with('w'));
     let mut flows = match id.as_deref() {
@@ -3906,6 +3930,15 @@ fn redacted_for_output(mut flow: crate::net::flow::FlowRecord) -> crate::net::fl
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn jsonl_filters_are_refused_on_other_formats() {
+        assert_eq!(jsonl_only_flag("jsonl", true, true), None);
+        assert_eq!(jsonl_only_flag("har", false, false), None);
+        assert_eq!(jsonl_only_flag("har", true, false), Some("--protocol"));
+        assert_eq!(jsonl_only_flag("curl", false, true), Some("--session"));
+        assert_eq!(jsonl_only_flag("fixtures", true, true), Some("--protocol"));
+    }
     use super::*;
     use crate::net::Matcher;
 

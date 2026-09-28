@@ -1184,11 +1184,11 @@ pub enum NetCmd {
         /// omitted for `jsonl`).
         #[arg(short = 'o', long)]
         out: Option<PathBuf>,
-        /// jsonl only: which protocol to export (http | websocket | all).
+        /// jsonl only (refused for other formats): which protocol to export (http | websocket | all).
         /// Default: all.
         #[arg(long, value_enum)]
         protocol: Option<ProtocolArg>,
-        /// jsonl only: restrict to one capture session id.
+        /// jsonl only (refused for other formats): restrict to one capture session id.
         #[arg(long, value_name = "SESSION")]
         session: Option<String>,
     },
