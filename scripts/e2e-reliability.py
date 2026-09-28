@@ -222,7 +222,10 @@ def main():
 
         # Exercise the literal generated Python recipe, preserving error JSON.
         skill = record("generated-skill", [args.cli, "skill", "codex"]).stdout
-        snippet = skill.split("```python\n", 1)[1].split("```", 1)[0]
+        # The skill points at the workflow guide, which carries the checked-run helper.
+        assert "commands --guide workflow" in skill
+        guide = record("workflow-guide", [args.cli, "commands", "--guide", "workflow"]).stdout
+        snippet = guide.split("```python\n", 1)[1].split("```", 1)[0]
         wrapper = args.evidence / "checked.py"
         wrapper.write_text(snippet + "\nchecked_run(sys.argv[1:])\n")
         child = record("checked-failure", ["python3", wrapper, args.cli, "not-a-command"], 2)
