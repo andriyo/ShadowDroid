@@ -508,13 +508,29 @@ impl Session {
                             ),
                         )
                     })?;
-                    let (owner, field) =
-                        self.find_field(object, field_name).await?.ok_or_else(|| {
-                            RpcError::new(
+                    let Some((owner, field)) = self.find_field(object, field_name).await? else {
+                        // A Kotlin delegated property (`by mutableStateOf`,
+                        // `by lazy`) is stored as `<name>$delegate`.
+                        let delegate = format!("{field_name}$delegate");
+                        let mut error = RpcError::new(
+                            "invalid_expression",
+                            format!("field not found: {field_name}"),
+                        );
+                        if self.find_field(object, &delegate).await?.is_some() {
+                            let whole = original.trim();
+                            let base = whole.strip_suffix(path).unwrap_or("");
+                            let suggestion =
+                                format!("{base}{}.{delegate}{}", &path[..pos], &path[end..]);
+                            error = RpcError::new(
                                 "invalid_expression",
-                                format!("field not found: {field_name}"),
+                                format!(
+                                    "field not found: {field_name} (a Kotlin delegated property; its state is in `{delegate}`)"
+                                ),
                             )
-                        })?;
+                            .detail(json!({"suggestion": suggestion}));
+                        }
+                        return Err(error);
+                    };
                     value = self.read_field(object, owner, &field).await?;
                     declared = Some(resolve::type_name(&field.signature));
                     pos = end;

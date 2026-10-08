@@ -122,7 +122,7 @@ async fn line_breakpoint_binds_hits_and_reads_the_frame() {
         .collect();
     assert_eq!(
         field_names,
-        ["counter", "label", "numbers"],
+        ["counter", "label", "numbers", "status$delegate"],
         "shadow$ hidden"
     );
     assert!(
@@ -440,4 +440,32 @@ async fn uncaught_means_not_caught_by_app_code() {
     vm.wait_for(WAIT, "the rethrow to resume", |s| s.resumes == resumes + 1);
     assert!(session.suspension().is_none());
     assert_eq!(session.breakpoints()[0]["hit_count"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_kotlin_property_points_at_its_delegate() {
+    let vm = FakeVm::start();
+    let session = attach(&vm, WAIT).await;
+    session
+        .break_line(target("MainActivity.kt"), 31)
+        .await
+        .unwrap();
+    vm.hit_breakpoint(5);
+    wait_suspended(&session).await;
+    let error = session
+        .eval("this.status", None, None, OPTIONS)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "invalid_expression");
+    assert!(
+        error.message.contains("status$delegate"),
+        "{}",
+        error.message
+    );
+    assert_eq!(error.detail["suggestion"], "this.status$delegate");
+    let plain = session
+        .eval("this.nothing", None, None, OPTIONS)
+        .await
+        .unwrap_err();
+    assert_eq!(plain.message, "field not found: nothing");
 }

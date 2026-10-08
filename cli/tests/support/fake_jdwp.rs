@@ -638,6 +638,7 @@ fn handle(shared: &Shared, set: u8, cmd: u8, body: &[u8]) -> (u16, Vec<u8>, Afte
                     (2001, "label", "Ljava/lang/String;"),
                     (2002, "numbers", "[I"),
                     (2003, "shadow$_klass_", "Ljava/lang/Class;"),
+                    (2004, "status$delegate", "Ljava/lang/Object;"),
                 ]
             } else {
                 &[]
