@@ -116,6 +116,10 @@ pub struct AutoArgs {
     /// Exception breakpoint set at attach (repeatable; jdwp backend).
     #[arg(long, value_name = "CLASS")]
     pub break_exception: Vec<String>,
+    /// Activity to start with --from-start when the app has several launcher
+    /// activities (`.Main` or a class name; jdwp backend).
+    #[arg(long, value_name = "ACTIVITY", requires = "from_start")]
+    pub launch_activity: Option<String>,
     /// App foreground wait timeout after launch.
     #[arg(long, default_value_t = 20000)]
     pub timeout_ms: u32,
@@ -1888,13 +1892,15 @@ async fn debug_auto_jdwp(
                 wait_for_launch: true,
                 launch_timeout: Duration::from_millis(u64::from(args.timeout_ms)),
             };
+            // Not the server's app start: it waits for the activity to reach
+            // the foreground, which cannot happen while the app sits in
+            // waitForDebugger ("Waiting For Debugger" has focus).
+            let activity = args.launch_activity.clone();
+            let host = crate::jdwp::launch::AdbHost {
+                serial: serial.as_str().to_string(),
+            };
             let attached = jdwp::attach_with(request, |package| async move {
-                let started = client.app_start(&package, None).await?;
-                Ok(json!({
-                    "ok": started.ok,
-                    "activity": started.activity,
-                    "warning": started.warning,
-                }))
+                crate::jdwp::launch::launcher_launch(&host, &package, activity.as_deref()).await
             })
             .await;
             let value = jdwp_attach_value(attached);

@@ -325,36 +325,41 @@ where
 
     // Every exit path: a leftover `-w` would freeze the next launch.
     restore_debug_app(host, &previous, steps).await;
+    let outcome = match outcome {
+        Some(Ok(attached)) => return Ok(attached),
+        failed => failed,
+    };
+    // Failed or interrupted before a debugger took the process: a process
+    // already in waitForDebugger keeps waiting after clear-debug-app (the
+    // setting is read once, at start), so stop it.
+    let started: Vec<u32> = package_pids(host, package)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|pid| !before.contains(pid))
+        .collect();
+    let interrupted = outcome.is_none();
+    if interrupted {
+        steps.push(json!({"step": "interrupted", "ok": false}));
+    }
+    if !started.is_empty() {
+        let stopped = host.shell(&format!("am force-stop {quoted}")).await;
+        steps.push(json!({
+            "step": "force_stop_waiting_process",
+            "ok": stopped.is_ok(),
+            "pids": started,
+        }));
+    }
     match outcome {
         Some(result) => result,
-        None => {
-            steps.push(json!({"step": "interrupted", "ok": false}));
-            // The new process waits in waitForDebugger with no one coming.
-            let started: Vec<u32> = package_pids(host, package)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|pid| !before.contains(pid))
-                .collect();
-            if !started.is_empty() {
-                let stopped = host.shell(&format!("am force-stop {quoted}")).await;
-                steps.push(json!({
-                    "step": "force_stop_waiting_process",
-                    "ok": stopped.is_ok(),
-                    "pids": started,
-                }));
-            }
-            Err(crate::diagnostic::DiagnosticError::new(
-                "debug_launch_interrupted",
-                "debugger",
-                format!("the launch of {package} under the debugger was interrupted"),
-            )
-            .detail(json!({"backend": "jdwp", "package": package, "launch_steps": steps}))
-            .next_actions([
-                "shadowdroid debug attach --backend jdwp --wait-for-launch --package <pkg>",
-            ])
-            .into())
-        }
+        None => Err(crate::diagnostic::DiagnosticError::new(
+            "debug_launch_interrupted",
+            "debugger",
+            format!("the launch of {package} under the debugger was interrupted"),
+        )
+        .detail(json!({"backend": "jdwp", "package": package, "launch_steps": steps}))
+        .next_actions(["shadowdroid debug attach --backend jdwp --wait-for-launch --package <pkg>"])
+        .into()),
     }
 }
 
@@ -551,8 +556,17 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("attach failed"));
-        assert_eq!(host.commands().last().unwrap(), "am clear-debug-app");
-        assert!(!host.commands().iter().any(|c| c.contains("force-stop")));
+        // The launched process is still waiting for a debugger: stopped
+        // after the setting is cleared.
+        let commands = host.commands();
+        let n = commands.len();
+        assert_eq!(commands[n - 2], "am clear-debug-app", "{commands:?}");
+        assert_eq!(
+            commands[n - 1],
+            "am force-stop 'io.example.app'",
+            "{commands:?}"
+        );
+        assert_eq!(steps.last().unwrap()["step"], "force_stop_waiting_process");
 
         // The process never appears: a typed timeout, still cleared.
         let host = FakeHost::new(vec![]);
