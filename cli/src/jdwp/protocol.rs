@@ -63,6 +63,7 @@ pub mod invoke {
 
 pub mod method {
     pub const LINE_TABLE: u8 = 1;
+    pub const BYTECODES: u8 = 3;
     pub const VARIABLE_TABLE_WITH_GENERIC: u8 = 5;
 }
 
@@ -140,6 +141,7 @@ pub mod modifier {
     pub const CLASS_EXCLUDE: u8 = 6;
     pub const LOCATION_ONLY: u8 = 7;
     pub const EXCEPTION_ONLY: u8 = 8;
+    pub const FIELD_ONLY: u8 = 9;
     pub const STEP: u8 = 10;
     pub const SOURCE_NAME_MATCH: u8 = 12;
 }
@@ -332,6 +334,7 @@ pub fn command_name(command_set: u8, command: u8) -> String {
         }
         (set::CLASS_TYPE, class_type::SUPERCLASS) => "ClassType.Superclass",
         (set::METHOD, method::LINE_TABLE) => "Method.LineTable",
+        (set::METHOD, method::BYTECODES) => "Method.Bytecodes",
         (set::METHOD, method::VARIABLE_TABLE_WITH_GENERIC) => "Method.VariableTableWithGeneric",
         (set::OBJECT_REFERENCE, object_reference::REFERENCE_TYPE) => {
             "ObjectReference.ReferenceType"

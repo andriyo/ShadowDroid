@@ -55,6 +55,9 @@ pub fn is_framework_class(class: &str) -> bool {
     })
 }
 
+/// Shown while a real field watch is armed.
+pub(super) const SLOW_WATCH_WARNING: &str = "a field watch makes ART interpret the whole app (about 10x slower UI on the emulator) until it is cleared; it auto-clears after --duration-ms";
+
 /// After this long suspended, an attach-to-running session warns about ANRs.
 const ANR_WARNING_SECS: f64 = 4.0;
 
@@ -182,6 +185,8 @@ pub(super) enum Owner {
     LinePrepare(String),
     /// Deferred exception-class binding for one breakpoint.
     ExceptionPrepare(String),
+    /// Deferred method/field binding: stays armed for every match.
+    MemberPrepare(String),
 }
 
 /// What a bound location re-arms with after a config change.
@@ -189,6 +194,30 @@ pub(super) enum Owner {
 pub(super) enum Arm {
     Line(Location),
     Exception(u64),
+    /// FieldAccess/FieldModification with FieldOnly (slow on ART).
+    Field {
+        type_id: u64,
+        field_id: u64,
+        modification: bool,
+    },
+}
+
+impl Arm {
+    pub(super) fn event_kind(&self) -> u8 {
+        match self {
+            Arm::Line(_) => event_kind::BREAKPOINT,
+            Arm::Exception(_) => event_kind::EXCEPTION,
+            Arm::Field {
+                modification: true, ..
+            } => event_kind::FIELD_MODIFICATION,
+            Arm::Field { .. } => event_kind::FIELD_ACCESS,
+        }
+    }
+
+    /// ART interprets the whole app while any field-watch request exists.
+    pub(super) fn is_slow(&self) -> bool {
+        matches!(self, Arm::Field { .. })
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -198,6 +227,10 @@ pub struct BoundLocation {
     pub class: String,
     pub method: String,
     pub code_index: u64,
+    /// What this location is for: `entry`, `exit`, `setter`, `getter`,
+    /// `field_access`, `field_modification` (method/field breakpoints).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<&'static str>,
     #[serde(skip)]
     pub class_id: u64,
     #[serde(skip)]
@@ -214,6 +247,23 @@ pub(super) enum BreakpointKind {
         class: String,
         caught: bool,
         uncaught: bool,
+    },
+    /// Line breakpoints at each matching method's first line (entry) and
+    /// at its return instructions (exit). Never MethodEntry/MethodExit.
+    Method {
+        class: String,
+        method: String,
+        entry: bool,
+        exit: bool,
+    },
+    /// A property/field watch: setter/getter line breakpoints by default,
+    /// a real FieldAccess/FieldModification watch only when opted in.
+    Field {
+        class: String,
+        field: String,
+        access: bool,
+        modification: bool,
+        watch: bool,
     },
 }
 
@@ -237,6 +287,9 @@ pub(super) struct Breakpoint {
     pub(super) expired: bool,
     /// Disarmed by the rate limit until this time (epoch seconds).
     pub(super) throttled_until: Option<f64>,
+    /// A slow field watch auto-clears at this time (epoch seconds).
+    pub(super) slow_until: Option<f64>,
+    pub(super) expired_reason: Option<&'static str>,
 }
 
 impl Breakpoint {
@@ -257,6 +310,8 @@ impl Breakpoint {
             dropped: 0,
             expired: false,
             throttled_until: None,
+            slow_until: None,
+            expired_reason: None,
         };
         breakpoint.set_opts(opts);
         breakpoint
@@ -272,7 +327,7 @@ impl Breakpoint {
     pub(super) fn line_key(&self) -> Option<(String, u32)> {
         match &self.kind {
             BreakpointKind::Line { target, line } => Some((target_key(target), *line)),
-            BreakpointKind::Exception { .. } => None,
+            _ => None,
         }
     }
 
@@ -319,6 +374,8 @@ impl Breakpoint {
             "rearm_at": self.throttled_until,
             "dropped": self.dropped,
             "expired": self.expired,
+            "expired_reason": self.expired_reason,
+            "slow_until": self.slow_until,
             "created_at": self.created_at,
         });
         let extra = match &self.kind {
@@ -339,6 +396,43 @@ impl Breakpoint {
                 "caught": caught,
                 "uncaught": uncaught,
             }),
+            BreakpointKind::Method {
+                class,
+                method,
+                entry,
+                exit,
+            } => json!({
+                "type": "method",
+                "class": class,
+                "method": method,
+                "entry": entry,
+                "exit": exit,
+                "mechanism": "line_breakpoints",
+                "return_value": if *exit { "unavailable at a return instruction" } else { "" },
+            }),
+            BreakpointKind::Field {
+                class,
+                field,
+                access,
+                modification,
+                watch,
+            } => {
+                let watched = self
+                    .locations
+                    .iter()
+                    .find(|l| l.role.is_some_and(|r| r.starts_with("field_")))
+                    .map(|l| l.method.clone());
+                json!({
+                    "type": "field",
+                    "class": class,
+                    "field": field,
+                    "watched_field": watched,
+                    "access": access,
+                    "modification": modification,
+                    "mechanism": if *watch { "field_watch" } else { "accessor_breakpoints" },
+                    "warning": watch.then_some(SLOW_WATCH_WARNING),
+                })
+            }
         };
         if let (Json::Object(map), Json::Object(extra)) = (&mut value, extra) {
             map.extend(extra);
@@ -688,6 +782,7 @@ impl Session {
             Some(object) if object != 0 => self.pin(object).await,
             _ => None,
         };
+        let slow_requests = self.slow_requests();
         // An attach-to-running process still has ANR timers: a stop with
         // pending input shows "Application Not Responding" after ~5 s.
         let anr_warning = suspension.as_ref().and_then(|s| {
@@ -723,6 +818,8 @@ impl Session {
             "breakpoints": state.breakpoints.len(),
             "live_handles": state.pinned.len(),
             "events_seen": state.events_seen,
+            "slow_requests": slow_requests,
+            "slow_watch_warning": (slow_requests > 0).then_some(SLOW_WATCH_WARNING),
             "invoke": self.invoke_stats(),
             "closed": state.closed,
         })
@@ -953,6 +1050,7 @@ impl Session {
                 class: resolve::type_name(&signature),
                 method: method.name.clone(),
                 code_index: index,
+                role: None,
                 class_id,
                 arm: Arm::Line(location),
             });
@@ -1086,6 +1184,7 @@ impl Session {
             class,
             method: String::new(),
             code_index: 0,
+            role: None,
             class_id: type_id,
             arm: Arm::Exception(type_id),
         })
@@ -1104,22 +1203,23 @@ impl Session {
             )
             .next(&["shadowdroid debug breakpoints --backend jdwp"]));
         };
-        let kind = match breakpoint.kind {
-            BreakpointKind::Line { .. } => event_kind::BREAKPOINT,
-            BreakpointKind::Exception { .. } => event_kind::EXCEPTION,
-        };
-        for request in breakpoint.locations.iter().filter_map(|l| l.request_id) {
-            let _ = self.jdwp.clear_event(kind, request).await;
-            self.state().owners.remove(&request);
+        for location in &breakpoint.locations {
+            if let Some(request) = location.request_id {
+                let _ = self
+                    .jdwp
+                    .clear_event(location.arm.event_kind(), request)
+                    .await;
+                self.state().owners.remove(&request);
+            }
         }
         // Exception breakpoints still waiting for their class.
         let pending: Vec<i32> = self
             .state()
             .owners
             .iter()
-            .filter(
-                |(_, owner)| matches!(owner, Owner::ExceptionPrepare(owner_id) if owner_id == id),
-            )
+            .filter(|(_, owner)| {
+                matches!(owner, Owner::ExceptionPrepare(owner_id) | Owner::MemberPrepare(owner_id) if owner_id == id)
+            })
             .map(|(request, _)| *request)
             .collect();
         for request in pending {
@@ -1624,6 +1724,24 @@ impl Session {
                         .await;
                 }
                 Ok(false)
+            }
+            (
+                Event::ClassPrepare {
+                    type_id, signature, ..
+                },
+                Some(Owner::MemberPrepare(id)),
+            ) => {
+                self.bind_member(&id, *type_id, signature).await?;
+                Ok(false)
+            }
+            (
+                Event::Field {
+                    thread, location, ..
+                },
+                Some(Owner::Breakpoint(id)),
+            ) => {
+                self.on_hit(&id, event.request_id(), *thread, *location, None)
+                    .await
             }
             (Event::VmDeath { .. }, _) => {
                 let mut state = self.state();

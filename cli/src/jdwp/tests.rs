@@ -305,6 +305,7 @@ async fn unowned_events_resume_and_lines_without_code_stay_pending() {
             class_match: None,
             step_thread: None,
             exception_flags: None,
+            field: None,
             modifier_kinds: vec![7],
         })
     });
@@ -1237,4 +1238,185 @@ async fn conditions_and_log_expressions_can_invoke_when_allowed() {
     wait_suspended(&session).await;
     assert_eq!(session.status().await["suspend_reason"], "breakpoint");
     assert!(vm.with_state(|s| s.invokes.iter().any(|(method, _)| *method == 1004)));
+}
+
+// ── P1c: method breakpoints and field watches ───────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn method_breakpoints_are_line_breakpoints_at_entry_and_returns() {
+    let vm = FakeVm::start();
+    let session = attach(&vm, WAIT).await;
+    let breakpoint = session
+        .break_method(
+            "io.example.app.Main*",
+            "onNew*",
+            true,
+            true,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    let locations = breakpoint["locations"].as_array().unwrap();
+    let roles: Vec<_> = locations
+        .iter()
+        .map(|l| {
+            (
+                l["method"].as_str().unwrap(),
+                l["role"].as_str().unwrap(),
+                l["code_index"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        roles,
+        [("onNewIntent", "entry", 0), ("onNewIntent", "exit", 10)],
+        "the synthetic bridge is skipped; exit is the DEX return-void"
+    );
+    assert_eq!(breakpoint["mechanism"], "line_breakpoints");
+    // Never MethodEntry/MethodExit (event kinds 40/41).
+    assert!(vm.with_state(|s| s.requests.iter().all(|r| r.kind != 40 && r.kind != 41)));
+    assert_eq!(vm.hit_at(1001, 0), 1);
+    wait_suspended(&session).await;
+    assert_eq!(
+        session.status().await["suspend_reason"],
+        "method_breakpoint"
+    );
+
+    // A class loaded later binds through ClassPrepare.
+    session.resume().await.unwrap();
+    let late = session
+        .break_method(
+            "io.example.app.Late",
+            "run",
+            true,
+            false,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(late["pending_reason"], "class_not_loaded");
+    vm.load_late_class();
+    let deadline = std::time::Instant::now() + WAIT;
+    while session.breakpoints()[1]["bound"] != true {
+        assert!(std::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(session.breakpoints()[1]["locations"][0]["method"], "run");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn property_watches_use_accessors_unless_slowdown_is_accepted() {
+    let vm = FakeVm::start();
+    let session = attach(&vm, WAIT).await;
+    let accessor = session
+        .break_field(
+            "io.example.app.MainActivity",
+            "counter",
+            true,
+            true,
+            false,
+            Duration::from_secs(60),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(accessor["mechanism"], "accessor_breakpoints");
+    let roles: Vec<_> = accessor["locations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| (l["method"].as_str().unwrap(), l["role"].as_str().unwrap()))
+        .collect();
+    assert_eq!(roles, [("setCounter", "setter"), ("getCounter", "getter")]);
+    assert!(vm.with_state(|s| s.requests.iter().all(|r| r.kind != 20 && r.kind != 21)));
+    assert_eq!(session.slow_requests(), 0);
+    assert!(session.status().await["slow_watch_warning"].is_null());
+
+    // No accessor: a real watch needs the opt-in.
+    let refused = session
+        .break_field(
+            "io.example.app.MainActivity",
+            "label",
+            false,
+            true,
+            false,
+            Duration::from_secs(60),
+            Default::default(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, "unsupported_location");
+    assert_eq!(refused.detail["reason"], "no_accessor");
+
+    let watch = session
+        .break_field(
+            "io.example.app.MainActivity",
+            "counter",
+            false,
+            true,
+            true,
+            Duration::from_secs(60),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(watch["mechanism"], "field_watch");
+    assert_eq!(watch["watched_field"], "counter");
+    assert!(
+        watch["warning"].as_str().unwrap().contains("slows")
+            || watch["warning"].as_str().unwrap().contains("interpret")
+    );
+    let request = vm.with_state(|s| {
+        s.requests
+            .iter()
+            .rev()
+            .find(|r| r.kind == 21)
+            .cloned()
+            .unwrap()
+    });
+    assert_eq!(request.field, Some(2000));
+    assert_eq!(request.modifier_kinds, [9], "FieldOnly");
+    assert_eq!(session.slow_requests(), 1);
+    assert!(session.status().await["slow_watch_warning"].is_string());
+
+    assert_eq!(vm.modify_counter(), 1);
+    wait_suspended(&session).await;
+    assert_eq!(session.status().await["suspend_reason"], "field_watch");
+    session.resume().await.unwrap();
+
+    // Auto-clear after the duration: disarmed, kept, marked expired.
+    let id = watch["id"].as_str().unwrap().to_string();
+    session
+        .update_breakpoint(&id, Default::default())
+        .await
+        .unwrap();
+    {
+        let short = session
+            .break_field(
+                "io.example.app.MainActivity",
+                "counter",
+                true,
+                false,
+                true,
+                Duration::ZERO,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(short["mechanism"], "field_watch");
+    }
+    session.expire_slow_watches().await;
+    let breakpoints = session.breakpoints();
+    let expired = breakpoints
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["expired_reason"] == "watch_duration_elapsed")
+        .expect("an expired watch");
+    assert!(expired["locations"][0]["request_id"].is_null());
+    assert_eq!(
+        session.slow_requests(),
+        1,
+        "only the 60 s watch remains armed"
+    );
 }

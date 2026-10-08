@@ -385,6 +385,7 @@ async fn serve(
             }
             _ = tick.tick() => {
                 session.rearm_due().await;
+                session.expire_slow_watches().await;
                 if let Some(reason) = session.closed_reason() {
                     tracing::info!("debugd exiting: {reason}");
                     break;
@@ -559,6 +560,53 @@ pub async fn dispatch(session: &Arc<Session>, method: &str, params: &Json) -> Rp
                 .unwrap_or(true);
             let breakpoint = session
                 .break_exception(class, caught, uncaught, options_param(params)?)
+                .await?;
+            Ok(json!({"breakpoint": breakpoint, "created": true}))
+        }
+        "break_method" => {
+            let class = str_param(params, "class")
+                .ok_or_else(|| RpcError::new("invalid_request", "missing class"))?;
+            let method = str_param(params, "method")
+                .ok_or_else(|| RpcError::new("invalid_request", "missing method"))?;
+            let entry = params.get("entry").and_then(Json::as_bool).unwrap_or(true);
+            let exit = params.get("exit").and_then(Json::as_bool).unwrap_or(false);
+            let breakpoint = session
+                .break_method(class, method, entry, exit, options_param(params)?)
+                .await?;
+            Ok(json!({"breakpoint": breakpoint, "created": true}))
+        }
+        "break_field" => {
+            let class = str_param(params, "class")
+                .ok_or_else(|| RpcError::new("invalid_request", "missing class"))?;
+            let field = str_param(params, "field")
+                .ok_or_else(|| RpcError::new("invalid_request", "missing field"))?;
+            let access = params
+                .get("access")
+                .and_then(Json::as_bool)
+                .unwrap_or(false);
+            let modification = params
+                .get("modification")
+                .and_then(Json::as_bool)
+                .unwrap_or(true);
+            let accept = params
+                .get("accept_slowdown")
+                .and_then(Json::as_bool)
+                .unwrap_or(false);
+            let duration = Duration::from_millis(u64_param(
+                params,
+                "duration_ms",
+                super::members::DEFAULT_WATCH_DURATION.as_millis() as u64,
+            ));
+            let breakpoint = session
+                .break_field(
+                    class,
+                    field,
+                    access,
+                    modification,
+                    accept,
+                    duration,
+                    options_param(params)?,
+                )
                 .await?;
             Ok(json!({"breakpoint": breakpoint, "created": true}))
         }

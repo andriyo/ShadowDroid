@@ -34,6 +34,7 @@ pub mod inspect;
 pub mod invoke;
 pub mod launch;
 pub mod logpoints;
+pub mod members;
 pub mod paths;
 #[allow(dead_code)] // numbered protocol table; not every entry has a caller yet
 pub mod protocol;

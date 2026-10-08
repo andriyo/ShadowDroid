@@ -268,10 +268,28 @@ impl Session {
                     uncaught: *uncaught,
                 }],
             ),
-            (Arm::Exception(_), BreakpointKind::Line { .. }) => {
+            (
+                Arm::Field {
+                    type_id,
+                    field_id,
+                    modification,
+                },
+                _,
+            ) => (
+                if modification {
+                    event_kind::FIELD_MODIFICATION
+                } else {
+                    event_kind::FIELD_ACCESS
+                },
+                vec![Modifier::FieldOnly {
+                    declaring: type_id,
+                    field: field_id,
+                }],
+            ),
+            (Arm::Exception(_), _) => {
                 return Err(RpcError::new(
                     "invalid_request",
-                    "line breakpoint with an exception arm",
+                    "exception arm on a non-exception breakpoint",
                 ));
             }
         };
@@ -290,23 +308,18 @@ impl Session {
         Ok(request_id)
     }
 
-    fn event_kind_of(kind: &BreakpointKind) -> u8 {
-        match kind {
-            BreakpointKind::Line { .. } => event_kind::BREAKPOINT,
-            BreakpointKind::Exception { .. } => event_kind::EXCEPTION,
-        }
-    }
-
     /// Clear every request of `id` and set them again from its current
     /// options (none while disabled).
     pub(super) async fn rearm(&self, id: &str) -> RpcResult<()> {
         let Some(snapshot) = self.state().breakpoints.get(id).cloned() else {
             return Ok(());
         };
-        let event = Self::event_kind_of(&snapshot.kind);
         for location in &snapshot.locations {
             if let Some(request) = location.request_id {
-                let _ = self.jdwp.clear_event(event, request).await;
+                let _ = self
+                    .jdwp
+                    .clear_event(location.arm.event_kind(), request)
+                    .await;
                 self.state().owners.remove(&request);
             }
         }
@@ -636,8 +649,10 @@ impl Session {
             return Ok(false);
         }
         let reason = match breakpoint.kind {
-            BreakpointKind::Line { .. } => "breakpoint",
             BreakpointKind::Exception { .. } => "exception",
+            BreakpointKind::Field { watch: true, .. } => "field_watch",
+            BreakpointKind::Method { .. } => "method_breakpoint",
+            _ => "breakpoint",
         };
         self.stop_on_hit(&breakpoint, reason, thread, location, exception)
             .await;
@@ -698,10 +713,14 @@ impl Session {
         let Some(snapshot) = self.state().breakpoints.get(id).cloned() else {
             return;
         };
-        let event = Self::event_kind_of(&snapshot.kind);
-        for request in snapshot.locations.iter().filter_map(|l| l.request_id) {
-            let _ = self.jdwp.clear_event(event, request).await;
-            self.state().owners.remove(&request);
+        for location in &snapshot.locations {
+            if let Some(request) = location.request_id {
+                let _ = self
+                    .jdwp
+                    .clear_event(location.arm.event_kind(), request)
+                    .await;
+                self.state().owners.remove(&request);
+            }
         }
         if let Some(b) = self.state().breakpoints.get_mut(id) {
             for location in &mut b.locations {
@@ -875,7 +894,7 @@ impl Session {
     ) {
         let (file, line) = match &breakpoint.kind {
             BreakpointKind::Line { target, line } => (Some(target_key(target)), Some(*line)),
-            BreakpointKind::Exception { .. } => (None, None),
+            _ => (None, None),
         };
         let raw = match (&message, &error) {
             (Some(message), _) => message.clone(),

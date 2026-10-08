@@ -843,7 +843,7 @@ const JDWP_DEBUG_VERBS: &[&str] = &[
     "step-until-screen-change",
     "step-until-log",
 ];
-const JDWP_BREAK_KINDS: &[&str] = &["line", "exception", "update", "remove"];
+const JDWP_BREAK_KINDS: &[&str] = &["line", "exception", "method", "field", "update", "remove"];
 
 /// A result from the jdwp debugger backend must not send an agent to the
 /// Studio bridge: catalog follow-ups for `debug` verbs gain `--backend jdwp`
@@ -1737,7 +1737,10 @@ mod tests {
         );
         assert_eq!(keep("shadowdroid debug watch list"), None);
         assert_eq!(keep("shadowdroid debug coroutines threads"), None);
-        assert_eq!(keep("shadowdroid debug break method --class A"), None);
+        assert_eq!(
+            keep("shadowdroid debug break method --class A").as_deref(),
+            Some("shadowdroid debug break method --class A --backend jdwp")
+        );
         // Explicit backends, discovery, and other commands pass through.
         for action in [
             "shadowdroid debug watch list --backend studio",

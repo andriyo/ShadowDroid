@@ -210,6 +210,10 @@ impl DebuggerCmd {
             DebuggerCmd::Eval(args) if args.invoke => Some("--invoke"),
             DebuggerCmd::Inspect(args) if args.invoke => Some("--invoke"),
             DebuggerCmd::Break(BreakCmd::Line { invoke: true, .. }) => Some("--invoke"),
+            DebuggerCmd::Break(BreakCmd::Field {
+                accept_slowdown: true,
+                ..
+            }) => Some("--accept-slowdown"),
             DebuggerCmd::Break(BreakCmd::Update(args)) if args.invoke => Some("--invoke"),
             DebuggerCmd::Logpoint(LogpointCmd::Add(args)) if args.invoke => Some("--invoke"),
             _ => None,
@@ -333,6 +337,12 @@ pub enum BreakCmd {
         /// Break on field modification.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         modification: bool,
+        /// Use a real field watch, which slows the whole app (jdwp backend).
+        #[arg(long)]
+        accept_slowdown: bool,
+        /// Auto-clear a field watch after this long (jdwp backend).
+        #[arg(long, default_value_t = 60_000)]
+        duration_ms: u64,
     },
     /// Update a breakpoint by stable id.
     Update(BreakpointUpdateArgs),
@@ -1019,6 +1029,7 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
             temporary,
             access,
             modification,
+            ..
         }) => {
             let canonical = canonicalize_for_bridge(file)?;
             let line_s = line.to_string();

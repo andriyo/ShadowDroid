@@ -224,8 +224,66 @@ pub async fn run(cmd: &DebuggerCmd, ctx: JdwpContext<'_>) -> Result<()> {
             )
             .await?
         }
-        DebuggerCmd::Break(BreakCmd::Method { .. }) => return Err(unsupported("break method")),
-        DebuggerCmd::Break(BreakCmd::Field { .. }) => return Err(unsupported("break field")),
+        DebuggerCmd::Break(BreakCmd::Method {
+            class,
+            method,
+            disabled,
+            entry,
+            exit,
+            ..
+        }) => {
+            let entry_point = select(ctx.serial, None)?;
+            let options = BreakpointOptions {
+                enabled: !*disabled,
+                ..Default::default()
+            };
+            rpc(
+                &entry_point,
+                "break_method",
+                json!({
+                    "class": class,
+                    "method": method,
+                    "entry": entry,
+                    "exit": exit,
+                    "options": options,
+                }),
+                DEFAULT_CALL_TIMEOUT,
+            )
+            .await?
+        }
+        DebuggerCmd::Break(BreakCmd::Field {
+            class,
+            field,
+            disabled,
+            temporary,
+            access,
+            modification,
+            accept_slowdown,
+            duration_ms,
+            ..
+        }) => {
+            let entry = select(ctx.serial, None)?;
+            let options = BreakpointOptions {
+                enabled: !*disabled,
+                temporary: *temporary,
+                ..Default::default()
+            };
+            rpc(
+                &entry,
+                "break_field",
+                json!({
+                    "class": class,
+                    "field": field,
+                    "access": access,
+                    "modification": modification,
+                    "accept_slowdown": accept_slowdown,
+                    "duration_ms": duration_ms,
+                    "options": options,
+                }),
+                DEFAULT_CALL_TIMEOUT,
+            )
+            .await?
+        }
         DebuggerCmd::Breakpoints => {
             let entry = select(ctx.serial, None)?;
             rpc(&entry, "breakpoints", json!({}), DEFAULT_CALL_TIMEOUT).await?

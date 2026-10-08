@@ -46,6 +46,8 @@ pub struct Request {
     pub step_thread: Option<u64>,
     /// ExceptionOnly `(caught, uncaught)` flags.
     pub exception_flags: Option<(bool, bool)>,
+    /// FieldOnly field id.
+    pub field: Option<u64>,
     pub modifier_kinds: Vec<u8>,
 }
 
@@ -265,6 +267,70 @@ impl FakeVm {
         matching.len()
     }
 
+    /// Write `counter` (field 2000) from onNewIntent: fires every armed
+    /// FieldModification request on it.
+    pub fn modify_counter(&self) -> usize {
+        let matching: Vec<i32> = self.with_state(|state| {
+            state
+                .requests
+                .iter()
+                .filter(|r| r.kind == 21 && r.field == Some(2000) && !state.cleared.contains(&r.id))
+                .map(|r| r.id)
+                .collect()
+        });
+        if matching.is_empty() {
+            return 0;
+        }
+        self.with_state(|state| state.suspend_count += 1);
+        let mut body = vec![2_u8];
+        put_i32(&mut body, matching.len() as i32);
+        for request in &matching {
+            body.push(21);
+            put_i32(&mut body, *request);
+            put_u64(&mut body, MAIN_THREAD);
+            put_location(&mut body, ACTIVITY_CLASS, ON_NEW_INTENT, 5);
+            body.push(1);
+            put_u64(&mut body, ACTIVITY_CLASS);
+            put_u64(&mut body, 2000);
+            body.push(b'L');
+            put_u64(&mut body, ACTIVITY_OBJECT);
+            body.push(b'I');
+            put_i32(&mut body, 8);
+        }
+        self.send(&command_packet(0x4000_0020, 64, 100, &body));
+        matching.len()
+    }
+
+    /// Fire breakpoint requests at `method`/`index` (any method).
+    pub fn hit_at(&self, method: u64, index: u64) -> usize {
+        let matching: Vec<i32> = self.with_state(|state| {
+            state
+                .requests
+                .iter()
+                .filter(|r| r.kind == 2 && !state.cleared.contains(&r.id))
+                .filter(|r| {
+                    r.location
+                        .is_some_and(|(_, m, at)| m == method && at == index)
+                })
+                .map(|r| r.id)
+                .collect()
+        });
+        if matching.is_empty() {
+            return 0;
+        }
+        self.with_state(|state| state.suspend_count += 1);
+        let mut body = vec![2_u8];
+        put_i32(&mut body, matching.len() as i32);
+        for request in &matching {
+            body.push(2);
+            put_i32(&mut body, *request);
+            put_u64(&mut body, MAIN_THREAD);
+            put_location(&mut body, ACTIVITY_CLASS, method, index);
+        }
+        self.send(&command_packet(0x4000_0021, 64, 100, &body));
+        matching.len()
+    }
+
     /// Let a pending `hang()` invoke reply.
     pub fn release_hang(&self) {
         self.with_state(|s| s.release_hang = true);
@@ -439,6 +505,16 @@ const CLASSES: &[Class] = &[
             (1008, "staticHelper", "()I", &[]),
             (1009, "greet", "(Ljava/lang/String;)Ljava/lang/String;", &[]),
             (1010, "getStatus", "()Ljava/lang/String;", &[]),
+            // Kotlin property accessors (`var counter`).
+            (1011, "setCounter", "(I)V", &[(0, 40), (3, 41)]),
+            (1012, "getCounter", "()I", &[(0, 42)]),
+            // A synthetic bridge a function reference adds: never bound.
+            (
+                1013,
+                "onNewIntentBridge",
+                "(Ljava/lang/Object;)V",
+                &[(0, 30)],
+            ),
         ],
     },
     Class {
@@ -762,7 +838,14 @@ fn handle(shared: &Shared, set: u8, cmd: u8, body: &[u8]) -> (u16, Vec<u8>, Afte
                 put_str(&mut out, name);
                 put_str(&mut out, signature);
                 put_str(&mut out, "");
-                put_i32(&mut out, if *name == "staticHelper" { 9 } else { 1 });
+                put_i32(
+                    &mut out,
+                    match *name {
+                        "staticHelper" => 9,
+                        "onNewIntentBridge" => 0x1041,
+                        _ => 1,
+                    },
+                );
             }
         }
         (2, 14) => {
@@ -817,6 +900,22 @@ fn handle(shared: &Shared, set: u8, cmd: u8, body: &[u8]) -> (u16, Vec<u8>, Afte
             for (index, line) in lines {
                 put_u64(&mut out, *index);
                 put_i32(&mut out, *line);
+            }
+        }
+        // Method.Bytecodes: onNewIntent is 10 nops then return-void.
+        (6, 3) => {
+            let _type_id = c.u64();
+            let method_id = c.u64();
+            let units: Vec<u16> = if method_id == ON_NEW_INTENT {
+                let mut units = vec![0x0000; 10];
+                units.push(0x000e);
+                units
+            } else {
+                vec![0x000e]
+            };
+            put_i32(&mut out, (units.len() * 2) as i32);
+            for unit in units {
+                out.extend_from_slice(&unit.to_le_bytes());
             }
         }
         (6, 5) => {
@@ -1088,6 +1187,7 @@ fn handle(shared: &Shared, set: u8, cmd: u8, body: &[u8]) -> (u16, Vec<u8>, Afte
                 class_match: None,
                 step_thread: None,
                 exception_flags: None,
+                field: None,
                 modifier_kinds: Vec::new(),
             };
             for _ in 0..count {
@@ -1116,6 +1216,10 @@ fn handle(shared: &Shared, set: u8, cmd: u8, body: &[u8]) -> (u16, Vec<u8>, Afte
                         let caught = c.u8() != 0;
                         let uncaught = c.u8() != 0;
                         request.exception_flags = Some((caught, uncaught));
+                    }
+                    9 => {
+                        c.u64();
+                        request.field = Some(c.u64());
                     }
                     10 => {
                         request.step_thread = Some(c.u64());

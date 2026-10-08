@@ -117,6 +117,10 @@ pub enum Modifier {
         caught: bool,
         uncaught: bool,
     },
+    FieldOnly {
+        declaring: u64,
+        field: u64,
+    },
     Step {
         thread: u64,
         size: i32,
@@ -155,6 +159,11 @@ impl Modifier {
                     .reference_type_id(*exception)
                     .bool(*caught)
                     .bool(*uncaught);
+            }
+            Modifier::FieldOnly { declaring, field } => {
+                w.u8(modifier::FIELD_ONLY)
+                    .reference_type_id(*declaring)
+                    .field_id(*field);
             }
             Modifier::Step {
                 thread,
@@ -629,6 +638,22 @@ impl Jdwp {
             Err(error) if matches!(error.vm_code(), Some(101) | Some(511)) => Ok(Vec::new()),
             Err(error) => Err(error),
         }
+    }
+
+    /// The method's code: DEX bytecode on ART (16-bit little-endian units).
+    pub async fn bytecodes(&self, type_id: u64, method_id: u64) -> Result<Vec<u8>, JdwpError> {
+        let data = self
+            .call(
+                set::METHOD,
+                method::BYTECODES,
+                self.method_body(type_id, method_id),
+            )
+            .await?;
+        decode("Method.Bytecodes", || {
+            let mut r = Reader::new(&data, self.sizes());
+            let count = r.count()?;
+            (0..count).map(|_| r.u8()).collect()
+        })
     }
 
     // ── ObjectReference / StringReference / ArrayReference ────────────
