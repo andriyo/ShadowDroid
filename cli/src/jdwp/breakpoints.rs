@@ -65,6 +65,9 @@ pub struct BreakpointOptions {
     pub max_message_chars: Option<u32>,
     /// Conditions and log expressions may call methods (`--invoke`).
     pub invoke: bool,
+    /// Which locations of a line to bind: all, the outer method, or the
+    /// innermost lambda.
+    pub variant: super::lambdas::LineVariant,
 }
 
 impl Default for BreakpointOptions {
@@ -83,6 +86,7 @@ impl Default for BreakpointOptions {
             max_events_per_second: None,
             max_message_chars: None,
             invoke: false,
+            variant: Default::default(),
         }
     }
 }

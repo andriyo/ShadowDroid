@@ -231,6 +231,11 @@ pub struct BoundLocation {
     /// `field_access`, `field_modification` (method/field breakpoints).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<&'static str>,
+    /// Inside a Kotlin lambda (`$lambda$` body, `invoke`/`invokeSuspend`
+    /// of a lambda class) rather than the outer call site.
+    pub lambda: bool,
+    /// Lambda nesting depth (0 for the outer method).
+    pub lambda_depth: u32,
     #[serde(skip)]
     pub class_id: u64,
     #[serde(skip)]
@@ -358,6 +363,7 @@ impl Breakpoint {
                 _ => "ALL",
             },
             "invoke": self.opts.invoke,
+            "variant": self.opts.variant,
             "condition": self.opts.condition,
             "log_expression": self.opts.log_expression,
             "log_message": self.opts.log_message,
@@ -987,12 +993,28 @@ impl Session {
     ) -> RpcResult<Vec<BoundLocation>> {
         let signature = self.signature(class_id).await?;
         let methods = self.methods(class_id).await?;
-        let mut bound = Vec::new();
+        let variant = self
+            .state()
+            .breakpoints
+            .get(id)
+            .map(|b| b.opts.variant)
+            .unwrap_or_default();
+        // Candidate methods holding the line, with their lambda depth.
+        let mut candidates = Vec::new();
         for method in methods.iter() {
+            if super::lambdas::is_bridge(method) {
+                continue;
+            }
             let table = self.line_table(class_id, method.method_id).await?;
             let Some(index) = table.first_index_of(line as i32) else {
                 continue;
             };
+            let depth = self.lambda_depth(class_id, &signature, method).await;
+            candidates.push((method, index, depth));
+        }
+        let candidates = super::lambdas::select_variant(candidates, variant);
+        let mut bound = Vec::new();
+        for (method, index, depth) in candidates {
             let location = Location {
                 type_tag: protocol::type_tag::CLASS,
                 class_id,
@@ -1051,6 +1073,8 @@ impl Session {
                 method: method.name.clone(),
                 code_index: index,
                 role: None,
+                lambda: depth > 0,
+                lambda_depth: depth,
                 class_id,
                 arm: Arm::Line(location),
             });
@@ -1185,6 +1209,8 @@ impl Session {
             method: String::new(),
             code_index: 0,
             role: None,
+            lambda: false,
+            lambda_depth: 0,
             class_id: type_id,
             arm: Arm::Exception(type_id),
         })

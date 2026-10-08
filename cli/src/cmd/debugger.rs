@@ -210,6 +210,17 @@ impl DebuggerCmd {
             DebuggerCmd::Eval(args) if args.invoke => Some("--invoke"),
             DebuggerCmd::Inspect(args) if args.invoke => Some("--invoke"),
             DebuggerCmd::Break(BreakCmd::Line { invoke: true, .. }) => Some("--invoke"),
+            DebuggerCmd::Break(BreakCmd::Line {
+                variant: Some(variant),
+                ..
+            }) if *variant != crate::jdwp::lambdas::LineVariant::All => Some("--variant"),
+            DebuggerCmd::Logpoint(LogpointCmd::Add(args))
+                if args
+                    .variant
+                    .is_some_and(|v| v != crate::jdwp::lambdas::LineVariant::All) =>
+            {
+                Some("--variant")
+            }
             DebuggerCmd::Break(BreakCmd::Field {
                 accept_slowdown: true,
                 ..
@@ -269,6 +280,9 @@ pub enum BreakCmd {
         /// Let the condition call app methods (jdwp backend; runs app code).
         #[arg(long)]
         invoke: bool,
+        /// Locations on the line: all (default), outer method, or innermost lambda (jdwp backend).
+        #[arg(long, value_enum)]
+        variant: Option<crate::jdwp::lambdas::LineVariant>,
     },
     /// Add a Java exception breakpoint.
     Exception {
@@ -426,6 +440,9 @@ pub struct LogpointAddArgs {
     /// Let the expression and condition call app methods (jdwp backend; runs app code).
     #[arg(long)]
     pub invoke: bool,
+    /// Locations on the line: all (default), outer method, or innermost lambda (jdwp backend).
+    #[arg(long, value_enum)]
+    pub variant: Option<crate::jdwp::lambdas::LineVariant>,
 }
 
 #[derive(Args, Clone, Debug, Default)]

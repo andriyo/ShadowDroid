@@ -32,6 +32,7 @@ pub mod events;
 pub mod expr;
 pub mod inspect;
 pub mod invoke;
+pub mod lambdas;
 pub mod launch;
 pub mod logpoints;
 pub mod members;

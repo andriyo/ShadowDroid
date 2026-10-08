@@ -1420,3 +1420,76 @@ async fn property_watches_use_accessors_unless_slowdown_is_accepted() {
         "only the 60 s watch remains armed"
     );
 }
+
+// ── P1c: line vs lambda ─────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn line_variants_choose_outer_or_the_innermost_lambda() {
+    use super::lambdas::LineVariant;
+    let vm = FakeVm::start();
+    let session = attach(&vm, WAIT).await;
+    let shape = |value: &serde_json::Value| {
+        value["breakpoint"]["locations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| {
+                (
+                    l["method"].as_str().unwrap().to_string(),
+                    l["lambda"].as_bool().unwrap(),
+                    l["lambda_depth"].as_u64().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    for (variant, expected) in [
+        (
+            LineVariant::All,
+            vec![
+                ("onNewIntent", false, 0),
+                ("onNewIntent$lambda$0", true, 1),
+                ("onNewIntent$lambda$0$lambda$1", true, 2),
+            ],
+        ),
+        (LineVariant::Outer, vec![("onNewIntent", false, 0)]),
+        (
+            LineVariant::Lambda,
+            vec![("onNewIntent$lambda$0$lambda$1", true, 2)],
+        ),
+    ] {
+        let created = session
+            .break_line_with(
+                target("MainActivity.kt"),
+                33,
+                BreakpointOptions {
+                    variant,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let expected: Vec<_> = expected
+            .into_iter()
+            .map(|(m, l, d)| (m.to_string(), l, d))
+            .collect();
+        assert_eq!(shape(&created), expected, "{variant:?}");
+        assert_eq!(
+            created["breakpoint"]["variant"],
+            serde_json::to_value(variant).unwrap()
+        );
+        let id = created["breakpoint"]["id"].as_str().unwrap().to_string();
+        session.remove_breakpoint(&id).await.unwrap();
+    }
+    // The synthetic bridge on line 30 is never bound.
+    let bridge = session
+        .break_line(target("MainActivity.kt"), 30, Default::default())
+        .await
+        .unwrap();
+    let methods: Vec<_> = bridge["locations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["method"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(methods, ["onNewIntent"]);
+}

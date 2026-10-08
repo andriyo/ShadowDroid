@@ -493,8 +493,11 @@ const CLASSES: &[Class] = &[
                 1001,
                 "onNewIntent",
                 "(Landroid/content/Intent;)V",
-                &[(0, 30), (5, 31), (10, 32)],
+                &[(0, 30), (5, 31), (10, 32), (12, 33)],
             ),
+            // Line 33 also holds a lambda and a lambda nested in it.
+            (1016, "onNewIntent$lambda$0", "()V", &[(0, 33)]),
+            (1017, "onNewIntent$lambda$0$lambda$1", "()V", &[(2, 33)]),
             // Invokable (no line tables).
             (1002, "getLabel", "()Ljava/lang/String;", &[]),
             (1003, "toString", "()Ljava/lang/String;", &[]),
@@ -843,6 +846,7 @@ fn handle(shared: &Shared, set: u8, cmd: u8, body: &[u8]) -> (u16, Vec<u8>, Afte
                     match *name {
                         "staticHelper" => 9,
                         "onNewIntentBridge" => 0x1041,
+                        n if n.contains("$lambda$") => 0x101a,
                         _ => 1,
                     },
                 );

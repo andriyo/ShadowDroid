@@ -128,6 +128,7 @@ pub async fn run(cmd: &DebuggerCmd, ctx: JdwpContext<'_>) -> Result<()> {
             clear_condition,
             force,
             invoke,
+            variant,
             ..
         }) => {
             let target = locate_target(file, *line, ctx.project_root)?;
@@ -138,6 +139,7 @@ pub async fn run(cmd: &DebuggerCmd, ctx: JdwpContext<'_>) -> Result<()> {
                 condition: condition.clone(),
                 force: *force,
                 invoke: *invoke,
+                variant: variant.unwrap_or_default(),
                 ..Default::default()
             };
             let mut value = rpc(
@@ -673,6 +675,7 @@ async fn logpoint(cmd: &LogpointCmd, ctx: &JdwpContext<'_>) -> Result<()> {
                 max_events_per_second: args.max_events_per_second,
                 max_message_chars: args.max_message_chars,
                 invoke: args.invoke,
+                variant: args.variant.unwrap_or_default(),
             };
             let mut value = rpc(
                 &entry,
