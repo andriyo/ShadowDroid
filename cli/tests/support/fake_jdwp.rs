@@ -75,6 +75,23 @@ pub struct State {
     pub step_line_index: u64,
     /// Breakpoint composites sent.
     pub hits: u32,
+    /// Strings made by CreateString or returned by invokes (id → text).
+    pub strings: std::collections::HashMap<u64, String>,
+    pub next_object: u64,
+    /// `(method id, args)` of every InvokeMethod.
+    pub invokes: Vec<(u64, Vec<Value>)>,
+    /// Lets a pending `hang()` invoke reply.
+    pub release_hang: bool,
+}
+
+/// A JDWP value as the fake decodes it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Value {
+    Int(i32),
+    Long(i64),
+    Bool(bool),
+    Object(u8, u64),
+    Other(u8),
 }
 
 struct Shared {
@@ -248,6 +265,12 @@ impl FakeVm {
         matching.len()
     }
 
+    /// Let a pending `hang()` invoke reply.
+    pub fn release_hang(&self) {
+        self.with_state(|s| s.release_hang = true);
+        self.shared.changed.notify_all();
+    }
+
     /// Drop the connection (the app process died).
     pub fn kill_connection(&self) {
         if let Some(stream) = self.shared.writer.lock().unwrap().take() {
@@ -406,6 +429,16 @@ const CLASSES: &[Class] = &[
                 "(Landroid/content/Intent;)V",
                 &[(0, 30), (5, 31), (10, 32)],
             ),
+            // Invokable (no line tables).
+            (1002, "getLabel", "()Ljava/lang/String;", &[]),
+            (1003, "toString", "()Ljava/lang/String;", &[]),
+            (1004, "add", "(II)I", &[]),
+            (1005, "boom", "()V", &[]),
+            (1006, "trap", "()V", &[]),
+            (1007, "hang", "()V", &[]),
+            (1008, "staticHelper", "()I", &[]),
+            (1009, "greet", "(Ljava/lang/String;)Ljava/lang/String;", &[]),
+            (1010, "getStatus", "()Ljava/lang/String;", &[]),
         ],
     },
     Class {
@@ -437,6 +470,12 @@ const CLASSES: &[Class] = &[
         signature: "Lio/example/app/Late;",
         source: Some("Late.kt"),
         methods: &[(1050, "run", "()V", &[(0, 7)])],
+    },
+    Class {
+        id: 107,
+        signature: "Ljava/lang/IllegalStateException;",
+        source: Some("IllegalStateException.java"),
+        methods: &[],
     },
     Class {
         id: 106,
@@ -512,12 +551,17 @@ fn serve(mut stream: TcpStream, shared: Arc<Shared>) {
             }
         }
         let (error, reply, after) = handle(&shared, set, cmd, &body);
+        if matches!(after, After::Trap | After::Hang) {
+            reply_later(shared.clone(), id, after);
+            shared.changed.notify_all();
+            continue;
+        }
         if let Some(writer) = shared.writer.lock().unwrap().as_mut() {
             let _ = writer.write_all(&reply_packet(id, error, &reply));
         }
         shared.changed.notify_all();
         match after {
-            After::Nothing => {}
+            After::Nothing | After::Trap | After::Hang => {}
             After::Close => {
                 if let Some(writer) = shared.writer.lock().unwrap().take() {
                     let _ = writer.shutdown(std::net::Shutdown::Both);
@@ -549,6 +593,80 @@ enum After {
     Nothing,
     Close,
     Step(i32),
+    /// `trap()`: raise a breakpoint on the main thread, reply only after
+    /// the debugger resumes it (what ART does when an invoke hits one).
+    Trap,
+    /// `hang()`: reply only once the test sets `release_hang`.
+    Hang,
+}
+
+fn new_string(state: &mut State, text: String) -> u64 {
+    if state.next_object < 600 {
+        state.next_object = 600;
+    }
+    let id = state.next_object;
+    state.next_object += 1;
+    state.strings.insert(id, text);
+    id
+}
+
+fn read_tagged(c: &mut Cursor<'_>) -> Value {
+    match c.u8() {
+        b'I' => Value::Int(c.i32()),
+        b'J' => Value::Long(c.u64() as i64),
+        b'Z' => Value::Bool(c.u8() != 0),
+        tag @ (b'L' | b's' | b'[' | b't' | b'g' | b'l' | b'c') => Value::Object(tag, c.u64()),
+        other => Value::Other(other),
+    }
+}
+
+/// Reply to a deferred invoke from another thread, so the serve loop keeps
+/// reading the debugger's commands (the Resume a trap waits for).
+fn reply_later(shared: Arc<Shared>, id: u32, after: After) {
+    std::thread::spawn(move || {
+        match after {
+            After::Trap => {
+                let resumes = {
+                    let mut state = shared.state.lock().unwrap();
+                    state.suspend_count += 1;
+                    (state.resumes, state.thread_resumes)
+                };
+                let mut event = vec![2_u8];
+                put_i32(&mut event, 1);
+                event.push(2);
+                put_i32(&mut event, 999);
+                put_u64(&mut event, MAIN_THREAD);
+                put_location(&mut event, ACTIVITY_CLASS, 1000, 4);
+                if let Some(writer) = shared.writer.lock().unwrap().as_mut() {
+                    let _ = writer.write_all(&command_packet(0x4000_0010, 64, 100, &event));
+                }
+                let mut state = shared.state.lock().unwrap();
+                while (state.resumes, state.thread_resumes) == resumes {
+                    state = shared
+                        .changed
+                        .wait_timeout(state, Duration::from_secs(10))
+                        .unwrap()
+                        .0;
+                }
+            }
+            After::Hang => {
+                let mut state = shared.state.lock().unwrap();
+                while !state.release_hang {
+                    state = shared
+                        .changed
+                        .wait_timeout(state, Duration::from_secs(10))
+                        .unwrap()
+                        .0;
+                }
+            }
+            _ => {}
+        }
+        let mut reply = vec![b'V', b'L'];
+        put_u64(&mut reply, 0);
+        if let Some(writer) = shared.writer.lock().unwrap().as_mut() {
+            let _ = writer.write_all(&reply_packet(id, 0, &reply));
+        }
+    });
 }
 
 fn handle(shared: &Shared, set: u8, cmd: u8, body: &[u8]) -> (u16, Vec<u8>, After) {
@@ -644,7 +762,7 @@ fn handle(shared: &Shared, set: u8, cmd: u8, body: &[u8]) -> (u16, Vec<u8>, Afte
                 put_str(&mut out, name);
                 put_str(&mut out, signature);
                 put_str(&mut out, "");
-                put_i32(&mut out, 1);
+                put_i32(&mut out, if *name == "staticHelper" { 9 } else { 1 });
             }
         }
         (2, 14) => {
@@ -656,6 +774,11 @@ fn handle(shared: &Shared, set: u8, cmd: u8, body: &[u8]) -> (u16, Vec<u8>, Afte
                     (2002, "numbers", "[I"),
                     (2003, "shadow$_klass_", "Ljava/lang/Class;"),
                     (2004, "status$delegate", "Ljava/lang/Object;"),
+                ]
+            } else if type_id == 107 {
+                &[
+                    (2010, "detailMessage", "Ljava/lang/String;"),
+                    (2011, "cause", "Ljava/lang/Throwable;"),
                 ]
             } else {
                 &[]
@@ -728,8 +851,10 @@ fn handle(shared: &Shared, set: u8, cmd: u8, body: &[u8]) -> (u16, Vec<u8>, Afte
             let object = c.u64();
             let type_id = match object {
                 500 => 100,
-                501 => 103,
+                501 | 504 => 103,
                 502 => 106,
+                503 => 107,
+                id if state.strings.contains_key(&id) => 103,
                 _ => return (20, out, After::Nothing),
             };
             out.push(if object == 502 { 3 } else { 1 });
@@ -737,6 +862,24 @@ fn handle(shared: &Shared, set: u8, cmd: u8, body: &[u8]) -> (u16, Vec<u8>, Afte
         }
         (9, 2) => {
             let object = c.u64();
+            if object == 503 {
+                // The thrown exception: detailMessage, cause (== itself).
+                let count = c.i32();
+                put_i32(&mut out, count);
+                for _ in 0..count {
+                    match c.u64() {
+                        2010 => {
+                            out.push(b's');
+                            put_u64(&mut out, 504);
+                        }
+                        _ => {
+                            out.push(b'L');
+                            put_u64(&mut out, 503);
+                        }
+                    }
+                }
+                return (0, out, After::Nothing);
+            }
             if object != ACTIVITY_OBJECT {
                 return (20, out, After::Nothing);
             }
@@ -773,12 +916,85 @@ fn handle(shared: &Shared, set: u8, cmd: u8, body: &[u8]) -> (u16, Vec<u8>, Afte
         }
         (9, 9) => {
             let object = c.u64();
-            out.push(u8::from(!matches!(object, 500..=502)));
+            out.push(u8::from(
+                !matches!(object, 500..=504) && !state.strings.contains_key(&object),
+            ));
         }
         (10, 1) => match c.u64() {
             501 => put_str(&mut out, "hello"),
-            _ => return (20, out, After::Nothing),
+            504 => put_str(&mut out, "kaboom"),
+            id => match state.strings.get(&id) {
+                Some(text) => put_str(&mut out, &text.clone()),
+                None => return (20, out, After::Nothing),
+            },
         },
+        // VirtualMachine.CreateString
+        (1, 11) => {
+            let text = c.string();
+            let id = new_string(&mut state, text);
+            put_u64(&mut out, id);
+        }
+        // ObjectReference.InvokeMethod / ClassType.InvokeMethod
+        (9, 6) | (3, 3) => {
+            let _receiver = c.u64();
+            let thread = c.u64();
+            if set == 9 {
+                let _class = c.u64();
+            }
+            let method = c.u64();
+            let count = c.i32();
+            let mut args = Vec::new();
+            for _ in 0..count {
+                args.push(read_tagged(&mut c));
+            }
+            let _options = c.i32();
+            state.invokes.push((method, args.clone()));
+            if thread != MAIN_THREAD || state.suspend_count == 0 {
+                return (10, out, After::Nothing);
+            }
+            match method {
+                1002 | 1010 => {
+                    out.push(b's');
+                    put_u64(&mut out, 501);
+                }
+                1003 => {
+                    let id = new_string(&mut state, "MainActivity{counter=7}".into());
+                    out.push(b's');
+                    put_u64(&mut out, id);
+                }
+                1004 => {
+                    let sum = args.iter().fold(0, |acc, arg| match arg {
+                        Value::Int(v) => acc + v,
+                        _ => acc,
+                    });
+                    out.push(b'I');
+                    put_i32(&mut out, sum);
+                }
+                1005 => {
+                    out.push(b'V');
+                    out.push(b'L');
+                    put_u64(&mut out, 503);
+                    return (0, out, After::Nothing);
+                }
+                1006 => return (0, Vec::new(), After::Trap),
+                1007 => return (0, Vec::new(), After::Hang),
+                1008 => {
+                    out.push(b'I');
+                    put_i32(&mut out, 7);
+                }
+                1009 => {
+                    let echoed = match args.first() {
+                        Some(Value::Object(_, id)) => *id,
+                        _ => 0,
+                    };
+                    out.push(b's');
+                    put_u64(&mut out, echoed);
+                }
+                _ => return (23, Vec::new(), After::Nothing),
+            }
+            out.push(b'L');
+            put_u64(&mut out, 0);
+        }
         // ThreadReference
         (11, 1) => match c.u64() {
             300 => put_str(&mut out, "main"),

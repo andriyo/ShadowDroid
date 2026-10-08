@@ -13,6 +13,8 @@ use futures_util::future::BoxFuture;
 use serde_json::{Value as Json, json};
 
 use super::codec::Value;
+use super::eval::{EvalCtx, HANDLE_ROOT, INVOKE_THREW};
+use super::expr::Expr;
 use super::protocol::{ACC_STATIC, tag, thread_status, thread_status_name};
 use super::resolve;
 use super::session::{RpcError, RpcResult, Session};
@@ -24,6 +26,63 @@ pub struct RenderOptions {
     pub depth: u32,
     pub max_fields: u32,
     pub max_array_items: u32,
+    /// Bound on rendered `toString()` text (`--max-message-chars`).
+    pub max_message_chars: u32,
+    /// With `--invoke`: objects without a built-in renderer show
+    /// `toString()`, run on this thread.
+    pub to_string: Option<ToStringOptions>,
+}
+
+impl RenderOptions {
+    pub const fn new(depth: u32, max_fields: u32, max_array_items: u32) -> Self {
+        Self {
+            depth,
+            max_fields,
+            max_array_items,
+            max_message_chars: DEFAULT_TO_STRING_CHARS,
+            to_string: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ToStringOptions {
+    pub thread: u64,
+    pub timeout: std::time::Duration,
+    pub max_chars: u32,
+}
+
+/// Default bound on a rendered `toString()`.
+pub const DEFAULT_TO_STRING_CHARS: u32 = 4096;
+
+/// Parse an `eval`/`inspect` input; calls need `--invoke`.
+fn parse_for_eval(source: &str, invoke: bool) -> RpcResult<Expr> {
+    let parsed = super::expr::parse(source.trim())
+        .map_err(|error| RpcError::new("invalid_expression", error))?;
+    if parsed.has_calls() && !invoke {
+        return Err(RpcError::new(
+            "invoke_not_allowed",
+            format!(
+                "`{}` calls a method; add --invoke to run app code",
+                source.trim()
+            ),
+        )
+        .next(&["re-run with --invoke"]));
+    }
+    Ok(parsed)
+}
+
+fn eval_value_type(value: &super::expr::EvalValue) -> &'static str {
+    use super::expr::EvalValue::*;
+    match value {
+        Null => "null",
+        Bool(_) => "boolean",
+        Int(_) => "long",
+        Float(_) => "double",
+        Char(_) => "char",
+        Str(_) => "java.lang.String",
+        Object { .. } => "object",
+    }
 }
 
 impl RenderOptions {
@@ -105,6 +164,7 @@ impl Session {
         frame: Option<usize>,
     ) -> RpcResult<SelectedFrame> {
         let (thread, thread_index) = self.select_thread(thread).await?;
+        self.ensure_thread_not_busy(thread)?;
         let frame_index = frame.unwrap_or(0);
         let frames = self
             .jdwp
@@ -279,7 +339,7 @@ impl Session {
     /// `this` of a frame. ART keeps it in an ordinary local slot named by the
     /// variable table (not necessarily slot 0), so read that slot when the
     /// table names it and fall back to StackFrame.ThisObject.
-    async fn this_value(&self, selected: &SelectedFrame) -> RpcResult<Option<Value>> {
+    pub(super) async fn this_value(&self, selected: &SelectedFrame) -> RpcResult<Option<Value>> {
         let table = self
             .variable_table(selected.location.class_id, selected.location.method_id)
             .await?;
@@ -308,7 +368,7 @@ impl Session {
             .await?)
     }
 
-    async fn visible_locals(
+    pub(super) async fn visible_locals(
         &self,
         selected: &SelectedFrame,
     ) -> RpcResult<Vec<(super::vm::Variable, Value)>> {
@@ -343,30 +403,70 @@ impl Session {
         thread: Option<&str>,
         frame: Option<usize>,
         options: RenderOptions,
+        invoke: Option<std::time::Duration>,
     ) -> RpcResult<Json> {
-        self.require_suspended()?;
+        let suspension = self.require_suspended()?;
+        let parsed = parse_for_eval(expression, invoke.is_some())?;
         let selected = self.select_frame(thread, frame).await?;
-        let (value, declared) = self.evaluate_path(&selected, expression).await?;
-        let mut visiting = HashSet::new();
+        let ctx = EvalCtx::new(Some(selected), suspension.exception, invoke);
         let result = self
-            .render(
-                expression.to_string(),
-                value,
-                declared,
-                options,
-                &mut visiting,
-            )
-            .await;
+            .evaluate_for_render(&ctx, &parsed, expression, options)
+            .await?;
         let thread_name = self.thread_name(selected.thread).await;
         Ok(json!({
             "session": self.status().await,
             "selected_frame": selected_json(&selected, &thread_name),
             "expression": expression,
-            "mode": "jdi_path",
+            "mode": if invoke.is_some() { "jdi_invoke" } else { "jdi_path" },
             "result": result,
         }))
     }
 
+    /// Evaluate and render: a path renders with its type; any other
+    /// expression renders its value; a thrown invoke is a result too.
+    async fn evaluate_for_render(
+        &self,
+        ctx: &EvalCtx,
+        parsed: &Expr,
+        name: &str,
+        options: RenderOptions,
+    ) -> RpcResult<Json> {
+        let options = RenderOptions {
+            to_string: ctx.invoke.map(|timeout| ToStringOptions {
+                thread: ctx.thread,
+                timeout,
+                max_chars: options.max_message_chars,
+            }),
+            ..options
+        };
+        match parsed {
+            Expr::Path(path) => match self.eval_path(ctx, path).await {
+                Ok((value, declared)) => {
+                    let mut visiting = HashSet::new();
+                    Ok(self
+                        .render(name.to_string(), value, declared, options, &mut visiting)
+                        .await)
+                }
+                Err(error) if error.code == INVOKE_THREW => Ok(json!({
+                    "name": name,
+                    "thrown": true,
+                    "exception": error.detail.get("thrown"),
+                    "value": error.message,
+                })),
+                Err(error) => Err(error),
+            },
+            other => match self.eval_expr(ctx, other).await {
+                Ok(value) => Ok(json!({
+                    "name": name,
+                    "type": eval_value_type(&value),
+                    "value": value.display(),
+                })),
+                Err(message) => Err(RpcError::new("invalid_expression", message)),
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn inspect(
         &self,
         expression: Option<&str>,
@@ -375,24 +475,29 @@ impl Session {
         thread: Option<&str>,
         frame: Option<usize>,
         options: RenderOptions,
+        invoke: Option<std::time::Duration>,
     ) -> RpcResult<Json> {
-        self.require_suspended()?;
-        let (value, declared, selected) = match (handle, expression) {
+        let suspension = self.require_suspended()?;
+        let (ctx, source, selected) = match (handle, expression) {
             (Some(handle), _) => {
                 let object = self.resolve_handle(handle).await?;
-                let start = Value::Object {
+                let root = Value::Object {
                     tag: tag::OBJECT,
                     id: object,
                 };
-                let (value, declared) = self
-                    .follow_path(start, None, path.unwrap_or(""), path.unwrap_or(""))
-                    .await?;
-                (value, declared, None)
+                // A frame is needed only to invoke on its thread.
+                let selected = match invoke {
+                    Some(_) => Some(self.select_frame(thread, frame).await?),
+                    None => None,
+                };
+                let ctx = EvalCtx::new(selected, suspension.exception, invoke).with_handle(root);
+                let source = format!("{HANDLE_ROOT}{}", path.unwrap_or("").trim());
+                (ctx, source, selected)
             }
             (None, Some(expression)) => {
                 let selected = self.select_frame(thread, frame).await?;
-                let (value, declared) = self.evaluate_path(&selected, expression).await?;
-                (value, declared, Some(selected))
+                let ctx = EvalCtx::new(Some(selected), suspension.exception, invoke);
+                (ctx, expression.to_string(), Some(selected))
             }
             (None, None) => {
                 return Err(RpcError::new(
@@ -401,22 +506,44 @@ impl Session {
                 ));
             }
         };
+        if let (Some(_), Some(path)) = (handle, path.map(str::trim))
+            && !path.is_empty()
+            && !path.starts_with(['.', '['])
+        {
+            return Err(RpcError::new(
+                "invalid_expression",
+                format!("relative path must start with . or [: {path}"),
+            ));
+        }
+        let parsed = parse_for_eval(&source, invoke.is_some())?;
+        if handle.is_some() && !matches!(parsed, Expr::Path(_)) {
+            return Err(RpcError::new(
+                "invalid_expression",
+                format!(
+                    "relative path must start with . or [: {}",
+                    path.unwrap_or("")
+                ),
+            ));
+        }
         let name = handle.or(expression).unwrap_or("result").to_string();
-        let mut visiting = HashSet::new();
         let result = self
-            .render(name, value, declared, options, &mut visiting)
-            .await;
+            .evaluate_for_render(&ctx, &parsed, &name, options)
+            .await?;
         let selected_frame = match &selected {
-            Some(selected) => {
+            Some(selected) if handle.is_none() => {
                 let thread_name = self.thread_name(selected.thread).await;
                 selected_json(selected, &thread_name)
             }
-            None => Json::Null,
+            _ => Json::Null,
         };
         Ok(json!({
             "type": "debug_inspect",
             "schema_version": 2,
-            "mode": if handle.is_some() { "object_handle" } else { "jdi_path" },
+            "mode": match (handle.is_some(), invoke.is_some()) {
+                (true, _) => "object_handle",
+                (false, true) => "jdi_invoke",
+                (false, false) => "jdi_path",
+            },
             "session": self.status().await,
             "selected_frame": selected_frame,
             "expression": expression,
@@ -432,200 +559,14 @@ impl Session {
         }))
     }
 
-    async fn evaluate_path(
-        &self,
-        selected: &SelectedFrame,
-        expression: &str,
-    ) -> RpcResult<(Value, Option<String>)> {
-        let exception = self.suspension().and_then(|s| s.exception);
-        self.evaluate_path_with(selected, expression, exception)
-            .await
-    }
-
-    /// Read a path in `selected`; `exception` is what `$exception` names
-    /// (the stop's throwable, or the event's while a condition runs).
-    pub(super) async fn evaluate_path_with(
-        &self,
-        selected: &SelectedFrame,
-        expression: &str,
-        exception: Option<Value>,
-    ) -> RpcResult<(Value, Option<String>)> {
-        let expr = expression.trim();
-        if expr.is_empty() {
-            return Err(RpcError::new("invalid_expression", "empty expression"));
-        }
-        let base_end = expr.find(['.', '[']).unwrap_or(expr.len());
-        let base = &expr[..base_end];
-        let (value, declared) = if base == EXCEPTION_ROOT {
-            // The exception an exception breakpoint stopped on.
-            let exception = exception.ok_or_else(|| {
-                RpcError::new(
-                    "invalid_expression",
-                    "`$exception` is only set while stopped at an exception breakpoint",
-                )
-            })?;
-            (exception, Some("java.lang.Throwable".to_string()))
-        } else if base == "this" {
-            let this = self.this_value(selected).await?.ok_or_else(|| {
-                RpcError::new(
-                    "invalid_expression",
-                    "`this` is unavailable in a static frame",
-                )
-            })?;
-            (this, None)
-        } else {
-            let locals = self.visible_locals(selected).await?;
-            // The bare name matches inlined slots too (`it` for `it\1`); the
-            // innermost visible one (latest start, then narrowest) wins.
-            let (local, value) = locals
-                .into_iter()
-                .filter(|(local, _)| {
-                    local.name == base || resolve::display_local_name(&local.name) == base
-                })
-                .max_by_key(|(local, _)| {
-                    (
-                        local.name == base,
-                        local.code_index,
-                        std::cmp::Reverse(local.length),
-                    )
-                })
-                .ok_or_else(|| {
-                    RpcError::new("invalid_expression", format!("unknown local: {base}"))
-                        .next(&["shadowdroid debug variables --backend jdwp"])
-                })?;
-            (value, Some(resolve::type_name(&local.signature)))
-        };
-        self.follow_path(value, declared, &expr[base_end..], expression)
-            .await
-    }
-
-    /// Apply `.field` / `[index]` segments to `value`.
-    async fn follow_path(
-        &self,
-        mut value: Value,
-        mut declared: Option<String>,
-        path: &str,
-        original: &str,
-    ) -> RpcResult<(Value, Option<String>)> {
-        let path = path.trim();
-        if !path.is_empty() && !path.starts_with(['.', '[']) {
-            return Err(RpcError::new(
-                "invalid_expression",
-                format!("relative path must start with . or [: {path}"),
-            ));
-        }
-        let bytes = path.as_bytes();
-        let mut pos = 0;
-        while pos < bytes.len() {
-            match bytes[pos] {
-                b'.' => {
-                    let start = pos + 1;
-                    let end = path[start..]
-                        .find(['.', '['])
-                        .map_or(path.len(), |offset| start + offset);
-                    let field_name = &path[start..end];
-                    if field_name.trim().is_empty() {
-                        return Err(RpcError::new(
-                            "invalid_expression",
-                            format!("empty field in expression: {original}"),
-                        ));
-                    }
-                    let object = value.object_id().ok_or_else(|| {
-                        RpcError::new(
-                            "invalid_expression",
-                            format!(
-                                "cannot read field {field_name} from a null or primitive value"
-                            ),
-                        )
-                    })?;
-                    let Some((owner, field)) = self.find_field(object, field_name).await? else {
-                        // A Kotlin delegated property (`by mutableStateOf`,
-                        // `by lazy`) is stored as `<name>$delegate`.
-                        let delegate = format!("{field_name}$delegate");
-                        let mut error = RpcError::new(
-                            "invalid_expression",
-                            format!("field not found: {field_name}"),
-                        );
-                        if self.find_field(object, &delegate).await?.is_some() {
-                            let whole = original.trim();
-                            let base = whole.strip_suffix(path).unwrap_or("");
-                            let suggestion =
-                                format!("{base}{}.{delegate}{}", &path[..pos], &path[end..]);
-                            error = RpcError::new(
-                                "invalid_expression",
-                                format!(
-                                    "field not found: {field_name} (a Kotlin delegated property; its state is in `{delegate}`)"
-                                ),
-                            )
-                            .detail(json!({"suggestion": suggestion}));
-                        }
-                        return Err(error);
-                    };
-                    value = self.read_field(object, owner, &field).await?;
-                    declared = Some(resolve::type_name(&field.signature));
-                    pos = end;
-                }
-                b'[' => {
-                    let end = path[pos..].find(']').map(|o| pos + o).ok_or_else(|| {
-                        RpcError::new(
-                            "invalid_expression",
-                            format!("missing closing ] in expression: {original}"),
-                        )
-                    })?;
-                    let index: i32 = path[pos + 1..end].trim().parse().map_err(|_| {
-                        RpcError::new("invalid_expression", "array index must be an integer")
-                    })?;
-                    let array = match value {
-                        Value::Object {
-                            tag: tag::ARRAY,
-                            id,
-                        } if id != 0 => id,
-                        _ => {
-                            return Err(RpcError::new(
-                                "invalid_expression",
-                                "cannot index a non-array value",
-                            ));
-                        }
-                    };
-                    let length = self.jdwp.array_length(array).await?;
-                    if index < 0 || index >= length {
-                        return Err(RpcError::new(
-                            "invalid_expression",
-                            format!("array index out of bounds: {index} (length {length})"),
-                        ));
-                    }
-                    value = self
-                        .jdwp
-                        .array_values(array, index, 1)
-                        .await?
-                        .into_iter()
-                        .next()
-                        .unwrap_or(Value::Object {
-                            tag: tag::OBJECT,
-                            id: 0,
-                        });
-                    declared = None;
-                    pos = end + 1;
-                }
-                _ => {
-                    return Err(RpcError::new(
-                        "invalid_expression",
-                        format!("unsupported expression syntax near: {}", &path[pos..]),
-                    ));
-                }
-            }
-        }
-        Ok((value, declared))
-    }
-
     /// Runtime class of `object`, with its signature cached.
-    async fn runtime_type(&self, object: u64) -> RpcResult<(u64, String)> {
+    pub(super) async fn runtime_type(&self, object: u64) -> RpcResult<(u64, String)> {
         let (_, type_id) = self.jdwp.object_type(object).await?;
         Ok((type_id, self.signature(type_id).await?))
     }
 
     /// Classes from `type_id` up to `java.lang.Object`.
-    async fn hierarchy(&self, type_id: u64) -> RpcResult<Vec<u64>> {
+    pub(super) async fn hierarchy(&self, type_id: u64) -> RpcResult<Vec<u64>> {
         let mut chain = vec![type_id];
         let mut current = type_id;
         while chain.len() < 32 {
@@ -640,7 +581,11 @@ impl Session {
         Ok(chain)
     }
 
-    async fn find_field(&self, object: u64, name: &str) -> RpcResult<Option<(u64, FieldInfo)>> {
+    pub(super) async fn find_field(
+        &self,
+        object: u64,
+        name: &str,
+    ) -> RpcResult<Option<(u64, FieldInfo)>> {
         let (type_id, _) = self.runtime_type(object).await?;
         for class in self.hierarchy(type_id).await? {
             if let Some(field) = self.fields(class).await?.iter().find(|f| f.name == name) {
@@ -650,7 +595,12 @@ impl Session {
         Ok(None)
     }
 
-    async fn read_field(&self, object: u64, owner: u64, field: &FieldInfo) -> RpcResult<Value> {
+    pub(super) async fn read_field(
+        &self,
+        object: u64,
+        owner: u64,
+        field: &FieldInfo,
+    ) -> RpcResult<Value> {
         let values = if field.mod_bits & ACC_STATIC != 0 {
             self.jdwp.static_values(owner, &[field.field_id]).await?
         } else {
@@ -664,7 +614,7 @@ impl Session {
         self.field_by_name(object, "value").await
     }
 
-    async fn field_by_name(&self, object: u64, name: &str) -> Option<Value> {
+    pub(super) async fn field_by_name(&self, object: u64, name: &str) -> Option<Value> {
         let (owner, field) = self.find_field(object, name).await.ok()??;
         self.read_field(object, owner, &field).await.ok()
     }
@@ -738,6 +688,26 @@ impl Session {
                     payload["boxed"] = json!(primitive);
                 }
                 return payload;
+            }
+            // With --invoke, the root object of a read shows its own
+            // toString() unless a built-in renderer describes it better.
+            if let Some(to_string) = options.to_string
+                && visiting.is_empty()
+                && !has_builtin_renderer(&signature)
+                && !self.is_throwable(type_id).await
+                && let Some(rendered) = self
+                    .to_string_of(
+                        to_string.thread,
+                        object,
+                        to_string.timeout,
+                        to_string.max_chars,
+                    )
+                    .await
+            {
+                if let Some(text) = rendered.get("text") {
+                    payload["value"] = text.clone();
+                }
+                payload["to_string"] = rendered;
             }
             if options.depth == 0 {
                 return payload;
@@ -1040,6 +1010,18 @@ fn primitive_text(value: &Value) -> Json {
         Value::Double(v) => json!(v.to_string()),
         Value::Object { .. } => Json::Null,
     }
+}
+
+/// Types the read renderers describe without running app code.
+fn has_builtin_renderer(signature: &str) -> bool {
+    signature.starts_with('[')
+        || matches!(
+            signature,
+            "Ljava/util/ArrayList;"
+                | "Ljava/util/Arrays$ArrayList;"
+                | "Ljava/util/HashMap;"
+                | "Ljava/util/LinkedHashMap;"
+        )
 }
 
 /// Whether a class signature is a boxed primitive.

@@ -566,7 +566,7 @@ fn breakpoint_lifecycle_through_the_cli() {
         "--condition",
         "f()",
     ]);
-    assert_eq!(invalid["code"], "debug_expression_invalid", "{invalid}");
+    assert_eq!(invalid["code"], "invoke_not_allowed", "{invalid}");
     let disabled = env.ok(&[
         "debug",
         "break",
@@ -630,4 +630,44 @@ fn breakpoint_lifecycle_through_the_cli() {
         condition_only["code"], "unsupported_by_backend",
         "{condition_only}"
     );
+}
+
+#[test]
+fn invoke_runs_only_on_request_and_only_on_jdwp() {
+    let env = Env::new();
+    // Studio refuses the flag before any device or bridge work.
+    let (studio, code) = env.run(&["debug", "eval", "this.getLabel()", "--invoke"]);
+    assert_ne!(code, 0);
+    assert_eq!(studio["code"], "unsupported_by_backend", "{studio}");
+
+    env.ok(&["debug", "attach", "--backend", "jdwp", "--pid", "4242"]);
+    env.ok(&[
+        "debug",
+        "break",
+        "line",
+        "--backend",
+        "jdwp",
+        "--file",
+        "MainActivity.kt",
+        "--line",
+        "31",
+    ]);
+    env.vm.hit_breakpoint(5);
+    wait_until("the stop", || {
+        env.ok(&["debug", "status", "--backend", "jdwp"])["sessions"][0]["suspended"] == true
+    });
+    let (refused, _) = env.run(&["debug", "eval", "--backend", "jdwp", "this.getLabel()"]);
+    assert_eq!(refused["code"], "invoke_not_allowed", "{refused}");
+    let called = env.ok(&[
+        "debug",
+        "eval",
+        "--backend",
+        "jdwp",
+        "--invoke",
+        "--timeout-ms",
+        "2000",
+        "this.getLabel()",
+    ]);
+    assert_eq!(called["result"]["value"], "hello", "{called}");
+    assert_eq!(called["mode"], "jdi_invoke");
 }

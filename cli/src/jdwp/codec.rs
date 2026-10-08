@@ -216,7 +216,6 @@ pub enum Value {
 }
 
 impl Value {
-    #[cfg(test)]
     pub fn tag(&self) -> u8 {
         match self {
             Value::Void => tag::VOID,
@@ -323,7 +322,6 @@ impl Writer {
     }
 
     /// A value without its tag (array regions of primitives, field writes).
-    #[cfg(test)]
     pub fn untagged_value(&mut self, value: &Value) -> &mut Self {
         match *value {
             Value::Void => self,
@@ -351,7 +349,6 @@ impl Writer {
         }
     }
 
-    #[cfg(test)]
     pub fn tagged_value(&mut self, value: &Value) -> &mut Self {
         self.u8(value.tag());
         self.untagged_value(value)

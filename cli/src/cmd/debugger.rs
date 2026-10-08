@@ -199,6 +199,24 @@ pub struct LaunchArgs {
     pub launch_activity: Option<String>,
 }
 
+impl DebuggerCmd {
+    /// A flag only the jdwp backend serves, if this invocation uses one;
+    /// the Studio path refuses it before touching a device.
+    pub fn jdwp_only_flag(&self) -> Option<&'static str> {
+        match self {
+            DebuggerCmd::Attach { launch, .. } if launch.is_requested() => {
+                Some("--wait-for-launch, --break, and --break-exception")
+            }
+            DebuggerCmd::Eval(args) if args.invoke => Some("--invoke"),
+            DebuggerCmd::Inspect(args) if args.invoke => Some("--invoke"),
+            DebuggerCmd::Break(BreakCmd::Line { invoke: true, .. }) => Some("--invoke"),
+            DebuggerCmd::Break(BreakCmd::Update(args)) if args.invoke => Some("--invoke"),
+            DebuggerCmd::Logpoint(LogpointCmd::Add(args)) if args.invoke => Some("--invoke"),
+            _ => None,
+        }
+    }
+}
+
 impl LaunchArgs {
     pub fn is_requested(&self) -> bool {
         self.wait_for_launch || !self.break_at.is_empty() || !self.break_exception.is_empty()
@@ -244,6 +262,9 @@ pub enum BreakCmd {
         /// Set the condition even if Android Studio's validation rejects it.
         #[arg(long, requires = "condition")]
         force: bool,
+        /// Let the condition call app methods (jdwp backend; runs app code).
+        #[arg(long)]
+        invoke: bool,
     },
     /// Add a Java exception breakpoint.
     Exception {
@@ -392,6 +413,9 @@ pub struct LogpointAddArgs {
     /// Maximum rendered-message characters retained per structured event.
     #[arg(long, value_parser = clap::value_parser!(u32).range(256..=65_536))]
     pub max_message_chars: Option<u32>,
+    /// Let the expression and condition call app methods (jdwp backend; runs app code).
+    #[arg(long)]
+    pub invoke: bool,
 }
 
 #[derive(Args, Clone, Debug, Default)]
@@ -593,9 +617,15 @@ pub struct EvalArgs {
     /// Maximum array/list items to include per array.
     #[arg(long, default_value_t = 32)]
     pub max_array_items: u32,
-    /// Evaluation request timeout.
+    /// Evaluation request timeout (bounds each method call with --invoke).
     #[arg(long, default_value_t = 5000)]
     pub timeout_ms: u32,
+    /// Allow method calls and `toString()` rendering (jdwp backend; runs app code).
+    #[arg(long)]
+    pub invoke: bool,
+    /// Maximum characters of a rendered `toString()`.
+    #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u32).range(16..=65_536))]
+    pub max_message_chars: u32,
 }
 
 #[derive(Args)]
@@ -627,9 +657,15 @@ pub struct InspectArgs {
     /// Maximum array/list items to include per array.
     #[arg(long, default_value_t = 32)]
     pub max_array_items: u32,
-    /// Inspection request timeout.
+    /// Inspection request timeout (bounds each method call with --invoke).
     #[arg(long, default_value_t = 5000)]
     pub timeout_ms: u32,
+    /// Allow method calls and `toString()` rendering (jdwp backend; runs app code).
+    #[arg(long)]
+    pub invoke: bool,
+    /// Maximum characters of a rendered `toString()`.
+    #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u32).range(16..=65_536))]
+    pub max_message_chars: u32,
 }
 
 #[derive(Subcommand)]
@@ -822,6 +858,9 @@ pub struct BreakpointUpdateArgs {
     /// Set expressions even if Android Studio's validation rejects them.
     #[arg(long)]
     pub force: bool,
+    /// Let the condition and log expression call app methods (jdwp backend).
+    #[arg(long)]
+    pub invoke: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -910,6 +949,7 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
             condition,
             clear_condition,
             force,
+            ..
         }) => {
             let canonical = canonicalize_for_bridge(file)?;
             let line_s = line.to_string();
@@ -3235,6 +3275,8 @@ mod tests {
             max_fields: 64,
             max_array_items: 32,
             timeout_ms: 100,
+            invoke: false,
+            max_message_chars: 4096,
         });
         let error = run(&command, None, Some(URL)).await.unwrap_err();
         assert_eq!(

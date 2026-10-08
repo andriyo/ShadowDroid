@@ -15,11 +15,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 
 use super::codec::{Location, Value};
-use super::expr::{self, EvalValue, Expr};
-use super::inspect::{RenderOptions, SelectedFrame};
+use super::eval::{DEFAULT_INVOKE_TIMEOUT, EvalCtx};
+use super::expr::{self, Expr};
+use super::inspect::{RenderOptions, SelectedFrame, ToStringOptions};
 use super::logpoints::{self, Filter};
 use super::protocol::{event_kind, suspend_policy};
-use super::resolve::{self, SourceTarget};
+use super::resolve::SourceTarget;
 use super::session::{
     Arm, Breakpoint, BreakpointKind, Owner, RpcError, RpcResult, Session, target_key,
 };
@@ -62,6 +63,8 @@ pub struct BreakpointOptions {
     pub owner: Option<String>,
     pub max_events_per_second: Option<u32>,
     pub max_message_chars: Option<u32>,
+    /// Conditions and log expressions may call methods (`--invoke`).
+    pub invoke: bool,
 }
 
 impl Default for BreakpointOptions {
@@ -79,6 +82,7 @@ impl Default for BreakpointOptions {
             owner: None,
             max_events_per_second: None,
             max_message_chars: None,
+            invoke: false,
         }
     }
 }
@@ -117,7 +121,7 @@ impl BreakpointOptions {
     }
 
     /// JDWP suspend policy for the request.
-    fn request_policy(&self) -> u8 {
+    pub fn request_policy(&self) -> u8 {
         if self.needs_suspend() {
             return suspend_policy::EVENT_THREAD;
         }
@@ -131,6 +135,22 @@ impl BreakpointOptions {
     /// Reject a condition or log expression that does not parse, unless
     /// `force` is set (it then fails at each hit, which is recorded).
     pub fn validate(&self) -> RpcResult<()> {
+        for (kind, source) in [
+            ("condition", &self.condition),
+            ("log_expression", &self.log_expression),
+        ] {
+            if let Some(source) = source
+                && !self.invoke
+                && expr::parse(source).is_ok_and(|parsed| parsed.has_calls())
+            {
+                return Err(RpcError::new(
+                    "invoke_not_allowed",
+                    format!("the {kind} `{source}` calls a method; add --invoke to run app code"),
+                )
+                .detail(json!({"kind": kind, "expression": source}))
+                .next(&["re-run with --invoke"]));
+            }
+        }
         if self.force {
             return Ok(());
         }
@@ -171,6 +191,7 @@ pub struct BreakpointUpdate {
     pub suspend: Option<SuspendKind>,
     pub pass_count: Option<u32>,
     pub force: bool,
+    pub invoke: Option<bool>,
 }
 
 impl BreakpointUpdate {
@@ -206,6 +227,9 @@ impl BreakpointUpdate {
             opts.pass_count = (pass_count > 0).then_some(pass_count);
         }
         opts.force = self.force;
+        if let Some(invoke) = self.invoke {
+            opts.invoke = invoke;
+        }
     }
 }
 
@@ -288,14 +312,16 @@ impl Session {
         }
         let mut armed = Vec::with_capacity(snapshot.locations.len());
         for location in &snapshot.locations {
-            let request = if snapshot.opts.enabled && snapshot.throttled_until.is_none() {
-                Some(
-                    self.arm(id, &snapshot.kind, location.arm, &snapshot.opts)
-                        .await?,
-                )
-            } else {
-                None
-            };
+            let request =
+                if snapshot.opts.enabled && snapshot.throttled_until.is_none() && !snapshot.expired
+                {
+                    Some(
+                        self.arm(id, &snapshot.kind, location.arm, &snapshot.opts)
+                            .await?,
+                    )
+                } else {
+                    None
+                };
             armed.push(request);
         }
         let mut state = self.state();
@@ -540,12 +566,16 @@ impl Session {
             None
         };
 
-        if let (Some(condition), Some(frame)) = (&breakpoint.condition, &frame) {
+        let ctx = frame.map(|frame| {
+            EvalCtx::new(
+                Some(frame),
+                exception,
+                opts.invoke.then_some(DEFAULT_INVOKE_TIMEOUT),
+            )
+        });
+        if let (Some(condition), Some(ctx)) = (&breakpoint.condition, &ctx) {
             let outcome = match condition {
-                Ok(expr) => self
-                    .evaluate(frame, exception, expr)
-                    .await
-                    .map(|v| v.truthy()),
+                Ok(expr) => self.eval_expr(ctx, expr).await.map(|v| v.truthy()),
                 Err(parse_error) => Err(format!("condition does not parse: {parse_error}")),
             };
             match outcome {
@@ -582,10 +612,7 @@ impl Session {
             }
         }
         if opts.logs() {
-            match self
-                .log_message(&breakpoint, location, frame.as_ref(), exception)
-                .await
-            {
+            match self.log_message(&breakpoint, location, ctx.as_ref()).await {
                 Ok(message) => {
                     self.append_log_event(&breakpoint, thread, None, Some(message))
                         .await
@@ -667,7 +694,7 @@ impl Session {
 
     /// Clear every request of `id`, keeping its locations for a later
     /// [`Session::rearm`].
-    async fn disarm(&self, id: &str) {
+    pub(super) async fn disarm(&self, id: &str) {
         let Some(snapshot) = self.state().breakpoints.get(id).cloned() else {
             return;
         };
@@ -758,103 +785,12 @@ impl Session {
         })
     }
 
-    /// Evaluate a condition/log expression in `frame`.
-    pub(super) fn evaluate<'a>(
-        &'a self,
-        frame: &'a SelectedFrame,
-        exception: Option<Value>,
-        expr: &'a Expr,
-    ) -> futures_util::future::BoxFuture<'a, Result<EvalValue, String>> {
-        Box::pin(async move {
-            match expr {
-                Expr::Literal(literal) => Ok(EvalValue::from(literal)),
-                Expr::Path(path) => {
-                    let (value, _) = self
-                        .evaluate_path_with(frame, path, exception)
-                        .await
-                        .map_err(|error| error.message)?;
-                    self.to_eval_value(value).await
-                }
-                Expr::Not(inner) => Ok(EvalValue::Bool(
-                    !self.evaluate(frame, exception, inner).await?.truthy(),
-                )),
-                Expr::And(left, right) => {
-                    if !self.evaluate(frame, exception, left).await?.truthy() {
-                        return Ok(EvalValue::Bool(false));
-                    }
-                    Ok(EvalValue::Bool(
-                        self.evaluate(frame, exception, right).await?.truthy(),
-                    ))
-                }
-                Expr::Or(left, right) => {
-                    if self.evaluate(frame, exception, left).await?.truthy() {
-                        return Ok(EvalValue::Bool(true));
-                    }
-                    Ok(EvalValue::Bool(
-                        self.evaluate(frame, exception, right).await?.truthy(),
-                    ))
-                }
-                Expr::Compare(left, op, right) => {
-                    let left = self.evaluate(frame, exception, left).await?;
-                    let right = self.evaluate(frame, exception, right).await?;
-                    expr::compare(&left, *op, &right).map(EvalValue::Bool)
-                }
-            }
-        })
-    }
-
-    /// JDWP value → comparable value: strings are read, boxed primitives
-    /// unboxed, other objects stay opaque.
-    async fn to_eval_value(&self, value: Value) -> Result<EvalValue, String> {
-        Ok(match value {
-            Value::Void => EvalValue::Null,
-            Value::Boolean(v) => EvalValue::Bool(v),
-            Value::Byte(v) => EvalValue::Int(i64::from(v)),
-            Value::Short(v) => EvalValue::Int(i64::from(v)),
-            Value::Int(v) => EvalValue::Int(i64::from(v)),
-            Value::Long(v) => EvalValue::Int(v),
-            Value::Char(v) => EvalValue::Char(char::from_u32(u32::from(v)).unwrap_or('\u{fffd}')),
-            Value::Float(v) => EvalValue::Float(f64::from(v)),
-            Value::Double(v) => EvalValue::Float(v),
-            Value::Object { id: 0, .. } => EvalValue::Null,
-            Value::Object { id, .. } => {
-                let (_, type_id) = self
-                    .jdwp
-                    .object_type(id)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let signature = self
-                    .signature(type_id)
-                    .await
-                    .map_err(|error| error.message)?;
-                if signature == "Ljava/lang/String;" {
-                    return self
-                        .jdwp
-                        .string_value(id)
-                        .await
-                        .map(EvalValue::Str)
-                        .map_err(|error| error.to_string());
-                }
-                if super::inspect::is_boxed(&signature)
-                    && let Some(inner) = self.unboxed(id).await
-                {
-                    return Box::pin(self.to_eval_value(inner)).await;
-                }
-                EvalValue::Object {
-                    id,
-                    text: format!("instance of {}(id={id})", resolve::type_name(&signature)),
-                }
-            }
-        })
-    }
-
     /// The rendered log message: default hit text, expression value, stack.
     async fn log_message(
         &self,
         breakpoint: &Breakpoint,
         location: Location,
-        frame: Option<&SelectedFrame>,
-        exception: Option<Value>,
+        ctx: Option<&EvalCtx>,
     ) -> Result<String, String> {
         let mut parts = Vec::new();
         if breakpoint.opts.log_message {
@@ -865,8 +801,8 @@ impl Session {
             ));
         }
         let needs_frame = breakpoint.log_expression.is_some() || breakpoint.opts.log_stack;
-        let frame = match frame {
-            Some(frame) => frame,
+        let ctx = match ctx {
+            Some(ctx) => ctx,
             None if needs_frame => return Err("no suspended frame to read".into()),
             None => return Ok(parts.join("\n")),
         };
@@ -877,22 +813,21 @@ impl Session {
                     // values, `instance of T(id=N)`).
                     Expr::Path(path) => {
                         let (value, declared) = self
-                            .evaluate_path_with(frame, path, exception)
+                            .eval_path(ctx, path)
                             .await
                             .map_err(|error| error.message)?;
                         let mut visiting = std::collections::HashSet::new();
+                        let options = RenderOptions {
+                            max_message_chars: breakpoint.opts.max_message_chars(),
+                            to_string: ctx.invoke.map(|timeout| ToStringOptions {
+                                thread: ctx.thread,
+                                timeout,
+                                max_chars: breakpoint.opts.max_message_chars(),
+                            }),
+                            ..RenderOptions::new(0, 8, 8)
+                        };
                         let rendered = self
-                            .render(
-                                path.clone(),
-                                value,
-                                declared,
-                                RenderOptions {
-                                    depth: 0,
-                                    max_fields: 8,
-                                    max_array_items: 8,
-                                },
-                                &mut visiting,
-                            )
+                            .render(path.text.clone(), value, declared, options, &mut visiting)
                             .await;
                         match rendered.get("value") {
                             Some(Json::String(text)) => text.clone(),
@@ -900,7 +835,7 @@ impl Session {
                             Some(other) => other.to_string(),
                         }
                     }
-                    other => self.evaluate(frame, exception, other).await?.display(),
+                    other => self.eval_expr(ctx, other).await?.display(),
                 };
                 parts.push(value);
             }
@@ -912,13 +847,13 @@ impl Session {
         if breakpoint.opts.log_stack {
             let count = self
                 .jdwp
-                .frame_count(frame.thread)
+                .frame_count(ctx.thread)
                 .await
                 .unwrap_or(1)
                 .clamp(1, MAX_LOG_STACK_FRAMES);
             let frames = self
                 .jdwp
-                .frames(frame.thread, 0, count)
+                .frames(ctx.thread, 0, count)
                 .await
                 .map_err(|error| error.to_string())?;
             let mut lines = Vec::with_capacity(frames.len());
@@ -1063,7 +998,8 @@ impl Session {
                     RpcError::new("debug_expression_invalid", format!("condition: {e}"))
                 })?;
                 let frame = self.top_frame(thread).await?;
-                match self.evaluate(&frame, suspension.exception, &expr).await {
+                let ctx = EvalCtx::new(Some(frame), suspension.exception, None);
+                match self.eval_expr(&ctx, &expr).await {
                     Ok(value) if value.truthy() => {}
                     Ok(_) => continue,
                     Err(message) => {
@@ -1241,12 +1177,25 @@ mod tests {
     #[test]
     fn invalid_expressions_are_rejected_unless_forced() {
         let bad = BreakpointOptions {
-            condition: Some("this.toString()".into()),
+            condition: Some("this.counter >".into()),
             ..Default::default()
         };
         assert_eq!(bad.validate().unwrap_err().code, "debug_expression_invalid");
         let forced = BreakpointOptions { force: true, ..bad };
         forced.validate().unwrap();
+        // Calls parse but need --invoke, even with --force.
+        let call = BreakpointOptions {
+            condition: Some("this.toString() == \"x\"".into()),
+            force: true,
+            ..Default::default()
+        };
+        assert_eq!(call.validate().unwrap_err().code, "invoke_not_allowed");
+        BreakpointOptions {
+            invoke: true,
+            ..call
+        }
+        .validate()
+        .unwrap();
     }
 
     #[test]

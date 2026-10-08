@@ -2210,12 +2210,10 @@ async fn run_inner() -> Result<()> {
         Cmd::Debug(args) if args.is_host_only() => {
             // Refuse before touching the device or the bridge: Studio cannot
             // see a process the jdwp daemon holds and would fail later.
-            if let DebugCmd::Studio(DebuggerCmd::Attach { launch, .. }) = &args.cmd
-                && launch.is_requested()
+            if let DebugCmd::Studio(cmd) = &args.cmd
+                && let Some(flag) = cmd.jdwp_only_flag()
             {
-                return Err(crate::cmd::debugger::studio_unsupported(
-                    "--wait-for-launch, --break, and --break-exception",
-                ));
+                return Err(crate::cmd::debugger::studio_unsupported(flag));
             }
             if let DebugCmd::Studio(DebuggerCmd::Attach { package, pid, .. }) = &args.cmd {
                 crate::jdwp::commands::ensure_not_held_by_jdwp(

@@ -853,9 +853,32 @@ pub(super) fn command_effect_contract(
                 Vec::new()
             },
         },
-        "conditional_effects": usage_log_conditional_effects(),
+        "conditional_effects": conditional_effects(path),
         "effectful_dependencies": resolved.dependencies,
     }))
+}
+
+/// Debugger verbs whose `--invoke` runs app methods in the debuggee.
+const INVOKE_COMMANDS: &[&str] = &[
+    "debug eval",
+    "debug inspect",
+    "debug break line",
+    "debug break update",
+    "debug logpoint add",
+];
+
+fn conditional_effects(path: &[String]) -> serde_json::Value {
+    let mut effects = usage_log_conditional_effects();
+    if INVOKE_COMMANDS.contains(&path.join(" ").as_str())
+        && let serde_json::Value::Array(list) = &mut effects
+    {
+        list.push(serde_json::json!({
+            "effect": "device_mutate",
+            "when": "--invoke is given (jdwp backend)",
+            "reason": "method calls and toString() run app code in the debugged process, which can change its state"
+        }));
+    }
+    effects
 }
 
 fn usage_log_conditional_effects() -> serde_json::Value {
@@ -890,6 +913,37 @@ pub(super) fn effect_model_json() -> serde_json::Value {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn invoke_flags_are_declared_effectful() {
+        let root = crate::cli::Cli::command();
+        for path in INVOKE_COMMANDS {
+            let words: Vec<String> = path.split(' ').map(str::to_string).collect();
+            let mut command = &root;
+            for word in &words {
+                command = command
+                    .get_subcommands()
+                    .find(|c| c.get_name() == word)
+                    .unwrap_or_else(|| panic!("{path}"));
+            }
+            assert!(
+                command
+                    .get_arguments()
+                    .any(|a| a.get_long() == Some("invoke")),
+                "{path} has --invoke"
+            );
+            let contract = command_effect_contract(command, &words).unwrap();
+            assert!(
+                contract["conditional_effects"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e["effect"] == "device_mutate"
+                        && e["when"].as_str().unwrap().contains("--invoke")),
+                "{path}: {contract}"
+            );
+        }
+    }
 
     fn visit_public_leaves(command: &Command, path: &mut Vec<String>, leaves: &mut Vec<String>) {
         let children = visible_children(command).collect::<Vec<_>>();

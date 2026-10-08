@@ -127,6 +127,7 @@ pub async fn run(cmd: &DebuggerCmd, ctx: JdwpContext<'_>) -> Result<()> {
             condition,
             clear_condition,
             force,
+            invoke,
             ..
         }) => {
             let target = locate_target(file, *line, ctx.project_root)?;
@@ -136,6 +137,7 @@ pub async fn run(cmd: &DebuggerCmd, ctx: JdwpContext<'_>) -> Result<()> {
                 temporary: *temporary,
                 condition: condition.clone(),
                 force: *force,
+                invoke: *invoke,
                 ..Default::default()
             };
             let mut value = rpc(
@@ -202,6 +204,7 @@ pub async fn run(cmd: &DebuggerCmd, ctx: JdwpContext<'_>) -> Result<()> {
                 }),
                 pass_count: args.pass_count,
                 force: args.force,
+                invoke: args.invoke.then_some(true),
             };
             rpc(
                 &entry,
@@ -335,6 +338,9 @@ pub async fn run(cmd: &DebuggerCmd, ctx: JdwpContext<'_>) -> Result<()> {
                     "depth": args.depth,
                     "max_fields": args.max_fields,
                     "max_array_items": args.max_array_items,
+                    "invoke": args.invoke,
+                    "timeout_ms": args.timeout_ms,
+                    "max_message_chars": args.max_message_chars,
                 }),
                 timeout_for(u64::from(args.timeout_ms)),
             )
@@ -354,6 +360,9 @@ pub async fn run(cmd: &DebuggerCmd, ctx: JdwpContext<'_>) -> Result<()> {
                     "depth": args.depth,
                     "max_fields": args.max_fields,
                     "max_array_items": args.max_array_items,
+                    "invoke": args.invoke,
+                    "timeout_ms": args.timeout_ms,
+                    "max_message_chars": args.max_message_chars,
                 }),
                 timeout_for(u64::from(args.timeout_ms)),
             )
@@ -605,6 +614,7 @@ async fn logpoint(cmd: &LogpointCmd, ctx: &JdwpContext<'_>) -> Result<()> {
                 owner: Some(args.owner.clone()),
                 max_events_per_second: args.max_events_per_second,
                 max_message_chars: args.max_message_chars,
+                invoke: args.invoke,
             };
             let mut value = rpc(
                 &entry,

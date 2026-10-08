@@ -35,6 +35,7 @@ pub mod vm {
     pub const ID_SIZES: u8 = 7;
     pub const SUSPEND: u8 = 8;
     pub const RESUME: u8 = 9;
+    pub const CREATE_STRING: u8 = 11;
     pub const CAPABILITIES_NEW: u8 = 17;
     pub const ALL_CLASSES_WITH_GENERIC: u8 = 20;
 }
@@ -51,6 +52,13 @@ pub mod reference_type {
 
 pub mod class_type {
     pub const SUPERCLASS: u8 = 1;
+    pub const INVOKE_METHOD: u8 = 3;
+}
+
+/// `options` bits of the InvokeMethod commands.
+pub mod invoke {
+    /// Only the invoking thread runs; every other thread stays suspended.
+    pub const SINGLE_THREADED: i32 = 0x01;
 }
 
 pub mod method {
@@ -61,6 +69,7 @@ pub mod method {
 pub mod object_reference {
     pub const REFERENCE_TYPE: u8 = 1;
     pub const GET_VALUES: u8 = 2;
+    pub const INVOKE_METHOD: u8 = 6;
     pub const DISABLE_COLLECTION: u8 = 7;
     pub const ENABLE_COLLECTION: u8 = 8;
     pub const IS_COLLECTED: u8 = 9;
@@ -302,6 +311,9 @@ pub fn command_name(command_set: u8, command: u8) -> String {
         (set::VIRTUAL_MACHINE, vm::SUSPEND) => "VirtualMachine.Suspend",
         (set::VIRTUAL_MACHINE, vm::RESUME) => "VirtualMachine.Resume",
         (set::VIRTUAL_MACHINE, vm::CAPABILITIES_NEW) => "VirtualMachine.CapabilitiesNew",
+        (set::VIRTUAL_MACHINE, vm::CREATE_STRING) => "VirtualMachine.CreateString",
+        (set::CLASS_TYPE, class_type::INVOKE_METHOD) => "ClassType.InvokeMethod",
+        (set::OBJECT_REFERENCE, object_reference::INVOKE_METHOD) => "ObjectReference.InvokeMethod",
         (set::VIRTUAL_MACHINE, vm::ALL_CLASSES_WITH_GENERIC) => {
             "VirtualMachine.AllClassesWithGeneric"
         }

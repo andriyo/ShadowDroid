@@ -500,10 +500,27 @@ fn u64_param(params: &Json, name: &str, default: u64) -> u64 {
 
 fn render_options(params: &Json, default_depth: u64) -> super::inspect::RenderOptions {
     super::inspect::RenderOptions {
-        depth: u64_param(params, "depth", default_depth).min(8) as u32,
-        max_fields: u64_param(params, "max_fields", 64).clamp(1, 512) as u32,
-        max_array_items: u64_param(params, "max_array_items", 32).min(512) as u32,
+        max_message_chars: u64_param(
+            params,
+            "max_message_chars",
+            u64::from(super::inspect::DEFAULT_TO_STRING_CHARS),
+        )
+        .clamp(16, 65_536) as u32,
+        ..super::inspect::RenderOptions::new(
+            u64_param(params, "depth", default_depth).min(8) as u32,
+            u64_param(params, "max_fields", 64).clamp(1, 512) as u32,
+            u64_param(params, "max_array_items", 32).min(512) as u32,
+        )
     }
+}
+
+/// `invoke: true` → the caller's `--timeout-ms` bounds each invoke.
+fn invoke_param(params: &Json) -> Option<Duration> {
+    params
+        .get("invoke")
+        .and_then(Json::as_bool)
+        .unwrap_or(false)
+        .then(|| super::inspect::read_timeout(u64_param(params, "timeout_ms", 5_000)))
 }
 
 pub async fn dispatch(session: &Arc<Session>, method: &str, params: &Json) -> RpcResult<Json> {
@@ -644,7 +661,13 @@ pub async fn dispatch(session: &Arc<Session>, method: &str, params: &Json) -> Rp
             let expression = str_param(params, "expression")
                 .ok_or_else(|| RpcError::new("invalid_expression", "missing expression"))?;
             session
-                .eval(expression, thread, frame, render_options(params, 1))
+                .eval(
+                    expression,
+                    thread,
+                    frame,
+                    render_options(params, 1),
+                    invoke_param(params),
+                )
                 .await
         }
         "inspect" => {
@@ -656,6 +679,7 @@ pub async fn dispatch(session: &Arc<Session>, method: &str, params: &Json) -> Rp
                     thread,
                     frame,
                     render_options(params, 1),
+                    invoke_param(params),
                 )
                 .await
         }

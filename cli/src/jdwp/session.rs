@@ -295,6 +295,14 @@ impl Breakpoint {
                 "shadowdroid_observed_session_pauses"
             },
             "suspend_policy": self.opts.suspend.as_studio(),
+            // What the VM is asked to suspend: a condition, log expression,
+            // or stack logging suspends the event thread even on a logpoint.
+            "wire_suspend_policy": match self.opts.request_policy() {
+                0 => "NONE",
+                1 => "THREAD",
+                _ => "ALL",
+            },
+            "invoke": self.opts.invoke,
             "condition": self.opts.condition,
             "log_expression": self.opts.log_expression,
             "log_message": self.opts.log_message,
@@ -403,6 +411,7 @@ pub struct Session {
     use_source_name_match: bool,
     pub(super) logpoint_log: super::logpoints::LogpointLog,
     initial_breakpoints: Mutex<Vec<Json>>,
+    pub(super) invoke_state: super::invoke::SharedInvokeState,
 }
 
 impl Session {
@@ -422,6 +431,7 @@ impl Session {
                 "SHADOWDROID_JDWP_NO_SOURCE_NAME_MATCH",
             ),
             initial_breakpoints: Mutex::new(Vec::new()),
+            invoke_state: Default::default(),
             logpoint_log: super::logpoints::LogpointLog::new(
                 format!(
                     "logpoints_jdwp_{}_{}",
@@ -713,6 +723,7 @@ impl Session {
             "breakpoints": state.breakpoints.len(),
             "live_handles": state.pinned.len(),
             "events_seen": state.events_seen,
+            "invoke": self.invoke_stats(),
             "closed": state.closed,
         })
     }
@@ -1356,6 +1367,65 @@ impl Session {
     // ── event loop ────────────────────────────────────────────────────
 
     pub async fn run_events(self: Arc<Self>, mut incoming: mpsc::UnboundedReceiver<Incoming>) {
+        // The forwarder runs beside the handler: while an invoke runs (often
+        // started by the handler itself, for a condition), events the invoked
+        // code raises on its thread are resumed here, never queued behind
+        // the busy handler — otherwise the invoke could never return.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let forwarder = {
+            let session = self.clone();
+            tokio::spawn(async move {
+                while let Some(message) = incoming.recv().await {
+                    if let Incoming::Command(command) = &message
+                        && command.command_set == protocol::set::EVENT
+                        && command.command == protocol::event::COMPOSITE
+                        && let Some(thread) = session.invoking_thread()
+                        && let Ok(composite) = Composite::parse(&command.data, session.jdwp.sizes())
+                        && !composite.events.is_empty()
+                        && composite.events.iter().all(|e| e.thread() == Some(thread))
+                    {
+                        session.absorb_during_invoke(composite, thread).await;
+                        continue;
+                    }
+                    if tx.send(message).is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+        self.handle_incoming(&mut rx).await;
+        forwarder.abort();
+    }
+
+    /// Resume what an invoked method's own events suspended: breakpoints in
+    /// app code an evaluation calls are not stops (as in IntelliJ).
+    async fn absorb_during_invoke(&self, composite: Composite, thread: u64) {
+        for event in &composite.events {
+            self.note_during_invoke(event);
+        }
+        {
+            let mut state = self.state();
+            for event in &composite.events {
+                state.events_seen += 1;
+                if state.recent_events.len() >= RECENT_EVENTS {
+                    state.recent_events.pop_front();
+                }
+                let mut summary = event.to_json();
+                summary["skipped_during_invoke"] = json!(true);
+                state.recent_events.push_back(summary);
+            }
+        }
+        let resumed = match composite.suspend_policy {
+            suspend_policy::ALL => self.jdwp.resume().await,
+            suspend_policy::EVENT_THREAD => self.jdwp.thread_resume(thread).await,
+            _ => Ok(()),
+        };
+        if let Err(error) = resumed {
+            tracing::warn!("resuming an event raised during an invoke: {error}");
+        }
+    }
+
+    async fn handle_incoming(&self, incoming: &mut mpsc::UnboundedReceiver<Incoming>) {
         while let Some(message) = incoming.recv().await {
             match message {
                 Incoming::Command(command)
@@ -1394,6 +1464,7 @@ impl Session {
     }
 
     pub(super) async fn handle_composite(&self, composite: Composite) {
+        self.drain_deferred().await;
         let mut stopped = false;
         let mut thread_to_resume = None;
         // One stop per (breakpoint, thread, location) per composite, even if
@@ -1456,7 +1527,7 @@ impl Session {
     }
 
     /// Returns whether the event is a user-visible stop.
-    async fn handle_event(&self, event: &Event) -> RpcResult<bool> {
+    pub(super) async fn handle_event(&self, event: &Event) -> RpcResult<bool> {
         let owner = self.state().owners.get(&event.request_id()).cloned();
         match (event, owner) {
             (

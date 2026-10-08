@@ -58,11 +58,7 @@ async fn wait_suspended(session: &Session) {
     }
 }
 
-const OPTIONS: RenderOptions = RenderOptions {
-    depth: 1,
-    max_fields: 64,
-    max_array_items: 32,
-};
+const OPTIONS: RenderOptions = RenderOptions::new(1, 64, 32);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn line_breakpoint_binds_hits_and_reads_the_frame() {
@@ -115,7 +111,7 @@ async fn line_breakpoint_binds_hits_and_reads_the_frame() {
         "markers and `this` are hidden; inlined `\\N` suffixes stripped"
     );
     assert_eq!(variables["variables"][2]["slot_name"], "it\\1");
-    let it = session.eval("it", None, None, OPTIONS).await.unwrap();
+    let it = session.eval("it", None, None, OPTIONS, None).await.unwrap();
     assert_eq!(it["result"]["value"], "42", "the innermost `it` wins");
     assert_eq!(variables["variables"][0]["value"], "hello");
     assert_eq!(variables["variables"][1]["value"], "42");
@@ -140,38 +136,49 @@ async fn line_breakpoint_binds_hits_and_reads_the_frame() {
     assert!(session.is_pinned(ACTIVITY_OBJECT));
 
     let eval = session
-        .eval("this.label", None, None, OPTIONS)
+        .eval("this.label", None, None, OPTIONS, None)
         .await
         .unwrap();
     assert_eq!(eval["result"]["value"], "hello");
     assert_eq!(eval["result"]["declared_type"], "java.lang.String");
     let eval = session
-        .eval("this.numbers[1]", None, None, OPTIONS)
+        .eval("this.numbers[1]", None, None, OPTIONS, None)
         .await
         .unwrap();
     assert_eq!(eval["result"]["value"], "2");
     let array = session
-        .eval("this.numbers", None, None, OPTIONS)
+        .eval("this.numbers", None, None, OPTIONS, None)
         .await
         .unwrap();
     assert_eq!(array["result"]["length"], 3);
     assert_eq!(array["result"]["items"][2]["value"], "3");
     let error = session
-        .eval("this.numbers[9]", None, None, OPTIONS)
+        .eval("this.numbers[9]", None, None, OPTIONS, None)
         .await
         .unwrap_err();
     assert_eq!(error.code, "invalid_expression");
-    let error = session.eval("nope", None, None, OPTIONS).await.unwrap_err();
+    let error = session
+        .eval("nope", None, None, OPTIONS, None)
+        .await
+        .unwrap_err();
     assert!(error.message.contains("unknown local"), "{error:?}");
 
     let inspect = session
-        .inspect(None, Some("obj_500"), Some(".counter"), None, None, OPTIONS)
+        .inspect(
+            None,
+            Some("obj_500"),
+            Some(".counter"),
+            None,
+            None,
+            OPTIONS,
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(inspect["result"]["value"], "7");
     assert_eq!(inspect["mode"], "object_handle");
     let stale = session
-        .inspect(None, Some("obj_777"), None, None, None, OPTIONS)
+        .inspect(None, Some("obj_777"), None, None, None, OPTIONS, None)
         .await
         .unwrap_err();
     assert_eq!(stale.code, "stale_object_handle");
@@ -220,7 +227,10 @@ async fn line_breakpoint_binds_hits_and_reads_the_frame() {
 
     let resumed = session.resume().await.unwrap();
     assert_eq!(resumed["suspended"], false);
-    let error = session.eval("tag", None, None, OPTIONS).await.unwrap_err();
+    let error = session
+        .eval("tag", None, None, OPTIONS, None)
+        .await
+        .unwrap_err();
     assert_eq!(error.code, "debugger_not_suspended");
     let stack = session.stack(None, 8).await.unwrap();
     assert_eq!(stack["warning"], "session is not suspended");
@@ -441,7 +451,7 @@ async fn uncaught_means_not_caught_by_app_code() {
     );
     assert_eq!(status["exception_expression"], "$exception", "{status}");
     let thrown = session
-        .eval("$exception", None, None, OPTIONS)
+        .eval("$exception", None, None, OPTIONS, None)
         .await
         .unwrap();
     assert_eq!(
@@ -470,7 +480,7 @@ async fn a_missing_kotlin_property_points_at_its_delegate() {
     vm.hit_breakpoint(5);
     wait_suspended(&session).await;
     let error = session
-        .eval("this.status", None, None, OPTIONS)
+        .eval("this.status", None, None, OPTIONS, None)
         .await
         .unwrap_err();
     assert_eq!(error.code, "invalid_expression");
@@ -481,7 +491,7 @@ async fn a_missing_kotlin_property_points_at_its_delegate() {
     );
     assert_eq!(error.detail["suggestion"], "this.status$delegate");
     let plain = session
-        .eval("this.nothing", None, None, OPTIONS)
+        .eval("this.nothing", None, None, OPTIONS, None)
         .await
         .unwrap_err();
     assert_eq!(plain.message, "field not found: nothing");
@@ -582,18 +592,29 @@ async fn conditions_evaluate_in_the_daemon_and_resume_when_false() {
     assert_eq!(error["kind"], "condition", "{error}");
     assert!(error["message"].as_str().unwrap().contains("unknown local"));
 
-    // An unparseable condition is rejected unless forced.
+    // An unparseable condition is rejected unless forced; calls need --invoke.
     let rejected = session
         .update_breakpoint(
             "bp_1",
             BreakpointUpdate {
-                condition: Some("this.toString()".into()),
+                condition: Some("count >".into()),
                 ..Default::default()
             },
         )
         .await
         .unwrap_err();
     assert_eq!(rejected.code, "debug_expression_invalid");
+    let call = session
+        .update_breakpoint(
+            "bp_1",
+            BreakpointUpdate {
+                condition: Some("this.toString() == \"x\"".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(call.code, "invoke_not_allowed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -976,4 +997,244 @@ async fn framework_internal_exceptions_are_not_crashes() {
     assert_eq!(vm.throw_exception_at(Some((104, 6000))), 1);
     wait_suspended(&session).await;
     assert_eq!(session.status().await["suspend_reason"], "exception");
+}
+
+// ── P1c: --invoke ───────────────────────────────────────────────────────
+
+const INVOKE: Option<Duration> = Some(Duration::from_secs(2));
+
+async fn stopped_at_line_31(vm: &FakeVm) -> Arc<Session> {
+    let session = attach(vm, WAIT).await;
+    session
+        .break_line(target("MainActivity.kt"), 31, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(vm.hit_breakpoint(5), 1);
+    wait_suspended(&session).await;
+    session
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invoke_calls_methods_only_when_asked() {
+    let vm = FakeVm::start();
+    let session = stopped_at_line_31(&vm).await;
+
+    let refused = session
+        .eval("this.getLabel()", None, None, OPTIONS, None)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, "invoke_not_allowed");
+    assert!(vm.with_state(|s| s.invokes.is_empty()), "nothing ran");
+
+    let label = session
+        .eval("this.getLabel()", None, None, OPTIONS, INVOKE)
+        .await
+        .unwrap();
+    assert_eq!(label["mode"], "jdi_invoke");
+    assert_eq!(label["result"]["value"], "hello");
+    let sum = session
+        .eval("this.add(2, count - 0 == 42)", None, None, OPTIONS, INVOKE)
+        .await
+        .unwrap_err();
+    assert_eq!(sum.code, "invalid_expression", "boolean does not fit int");
+    let sum = session
+        .eval("this.add(2, 40)", None, None, OPTIONS, INVOKE)
+        .await
+        .unwrap();
+    assert_eq!(sum["result"]["value"], "42");
+    let with_local = session
+        .eval("add(count, 1)", None, None, OPTIONS, INVOKE)
+        .await
+        .unwrap();
+    assert_eq!(
+        with_local["result"]["value"], "43",
+        "a bare call is on `this`"
+    );
+    let statik = session
+        .eval("this.staticHelper()", None, None, OPTIONS, INVOKE)
+        .await
+        .unwrap();
+    assert_eq!(statik["result"]["value"], "7");
+    let echoed = session
+        .eval("this.greet(\"yo\")", None, None, OPTIONS, INVOKE)
+        .await
+        .unwrap();
+    assert_eq!(
+        echoed["result"]["value"], "yo",
+        "string literal via CreateString"
+    );
+
+    // Kotlin property sugar: no `status` field, a getStatus() getter.
+    let sugar = session
+        .eval("this.status", None, None, OPTIONS, INVOKE)
+        .await
+        .unwrap();
+    assert_eq!(sugar["result"]["value"], "hello");
+    let no_sugar = session
+        .eval("this.status", None, None, OPTIONS, None)
+        .await
+        .unwrap_err();
+    assert_eq!(no_sugar.detail["getter"], "getStatus");
+
+    // A comparison over calls renders its value.
+    let compared = session
+        .eval(
+            "this.add(1, 1) == 2 && tag == \"hello\"",
+            None,
+            None,
+            OPTIONS,
+            INVOKE,
+        )
+        .await
+        .unwrap();
+    assert_eq!(compared["result"]["value"], "true");
+
+    // toString() for objects without a built-in renderer.
+    let this = session
+        .eval("this", None, None, OPTIONS, INVOKE)
+        .await
+        .unwrap();
+    assert_eq!(this["result"]["value"], "MainActivity{counter=7}", "{this}");
+    assert_eq!(this["result"]["to_string"]["truncated"], false);
+    let plain = session
+        .eval("this", None, None, OPTIONS, None)
+        .await
+        .unwrap();
+    assert!(plain["result"].get("to_string").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_thrown_exception_is_a_structured_result() {
+    let vm = FakeVm::start();
+    let session = stopped_at_line_31(&vm).await;
+    let thrown = session
+        .eval("this.boom()", None, None, OPTIONS, INVOKE)
+        .await
+        .unwrap();
+    assert_eq!(thrown["result"]["thrown"], true, "{thrown}");
+    assert_eq!(
+        thrown["result"]["exception"]["type"],
+        "java.lang.IllegalStateException"
+    );
+    assert_eq!(thrown["result"]["exception"]["message"], "kaboom");
+    // In a condition, a throw is an evaluation error (the thread stays put).
+    let error = session
+        .inspect(Some("this.boom()"), None, None, None, None, OPTIONS, INVOKE)
+        .await
+        .unwrap();
+    assert_eq!(error["result"]["thrown"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn breakpoints_are_disarmed_during_an_invoke_and_its_events_resumed() {
+    let vm = FakeVm::start();
+    let session = stopped_at_line_31(&vm).await;
+    let armed = session.breakpoints()[0]["locations"][0]["request_id"]
+        .as_i64()
+        .unwrap() as i32;
+    // trap() raises a breakpoint on the invoking thread and replies only
+    // after it is resumed: without the forwarder this would deadlock.
+    let trapped = tokio::time::timeout(
+        WAIT,
+        session.eval("this.trap()", None, None, OPTIONS, INVOKE),
+    )
+    .await
+    .expect("no deadlock")
+    .unwrap();
+    assert_eq!(trapped["result"]["type"], "void");
+    assert_eq!(
+        session.status().await["invoke"]["events_skipped_during_invoke"],
+        1
+    );
+    assert_eq!(session.status().await["suspend_reason"], "breakpoint");
+    // Our breakpoint request was cleared for the invoke and re-armed.
+    assert!(vm.with_state(|s| s.cleared.contains(&armed)));
+    let rearmed = session.breakpoints()[0]["locations"][0]["request_id"].clone();
+    assert!(rearmed.is_number() && rearmed != armed, "{rearmed}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_invoke_marks_the_thread_busy_until_it_returns() {
+    let vm = FakeVm::start();
+    let session = stopped_at_line_31(&vm).await;
+    let late = session
+        .eval(
+            "this.hang()",
+            None,
+            None,
+            OPTIONS,
+            Some(Duration::from_millis(100)),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(late.code, "invoke_timeout");
+    let busy = session
+        .eval("tag", None, None, OPTIONS, None)
+        .await
+        .unwrap_err();
+    assert_eq!(busy.code, "thread_busy_invoking");
+    vm.release_hang();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        match session.eval("tag", None, None, OPTIONS, None).await {
+            Ok(value) => {
+                assert_eq!(value["result"]["value"], "hello");
+                break;
+            }
+            Err(error) => {
+                assert_eq!(error.code, "thread_busy_invoking");
+                assert!(tokio::time::Instant::now() < deadline);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paused_session_refuses_invokes() {
+    let vm = FakeVm::start();
+    let session = attach(&vm, WAIT).await;
+    session.pause().await.unwrap();
+    let refused = session
+        .eval("this.getLabel()", None, None, OPTIONS, INVOKE)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, "invoke_requires_event_stop");
+    assert!(refused.next_actions[0].contains("step-over"));
+    assert!(vm.with_state(|s| s.invokes.is_empty()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conditions_and_log_expressions_can_invoke_when_allowed() {
+    let vm = FakeVm::start();
+    let session = attach(&vm, WAIT).await;
+    let refused = session
+        .break_line_with(
+            target("MainActivity.kt"),
+            31,
+            BreakpointOptions {
+                condition: Some("this.add(1, 1) == 2".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, "invoke_not_allowed");
+    session
+        .break_line_with(
+            target("MainActivity.kt"),
+            31,
+            BreakpointOptions {
+                condition: Some("this.add(1, 1) == 2".into()),
+                invoke: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(session.breakpoints()[0]["invoke"], true);
+    assert_eq!(vm.hit_breakpoint(5), 1);
+    wait_suspended(&session).await;
+    assert_eq!(session.status().await["suspend_reason"], "breakpoint");
+    assert!(vm.with_state(|s| s.invokes.iter().any(|(method, _)| *method == 1004)));
 }

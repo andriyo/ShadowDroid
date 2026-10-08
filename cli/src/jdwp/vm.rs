@@ -32,6 +32,21 @@ pub struct MethodInfo {
     pub method_id: u64,
     pub name: String,
     pub signature: String,
+    pub mod_bits: i32,
+}
+
+impl MethodInfo {
+    pub fn is_static(&self) -> bool {
+        self.mod_bits & super::protocol::ACC_STATIC != 0
+    }
+}
+
+/// An InvokeMethod reply: the returned value, or the thrown exception.
+#[derive(Clone, Copy, Debug)]
+pub struct InvokeResult {
+    pub value: Value,
+    /// Non-null when the invoked method threw.
+    pub exception: Value,
 }
 
 #[derive(Clone, Debug)]
@@ -462,11 +477,12 @@ impl Jdwp {
                 let name = r.string()?;
                 let signature = r.string()?;
                 let _generic = r.string()?;
-                let _mod_bits = r.i32()?;
+                let mod_bits = r.i32()?;
                 out.push(MethodInfo {
                     method_id,
                     name,
                     signature,
+                    mod_bits,
                 });
             }
             Ok(out)
@@ -877,6 +893,86 @@ impl Jdwp {
         })
     }
 
+    // ── Invocation (`--invoke`) ───────────────────────────────────────
+
+    /// A `java.lang.String` in the debuggee (for string arguments).
+    pub async fn create_string(&self, value: &str) -> Result<u64, JdwpError> {
+        let mut w = self.writer();
+        w.string(value);
+        let data = self
+            .call(set::VIRTUAL_MACHINE, vm::CREATE_STRING, w.into_bytes())
+            .await?;
+        decode("VirtualMachine.CreateString", || {
+            Reader::new(&data, self.sizes()).object_id()
+        })
+    }
+
+    /// ObjectReference.InvokeMethod on `thread`, single-threaded, bounded
+    /// by `timeout`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn invoke_instance(
+        &self,
+        object: u64,
+        thread: u64,
+        class_id: u64,
+        method_id: u64,
+        args: &[Value],
+        timeout: Duration,
+    ) -> Result<InvokeResult, JdwpError> {
+        let mut w = self.writer();
+        w.object_id(object)
+            .object_id(thread)
+            .reference_type_id(class_id)
+            .method_id(method_id)
+            .i32(args.len() as i32);
+        for arg in args {
+            w.tagged_value(arg);
+        }
+        w.i32(super::protocol::invoke::SINGLE_THREADED);
+        let data = self
+            .call_with(
+                set::OBJECT_REFERENCE,
+                object_reference::INVOKE_METHOD,
+                w.into_bytes(),
+                timeout,
+            )
+            .await?;
+        decode("ObjectReference.InvokeMethod", || {
+            read_invoke(&data, self.sizes())
+        })
+    }
+
+    /// ClassType.InvokeMethod (a static method) on `thread`.
+    pub async fn invoke_static(
+        &self,
+        class_id: u64,
+        thread: u64,
+        method_id: u64,
+        args: &[Value],
+        timeout: Duration,
+    ) -> Result<InvokeResult, JdwpError> {
+        let mut w = self.writer();
+        w.reference_type_id(class_id)
+            .object_id(thread)
+            .method_id(method_id)
+            .i32(args.len() as i32);
+        for arg in args {
+            w.tagged_value(arg);
+        }
+        w.i32(super::protocol::invoke::SINGLE_THREADED);
+        let data = self
+            .call_with(
+                set::CLASS_TYPE,
+                class_type::INVOKE_METHOD,
+                w.into_bytes(),
+                timeout,
+            )
+            .await?;
+        decode("ClassType.InvokeMethod", || {
+            read_invoke(&data, self.sizes())
+        })
+    }
+
     // ── EventRequest ──────────────────────────────────────────────────
 
     pub async fn set_event(
@@ -912,6 +1008,14 @@ impl Jdwp {
         .await
         .map(drop)
     }
+}
+
+fn read_invoke(data: &[u8], sizes: IdSizes) -> Result<InvokeResult, CodecError> {
+    let mut r = Reader::new(data, sizes);
+    Ok(InvokeResult {
+        value: r.tagged_value()?,
+        exception: r.tagged_object_id()?,
+    })
 }
 
 fn read_values(data: &[u8], sizes: IdSizes) -> Result<Vec<Value>, CodecError> {

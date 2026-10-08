@@ -10,20 +10,77 @@
 //! unary   := "!" unary | compare
 //! compare := primary (("==" | "!=" | "<" | "<=" | ">" | ">=") primary)?
 //! primary := "(" expr ")" | number | string | "true" | "false" | "null" | path
-//! path    := root ("." name | "[" integer "]")*
+//! path    := root ("." name | "." name "(" args ")" | "[" integer "]")*
+//!          | name "(" args ")" (...)*          -- a call on `this`
+//! args    := (expr ("," expr)*)?
 //! ```
 //!
-//! Paths are kept as source text and handed to the session's path reader,
-//! so the condition grammar and `debug eval` always agree on what a path is.
+//! Calls parse always but run only with `--invoke`: [`Expr::has_calls`] lets
+//! callers reject them up front. With `--invoke`, `x.name` that is not a
+//! field becomes `getName()` / `isName()` (Kotlin property sugar).
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
     Literal(Literal),
-    Path(String),
+    Path(Path),
     Not(Box<Expr>),
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
     Compare(Box<Expr>, CompareOp, Box<Expr>),
+}
+
+/// A path: a root (`this`, a local, `$exception`, ...) and segments.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Path {
+    /// Source text, for messages and names.
+    pub text: String,
+    pub root: String,
+    pub segments: Vec<Segment>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Segment {
+    Field(String),
+    Index(i64),
+    Call(String, Vec<Expr>),
+}
+
+impl Path {
+    pub fn has_calls(&self) -> bool {
+        self.segments.iter().any(|segment| match segment {
+            Segment::Call(..) => true,
+            Segment::Field(_) | Segment::Index(_) => false,
+        })
+    }
+}
+
+impl Expr {
+    /// Whether evaluating this runs a method (needs `--invoke`).
+    pub fn has_calls(&self) -> bool {
+        match self {
+            Expr::Literal(_) => false,
+            Expr::Path(path) => {
+                path.has_calls()
+                    || path.segments.iter().any(|segment| match segment {
+                        Segment::Call(_, args) => args.iter().any(Expr::has_calls),
+                        _ => false,
+                    })
+            }
+            Expr::Not(inner) => inner.has_calls(),
+            Expr::And(a, b) | Expr::Or(a, b) | Expr::Compare(a, _, b) => {
+                a.has_calls() || b.has_calls()
+            }
+        }
+    }
+}
+
+/// Parse an input that must be a single path.
+#[cfg(test)]
+pub fn parse_path(source: &str) -> Result<Path, String> {
+    match parse(source)? {
+        Expr::Path(path) => Ok(path),
+        _ => Err(format!("`{source}` is not a path")),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -377,55 +434,87 @@ impl Parser<'_> {
         }
     }
 
-    fn path_or_keyword(&mut self) -> Result<Expr, String> {
-        let start = self.pos;
-        let ident_len = self
+    fn ident(&mut self) -> &str {
+        let len = self
             .rest()
             .char_indices()
             .find(|(_, c)| !(c.is_alphanumeric() || *c == '_' || *c == '$'))
             .map_or(self.rest().len(), |(i, _)| i);
-        let ident = &self.rest()[..ident_len];
-        let keyword = match ident {
+        let start = self.pos;
+        self.pos += len;
+        &self.src[start..start + len]
+    }
+
+    /// `(` already consumed: `args )`.
+    fn call_args(&mut self) -> Result<Vec<Expr>, String> {
+        let mut args = Vec::new();
+        if self.eat(")") {
+            return Ok(args);
+        }
+        loop {
+            args.push(self.or()?);
+            if self.eat(",") {
+                continue;
+            }
+            if self.eat(")") {
+                return Ok(args);
+            }
+            return Err(format!("expected `,` or `)` at offset {}", self.pos));
+        }
+    }
+
+    fn path_or_keyword(&mut self) -> Result<Expr, String> {
+        let start = self.pos;
+        let ident = self.ident().to_string();
+        let keyword = match ident.as_str() {
             "true" => Some(Literal::Bool(true)),
             "false" => Some(Literal::Bool(false)),
             "null" => Some(Literal::Null),
             _ => None,
         };
-        self.pos += ident_len;
         if let Some(literal) = keyword {
             return Ok(Expr::Literal(literal));
+        }
+        let mut root = ident.clone();
+        let mut segments = Vec::new();
+        if self.rest().trim_start().starts_with('(') {
+            // `name(...)` is a call on `this`.
+            self.eat("(");
+            segments.push(Segment::Call(ident, self.call_args()?));
+            root = "this".into();
         }
         loop {
             if self.rest().starts_with('.') {
                 self.pos += 1;
-                let len = self
-                    .rest()
-                    .char_indices()
-                    .find(|(_, c)| !(c.is_alphanumeric() || *c == '_' || *c == '$'))
-                    .map_or(self.rest().len(), |(i, _)| i);
-                if len == 0 {
+                let name = self.ident().to_string();
+                if name.is_empty() {
                     return Err(format!("empty field name at offset {}", self.pos));
                 }
-                if self.rest()[len..].trim_start().starts_with('(') {
-                    return Err("method calls are not allowed in conditions".into());
+                if self.rest().trim_start().starts_with('(') {
+                    self.eat("(");
+                    segments.push(Segment::Call(name, self.call_args()?));
+                } else {
+                    segments.push(Segment::Field(name));
                 }
-                self.pos += len;
             } else if self.rest().starts_with('[') {
                 let Some(close) = self.rest().find(']') else {
                     return Err(format!("missing `]` at offset {}", self.pos));
                 };
                 let index = self.rest()[1..close].trim();
-                if index.parse::<i64>().is_err() {
+                let Ok(index) = index.parse::<i64>() else {
                     return Err(format!("array index must be an integer, got `{index}`"));
-                }
+                };
+                segments.push(Segment::Index(index));
                 self.pos += close + 1;
-            } else if self.rest().trim_start().starts_with('(') {
-                return Err("method calls are not allowed in conditions".into());
             } else {
                 break;
             }
         }
-        Ok(Expr::Path(self.src[start..self.pos].to_string()))
+        Ok(Expr::Path(Path {
+            text: self.src[start..self.pos].to_string(),
+            root,
+            segments,
+        }))
     }
 }
 
@@ -434,7 +523,7 @@ mod tests {
     use super::*;
 
     fn path(p: &str) -> Box<Expr> {
-        Box::new(Expr::Path(p.into()))
+        Box::new(Expr::Path(parse_path(p).unwrap()))
     }
 
     #[test]
@@ -466,8 +555,16 @@ mod tests {
             )
         );
         assert_eq!(
-            parse("$exception").unwrap(),
-            Expr::Path("$exception".into())
+            parse_path("$exception").unwrap(),
+            Path {
+                text: "$exception".into(),
+                root: "$exception".into(),
+                segments: vec![],
+            }
+        );
+        assert_eq!(
+            parse_path("items[0].name").unwrap().segments,
+            [Segment::Index(0), Segment::Field("name".into())]
         );
         assert_eq!(
             parse("x <= -2.5f").unwrap(),
@@ -488,17 +585,35 @@ mod tests {
     }
 
     #[test]
-    fn rejects_calls_and_malformed_input() {
+    fn calls_parse_and_are_flagged() {
+        let call = parse_path("this.add(1, count).name").unwrap();
+        assert_eq!(call.root, "this");
+        assert_eq!(
+            call.segments,
+            [
+                Segment::Call(
+                    "add".into(),
+                    vec![
+                        Expr::Literal(Literal::Int(1)),
+                        Expr::Path(parse_path("count").unwrap())
+                    ]
+                ),
+                Segment::Field("name".into()),
+            ]
+        );
+        assert!(Expr::Path(call).has_calls());
+        let bare = parse_path("toString()").unwrap();
+        assert_eq!(bare.root, "this");
+        assert_eq!(bare.segments, [Segment::Call("toString".into(), vec![])]);
+        assert!(parse("label.isEmpty() || !x.f(\"a\")").unwrap().has_calls());
+        assert!(!parse("a.b > 1 && c[0] == null").unwrap().has_calls());
+        assert!(parse_path("a > 1").is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_input() {
         for bad in [
-            "",
-            "foo()",
-            "this.toString()",
-            "a ==",
-            "(a",
-            "a[x]",
-            "\"open",
-            "a + b",
-            "a.",
+            "", "a.f(1", "a.f(1 2)", "a ==", "(a", "a[x]", "\"open", "a + b", "a.",
         ] {
             assert!(parse(bad).is_err(), "{bad} should not parse");
         }
