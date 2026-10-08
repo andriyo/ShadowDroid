@@ -67,6 +67,19 @@ pub fn select_variant<T>(
     }
 }
 
+/// Nesting depth of a Kotlin 2.x indy lambda body from its method name:
+/// the numeric segments after the first `$lambda$`. `f$lambda$18` is 1;
+/// `f$lambda$18$1$1$0` (nested through inline lambdas) is 4;
+/// `f$lambda$0$lambda$1` is 2. `None` for names without `$lambda$`.
+pub fn indy_lambda_depth(name: &str) -> Option<u32> {
+    let (_, rest) = name.split_once("$lambda$")?;
+    let depth = rest
+        .split('$')
+        .filter(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+        .count() as u32;
+    Some(depth.max(1))
+}
+
 impl Session {
     /// Lambda nesting depth of `method` in class `class_id` (0: outer).
     pub(super) async fn lambda_depth(
@@ -75,9 +88,8 @@ impl Session {
         signature: &str,
         method: &MethodInfo,
     ) -> u32 {
-        let segments = method.name.matches("$lambda$").count() as u32;
-        if segments > 0 {
-            return segments;
+        if let Some(depth) = indy_lambda_depth(&method.name) {
+            return depth;
         }
         if method.name != "invoke" && method.name != "invokeSuspend" {
             return 0;
@@ -127,6 +139,20 @@ mod tests {
             ACC_SYNTHETIC | 0x8
         )));
         assert!(!is_bridge(&method("onCreate", 1)));
+    }
+
+    #[test]
+    fn nested_indy_lambdas_are_deeper_than_their_parent() {
+        // Device names (sample, Kotlin 2.x + D8): the slider's
+        // `onValueChange = { continuous = it }` inside a composable lambda.
+        assert_eq!(indy_lambda_depth("ComposeRangeFixtures$lambda$18"), Some(1));
+        assert_eq!(
+            indy_lambda_depth("ComposeRangeFixtures$lambda$18$1$1$0"),
+            Some(4)
+        );
+        assert_eq!(indy_lambda_depth("onCreate$lambda$2$0"), Some(2));
+        assert_eq!(indy_lambda_depth("onNewIntent$lambda$0$lambda$1"), Some(2));
+        assert_eq!(indy_lambda_depth("onCreate"), None);
     }
 
     #[test]
