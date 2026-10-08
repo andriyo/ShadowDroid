@@ -929,6 +929,8 @@ impl Session {
             if breakpoint.locations.is_empty() {
                 breakpoint.pending_reason = Some(if source_matched == 0 {
                     "class_not_loaded"
+                } else if breakpoint.note == Some(VARIANT_MATCHES_NOTHING_NOTE) {
+                    "no_location_for_variant"
                 } else {
                     "line_not_in_loaded_classes"
                 });
@@ -1032,7 +1034,15 @@ impl Session {
             let depth = self.lambda_depth(class_id, &signature, method).await;
             candidates.push((method, index, depth));
         }
+        let had_code = !candidates.is_empty();
         let candidates = super::lambdas::select_variant(candidates, variant);
+        if had_code && candidates.is_empty() {
+            // The line has code here, just none the variant asks for (an
+            // `--variant outer` on a line that only holds lambdas).
+            if let Some(b) = self.state().breakpoints.get_mut(id) {
+                b.note = Some(VARIANT_MATCHES_NOTHING_NOTE);
+            }
+        }
         let mut bound = Vec::new();
         for (method, index, depth) in candidates {
             let location = Location {
@@ -2027,3 +2037,7 @@ mod tests {
         assert_eq!(timeout.detail["command"], "VirtualMachine.Version");
     }
 }
+
+/// Set when a line has code in a loaded class but none of it matches the
+/// breakpoint's `--variant`.
+pub(super) const VARIANT_MATCHES_NOTHING_NOTE: &str = "the line has code, but none of it matches --variant (outer: the enclosing method; lambda: the innermost lambda); try --variant all";

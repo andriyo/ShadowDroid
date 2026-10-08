@@ -513,6 +513,8 @@ const CLASSES: &[Class] = &[
             (1012, "getCounter", "()I", &[(0, 42)]),
             // Setter of the delegated property `status` (field `status$delegate`).
             (1018, "setStatus", "(Ljava/lang/String;)V", &[(0, 44)]),
+            // Line 27 holds only a lambda body (no outer call site).
+            (1019, "onCreate$lambda$5", "()V", &[(0, 27)]),
             // A synthetic bridge a function reference adds: never bound.
             (
                 1013,

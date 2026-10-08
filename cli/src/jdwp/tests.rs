@@ -1654,3 +1654,32 @@ async fn each_variant_of_a_line_is_its_own_breakpoint() {
     assert_eq!(again["created"], false);
     assert_eq!(again["breakpoint"]["id"], lambda["breakpoint"]["id"]);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_variant_with_no_location_on_the_line_says_so() {
+    use super::lambdas::LineVariant;
+    let vm = FakeVm::start();
+    let session = attach(&vm, WAIT).await;
+    // Line 27 holds only the lambda body `onCreate$lambda$5`.
+    let outer = session
+        .break_line_with(
+            target("MainActivity.kt"),
+            27,
+            BreakpointOptions {
+                variant: LineVariant::Outer,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outer["breakpoint"]["pending_reason"], "no_location_for_variant",
+        "{outer}"
+    );
+    assert!(
+        outer["breakpoint"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("--variant")
+    );
+}
