@@ -8,31 +8,39 @@
 > E11 decision in the [agent verification roadmap](agent-verification-roadmap.md)
 > that declined to build a JDWP stack.
 
-> **P0 status (2026-10-08, branch `feat/jdwp-debugger-p0`).** Landed in
-> [cli/src/jdwp/](../cli/src/jdwp): the codec, connection, and typed commands
-> for every command set in §4.3 except the invoke tier; `jdwp:<pid>` transport
-> over the in-tree ADB client plus a plain-TCP override
-> (`SHADOWDROID_JDWP_TCP`) for tests; line and exception breakpoints with
-> deferred binding (ClassPrepare + `SourceNameMatch`, which the spike showed
-> ART honours although `canUseSourceNameFilters` is false); the `__debugd`
-> daemon (JSON-RPC 2.0 over a `0600` unix socket, registry under
-> `~/.shadowdroid/debug/<serial>/`, idle timeout, Dispose on every exit path);
-> and `debug attach|detach|sessions|status|break line|break exception|break
-> remove|breakpoints|pause|resume|step-*|stack|threads|variables|eval|inspect
-> --backend jdwp`. Tested device-free against a fake VM
-> (`cli/tests/support/fake_jdwp.rs`). Stubbed (`unsupported_by_backend`):
-> logpoints, conditions, method/field breakpoints, watches, continue-until,
-> coroutines, `debug auto`/`snapshot`/run-until helpers, `--wait-for-launch`,
-> the doctor check, SMAP (inline bodies report `unsupported_location`).
-> Changes to this design: `auto` currently means `studio`; the config key is
-> the flat `debug_backend` (like `debug_mode`), not `debug.backend`; the jdwp
-> backend needs a unix host; method breakpoints must become line breakpoints
-> at each method's first line (the spike measured MethodEntry as far too
-> costly on ART), never MethodEntry. Live validation added: on Android a
-> crash is never "uncaught" to JDWP (Looper and Compose input dispatch catch
-> and rethrow), so `--uncaught` means "not caught by app code": the request
-> asks for caught events too and the daemon drops those an app frame
-> catches; the thrown object is reachable as `$exception`.
+> **P1b status (2026-10-08, branch `feat/jdwp-debugger-p1b`; P0 is on
+> main).** The standalone backend ([cli/src/jdwp/](../cli/src/jdwp)) now
+> serves, with `--backend jdwp`: `attach|detach|sessions|status`; `break
+> line|exception|update|remove` with `--condition`, `--temporary`,
+> `--disabled`, `--pass-count` (native Count, always the last modifier; the
+> breakpoint reports `expired` after it fires), suspend policy, and
+> idempotent `break line` per file:line; `breakpoints`;
+> `pause|resume|step-*|stack|threads|variables|eval|inspect`;
+> `logpoint add|list|events|follow|remove|clear` with the Studio event and
+> cursor/stream-id contract; `continue-until --file --line [--condition]`;
+> and the composed `auto [--from-start]`, `snapshot`, `run-until-crash`,
+> `step-until-screen-change`, `step-until-log`. Launch-time debugging:
+> `attach --wait-for-launch` and `auto --from-start` restart the app under
+> `am set-debug-app -w`, attach to the new pid, install `--break FILE:LINE`
+> and `--break-exception CLASS` while a 300 ms keep-alive holds
+> `Debug.waitForDebugger`, and run `am clear-debug-app` on every exit path.
+> Conditions and log expressions use the path grammar plus comparisons,
+> literals, `&& || !`, and parentheses (no calls), evaluated daemon-side with
+> SUSPEND_EVENT_THREAD; a failed condition leaves the thread suspended and
+> records `last_evaluation_error`. Suspending hits default to 20/s (ceiling
+> 100/s); above the rate the breakpoint is disarmed until the next second
+> (`throttled`, `dropped`, `rearm_at`), never deleted. A logpoint that only
+> logs its position uses SUSPEND_NONE. `run-until-crash` stops on an
+> app-uncaught Throwable and returns the live `$exception`, throwing frame,
+> and locals without resuming; a process that dies without a Java stop (EOF,
+> no VMDeath) falls back to the logcat crash, ANR, and tombstone scan.
+> Attach-to-running sessions warn after 4 s suspended (ANR timers still run).
+> Still `unsupported_by_backend`: method/field breakpoints, watches, invoke
+> eval, coroutines, `debug record`, `debug native`, the doctor check, SMAP,
+> and the `auto` backend policy (`auto` still means `studio`). Earlier design
+> changes stand: flat `debug_backend` config key, unix hosts only, method
+> breakpoints as first-line breakpoints (never MethodEntry), and `--uncaught`
+> meaning "not caught by app code".
 
 Design and phased plan for a debugger that needs **no Android Studio**: the CLI
 speaks JDWP to the app itself, through the same adb connection it already owns,
