@@ -437,7 +437,16 @@ impl Session {
         }
         let base_end = expr.find(['.', '[']).unwrap_or(expr.len());
         let base = &expr[..base_end];
-        let (value, declared) = if base == "this" {
+        let (value, declared) = if base == EXCEPTION_ROOT {
+            // The exception an exception breakpoint stopped on.
+            let exception = self.suspension().and_then(|s| s.exception).ok_or_else(|| {
+                RpcError::new(
+                    "invalid_expression",
+                    "`$exception` is only set while stopped at an exception breakpoint",
+                )
+            })?;
+            (exception, Some("java.lang.Throwable".to_string()))
+        } else if base == "this" {
             let this = self.this_value(selected).await?.ok_or_else(|| {
                 RpcError::new(
                     "invalid_expression",
@@ -1005,6 +1014,9 @@ fn truncate(text: &str, max: usize) -> (String, bool) {
 }
 
 /// Request deadline for read verbs: the caller's `--timeout-ms`, bounded.
+/// Expression root naming the thrown object at an exception stop.
+pub const EXCEPTION_ROOT: &str = "$exception";
+
 pub fn read_timeout(timeout_ms: u64) -> Duration {
     Duration::from_millis(timeout_ms.clamp(100, 120_000))
 }

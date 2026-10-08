@@ -283,6 +283,7 @@ async fn unowned_events_resume_and_lines_without_code_stay_pending() {
             source_name: None,
             class_match: None,
             step_thread: None,
+            exception_flags: None,
             modifier_kinds: vec![7],
         })
     });
@@ -382,4 +383,59 @@ async fn a_class_prepared_during_the_scan_is_bound_once() {
         1,
         "{breakpoints}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uncaught_means_not_caught_by_app_code() {
+    let vm = FakeVm::start();
+    let session = attach(&vm, WAIT).await;
+    // java.lang.String (id 103) stands in for any loaded throwable class.
+    let breakpoint = session
+        .break_exception("java.lang.String", false, true)
+        .await
+        .unwrap();
+    assert_eq!(breakpoint["bound"], true, "{breakpoint}");
+    // ART reports a catch location for Android crashes (Looper rethrows):
+    // the request must ask for caught events too.
+    let flags = vm.with_state(|s| {
+        s.requests
+            .iter()
+            .find(|r| r.kind == 4)
+            .and_then(|r| r.exception_flags)
+    });
+    assert_eq!(flags, Some((true, true)));
+
+    // Caught by app code (MainActivity, id 100): not a stop, VM resumed.
+    assert_eq!(vm.throw_exception(Some(100)), 1);
+    vm.wait_for(WAIT, "the filtered exception to resume", |s| s.resumes == 1);
+    assert!(session.suspension().is_none());
+
+    // Caught by framework code (java.lang.Object, id 104): a crash path.
+    assert_eq!(vm.throw_exception(Some(104)), 1);
+    wait_suspended(&session).await;
+    let status = session.status().await;
+    assert_eq!(status["suspend_reason"], "exception", "{status}");
+    assert_eq!(session.breakpoints()[0]["hit_count"], 1);
+    // The thrown object is pinned and reachable as `$exception`.
+    assert_eq!(
+        status["exception_handle"],
+        format!("obj_{ACTIVITY_OBJECT}"),
+        "{status}"
+    );
+    assert_eq!(status["exception_expression"], "$exception", "{status}");
+    let thrown = session
+        .eval("$exception", None, None, OPTIONS)
+        .await
+        .unwrap();
+    assert_eq!(
+        thrown["result"]["object_handle"],
+        format!("obj_{ACTIVITY_OBJECT}"),
+        "{thrown}"
+    );
+    session.resume().await.unwrap();
+
+    // Truly uncaught: a stop as well.
+    assert_eq!(vm.throw_exception(None), 1);
+    wait_suspended(&session).await;
+    assert_eq!(session.breakpoints()[0]["hit_count"], 2);
 }

@@ -44,6 +44,8 @@ pub struct Request {
     pub source_name: Option<String>,
     pub class_match: Option<String>,
     pub step_thread: Option<u64>,
+    /// ExceptionOnly `(caught, uncaught)` flags.
+    pub exception_flags: Option<(bool, bool)>,
     pub modifier_kinds: Vec<u8>,
 }
 
@@ -179,6 +181,54 @@ impl FakeVm {
             self.send(&packet);
         }
         count
+    }
+
+    /// Throw from `onNewIntent` index 5, caught in `catch_class` (`None`:
+    /// uncaught). Fires every exception request whose flags match as one
+    /// composite (suspend policy ALL), as ART does.
+    pub fn throw_exception(&self, catch_class: Option<u64>) -> usize {
+        let matching: Vec<i32> = self.with_state(|state| {
+            state
+                .requests
+                .iter()
+                .filter(|r| r.kind == 4 && !state.cleared.contains(&r.id))
+                .filter(|r| {
+                    r.exception_flags.is_some_and(|(caught, uncaught)| {
+                        if catch_class.is_some() {
+                            caught
+                        } else {
+                            uncaught
+                        }
+                    })
+                })
+                .map(|r| r.id)
+                .collect()
+        });
+        if matching.is_empty() {
+            return 0;
+        }
+        self.with_state(|state| state.suspend_count += 1);
+        let mut body = vec![2_u8];
+        put_i32(&mut body, matching.len() as i32);
+        for request in &matching {
+            body.push(4);
+            put_i32(&mut body, *request);
+            put_u64(&mut body, MAIN_THREAD);
+            put_location(&mut body, ACTIVITY_CLASS, ON_NEW_INTENT, 5);
+            body.push(b'L');
+            put_u64(&mut body, ACTIVITY_OBJECT);
+            match catch_class {
+                Some(class) => put_location(&mut body, class, 0, 0),
+                None => {
+                    body.push(0);
+                    put_u64(&mut body, 0);
+                    put_u64(&mut body, 0);
+                    put_u64(&mut body, 0);
+                }
+            }
+        }
+        self.send(&command_packet(0x4000_0004, 64, 100, &body));
+        matching.len()
     }
 
     /// Drop the connection (the app process died).
@@ -791,6 +841,7 @@ fn handle(shared: &Shared, set: u8, cmd: u8, body: &[u8]) -> (u16, Vec<u8>, Afte
                 source_name: None,
                 class_match: None,
                 step_thread: None,
+                exception_flags: None,
                 modifier_kinds: Vec::new(),
             };
             for _ in 0..count {
@@ -816,8 +867,9 @@ fn handle(shared: &Shared, set: u8, cmd: u8, body: &[u8]) -> (u16, Vec<u8>, Afte
                     }
                     8 => {
                         c.u64();
-                        c.u8();
-                        c.u8();
+                        let caught = c.u8() != 0;
+                        let uncaught = c.u8() != 0;
+                        request.exception_flags = Some((caught, uncaught));
                     }
                     10 => {
                         request.step_thread = Some(c.u64());

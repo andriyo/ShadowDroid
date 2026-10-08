@@ -44,6 +44,16 @@ pub const DEFAULT_STEP_FILTERS: &[&str] = &[
     "libcore.*",
 ];
 
+/// Whether `class` (dotted name) belongs to the packages
+/// [`DEFAULT_STEP_FILTERS`] treat as framework or library code.
+pub fn is_framework_class(class: &str) -> bool {
+    DEFAULT_STEP_FILTERS.iter().any(|pattern| {
+        pattern
+            .strip_suffix('*')
+            .is_some_and(|prefix| class.starts_with(prefix))
+    })
+}
+
 /// Cap on objects pinned with DisableCollection while suspended.
 pub const MAX_LIVE_HANDLES: usize = 512;
 const RECENT_EVENTS: usize = 64;
@@ -531,6 +541,15 @@ impl Session {
             Some(thread) => Some(self.thread_name(thread).await),
             None => None,
         };
+        // Pinned so the thrown object stays inspectable for this suspension.
+        let exception_handle = match suspension
+            .as_ref()
+            .and_then(|s| s.exception)
+            .and_then(|e| e.object_id())
+        {
+            Some(object) if object != 0 => self.pin(object).await,
+            _ => None,
+        };
         let state = self.state();
         json!({
             "id": self.info.session_id,
@@ -545,6 +564,8 @@ impl Session {
             "suspend_reason": suspension.as_ref().map(|s| s.reason),
             "suspended_at": suspension.as_ref().map(|s| s.at),
             "exception_id": suspension.as_ref().and_then(|s| s.exception).and_then(|e| e.object_id()),
+            "exception_handle": exception_handle,
+            "exception_expression": exception_handle.as_ref().map(|_| super::inspect::EXCEPTION_ROOT),
             "breakpoint_id": suspension.as_ref().and_then(|s| s.breakpoint_id.clone()),
             "thread": thread_name,
             "position": position,
@@ -878,6 +899,11 @@ impl Session {
         caught: bool,
         uncaught: bool,
     ) -> RpcResult<BoundLocation> {
+        // On Android a crash is never "uncaught" to JDWP: Looper.loopOnce and
+        // Compose's pointer dispatch catch and rethrow, so ART reports a catch
+        // location and an uncaught-only request never fires (spike Q11).
+        // Ask for caught events too and keep, daemon-side, the ones no app
+        // frame catches (see `caught_by_app`).
         let request_id = self
             .jdwp
             .set_event(
@@ -885,7 +911,7 @@ impl Session {
                 suspend_policy::ALL,
                 &[Modifier::ExceptionOnly {
                     exception: type_id,
-                    caught,
+                    caught: caught || uncaught,
                     uncaught,
                 }],
             )
@@ -1300,10 +1326,22 @@ impl Session {
                     thread,
                     location,
                     exception,
+                    catch_location,
                     ..
                 },
                 Some(Owner::Breakpoint(id)),
             ) => {
+                let uncaught_only = matches!(
+                    self.state().breakpoints.get(&id).map(|b| &b.kind),
+                    Some(BreakpointKind::Exception {
+                        caught: false,
+                        uncaught: true,
+                        ..
+                    })
+                );
+                if uncaught_only && self.caught_by_app(catch_location.as_ref()).await {
+                    return Ok(false);
+                }
                 self.record_stop(
                     "exception",
                     Some(*thread),
@@ -1375,6 +1413,20 @@ impl Session {
                 );
                 Ok(false)
             }
+        }
+    }
+
+    /// Whether an app frame catches the exception. A catch in framework or
+    /// library code (the same packages step-into skips) still lets it crash
+    /// the app on Android, so it counts as uncaught.
+    async fn caught_by_app(&self, catch_location: Option<&Location>) -> bool {
+        let Some(location) = catch_location else {
+            return false;
+        };
+        match self.signature(location.class_id).await {
+            Ok(signature) => !is_framework_class(&resolve::type_name(&signature)),
+            // Unknown catcher: report the stop rather than hide a crash.
+            Err(_) => false,
         }
     }
 
