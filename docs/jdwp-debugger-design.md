@@ -1,46 +1,63 @@
 # ShadowDroid — Standalone Debugger Design (`debug --backend jdwp`)
 
-> Status: **DESIGN, approved for a spike** (2026-10-08). Nothing below is
-> implemented. The current `debug` surface is served only by the Android Studio
-> plugin bridge ([cmd/debugger.rs](../cli/src/cmd/debugger.rs),
-> [cmd/studio_contract.rs](../cli/src/cmd/studio_contract.rs),
-> [shadowdroid-plugin](../shadowdroid-plugin)). This document supersedes the
-> E11 decision in the [agent verification roadmap](agent-verification-roadmap.md)
-> that declined to build a JDWP stack.
+> Status: **IMPLEMENTED through P1c** (2026-10-08; P0 and P1b are on main,
+> P1c on branch `feat/jdwp-debugger-p1c`). The standalone backend lives in
+> [cli/src/jdwp/](../cli/src/jdwp); the Studio plugin bridge
+> ([cmd/debugger.rs](../cli/src/cmd/debugger.rs),
+> [shadowdroid-plugin](../shadowdroid-plugin)) remains the other backend.
+> This document supersedes the E11 decision in the
+> [agent verification roadmap](agent-verification-roadmap.md) that declined to
+> build a JDWP stack. User-facing docs:
+> [debugging.md](debugging.md#standalone-debugger-no-android-studio).
 
-> **P1b status (2026-10-08, branch `feat/jdwp-debugger-p1b`; P0 is on
-> main).** The standalone backend ([cli/src/jdwp/](../cli/src/jdwp)) now
-> serves, with `--backend jdwp`: `attach|detach|sessions|status`; `break
-> line|exception|update|remove` with `--condition`, `--temporary`,
-> `--disabled`, `--pass-count` (native Count, always the last modifier; the
-> breakpoint reports `expired` after it fires), suspend policy, and
-> idempotent `break line` per file:line; `breakpoints`;
-> `pause|resume|step-*|stack|threads|variables|eval|inspect`;
-> `logpoint add|list|events|follow|remove|clear` with the Studio event and
-> cursor/stream-id contract; `continue-until --file --line [--condition]`;
-> and the composed `auto [--from-start]`, `snapshot`, `run-until-crash`,
-> `step-until-screen-change`, `step-until-log`. Launch-time debugging:
-> `attach --wait-for-launch` and `auto --from-start` restart the app under
-> `am set-debug-app -w`, attach to the new pid, install `--break FILE:LINE`
-> and `--break-exception CLASS` while a 300 ms keep-alive holds
-> `Debug.waitForDebugger`, and run `am clear-debug-app` on every exit path.
-> Conditions and log expressions use the path grammar plus comparisons,
-> literals, `&& || !`, and parentheses (no calls), evaluated daemon-side with
-> SUSPEND_EVENT_THREAD; a failed condition leaves the thread suspended and
-> records `last_evaluation_error`. Suspending hits default to 20/s (ceiling
-> 100/s); above the rate the breakpoint is disarmed until the next second
-> (`throttled`, `dropped`, `rearm_at`), never deleted. A logpoint that only
-> logs its position uses SUSPEND_NONE. `run-until-crash` stops on an
-> app-uncaught Throwable and returns the live `$exception`, throwing frame,
-> and locals without resuming; a process that dies without a Java stop (EOF,
-> no VMDeath) falls back to the logcat crash, ANR, and tombstone scan.
-> Attach-to-running sessions warn after 4 s suspended (ANR timers still run).
-> Still `unsupported_by_backend`: method/field breakpoints, watches, invoke
-> eval, coroutines, `debug record`, `debug native`, the doctor check, SMAP,
-> and the `auto` backend policy (`auto` still means `studio`). Earlier design
-> changes stand: flat `debug_backend` config key, unix hosts only, method
-> breakpoints as first-line breakpoints (never MethodEntry), and `--uncaught`
-> meaning "not caught by app code".
+> **What ships (P0–P1c).** `attach|detach|sessions|status`; `break
+> line|exception|method|field|update|remove` with conditions, pass counts
+> (native Count, reported `expired`), temporary/disabled, suspend policy;
+> `logpoint add|list|events|follow|remove|clear` with Studio's cursor
+> contract; `pause|resume|step-*|continue-until`, `stack|threads|variables|
+> eval|inspect`, handles; `watch add|list|remove|clear`; `coroutines
+> snapshot|threads|continuation|flow`; the composed `auto [--from-start]`,
+> `snapshot`, `run-until-crash`, `step-until-log`, `step-until-screen-change`;
+> launch-time breakpoints via `attach --wait-for-launch --break`.
+> Measured behaviour that shaped the design, each a change from the sections
+> below:
+>
+> - **Invoke tier** (`--invoke` on eval/inspect/conditions/logpoints/
+>   `break update`): INVOKE_SINGLE_THREADED, 1.7–3.1 ms per call on the
+>   emulator; property sugar `x` → `getX()`/`isX()` only with `--invoke`;
+>   a thrown exception is a result (`thrown: {type, message}`), not an error.
+>   Every daemon-owned breakpoint and step request is cleared for the call and
+>   re-armed after; events during it resume their thread unrecorded. ART
+>   refuses invokes on a thread stopped by `debug pause` (error 10), so those
+>   are rejected up front (`invoke_requires_event_stop`). A call past its
+>   deadline returns `invoke_timeout` and marks the thread busy until the late
+>   reply (frame reads refuse `thread_busy_invoking`).
+> - **Method breakpoints** are line breakpoints at the first line and at every
+>   return (DEX return opcodes from Method.Bytecodes), never
+>   MethodEntry/MethodExit, which deoptimize the whole app.
+> - **Field breakpoints** default to the Kotlin accessors' lines; a real field
+>   watch needs `--accept-slowdown`, warns on every response, and auto-clears
+>   after `--duration-ms` (60 s); `status.slow_requests` counts armed ones.
+> - **Lambdas**: a location is a lambda when its method contains `$lambda$`
+>   (depth = count), or is `invoke`/`invokeSuspend` of a Lambda/SuspendLambda/
+>   function-reference class; bridges are skipped. `--variant
+>   all|outer|lambda` (lambda = deepest).
+> - **step-until-screen-change** runs `mode: "run_to_frame"`
+>   ([§5.5](#55-stepping-and-threads)).
+> - **Coroutines**: `snapshot` also discovers coroutines process-wide with
+>   ReferenceType.Instances (capped at 100 per class, class discovery cached
+>   per session); source lines are not read (they need an invoke) and the
+>   response points at `aar coroutines`.
+> - **Backend policy** ([§4.4](#44-backend-selection)): `auto` resolves per
+>   command and reports `backend_reason`.
+> - Earlier decisions stand: flat `debug_backend` config key, unix hosts
+>   only, `--uncaught` meaning "not caught by app code", keep-alive Version
+>   pings during wait-for-launch, suspending hits capped at 20/s by default
+>   (ceiling 100/s), ANR warning after 4 s for attach-to-running sessions.
+>
+> Not done: `debug record`, `debug native`/mixed mode, and `debug clients`
+> (Studio only); the doctor check; SMAP inline-body resolution; coroutine
+> source lines; `step-until-screen-change --stop-at frame`; Windows hosts.
 
 Design and phased plan for a debugger that needs **no Android Studio**: the CLI
 speaks JDWP to the app itself, through the same adb connection it already owns,

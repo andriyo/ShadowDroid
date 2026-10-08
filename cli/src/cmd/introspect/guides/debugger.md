@@ -1,6 +1,28 @@
-# Android Studio debugger and layout guide
+# Debugger and layout guide
 
-The optional Studio plugin adds debugger and Layout Inspector data. Begin with:
+`debug` runs on Android Studio's debugger (plugin bridge) or on the built-in
+standalone debugger (`--backend jdwp`, no Studio). The default `--backend
+auto` uses a live jdwp session that holds the target, else a reachable Studio
+bridge, else jdwp; results carry `backend` and `backend_reason`. Layout
+Inspector data and native/mixed debugging always need Studio.
+
+Without Studio:
+
+```bash
+shadowdroid debug attach --package com.example --backend jdwp
+shadowdroid debug attach --package com.example --wait-for-launch \
+  --break MainActivity.kt:54 --backend jdwp   # code that runs at startup
+shadowdroid debug stack --backend jdwp
+shadowdroid debug eval 'this.getLabel()' --invoke --backend jdwp
+shadowdroid debug detach --backend jdwp
+```
+
+Reads never run app code; `--invoke` opts into method calls and is reported
+as a device mutation. Attaching to an already running app keeps its ANR
+timers: a session suspended for more than a few seconds warns, so prefer
+`--wait-for-launch` for long inspection.
+
+With Studio:
 
 ```bash
 shadowdroid studio status --json

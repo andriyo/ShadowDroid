@@ -44,14 +44,16 @@ matching the active policy.
 ## The agent debugger
 
 Driving a UI tells an agent *what* happened on screen; debugging tells it
-*why*. ShadowDroid hands a coding agent a live Android Studio debugger as plain
-JSON — so when a tap doesn't do what the agent expected, it can set a
+*why*. ShadowDroid hands a coding agent a live debugger as plain JSON — its
+own [standalone debugger](#standalone-debugger-no-android-studio) or Android
+Studio's — so when a tap doesn't do what the agent expected, it can set a
 breakpoint and read the actual program state instead of guessing from
 screenshots. Reads are bounded, while attach, pause/resume/step,
 breakpoint/watch changes, and evaluation have normal debugger side effects. It
 is a debugger control surface, not a remote shell.
 
-Backed by the optional Android Studio plugin:
+The `debug` verbs below run on either backend unless noted; with the
+optional Android Studio plugin they also reach Studio's debugger:
 
 - **`debug auto [app]`** — low-effort path: resolve an app alias/name/package,
   launch it, attach the Studio debugger when available, then return a full
@@ -83,10 +85,70 @@ Backed by the optional Android Studio plugin:
   Inspector is live) with Compose source locations, semantics, and recomposition
   counters.
 
+## Standalone debugger (no Android Studio)
+
+`--backend jdwp` debugs the app directly over JDWP through the adb connection
+ShadowDroid already owns: no Android Studio, no plugin, no port forwards. A
+small per-process daemon holds the session (one debugger per process, as with
+any JDWP client), so verbs in later commands find it again; `debug detach`
+ends it and resumes the app.
+
+The default `--backend auto` picks a backend per command: a live standalone
+session that holds the target wins; otherwise a reachable Studio bridge keeps
+the Studio path; otherwise the standalone debugger. Every result says which
+one answered (`backend`) and why (`backend_reason`). Set `debug_backend` in
+config, or pass `--backend studio|jdwp`, to pin one.
+
+What works:
+
+- `attach`/`detach`/`sessions`/`status`, `pause`/`resume`/`step-*`,
+  `continue-until`, `stack`, `threads`, `variables`, `eval`, `inspect`, object
+  handles, `watch`, and the composed `auto`, `snapshot`, `run-until-crash`,
+  `step-until-log`, and `step-until-screen-change`.
+- Line breakpoints resolved from your project sources (lambdas included;
+  `--variant outer|lambda` picks one), exception breakpoints, conditions,
+  pass counts, temporary/disabled breakpoints, and logpoints with the same
+  event stream and cursors as Studio.
+- Method breakpoints, set as line breakpoints at the method's first line and
+  at each return. Kotlin property watches use the getter/setter;
+  `break field --accept-slowdown` sets a real field watch for a bounded
+  `--duration-ms` (it slows the whole app while armed).
+- Startup code: `debug attach --wait-for-launch --package <pkg> --break
+  File.kt:LINE` (or `debug auto --from-start --break …`) restarts the app
+  under the debugger and installs breakpoints before the first line runs.
+- `run-until-crash` stops on an uncaught exception with the throwing frame
+  and its locals still live, before the process dies.
+- `debug coroutines snapshot` lists coroutines process-wide (name,
+  dispatcher, state, suspended continuations) from a stopped session, read
+  from fields only; source lines need `aar coroutines`.
+
+Method calls are opt-in. Reads (fields, locals, array items, Kotlin
+properties with a backing field) never run app code. `--invoke` on `eval`,
+`inspect`, conditions, and logpoints allows getters, `toString()`, and other
+calls (single-threaded, bounded by `--timeout-ms`); the catalog marks it as
+a device mutation. Invocation needs a thread stopped by a breakpoint or step,
+not by `debug pause`.
+
+Limits:
+
+- Attaching to an app that is already running keeps Android's ANR timers.
+  A session suspended for more than about 4 s warns, and pending input will
+  raise an ANR dialog; use `--wait-for-launch` for long inspection.
+- Not available standalone: native/mixed debugging (`debug native`,
+  `attach --mode native|mixed`), `debug record`, `debug clients`, and Layout
+  Inspector data (`layout`, `ui dump --deep`). These stay on Studio.
+- Expressions use the deterministic path grammar (plus comparisons and, with
+  `--invoke`, calls), not Kotlin compiled by the IDE.
+- Field watches and method-exit events deoptimize the whole app; the
+  defaults avoid them and the opt-in reports the cost.
+- Unix hosts (macOS, Linux); Android 9 (API 28) or newer; debuggable apps
+  (or any process on `ro.debuggable=1` emulator images).
+
 ## Non-suspending logpoints
 
 Logpoints observe a source line without leaving the app paused on successful
-hits. They require the ShadowDroid Android Studio plugin, the matching Android
+hits. On the standalone debugger they need only an attached session. On
+Studio they require the ShadowDroid Android Studio plugin, the matching Android
 project open in Studio, and a debuggable app attached to the Studio debugger.
 The source must match the installed build. Conditions and expressions run in
 the app's debugger context and can call code, mutate state, block, or throw;
@@ -166,6 +228,7 @@ available for convenience but can change as sessions start/stop. Global `-d
 ## Graceful degradation
 
 Everything degrades gracefully: with no Studio plugin running, the device and UI
-commands still work and the debugger section just reports `available:false`.
+commands still work, `debug` falls back to the standalone debugger, and only
+Layout Inspector sections report `available:false`.
 Run `shadowdroid debug --help` and `shadowdroid layout --help` for the live
 command surface.

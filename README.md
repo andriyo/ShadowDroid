@@ -193,8 +193,8 @@ possible:
   resulting screen in the same response.
 - **Failures that explain themselves**: what *is* on screen, ranked
   near-matches, crash events riding the next response.
-- **A debugger an agent can read**: Android Studio breakpoints, stacks,
-  variables, and Layout Inspector data as JSON.
+- **A debugger an agent can read**: breakpoints, stacks, and variables as
+  JSON, with or without Android Studio, plus Layout Inspector data.
 
 ShadowDroid is a **complement, not a replacement**: keep `adb`, Android
 Studio, and the `android` CLI for scaffold/build/deploy/SDK work, and keep
@@ -236,13 +236,15 @@ network failures into a single verdict with evidence and next steps.
 `collect` bundles everything for a hand-off. →
 [docs/debugging.md](docs/debugging.md)
 
-**The debugger, as JSON.** Through the optional Android Studio plugin, the
-agent gets a live debugger it can read: breakpoints (line, exception, method,
-field; conditional and temporary), call stacks, threads, variables, watches,
-expression evaluation, non-suspending logpoints with structured hit streams,
-coroutine insight, and Layout Inspector data — Compose source locations and
-recomposition counts. UI polling tells an agent *what* happened; this tells it
-*why*. → [docs/debugging.md](docs/debugging.md)
+**The debugger, as JSON.** The agent gets a live debugger it can read:
+breakpoints (line, exception, method, field; conditional and temporary),
+call stacks, threads, variables, watches, expression evaluation,
+non-suspending logpoints with structured hit streams, and coroutine insight.
+It runs standalone over JDWP (no Android Studio needed, including breakpoints
+in startup code) or through Android Studio's debugger when it is open; the
+optional Studio plugin adds native/mixed debugging and Layout Inspector data —
+Compose source locations and recomposition counts. UI polling tells an agent
+*what* happened; this tells it *why*. → [docs/debugging.md](docs/debugging.md)
 
 **The network, observed and shaped.** A host-side MITM proxy built into the
 binary captures decrypted HTTP(S) — HTTP/2, SSE, streaming bodies,
@@ -281,9 +283,9 @@ for agents is the CLI and `shadowdroid commands --json`.
 Three optional integrations extend the same command surface, and everything
 degrades gracefully without them:
 
-- **Android Studio plugin** — exposes the debugger and Layout Inspector to
-  `shadowdroid debug ...` and `shadowdroid layout ...` (installed by
-  `shadowdroid init` or `studio install`).
+- **Android Studio plugin** — exposes Studio's debugger and Layout Inspector
+  to `shadowdroid debug ...` and `shadowdroid layout ...` (installed by
+  `shadowdroid init` or `studio install`). `debug` also works without it.
 - **Built-in MITM proxy** — `shadowdroid net ...` wires the device through
   `adb reverse` and restores the previous proxy state on stop.
 - **Debug-only in-app AAR** — `shadowdroid aar ...` adds process/coroutine
@@ -347,7 +349,8 @@ replace them. Any other agent that can run a shell command can bootstrap from
 - [Network](docs/network.md) — HTTP(S)/WebSocket capture, interception,
   rules, fixtures and replay, CA management, the OkHttp AAR companion.
 - [Triage and debugging](docs/debugging.md) — `why`/`log`/`collect`, the
-  Android Studio debugger surface, logpoints, layout/Compose inspection.
+  debugger (standalone or Android Studio), logpoints, layout/Compose
+  inspection.
 - [Device and state controls](docs/device-state.md) — app state
   snapshot/restore, permissions/app-ops, files, display profiles, screen
   video evidence.
@@ -357,8 +360,8 @@ replace them. Any other agent that can run a shell command can bootstrap from
   sample app.
 - [Agent verification roadmap](docs/agent-verification-roadmap.md) — implementation status,
   acceptance gates and remaining experiments.
-- [Standalone debugger design](docs/jdwp-debugger-design.md) — the planned
-  `debug --backend jdwp` path that needs no Android Studio (design, not shipped).
+- [Standalone debugger design](docs/jdwp-debugger-design.md) — how
+  `debug --backend jdwp` works without Android Studio, and what is left.
 - [Requirement verification](docs/verification.md) — executable plans, build/JUnit evidence,
   lifecycle, configuration, SQLite, visual and Android platform checks (experimental).
 - [Concurrent agent sessions](docs/sessions.md) — one device driver, passive advisers,
@@ -424,10 +427,12 @@ counters; `ui dump --deep` cross-checks the accessibility tree against
 Compose data and can target nodes the normal tree misses.
 
 **Do I need Android Studio?**
-Not for the core. The CLI plus `adb` cover UI automation, app/device control,
-network capture, structured logs, and event streaming. The optional Studio
-plugin adds the live debugger and Layout Inspector enrichment; without it
-those sections report `available:false` and everything else keeps working.
+Not for the core, and not for debugging. The CLI plus `adb` cover UI
+automation, app/device control, network capture, structured logs, event
+streaming, and a standalone debugger (`debug --backend jdwp`). The optional
+Studio plugin adds Studio's debugger (including native/mixed mode) and Layout
+Inspector enrichment; without it the Layout Inspector sections report
+`available:false` and everything else keeps working.
 
 **Which devices work?**
 Real devices and emulators with USB debugging, plus Android TV / leanback

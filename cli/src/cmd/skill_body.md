@@ -15,7 +15,7 @@ shadowdroid commands --guide net
 
 Reuse syntax within one CLI/schema version.
 `--compact` references shared metadata; full JSON remains available.
-Before first use, read `--guide net` (proxy/AAR), `--guide debugger` (Studio/layout),
+Before first use, read `--guide net` (proxy/AAR), `--guide debugger` (debugger/layout),
 `--guide state` (private files/app state), `--guide evidence` (checkpoints
 and video coverage), or `--guide faults` (failure injection). Use `--guide verification` for coding-task checks and concurrent agents.
 Aliases: `aar` → net, `video` → evidence.
@@ -134,9 +134,9 @@ with working `run-as` and never prints file contents. Read
 `commands --guide state` before appops scoping, `profile apply --file`, or
 `app state` snapshot/restore work.
 
-## Android Studio debugger and layout
+## Debugger and layout
 
-Use `commands --guide debugger` before Studio/debugger/layout work.
+Use `commands --guide debugger` before debugger/layout work (Studio optional).
 `debug auto Example` starts the workflow. Expression evaluation can have side
 effects. With multiple sessions, select an observed stable `id`; never choose
 arbitrarily. `debug logpoint` observes without suspension.
