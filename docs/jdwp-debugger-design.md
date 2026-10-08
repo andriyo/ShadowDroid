@@ -472,6 +472,8 @@ the plugin's bridge.
 
 ## 11. Open questions for the spike
 
+> Answered on the emulator on 2026-10-08; see [jdwp-spike-2026-10-08.md](jdwp-spike-2026-10-08.md) (probe scripts in `scripts/jdwp-spike/`). In short: Q1 yes, SourceNameMatch works despite the capability flag; Q2 pinning is required, unpinned ids are collected between hits; Q3 the transport works on adb 37 and is faster than a forward; Q4 MethodEntry is far too costly, use first-line breakpoints; Q5 `canRedefineClasses` is false, the route is closed.
+
 1. Does ART honour the `SourceNameMatch` ClassPrepare modifier? If yes,
    deferred binding can filter by file instead of by package prefix.
 2. Does `DisableCollection` behave on ART under memory pressure, or must
