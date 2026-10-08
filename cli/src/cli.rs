@@ -2196,6 +2196,17 @@ async fn run_inner() -> Result<()> {
             )
             .await;
         }
+        // Launch-time flags need the standalone debugger: refuse them on the
+        // Studio path before any device is resolved or touched.
+        Cmd::Debug(args)
+            if !args.uses_jdwp()
+                && matches!(&args.cmd, DebugCmd::Auto(auto)
+                    if auto.from_start || !auto.break_at.is_empty() || !auto.break_exception.is_empty()) =>
+        {
+            return Err(crate::cmd::debugger::studio_unsupported(
+                "--from-start, --break, and --break-exception",
+            ));
+        }
         Cmd::Debug(args) if args.is_host_only() => {
             // Refuse before touching the device or the bridge: Studio cannot
             // see a process the jdwp daemon holds and would fail later.

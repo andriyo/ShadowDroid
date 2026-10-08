@@ -268,6 +268,45 @@ fn the_daemon_exits_when_the_process_dies() {
 }
 
 #[test]
+fn studio_launch_flags_are_refused_before_any_device_work() {
+    let env = Env::new();
+    // -d fake-serial is not an online device: reaching device resolution
+    // would fail with device_unavailable instead.
+    for args in [
+        &[
+            "debug",
+            "auto",
+            "io.example.app",
+            "--from-start",
+            "--backend",
+            "studio",
+        ][..],
+        &[
+            "debug",
+            "auto",
+            "io.example.app",
+            "--break",
+            "MainActivity.kt:20",
+            "--backend",
+            "studio",
+        ][..],
+        &[
+            "debug",
+            "attach",
+            "--package",
+            "io.example.app",
+            "--wait-for-launch",
+            "--backend",
+            "studio",
+        ][..],
+    ] {
+        let (error, code) = env.run(args);
+        assert_ne!(code, 0, "{args:?}");
+        assert_eq!(error["code"], "unsupported_by_backend", "{args:?}: {error}");
+    }
+}
+
+#[test]
 fn unsupported_verbs_fail_typed_and_studio_stays_the_default() {
     let env = Env::new();
     let (error, code) = env.run(&["debug", "watch", "list", "--backend", "jdwp"]);
