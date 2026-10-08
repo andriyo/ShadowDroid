@@ -345,7 +345,8 @@ fn fake_bridge() -> String {
         for mut stream in listener.incoming().flatten() {
             let mut buf = [0u8; 4096];
             let _ = stream.read(&mut buf);
-            let body = r#"{"ok":true,"sessions":[]}"#;
+            // One Studio session on another app of the same device.
+            let body = r#"{"ok":true,"sessions":[{"id":"session_1","index":0,"name":"other app","device":{"serial":"fake-serial"},"suspended":false}]}"#;
             let _ = write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -407,8 +408,21 @@ fn auto_follows_the_process_then_studio_then_jdwp() {
         "{held}"
     );
     assert_eq!(held["sessions"][0]["backend"], "jdwp");
+    // Auto never lets one backend hide the other: Studio's session is listed.
+    assert_eq!(held["sessions"][1]["backend"], "studio", "{held}");
+    assert_eq!(held["sessions"][1]["id"], "session_1");
+    assert_eq!(held["backends"]["studio"]["reachable"], true);
     let status = env.ok(&["debug", "status", "--studio-url", &bridge_url]);
     assert_eq!(status["backend_reason"], "jdwp_session_holds_target");
+    assert_eq!(status["sessions"].as_array().unwrap().len(), 2, "{status}");
+    assert_eq!(status["backends"]["studio"]["reachable"], true);
+    assert_eq!(
+        status["backends"]["jdwp"]["daemons"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     // Follow-ups stay on the backend that answered.
     assert!(
         held["next_actions"]

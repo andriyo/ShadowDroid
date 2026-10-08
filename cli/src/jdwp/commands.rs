@@ -69,13 +69,17 @@ pub struct JdwpContext<'a> {
     /// every device's registry.
     pub serial: Option<&'a str>,
     pub project_root: Option<&'a Path>,
+    /// `Some(studio url)` when `--backend auto` chose jdwp: `sessions` and
+    /// `status` then list the Studio bridge's sessions too, so one backend
+    /// never hides the other.
+    pub studio: Option<Option<&'a str>>,
 }
 
 /// Run one `debug` verb on the jdwp backend.
 pub async fn run(cmd: &DebuggerCmd, ctx: JdwpContext<'_>) -> Result<()> {
     let value = match cmd {
-        DebuggerCmd::Status => status(ctx.serial).await?,
-        DebuggerCmd::Sessions => sessions(ctx.serial).await?,
+        DebuggerCmd::Status => status(ctx.serial, ctx.studio).await?,
+        DebuggerCmd::Sessions => sessions(ctx.serial, ctx.studio).await?,
         DebuggerCmd::Attach {
             package,
             pid,
@@ -1176,19 +1180,103 @@ async fn live_sessions(serial: Option<&str>) -> Vec<Json> {
     sessions
 }
 
-async fn sessions(serial: Option<&str>) -> Result<Json> {
-    Ok(json!({"sessions": live_sessions(serial).await}))
+async fn sessions(serial: Option<&str>, studio: Option<Option<&str>>) -> Result<Json> {
+    let mut sessions = live_sessions(serial).await;
+    let studio_info = match studio {
+        Some(url) => {
+            let (studio_sessions, info) = studio_sessions(url, serial).await;
+            sessions.extend(studio_sessions);
+            info
+        }
+        None => json!({"checked": false}),
+    };
+    Ok(json!({"sessions": sessions, "backends": {"studio": studio_info}}))
 }
 
-async fn status(serial: Option<&str>) -> Result<Json> {
+async fn status(serial: Option<&str>, studio: Option<Option<&str>>) -> Result<Json> {
     let daemons = live_sessions(serial).await;
+    let mut sessions = daemons.clone();
+    let studio_info = match studio {
+        Some(url) => {
+            let (studio_sessions, mut info) = studio_sessions(url, serial).await;
+            sessions.extend(studio_sessions);
+            if info["reachable"] == true
+                && let Ok(bridge) =
+                    crate::cmd::debugger::BridgeClient::with_timeout(url, STUDIO_LIST_TIMEOUT)
+            {
+                info["status"] = bridge
+                    .get(crate::cmd::studio_contract::route::STATUS, &[])
+                    .await
+                    .unwrap_or_else(|error| json!({"error": format!("{error:#}")}));
+            }
+            info
+        }
+        None => json!({"checked": false, "hint": "shadowdroid debug status --backend studio"}),
+    };
     Ok(json!({
         "backends": {
             "jdwp": {"available": cfg!(unix), "daemons": daemons},
-            "studio": {"checked": false, "hint": "shadowdroid debug status --backend studio"},
+            "studio": studio_info,
         },
-        "sessions": daemons,
+        "sessions": sessions,
     }))
+}
+
+/// Bound on reading the Studio bridge from a jdwp `sessions`/`status`.
+const STUDIO_LIST_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The Studio bridge's sessions (on `serial`, when given), each tagged
+/// `backend: "studio"`, and what was checked.
+async fn studio_sessions(url: Option<&str>, serial: Option<&str>) -> (Vec<Json>, Json) {
+    if !crate::cmd::debugger::studio_bridge_reachable(url).await {
+        return (Vec::new(), json!({"checked": true, "reachable": false}));
+    }
+    let reply = match crate::cmd::debugger::BridgeClient::with_timeout(url, STUDIO_LIST_TIMEOUT) {
+        Ok(bridge) => {
+            bridge
+                .get(crate::cmd::studio_contract::route::SESSIONS, &[])
+                .await
+        }
+        Err(error) => Err(error),
+    };
+    match reply {
+        Ok(reply) => {
+            let sessions = studio_sessions_on(&reply, serial);
+            let count = sessions.len();
+            (
+                sessions,
+                json!({"checked": true, "reachable": true, "sessions": count}),
+            )
+        }
+        Err(error) => (
+            Vec::new(),
+            json!({"checked": true, "reachable": true, "error": format!("{error:#}")}),
+        ),
+    }
+}
+
+/// `/v1/sessions` reply → its sessions on `serial` (all when `None`),
+/// tagged with their backend.
+fn studio_sessions_on(reply: &Json, serial: Option<&str>) -> Vec<Json> {
+    reply
+        .get("sessions")
+        .and_then(Json::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|session| {
+            serial.is_none_or(|serial| {
+                session
+                    .pointer("/device/serial")
+                    .and_then(Json::as_str)
+                    .is_none_or(|actual| actual == serial)
+            })
+        })
+        .map(|session| {
+            let mut session = session.clone();
+            session["backend"] = json!("studio");
+            session
+        })
+        .collect()
 }
 
 async fn attach(
@@ -1404,5 +1492,26 @@ async fn resolve_package_pid(serial: &str, package: &str) -> Result<u32> {
             "candidates": many.iter().map(|(pid, name)| json!({"pid": pid, "name": name})).collect::<Vec<_>>(),
         }))
         .into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn studio_sessions_are_tagged_and_scoped_to_the_device() {
+        let reply = json!({"ok": true, "sessions": [
+            {"id": "session_1", "device": {"serial": "emulator-5554"}},
+            {"id": "session_2", "device": {"serial": "emulator-5556"}},
+            {"id": "session_3"},
+        ]});
+        let mine = studio_sessions_on(&reply, Some("emulator-5554"));
+        let ids: Vec<_> = mine.iter().map(|s| s["id"].clone()).collect();
+        // A session without a device cannot be ruled out.
+        assert_eq!(ids, [json!("session_1"), json!("session_3")]);
+        assert!(mine.iter().all(|s| s["backend"] == "studio"));
+        assert_eq!(studio_sessions_on(&reply, None).len(), 3);
+        assert!(studio_sessions_on(&json!({}), None).is_empty());
     }
 }

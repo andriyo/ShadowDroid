@@ -25,6 +25,11 @@ pub fn set_backend_reason(reason: &'static str) {
     let _ = BACKEND_REASON.set(reason);
 }
 
+/// Why `--backend auto` picked the backend; `None` for an explicit backend.
+pub fn backend_reason() -> Option<&'static str> {
+    BACKEND_REASON.get().copied()
+}
+
 fn attach_backend_reason(map: &mut serde_json::Map<String, serde_json::Value>) {
     if let Some(reason) = BACKEND_REASON.get() {
         map.entry("backend_reason")

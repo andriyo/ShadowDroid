@@ -2225,6 +2225,10 @@ async fn run_inner() -> Result<()> {
                 crate::jdwp::commands::JdwpContext {
                     serial: serial.as_deref(),
                     project_root: project.as_deref(),
+                    // Under `--backend auto`, list Studio's sessions too.
+                    studio: crate::events::backend_reason()
+                        .is_some()
+                        .then_some(args.studio_url.as_deref()),
                 },
             )
             .await;
