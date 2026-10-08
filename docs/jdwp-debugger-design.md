@@ -8,6 +8,28 @@
 > E11 decision in the [agent verification roadmap](agent-verification-roadmap.md)
 > that declined to build a JDWP stack.
 
+> **P0 status (2026-10-08, branch `feat/jdwp-debugger-p0`).** Landed in
+> [cli/src/jdwp/](../cli/src/jdwp): the codec, connection, and typed commands
+> for every command set in §4.3 except the invoke tier; `jdwp:<pid>` transport
+> over the in-tree ADB client plus a plain-TCP override
+> (`SHADOWDROID_JDWP_TCP`) for tests; line and exception breakpoints with
+> deferred binding (ClassPrepare + `SourceNameMatch`, which the spike showed
+> ART honours although `canUseSourceNameFilters` is false); the `__debugd`
+> daemon (JSON-RPC 2.0 over a `0600` unix socket, registry under
+> `~/.shadowdroid/debug/<serial>/`, idle timeout, Dispose on every exit path);
+> and `debug attach|detach|sessions|status|break line|break exception|break
+> remove|breakpoints|pause|resume|step-*|stack|threads|variables|eval|inspect
+> --backend jdwp`. Tested device-free against a fake VM
+> (`cli/tests/support/fake_jdwp.rs`). Stubbed (`unsupported_by_backend`):
+> logpoints, conditions, method/field breakpoints, watches, continue-until,
+> coroutines, `debug auto`/`snapshot`/run-until helpers, `--wait-for-launch`,
+> the doctor check, SMAP (inline bodies report `unsupported_location`).
+> Changes to this design: `auto` currently means `studio`; the config key is
+> the flat `debug_backend` (like `debug_mode`), not `debug.backend`; the jdwp
+> backend needs a unix host; method breakpoints must become line breakpoints
+> at each method's first line (the spike measured MethodEntry as far too
+> costly on ART), never MethodEntry.
+
 Design and phased plan for a debugger that needs **no Android Studio**: the CLI
 speaks JDWP to the app itself, through the same adb connection it already owns,
 and keeps the existing `debug` verbs and JSON contract.
