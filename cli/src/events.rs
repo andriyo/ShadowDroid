@@ -798,6 +798,9 @@ fn attach_next_actions(map: &mut serde_json::Map<String, serde_json::Value>) {
         .map(|action| executable_action(action, map))
         .filter_map(|action| on_debug_backend(action, map))
         .collect::<Vec<_>>();
+    // Two templated actions can rewrite to the same discovery command.
+    let mut seen = std::collections::HashSet::new();
+    actions.retain(|action| seen.insert(action.clone()));
 
     let command_path = effective_command_path(map);
     let mut fallbacks = domain_guidance(command_path, map);
@@ -1732,6 +1735,28 @@ pub fn emit_error(stage: &str, code: &str, msg: &str, extra: serde_json::Value) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn next_actions_are_deduplicated_after_rewriting() {
+        let mut map = serde_json::json!({
+            "next_actions": [
+                "shadowdroid debug attach --package <pkg>",
+                "shadowdroid debug attach --pid <pid>",
+            ],
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        attach_next_actions(&mut map);
+        let actions: Vec<_> = map["next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        let unique: std::collections::HashSet<_> = actions.iter().collect();
+        assert_eq!(unique.len(), actions.len(), "{actions:?}");
+    }
 
     #[test]
     fn jdwp_results_keep_debug_follow_ups_on_the_jdwp_backend() {
