@@ -322,6 +322,64 @@ jobs:
           path: ${{ runner.temp }}/android-surfaces-${{ matrix.name }}
           if-no-files-found: warn
 
+  jdwp-debugger:
+    name: Standalone JDWP debugger (phone-api-36)
+    needs:
+      - rust
+      - server
+      - agent-and-sample
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: ci-linux-cli
+          path: ci-artifacts/cli
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: ci-server-apks
+          path: ci-artifacts/server
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: ci-field-lab-apk
+          path: ci-artifacts/sample
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Drive the Field Lab through debug --backend jdwp
+        uses: reactivecircus/android-emulator-runner@v2.37.0
+        env:
+          SHADOWDROID_CLI_BIN: ${{ github.workspace }}/ci-artifacts/cli/shadowdroid
+          SHADOWDROID_SERVER_TEST_APK: ${{ github.workspace }}/ci-artifacts/server/app-debug-androidTest.apk
+          SHADOWDROID_SAMPLE_APK: ${{ github.workspace }}/ci-artifacts/sample/app-debug.apk
+          SHADOWDROID_DEVICE: emulator-5554
+          SHADOWDROID_E2E_EVIDENCE: ${{ runner.temp }}/jdwp-debugger
+        with:
+          api-level: 36
+          target: google_apis
+          arch: x86_64
+          script: |
+            chmod +x ci-artifacts/cli/shadowdroid
+            ./scripts/e2e-jdwp-debugger.sh
+
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: jdwp-debugger-evidence
+          path: |
+            ${{ runner.temp }}/jdwp-debugger
+            ~/.shadowdroid/debug
+          if-no-files-found: warn
+
   android-verification:
     name: Headless verification contracts (API 36)
     needs: [rust, server, agent-and-sample]
