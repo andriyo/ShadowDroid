@@ -923,6 +923,35 @@ pub async fn debugger_snapshot(serial: &str, depth: u32) -> Json {
 /// `debugger_attached=false`, spike Q9), and its own attach then fails
 /// asynchronously after the bridge already answered ok. Refuse a Studio
 /// attach to a pid or package a live jdwp session holds, up front.
+/// A live daemon that holds the target: the `--backend auto` rule that
+/// follows the process (design §4.4). A pid or package narrows the match;
+/// without either any live session in scope counts. Dead registries are
+/// pruned on the way.
+pub async fn live_session(
+    device: Option<&str>,
+    package: Option<&str>,
+    pid: Option<i32>,
+) -> Option<RegistryEntry> {
+    for entry in paths::entries(device) {
+        let same = match (pid.filter(|pid| *pid > 0), package) {
+            (Some(pid), _) => entry.pid == pid as u32,
+            (None, Some(package)) => entry.package.as_deref() == Some(package),
+            (None, None) => true,
+        };
+        if !same {
+            continue;
+        }
+        if let Err(CallError::Unreachable(_)) =
+            control::call(&entry, "status", json!({}), Duration::from_secs(2)).await
+        {
+            control::prune(&entry);
+            continue;
+        }
+        return Some(entry);
+    }
+    None
+}
+
 pub async fn ensure_not_held_by_jdwp(
     device: Option<&str>,
     package: Option<&str>,

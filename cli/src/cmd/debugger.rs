@@ -76,8 +76,9 @@ impl DebugMode {
     }
 }
 
-/// Which debugger serves a `debug` verb. `auto` follows Studio until the
-/// registry-driven selection of design §4.4 lands.
+/// Which debugger serves a `debug` verb. `auto` follows the process
+/// (design §4.4): a live jdwp daemon, else a reachable Studio bridge, else
+/// jdwp; see `cmd::debug::resolve_auto_backend`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum DebugBackend {
     Auto,
@@ -2535,6 +2536,32 @@ fn route_is_session_scoped(path: &str) -> bool {
         || path == route::WATCHES
         || path == route::LOGPOINTS
         || path == route::LOGPOINT_EVENTS
+}
+
+/// Whether the Studio bridge accepts connections (a bare TCP connect; the
+/// IDE's UI thread is not involved, so a busy Studio still counts).
+pub(crate) async fn studio_bridge_reachable(explicit_url: Option<&str>) -> bool {
+    let Ok(base) = resolve_url(explicit_url) else {
+        return false;
+    };
+    let Ok(url) = reqwest::Url::parse(&base) else {
+        return false;
+    };
+    let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+        return false;
+    };
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    matches!(
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            tokio::net::TcpStream::connect((host.as_str(), port)),
+        )
+        .await,
+        Ok(Ok(_))
+    )
 }
 
 fn resolve_url(explicit_url: Option<&str>) -> Result<String> {

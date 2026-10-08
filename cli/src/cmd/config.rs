@@ -567,7 +567,7 @@ fn schema_value() -> Value {
             "studio_plugin": {"type": "string", "optional": true, "description": "Local Studio plugin ZIP path."},
             "debugger": {"type": "string", "optional": true, "description": "Default Android debugger id/display name."},
             "debug_mode": {"type": "string", "optional": true, "enum": ["auto", "java", "native", "mixed"], "description": "Default semantic debugger mode."},
-            "debug_backend": {"type": "string", "optional": true, "enum": ["auto", "studio", "jdwp"], "description": "Default debugger backend for `debug` verbs (auto currently means studio)."},
+            "debug_backend": {"type": "string", "optional": true, "enum": ["auto", "studio", "jdwp"], "description": "Default debugger backend for `debug` verbs. auto: a live jdwp session holding the target, else a reachable Android Studio bridge, else the standalone jdwp debugger."},
             "run_configuration": {"type": "string", "optional": true, "description": "Default Android Studio run configuration."},
             "usage_log": {"type": "boolean", "optional": true, "description": "Opt-in local usage log (verb, duration, error code — never argument values) at ~/.shadowdroid/usage.jsonl; see `shadowdroid usage`."},
             "redaction": {

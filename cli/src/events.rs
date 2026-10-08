@@ -18,6 +18,19 @@ const MAX_NEXT_ACTIONS: usize = 5;
 static CURRENT_COMMAND_PATH: OnceLock<String> = OnceLock::new();
 static CURRENT_DEVICE: OnceLock<String> = OnceLock::new();
 static CURRENT_TARGET: OnceLock<String> = OnceLock::new();
+/// Why `debug --backend auto` picked its backend; set once per process.
+static BACKEND_REASON: OnceLock<&'static str> = OnceLock::new();
+
+pub fn set_backend_reason(reason: &'static str) {
+    let _ = BACKEND_REASON.set(reason);
+}
+
+fn attach_backend_reason(map: &mut serde_json::Map<String, serde_json::Value>) {
+    if let Some(reason) = BACKEND_REASON.get() {
+        map.entry("backend_reason")
+            .or_insert_with(|| serde_json::Value::from(*reason));
+    }
+}
 
 pub fn set_current_target(target: String) {
     let _ = CURRENT_TARGET.set(target);
@@ -597,6 +610,7 @@ fn stream_event_value(value: &impl Serialize, device: &str) -> serde_json::Value
 pub fn emit_result(value: &impl Serialize) {
     let mut value = serde_json::to_value(value).unwrap_or_else(|_| serde_json::json!({}));
     if let serde_json::Value::Object(map) = &mut value {
+        attach_backend_reason(map);
         attach_next_actions(map);
     }
     if !crate::runtime::defer_terminal(&value) {
@@ -723,6 +737,7 @@ fn action_envelope(cmd: &str, body: &serde_json::Value) -> serde_json::Value {
     m.insert("cmd".into(), cmd.into());
     m.insert("ok".into(), true.into());
     attach_events(&mut m);
+    attach_backend_reason(&mut m);
     attach_next_actions(&mut m);
     serde_json::Value::Object(m)
 }
@@ -766,6 +781,7 @@ fn error_envelope(
     // errored with element_not_found *because the app crashed* carries the
     // crash in the same error line.
     attach_events(&mut m);
+    attach_backend_reason(&mut m);
     attach_next_actions(&mut m);
     serde_json::Value::Object(m)
 }

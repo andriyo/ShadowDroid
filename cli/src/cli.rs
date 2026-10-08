@@ -2090,6 +2090,9 @@ async fn run_inner() -> Result<()> {
             .unwrap_or_default();
     }
     apply_config_defaults(&mut cmd, &config);
+    if let Cmd::Debug(args) = &mut cmd {
+        crate::cmd::debug::resolve_auto_backend(args, selection.explicit_device.as_deref()).await;
+    }
     if let Cmd::Net(NetCmd::Start { host, .. }) = &cmd {
         crate::net::proxy::validate_capture_host_filters(host)?;
     }

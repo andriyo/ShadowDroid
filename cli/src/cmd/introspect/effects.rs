@@ -1376,9 +1376,9 @@ mod tests {
         for (call, expected_count) in [
             ("selection.resolve(&config)", 16),
             ("selection.resolve_existing(&config)", 4),
-            // +1: `debug attach --backend jdwp` without -d resolves an online
-            // device (opt-in backend; the leaf's default Studio contract is
-            // unchanged, like the conditional Studio resolve above it).
+            // +1: `debug attach` on the jdwp backend (explicit, or chosen by
+            // `--backend auto`) without -d resolves an online device; like the
+            // conditional Studio resolve above it, the leaf declares none.
             ("selection.resolve_online(&config)", 6),
         ] {
             assert_eq!(

@@ -40,7 +40,8 @@ pub struct DebugArgs {
     pub studio_url: Option<String>,
 
     /// Debugger backend: studio (Android Studio bridge), jdwp (standalone), or
-    /// auto (currently studio). Defaults to config `debug_backend`.
+    /// auto (default): a live jdwp session holding the target, else a reachable
+    /// Studio bridge, else jdwp. Defaults to config `debug_backend`.
     // Distinct id: no `debug` subcommand may define a `debug_backend` arg.
     #[arg(long = "backend", id = "debug_backend", global = true, value_enum)]
     pub backend: Option<debugger::DebugBackend>,
@@ -328,6 +329,67 @@ impl DebugArgs {
     pub fn jdwp_unsupported_workflow(&self) -> bool {
         self.uses_jdwp() && matches!(self.cmd, DebugCmd::Record(_) | DebugCmd::Native(_))
     }
+}
+
+/// Resolve `--backend auto` (the default) to a concrete backend, design
+/// §4.4: (a) a live jdwp daemon holds the target → jdwp; (b) else the Studio
+/// bridge is reachable → studio; (c) else jdwp. Verbs only one backend serves
+/// go there directly. The reason rides on every result as `backend_reason`.
+pub async fn resolve_auto_backend(args: &mut DebugArgs, device: Option<&str>) {
+    if !matches!(args.backend, None | Some(debugger::DebugBackend::Auto)) {
+        return;
+    }
+    if let Some((backend, reason)) = auto_backend(args, device).await {
+        args.backend = Some(backend);
+        crate::events::set_backend_reason(reason);
+    }
+}
+
+async fn auto_backend(
+    args: &DebugArgs,
+    device: Option<&str>,
+) -> Option<(debugger::DebugBackend, &'static str)> {
+    use debugger::DebugBackend::{Jdwp, Studio};
+    let (package, pid) = match &args.cmd {
+        // Not debugger verbs.
+        DebugCmd::Replay(_) | DebugCmd::Tombstones(_) => return None,
+        // Only Studio serves these: keep its errors when it is not running.
+        DebugCmd::Record(_) | DebugCmd::Native(_) => return Some((Studio, "studio_only_verb")),
+        DebugCmd::Studio(DebuggerCmd::Clients(_)) => return Some((Studio, "studio_only_verb")),
+        DebugCmd::Studio(DebuggerCmd::Attach { dialog: true, .. }) => {
+            return Some((Studio, "studio_only_option"));
+        }
+        DebugCmd::Studio(DebuggerCmd::Attach {
+            mode: Some(DebugMode::Native | DebugMode::Mixed),
+            ..
+        })
+        | DebugCmd::Auto(AutoArgs {
+            mode: Some(DebugMode::Native | DebugMode::Mixed),
+            ..
+        }) => return Some((Studio, "studio_only_option")),
+        // Only the standalone debugger serves these.
+        DebugCmd::Studio(cmd) if cmd.jdwp_only_flag().is_some() => {
+            return Some((Jdwp, "jdwp_only_option"));
+        }
+        DebugCmd::Auto(auto)
+            if auto.from_start || !auto.break_at.is_empty() || !auto.break_exception.is_empty() =>
+        {
+            return Some((Jdwp, "jdwp_only_option"));
+        }
+        DebugCmd::Studio(DebuggerCmd::Attach { package, pid, .. }) => (package.as_deref(), *pid),
+        DebugCmd::Auto(auto) => (auto.package.as_deref(), None),
+        _ => (None, None),
+    };
+    if crate::jdwp::commands::live_session(device, package, pid)
+        .await
+        .is_some()
+    {
+        return Some((Jdwp, "jdwp_session_holds_target"));
+    }
+    if debugger::studio_bridge_reachable(args.studio_url.as_deref()).await {
+        return Some((Studio, "studio_bridge_reachable"));
+    }
+    Some((Jdwp, "studio_bridge_unreachable"))
 }
 
 pub async fn run_host_only(args: &DebugArgs, device: Option<&str>) -> Result<()> {

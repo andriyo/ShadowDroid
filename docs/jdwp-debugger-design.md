@@ -204,9 +204,24 @@ gaps; it is detected and reported as `unsupported_api_level`, not worked around.
 `auto`). JDWP attach is **exclusive per process**: Studio and ShadowDroid cannot
 both hold the same pid. `auto` therefore follows the process:
 
-1. a live `debugd` registry for the resolved pid → `jdwp`;
-2. else a reachable Studio bridge whose `debug sessions` lists that pid → `studio`;
-3. else `jdwp`, with a one-line note when a Studio bridge was reachable but idle.
+1. a live `debugd` registry for the target (the `--pid`/`--package` when the
+   verb names one, else any live session on the device) → `jdwp`;
+2. else a reachable Studio bridge (a TCP connect, so a busy IDE still
+   counts) → `studio`;
+3. else `jdwp`.
+
+Studio cannot report that ShadowDroid holds a pid (it shows
+`debugger_attached=false`), so the registry is the only signal for rule 1,
+and rule 2 does not ask Studio about the pid. Verbs or options only one
+backend serves skip the probes: `record`, `native`, `clients`,
+`attach --dialog`, and `--mode native|mixed` go to Studio (keeping Studio's
+errors when it is not running); `--wait-for-launch`, `--break*`,
+`--from-start`, `--invoke`, `--variant outer|lambda`, and
+`--accept-slowdown` go to jdwp. Results and errors of an `auto` decision
+carry `backend_reason`: `jdwp_session_holds_target`,
+`studio_bridge_reachable`, `studio_bridge_unreachable`, `studio_only_verb`,
+`studio_only_option`, or `jdwp_only_option`. An explicit `--backend` (or
+config `debug_backend`) carries none.
 
 An attach that fails because the other debugger holds the process returns
 `debugger_already_attached` naming the holder and the two ways out

@@ -307,7 +307,7 @@ fn studio_launch_flags_are_refused_before_any_device_work() {
 }
 
 #[test]
-fn unsupported_verbs_fail_typed_and_studio_stays_the_default() {
+fn unsupported_verbs_fail_typed_on_jdwp() {
     let env = Env::new();
     let (error, code) = env.run(&["debug", "clients", "--backend", "jdwp"]);
     assert_ne!(code, 0);
@@ -316,11 +316,127 @@ fn unsupported_verbs_fail_typed_and_studio_stays_the_default() {
     let (error, _) = env.run(&["debug", "record", "-o", "t.jsonl", "--backend", "jdwp"]);
     assert_eq!(error["code"], "unsupported_by_backend", "{error}");
 
-    // Without --backend nothing reaches the JDWP registry or daemon: the
-    // Studio bridge answers (here: is unreachable) exactly as before.
-    let (studio, _) = env.run(&["debug", "sessions", "--studio-url", "http://127.0.0.1:9"]);
+    // An explicit studio backend never reaches the JDWP registry or daemon
+    // and carries no auto reason.
+    let (studio, _) = env.run(&[
+        "debug",
+        "sessions",
+        "--backend",
+        "studio",
+        "--studio-url",
+        "http://127.0.0.1:9",
+    ]);
     assert_ne!(studio["backend"], "jdwp", "{studio}");
+    assert!(studio.get("backend_reason").is_none(), "{studio}");
     assert!(!env.registry_dir().exists());
+}
+
+/// A reachable "Studio bridge" for the auto policy: every request gets an
+/// empty, successful reply.
+fn fake_bridge() -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"ok":true,"sessions":[]}"#;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    url
+}
+
+#[test]
+fn auto_follows_the_process_then_studio_then_jdwp() {
+    let env = Env::new();
+    let bridge_url = fake_bridge();
+
+    // (c) No daemon, Studio unreachable: jdwp, with the reason.
+    let fallback = env.ok(&["debug", "sessions", "--studio-url", "http://127.0.0.1:9"]);
+    assert_eq!(
+        fallback["backend_reason"], "studio_bridge_unreachable",
+        "{fallback}"
+    );
+
+    // (b) No daemon, Studio reachable: studio, as before this policy.
+    let (studio, code) = env.run(&["debug", "sessions", "--studio-url", &bridge_url]);
+    assert_eq!(code, 0, "{studio}");
+    assert_eq!(studio["backend"], "studio", "{studio}");
+    assert_eq!(
+        studio["backend_reason"], "studio_bridge_reachable",
+        "{studio}"
+    );
+
+    // Studio-only verbs keep Studio's errors even when it is not running.
+    let (native, _) = env.run(&[
+        "debug",
+        "attach",
+        "--pid",
+        "4242",
+        "--mode",
+        "native",
+        "--studio-url",
+        "http://127.0.0.1:9",
+    ]);
+    assert_eq!(native["backend_reason"], "studio_only_option", "{native}");
+    assert_ne!(native["detail"]["backend"], "jdwp", "{native}");
+
+    // (a) A live jdwp daemon holds the target: jdwp, even with Studio up.
+    let attached = env.ok(&[
+        "debug",
+        "attach",
+        "--pid",
+        "4242",
+        "--studio-url",
+        "http://127.0.0.1:9",
+    ]);
+    assert_eq!(attached["backend_reason"], "studio_bridge_unreachable");
+    let held = env.ok(&["debug", "sessions", "--studio-url", &bridge_url]);
+    assert_eq!(
+        held["backend_reason"], "jdwp_session_holds_target",
+        "{held}"
+    );
+    assert_eq!(held["sessions"][0]["backend"], "jdwp");
+    let status = env.ok(&["debug", "status", "--studio-url", &bridge_url]);
+    assert_eq!(status["backend_reason"], "jdwp_session_holds_target");
+    // Follow-ups stay on the backend that answered.
+    assert!(
+        held["next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|a| a.contains(" debug "))
+            .all(|a| a.contains("--backend jdwp")),
+        "{held}"
+    );
+    // An explicit backend wins and carries no reason.
+    let explicit = env.ok(&["debug", "sessions", "--backend", "jdwp"]);
+    assert!(explicit.get("backend_reason").is_none(), "{explicit}");
+
+    // Jdwp-only options go to jdwp without asking Studio.
+    let detached = env.ok(&["debug", "detach", "--studio-url", &bridge_url]);
+    assert_eq!(detached["backend_reason"], "jdwp_session_holds_target");
+    wait_until("daemon exit", || {
+        registry_files(&env.registry_dir()).is_empty()
+    });
+    let (invoke, code) = env.run(&[
+        "debug",
+        "eval",
+        "this",
+        "--invoke",
+        "--studio-url",
+        &bridge_url,
+    ]);
+    assert_ne!(code, 0);
+    assert_eq!(invoke["backend_reason"], "jdwp_only_option", "{invoke}");
+    assert_eq!(invoke["code"], "debugger_session_not_found", "{invoke}");
 }
 
 // ── P1b ──────────────────────────────────────────────────────────────────
@@ -350,13 +466,15 @@ impl Env {
 #[test]
 fn wait_for_launch_installs_breakpoints_before_reporting_ready() {
     let env = Env::new();
-    // Studio does not take launch-time options; its default path is unchanged.
+    // Studio does not take launch-time options.
     let (studio, code) = env.run(&[
         "debug",
         "attach",
         "--wait-for-launch",
         "--package",
         "io.example.app",
+        "--backend",
+        "studio",
         "--studio-url",
         "http://127.0.0.1:9",
     ]);
@@ -636,7 +754,14 @@ fn breakpoint_lifecycle_through_the_cli() {
 fn invoke_runs_only_on_request_and_only_on_jdwp() {
     let env = Env::new();
     // Studio refuses the flag before any device or bridge work.
-    let (studio, code) = env.run(&["debug", "eval", "this.getLabel()", "--invoke"]);
+    let (studio, code) = env.run(&[
+        "debug",
+        "eval",
+        "this.getLabel()",
+        "--invoke",
+        "--backend",
+        "studio",
+    ]);
     assert_ne!(code, 0);
     assert_eq!(studio["code"], "unsupported_by_backend", "{studio}");
 

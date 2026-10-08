@@ -543,13 +543,13 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "next_actions": ["debug snapshot", "debug record", "collect"]
         })),
         "debug status" => Some(serde_json::json!({
-            "use_when": ["Need raw Android Studio bridge/debugger session status before attaching, stepping, or reading variables."],
-            "output": "bridge status JSON",
+            "use_when": ["Need debugger status (Android Studio bridge or standalone jdwp daemons) before attaching, stepping, or reading variables."],
+            "output": "status JSON with backend; backend_reason says why --backend auto chose it",
             "side_effects": ["none"],
             "next_actions": ["debug clients", "debug attach", "studio status --json"]
         })),
         "debug sessions" => Some(serde_json::json!({
-            "use_when": ["Need to list active Android Studio debugger sessions before selecting one for stack, variables, stepping, or resume."],
+            "use_when": ["Need to list active debugger sessions (Android Studio or standalone jdwp) before selecting one for stack, variables, stepping, or resume."],
             "output": "debug session list JSON; each entry has a stable id for the lifetime of that Studio debug session plus a current index and device identity",
             "side_effects": ["none"],
             "next_actions": ["debug stack --session <id>", "debug variables --session <id>", "debug resume --session <id>"]
@@ -561,10 +561,10 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "next_actions": ["debug attach --package <pkg>", "debug auto --app <app>"]
         })),
         "debug attach" => Some(serde_json::json!({
-            "use_when": ["Need Android Studio to attach its debugger to an already-running app/process."],
-            "output": "attach result JSON",
-            "side_effects": ["starts/attaches an Android Studio debugger session"],
-            "prerequisites": ["Android Studio bridge must be running", "target app must be debuggable and visible in debug clients"],
+            "use_when": ["Need a debugger attached to a running app/process, or (--wait-for-launch, jdwp backend) to code that runs at startup."],
+            "output": "attach result JSON with backend (and backend_reason under --backend auto)",
+            "side_effects": ["attaches a debugger session: Android Studio's when its bridge is reachable, else the standalone jdwp daemon"],
+            "prerequisites": ["target app must be debuggable", "native/mixed mode needs the Android Studio bridge"],
             "next_actions": ["debug snapshot", "debug break line", "debug variables"]
         })),
         "debug break" => Some(serde_json::json!({
