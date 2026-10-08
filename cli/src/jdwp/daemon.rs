@@ -267,6 +267,15 @@ async fn start(args: &DebugdArgs) -> RpcResult<()> {
         launched_under_debugger: args.launched_under_debugger,
     };
     let session = Session::new(jdwp, info);
+    if let Some(package) = args.package.clone() {
+        // Field watches without an accessor read the APK's dex files.
+        let serial = args.serial.clone();
+        session.set_dex_loader(std::sync::Arc::new(move || {
+            let serial = serial.clone();
+            let package = package.clone();
+            Box::pin(async move { super::dex::load_app_dex(&serial, &package).await })
+        }));
+    }
     let events = tokio::spawn(session.clone().run_events(incoming));
     if let Some(path) = &args.init {
         let init: InitialBreakpoints = std::fs::read_to_string(path)

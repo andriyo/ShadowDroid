@@ -56,6 +56,11 @@ impl Env {
             .env("SHADOWDROID_QUIET", "1")
             .env("SHADOWDROID_JDWP_TCP", self.vm.address())
             .env("ANDROID_ADB_SERVER_PORT", self.adb.port().to_string())
+            // The app's dex files (instead of pulling the APK).
+            .env(
+                "SHADOWDROID_JDWP_DEX",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dex/fields.dex"),
+            )
             .output()
             .expect("spawn shadowdroid");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1022,4 +1027,32 @@ fn relaunch_restarts_under_the_debugger_and_carries_breakpoints_over() {
     ]);
     assert_ne!(code, 0);
     assert_eq!(studio["code"], "unsupported_by_backend", "{studio}");
+}
+
+#[test]
+fn a_setterless_field_is_watched_at_its_write_sites_through_the_cli() {
+    let env = Env::new();
+    env.ok(&["debug", "attach", "--backend", "jdwp", "--pid", "4242"]);
+    let watch = env.ok(&[
+        "debug",
+        "break",
+        "field",
+        "--file",
+        "Counter.kt",
+        "--line",
+        "1",
+        "--class",
+        "io.example.app.Counter",
+        "--field",
+        "count",
+        "--backend",
+        "jdwp",
+    ]);
+    let breakpoint = &watch["breakpoint"];
+    assert_eq!(breakpoint["strategy"], "write_sites", "{watch}");
+    let sites = breakpoint["sites"].as_array().unwrap();
+    assert_eq!(sites.len(), 3, "{watch}");
+    assert_eq!(sites[0]["method"], "bump");
+    assert_eq!(sites[0]["line"], 51);
+    assert!(breakpoint["warning"].is_null());
 }

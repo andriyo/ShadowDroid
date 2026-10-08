@@ -882,6 +882,15 @@ fn conditional_effects(path: &[String]) -> serde_json::Value {
             "reason": "method calls and toString() run app code in the debugged process, which can change its state"
         }));
     }
+    if path.join(" ") == "debug break field"
+        && let serde_json::Value::Array(list) = &mut effects
+    {
+        list.push(serde_json::json!({
+            "effect": "host_write",
+            "when": "the field has no accessor for what is asked (jdwp backend)",
+            "reason": "the app's APK is pulled once into ~/.shadowdroid/debug/<serial>/apk-cache/ to find the field's read/write instructions"
+        }));
+    }
     effects
 }
 

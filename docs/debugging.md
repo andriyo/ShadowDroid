@@ -126,7 +126,13 @@ What works:
   pass counts, temporary/disabled breakpoints, and logpoints with the same
   event stream and cursors as Studio.
 - Method breakpoints, set as line breakpoints at the method's first line and
-  at each return. Kotlin property watches use the getter/setter;
+  at each return. Kotlin property watches use the getter/setter. A field
+  with no setter (a private property, a Java field) is watched at the
+  instructions that write it (`--access`: read it), found in the app's dex
+  files: the daemon pulls the APK once (`pm path`, cached by hash under
+  `~/.shadowdroid/debug/<serial>/apk-cache/`) and sets a line breakpoint at
+  each write in every class as it loads, with no slowdown; the breakpoint
+  reports `strategy: write_sites` and its `sites` (class, method, line).
   `break field --accept-slowdown` sets a real field watch for a bounded
   `--duration-ms` (it slows the whole app while armed). A delegated property
   (`by mutableStateOf`, `by lazy`) keeps the getter/setter even then: its

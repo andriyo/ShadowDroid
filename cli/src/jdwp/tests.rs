@@ -1986,3 +1986,173 @@ async fn relaunch_exports_enabled_line_and_exception_breakpoints_only() {
     assert!(!exported.exceptions[0].caught);
     assert!(exported.exceptions[0].uncaught);
 }
+
+// ── Field reads/writes from the APK's dex files ───────────────────────
+
+const DEX_FIXTURE: &[u8] = include_bytes!("../../tests/fixtures/dex/fields.dex");
+
+fn with_dex_fixture(session: &Session) {
+    session.set_dex_loader(Arc::new(|| {
+        Box::pin(async { Ok(vec![DEX_FIXTURE.to_vec()]) })
+    }));
+}
+
+fn armed_at(vm: &FakeVm, method: u64, index: u64) -> bool {
+    vm.with_state(|s| {
+        s.requests.iter().any(|r| {
+            r.kind == 2
+                && !s.cleared.contains(&r.id)
+                && r.location
+                    .is_some_and(|(_, m, at)| m == method && at == index)
+        })
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_field_without_a_setter_breaks_at_its_write_instructions() {
+    let vm = FakeVm::start();
+    let session = attach(&vm, WAIT).await;
+    with_dex_fixture(&session);
+    let watch = session
+        .break_field(
+            "io.example.app.Counter",
+            "count",
+            false,
+            true,
+            false,
+            Duration::from_secs(60),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(watch["strategy"], "write_sites", "{watch}");
+    assert_eq!(watch["mechanism"], "line_breakpoints_at_field_instructions");
+    assert!(watch["warning"].is_null(), "no slowdown");
+    let sites = watch["sites"].as_array().unwrap();
+    let summary: Vec<_> = sites
+        .iter()
+        .map(|s| {
+            (
+                s["class"].as_str().unwrap().to_string(),
+                s["method"].as_str().unwrap().to_string(),
+                s["line"].clone(),
+                s["bound"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            (
+                "io.example.app.Counter".to_string(),
+                "bump".to_string(),
+                json!(51),
+                json!(true)
+            ),
+            (
+                "io.example.app.Counter".to_string(),
+                "reset".to_string(),
+                json!(56),
+                json!(true)
+            ),
+            (
+                "io.example.app.Ui".to_string(),
+                "onClick".to_string(),
+                serde_json::Value::Null,
+                json!(false)
+            ),
+        ],
+        "{watch}"
+    );
+    assert!(armed_at(&vm, 1030, 4) && armed_at(&vm, 1031, 1));
+    // Never a FieldModification request (kind 21).
+    assert!(vm.with_state(|s| s.requests.iter().all(|r| r.kind != 20 && r.kind != 21)));
+
+    // The writer that loads later binds through ClassPrepare.
+    assert_eq!(vm.load_late_ui_class(), 1);
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !armed_at(&vm, 1032, 2) {
+        assert!(tokio::time::Instant::now() < deadline, "Ui never bound");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let id = watch["id"].as_str().unwrap();
+    let all = session.breakpoints();
+    let now = all
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["id"] == id)
+        .unwrap()
+        .clone();
+    assert_eq!(now["sites"][2]["line"], 61, "{now}");
+    assert_eq!(now["locations"][0]["role"], "write_site");
+
+    // A write stops the app before the instruction runs.
+    vm.hit_at(1030, 4);
+    wait_suspended(&session).await;
+    assert_eq!(session.status().await["breakpoint_id"], id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reads_use_read_sites_and_a_missing_apk_says_why() {
+    let vm = FakeVm::start();
+    let session = attach(&vm, WAIT).await;
+    with_dex_fixture(&session);
+    let reads = session
+        .break_field(
+            "io.example.app.Counter",
+            "count",
+            true,
+            false,
+            false,
+            Duration::from_secs(60),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reads["strategy"], "read_sites", "{reads}");
+    let kinds: Vec<_> = reads["sites"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            (
+                s["method"].clone(),
+                s["kind"].clone(),
+                s["code_index"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            (json!("bump"), json!("read"), json!(0)),
+            (json!("onClick"), json!("read"), json!(0)),
+        ]
+    );
+    assert!(armed_at(&vm, 1030, 0));
+
+    // No APK source: the old error, with the reason.
+    let vm = FakeVm::start();
+    let session = attach(&vm, WAIT).await;
+    let error = session
+        .break_field(
+            "io.example.app.Counter",
+            "count",
+            false,
+            true,
+            false,
+            Duration::from_secs(60),
+            Default::default(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "unsupported_location");
+    assert!(
+        error.detail["dex_error"]
+            .as_str()
+            .unwrap()
+            .contains("no APK source")
+    );
+    assert!(error.next_actions[0].contains("--accept-slowdown"));
+}

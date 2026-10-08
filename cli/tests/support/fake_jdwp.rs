@@ -89,6 +89,8 @@ pub struct State {
     pub late_coroutine_loaded: bool,
     /// Type ids asked for with ReferenceType.Instances.
     pub instances_asked: Vec<u64>,
+    /// `io.example.app.Ui` (writes `Counter.count`) has loaded.
+    pub late_ui_loaded: bool,
 }
 
 /// A JDWP value as the fake decodes it.
@@ -239,6 +241,47 @@ impl FakeVm {
             (
                 matching.len(),
                 Some(command_packet(0x4000_0003, 64, 100, &body)),
+            )
+        });
+        if let Some(packet) = packet {
+            self.send(&packet);
+        }
+        count
+    }
+
+    /// Load `io.example.app.Ui`: a ClassPrepare (policy EVENT_THREAD) for
+    /// every ClassPrepare request whose ClassMatch covers it.
+    pub fn load_late_ui_class(&self) -> usize {
+        let (count, packet) = self.with_state(|state| {
+            state.late_ui_loaded = true;
+            let matching: Vec<i32> = state
+                .requests
+                .iter()
+                .filter(|r| r.kind == 8 && !state.cleared.contains(&r.id))
+                .filter(|r| {
+                    r.class_match
+                        .as_deref()
+                        .is_some_and(|pattern| class_matches("io.example.app.Ui", pattern))
+                })
+                .map(|r| r.id)
+                .collect();
+            if matching.is_empty() {
+                return (0, None);
+            }
+            let mut body = vec![1_u8];
+            put_i32(&mut body, matching.len() as i32);
+            for request in &matching {
+                body.push(8);
+                put_i32(&mut body, *request);
+                put_u64(&mut body, MAIN_THREAD);
+                body.push(1);
+                put_u64(&mut body, 135);
+                put_str(&mut body, "Lio/example/app/Ui;");
+                put_i32(&mut body, 7);
+            }
+            (
+                matching.len(),
+                Some(command_packet(0x4000_0004, 64, 100, &body)),
             )
         });
         if let Some(packet) = packet {
@@ -700,6 +743,29 @@ const CLASSES: &[Class] = &[
         source: Some("StackTraceElement.java"),
         methods: &[],
     },
+    // The classes of the dex fixture (tests/fixtures/dex/fields.dex):
+    // Counter writes `count` in bump()@4 and reset()@1; Ui (loaded late)
+    // in onClick()@2. Neither has a setter.
+    Class {
+        id: 134,
+        signature: "Lio/example/app/Counter;",
+        source: Some("Counter.kt"),
+        methods: &[
+            (1030, "bump", "()V", &[(0, 50), (4, 51), (6, 52)]),
+            (1031, "reset", "()V", &[(0, 55), (1, 56), (3, 57)]),
+        ],
+    },
+    Class {
+        id: 135,
+        signature: "Lio/example/app/Ui;",
+        source: Some("Ui.kt"),
+        methods: &[(
+            1032,
+            "onClick",
+            "(Lio/example/app/Counter;)V",
+            &[(0, 60), (2, 61), (4, 62)],
+        )],
+    },
     // A coroutine class with no live instance (InstanceCounts skips it).
     Class {
         id: 132,
@@ -766,6 +832,8 @@ const WORLD_CLASS_FIELDS: &[(u64, u64, &str, &str)] = &[
     (133, 2111, "methodName", "Ljava/lang/String;"),
     (133, 2112, "fileName", "Ljava/lang/String;"),
     (133, 2113, "lineNumber", "I"),
+    (134, 2120, "count", "I"),
+    (134, 2121, "hits", "I"),
 ];
 
 /// Live instances of exactly `type_id`.
@@ -800,6 +868,7 @@ fn loaded(state: &State) -> impl Iterator<Item = &'static Class> + '_ {
         .iter()
         .filter(move |c| c.id != 105 || state.late_loaded)
         .filter(move |c| c.id != 131 || state.late_coroutine_loaded)
+        .filter(move |c| c.id != 135 || state.late_ui_loaded)
 }
 
 fn serve(mut stream: TcpStream, shared: Arc<Shared>) {

@@ -37,6 +37,7 @@ pub mod conn;
 pub mod control;
 pub mod coroutines;
 pub mod daemon;
+pub mod dex;
 pub mod eval;
 pub mod events;
 pub mod expr;

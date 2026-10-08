@@ -35,9 +35,17 @@
 > - **Method breakpoints** are line breakpoints at the first line and at every
 >   return (DEX return opcodes from Method.Bytecodes), never
 >   MethodEntry/MethodExit, which deoptimize the whole app.
-> - **Field breakpoints** default to the Kotlin accessors' lines; a real field
->   watch needs `--accept-slowdown`, warns on every response, and auto-clears
->   after `--duration-ms` (60 s); `status.slow_requests` counts armed ones.
+> - **Field breakpoints** default to the Kotlin accessors' lines. Without an
+>   accessor for what is asked, they break at the field's write
+>   (`iput*`/`sput*`) or read (`iget*`/`sget*`) instructions: Method.Bytecodes
+>   is the APK's own dex code, so the APK's dex `field_ids` resolve those
+>   operands. The daemon pulls the APK(s) once per hash, reads every
+>   `classes*.dex` (`jdwp/dex.rs`; each method's code is scanned with the ids
+>   of the dex file that defines its class), and binds line breakpoints per
+>   class, now or on ClassPrepare (`strategy: write_sites`, `sites[]`). A real
+>   field watch needs `--accept-slowdown`, warns on every response, and
+>   auto-clears after `--duration-ms` (60 s); `status.slow_requests` counts
+>   armed ones.
 > - **Lambdas**: a location is a lambda when its method contains `$lambda$`
 >   (depth = count), or is `invoke`/`invokeSuspend` of a Lambda/SuspendLambda/
 >   function-reference class; bridges are skipped. `--variant

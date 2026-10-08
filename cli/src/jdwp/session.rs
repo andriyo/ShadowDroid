@@ -304,6 +304,11 @@ pub(super) struct Breakpoint {
     pub(super) expired_reason: Option<&'static str>,
     /// Why the daemon bound something other than what was asked for.
     pub(super) note: Option<&'static str>,
+    /// Field reads/writes found in the APK's dex files (`break field`
+    /// without an accessor): bound per class as each loads.
+    pub(super) dex_sites: Option<Vec<super::members::SiteState>>,
+    /// Why the dex files could not be read, when they could not.
+    pub(super) dex_error: Option<String>,
 }
 
 impl Breakpoint {
@@ -327,6 +332,8 @@ impl Breakpoint {
             slow_until: None,
             expired_reason: None,
             note: None,
+            dex_sites: None,
+            dex_error: None,
         };
         breakpoint.set_opts(opts);
         breakpoint
@@ -439,6 +446,24 @@ impl Breakpoint {
                     .iter()
                     .find(|l| l.role.is_some_and(|r| r.starts_with("field_")))
                     .map(|l| l.method.clone());
+                let accessors = self
+                    .locations
+                    .iter()
+                    .any(|l| matches!(l.role, Some("setter" | "getter")));
+                let sites = self.dex_sites.as_deref().unwrap_or_default();
+                let writes = sites.iter().any(|s| s.site.write);
+                let reads = sites.iter().any(|s| !s.site.write);
+                let strategy = if *watch {
+                    "field_watch"
+                } else if writes && reads {
+                    "access_sites"
+                } else if writes {
+                    "write_sites"
+                } else if reads {
+                    "read_sites"
+                } else {
+                    "accessors"
+                };
                 json!({
                     "type": "field",
                     "class": class,
@@ -446,7 +471,17 @@ impl Breakpoint {
                     "watched_field": watched,
                     "access": access,
                     "modification": modification,
-                    "mechanism": if *watch { "field_watch" } else { "accessor_breakpoints" },
+                    "strategy": strategy,
+                    "accessors": accessors,
+                    "mechanism": if *watch {
+                        "field_watch"
+                    } else if sites.is_empty() {
+                        "accessor_breakpoints"
+                    } else {
+                        "line_breakpoints_at_field_instructions"
+                    },
+                    "sites": sites.iter().map(super::members::SiteState::to_json).collect::<Vec<_>>(),
+                    "dex_error": self.dex_error,
                     "warning": watch.then_some(SLOW_WATCH_WARNING),
                 })
             }
@@ -533,6 +568,11 @@ pub struct Session {
     pub(super) coroutine_pending: Mutex<Vec<(u64, String)>>,
     /// ANR detection for attach-to-running sessions.
     pub(super) anr: Mutex<super::anr::AnrState>,
+    /// Reads the app's dex files (the daemon pulls the APK); unset in tests
+    /// that do not need it.
+    pub(super) dex_loader: std::sync::OnceLock<super::members::DexLoader>,
+    /// The dex files, read once per session.
+    pub(super) dex_files: tokio::sync::Mutex<Option<super::members::DexFiles>>,
 }
 
 impl Session {
@@ -557,6 +597,8 @@ impl Session {
             coroutine_classes: Mutex::new(None),
             coroutine_pending: Mutex::new(Vec::new()),
             anr: Mutex::new(Default::default()),
+            dex_loader: std::sync::OnceLock::new(),
+            dex_files: tokio::sync::Mutex::new(None),
             logpoint_log: super::logpoints::LogpointLog::new(
                 format!(
                     "logpoints_jdwp_{}_{}",

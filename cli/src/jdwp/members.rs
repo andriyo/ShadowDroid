@@ -11,6 +11,11 @@
 //!   (`set<Name>` for modification, `get<Name>`/`is<Name>` for access). A
 //!   real field watch needs `--accept-slowdown`, warns on every response,
 //!   and auto-clears after `--duration-ms`.
+//! * A field with no accessor for what is asked (a private Kotlin property
+//!   with no setter, a Java field) is watched at its write (`iput*`/`sput*`)
+//!   or read (`iget*`/`sget*`) instructions, found in the APK's dex files
+//!   ([`super::dex`]): line breakpoints at each such code index, bound in
+//!   every class as it loads. No slowdown.
 
 use std::time::Duration;
 
@@ -29,6 +34,40 @@ const ACC_NATIVE: i32 = 0x0100;
 const ACC_ABSTRACT: i32 = 0x0400;
 const ACC_BRIDGE: i32 = 0x0040;
 const ACC_SYNTHETIC: i32 = 0x1000;
+
+/// Reads the app's dex files (`classes*.dex` of every APK).
+pub type DexLoader = std::sync::Arc<
+    dyn Fn() -> futures_util::future::BoxFuture<'static, Result<Vec<Vec<u8>>, String>>
+        + Send
+        + Sync,
+>;
+
+/// The app's dex files once read, or why they could not be.
+pub type DexFiles = Result<std::sync::Arc<Vec<Vec<u8>>>, String>;
+
+/// A field read/write site and what binding found for it.
+#[derive(Clone, Debug)]
+pub struct SiteState {
+    pub site: super::dex::FieldSite,
+    /// Java class name of `site.class`.
+    pub class_name: String,
+    pub line: Option<i32>,
+    pub bound: bool,
+}
+
+impl SiteState {
+    pub fn to_json(&self) -> Json {
+        json!({
+            "kind": if self.site.write { "write" } else { "read" },
+            "class": self.class_name,
+            "method": self.site.method,
+            "signature": self.site.signature,
+            "code_index": self.site.index,
+            "line": self.line,
+            "bound": self.bound,
+        })
+    }
+}
 
 /// Default lifetime of a slow field watch.
 pub const DEFAULT_WATCH_DURATION: Duration = Duration::from_secs(60);
@@ -71,59 +110,15 @@ pub fn class_match_pattern(pattern: &str) -> String {
 /// Walks instruction widths per the Dalvik format table and skips the
 /// switch/array payload pseudo-instructions.
 pub fn dex_return_indices(code: &[u8]) -> Vec<u64> {
-    let units: Vec<u16> = code
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-        .collect();
     let mut returns = Vec::new();
-    let mut pc = 0usize;
-    while pc < units.len() {
-        let unit = units[pc];
-        let opcode = (unit & 0xff) as u8;
-        let width = match unit {
-            // Payloads: packed-switch, sparse-switch, fill-array-data.
-            0x0100 => units.get(pc + 1).map_or(1, |&n| n as usize * 2 + 4),
-            0x0200 => units.get(pc + 1).map_or(1, |&n| n as usize * 4 + 2),
-            0x0300 => {
-                let element = units.get(pc + 1).copied().unwrap_or(0) as usize;
-                let size = units.get(pc + 2).copied().unwrap_or(0) as usize
-                    | (units.get(pc + 3).copied().unwrap_or(0) as usize) << 16;
-                (size * element).div_ceil(2) + 4
-            }
-            _ => dex_width(opcode),
-        };
+    super::dex::walk(&super::dex::code_units(code), |pc, rest| {
         // return-void, return, return-wide, return-object, and ART's
         // quickened return-void-no-barrier.
-        if matches!(opcode, 0x0e..=0x11 | 0x73) && unit & 0xff00 != 0x0100 {
+        if matches!((rest[0] & 0xff) as u8, 0x0e..=0x11 | 0x73) {
             returns.push(pc as u64);
         }
-        pc += width.max(1);
-    }
+    });
     returns
-}
-
-/// Instruction width in code units for a Dalvik opcode.
-fn dex_width(opcode: u8) -> usize {
-    match opcode {
-        0x00..=0x01 | 0x04 | 0x07 | 0x0a..=0x12 | 0x1d | 0x1e | 0x21 | 0x27 | 0x28 => 1,
-        0x02 | 0x05 | 0x08 | 0x13 | 0x15 | 0x16 | 0x19 | 0x1a | 0x1c | 0x1f | 0x20 | 0x22
-        | 0x23 => 2,
-        0x03 | 0x06 | 0x09 | 0x14 | 0x17 | 0x1b | 0x24..=0x26 | 0x2a..=0x2c => 3,
-        0x18 => 5,
-        0x29 | 0x2d..=0x3d => 2,
-        0x3e..=0x43 => 1,
-        0x44..=0x6d => 2,
-        0x6e..=0x72 | 0x74..=0x78 => 3,
-        0x73 | 0x79 | 0x7a => 1,
-        0x7b..=0x8f => 1,
-        0x90..=0xaf => 2,
-        0xb0..=0xcf => 1,
-        0xd0..=0xe2 => 2,
-        0xe3..=0xf9 => 1,
-        0xfa | 0xfb => 4,
-        0xfc | 0xfd => 3,
-        0xfe | 0xff => 2,
-    }
 }
 
 fn capitalized(name: &str) -> String {
@@ -205,15 +200,21 @@ impl Session {
             .get(&id)
             .is_some_and(|b| b.locations.is_empty() && b.pending_reason == Some("no_accessor"));
         if unbound && !accept_slowdown {
+            let dex_error = self
+                .state()
+                .breakpoints
+                .get(&id)
+                .and_then(|b| b.dex_error.clone());
             let _ = self.remove_breakpoint(&id).await;
             return Err(RpcError::new(
                 "unsupported_location",
                 format!(
-                    "{class} has no set{0}/get{0} accessor to break on; a real field watch slows the whole app",
-                    capitalized(field)
+                    "{class} has no set{0}/get{0} accessor to break on and no instruction in the app's dex files {1} `{field}`; a real field watch slows the whole app",
+                    capitalized(field),
+                    if modification { "writes" } else { "reads" },
                 ),
             )
-            .detail(json!({"reason": "no_accessor", "class": class, "field": field}))
+            .detail(json!({"reason": "no_accessor", "class": class, "field": field, "dex_error": dex_error}))
             .next(&["re-run with --accept-slowdown (auto-clears after --duration-ms)"]));
         }
         Ok(value)
@@ -298,6 +299,8 @@ impl Session {
         }
         let class_name = resolve::type_name(signature);
         let mut sites: Vec<(Arm, &'static str, String, u64)> = Vec::new();
+        // A dex plan was made just now: bind it in the other classes too.
+        let mut planned = false;
         match &breakpoint.kind {
             BreakpointKind::Method {
                 class,
@@ -346,93 +349,109 @@ impl Session {
                 watch,
             } => {
                 if *class != class_name {
-                    return Ok(());
-                }
-                let mut watch = *watch;
-                if watch {
-                    // A delegated property (`by mutableStateOf`, `by lazy`)
-                    // stores the delegate object, assigned once: a watch on
-                    // `<name>$delegate` never fires on property writes, which
-                    // go through set<Name>(). Break on the accessors instead,
-                    // and skip the whole-app slowdown.
-                    let fields = self.fields(class_id).await?;
-                    let delegate = format!("{field}$delegate");
-                    if !fields.iter().any(|f| f.name == *field)
-                        && fields.iter().any(|f| f.name == delegate)
-                    {
-                        watch = false;
-                        let mut state = self.state();
-                        if let Some(b) = state.breakpoints.get_mut(id) {
-                            b.slow_until = None;
-                            b.note = Some(DELEGATED_PROPERTY_NOTE);
-                            if let BreakpointKind::Field { watch, .. } = &mut b.kind {
-                                *watch = false;
+                    // Another class: only the field's read/write sites in it.
+                    sites.extend(self.plan_sites_in(id, class_id, &class_name).await?);
+                    if sites.is_empty() {
+                        return Ok(());
+                    }
+                } else {
+                    let mut watch = *watch;
+                    if watch {
+                        // A delegated property (`by mutableStateOf`, `by lazy`)
+                        // stores the delegate object, assigned once: a watch on
+                        // `<name>$delegate` never fires on property writes, which
+                        // go through set<Name>(). Break on the accessors instead,
+                        // and skip the whole-app slowdown.
+                        let fields = self.fields(class_id).await?;
+                        let delegate = format!("{field}$delegate");
+                        if !fields.iter().any(|f| f.name == *field)
+                            && fields.iter().any(|f| f.name == delegate)
+                        {
+                            watch = false;
+                            let mut state = self.state();
+                            if let Some(b) = state.breakpoints.get_mut(id) {
+                                b.slow_until = None;
+                                b.note = Some(DELEGATED_PROPERTY_NOTE);
+                                if let BreakpointKind::Field { watch, .. } = &mut b.kind {
+                                    *watch = false;
+                                }
                             }
                         }
                     }
-                }
-                if watch {
-                    let fields = self.fields(class_id).await?;
-                    let found = fields.iter().find(|f| f.name == *field);
-                    let Some(found) = found else {
-                        let mut state = self.state();
-                        if let Some(b) = state.breakpoints.get_mut(id) {
-                            b.pending_reason = Some("field_not_found");
+                    if watch {
+                        let fields = self.fields(class_id).await?;
+                        let found = fields.iter().find(|f| f.name == *field);
+                        let Some(found) = found else {
+                            let mut state = self.state();
+                            if let Some(b) = state.breakpoints.get_mut(id) {
+                                b.pending_reason = Some("field_not_found");
+                            }
+                            return Ok(());
+                        };
+                        for (wanted, modifies, role) in [
+                            (*modification, true, "field_modification"),
+                            (*access, false, "field_access"),
+                        ] {
+                            if wanted {
+                                sites.push((
+                                    Arm::Field {
+                                        type_id: class_id,
+                                        field_id: found.field_id,
+                                        modification: modifies,
+                                    },
+                                    role,
+                                    found.name.clone(),
+                                    0,
+                                ));
+                            }
                         }
-                        return Ok(());
-                    };
-                    for (wanted, modifies, role) in [
-                        (*modification, true, "field_modification"),
-                        (*access, false, "field_access"),
-                    ] {
-                        if wanted {
+                    } else {
+                        let name = capitalized(field);
+                        for info in self.methods(class_id).await?.iter() {
+                            let role = if *modification
+                                && info.name == format!("set{name}")
+                                && super::eval::method_types(&info.signature).0.len() == 1
+                            {
+                                "setter"
+                            } else if *access
+                                && (info.name == format!("get{name}")
+                                    || info.name == format!("is{name}"))
+                                && info.signature.starts_with("()")
+                            {
+                                "getter"
+                            } else {
+                                continue;
+                            };
+                            if !has_code(info) {
+                                continue;
+                            }
+                            let table = self.line_table(class_id, info.method_id).await?;
+                            let index =
+                                table.lines.iter().map(|(code, _)| *code).min().unwrap_or(0);
                             sites.push((
-                                Arm::Field {
-                                    type_id: class_id,
-                                    field_id: found.field_id,
-                                    modification: modifies,
-                                },
+                                self.line_arm(class_id, info, index),
                                 role,
-                                found.name.clone(),
-                                0,
+                                info.name.clone(),
+                                index,
                             ));
                         }
-                    }
-                } else {
-                    let name = capitalized(field);
-                    for info in self.methods(class_id).await?.iter() {
-                        let role = if *modification
-                            && info.name == format!("set{name}")
-                            && super::eval::method_types(&info.signature).0.len() == 1
-                        {
-                            "setter"
-                        } else if *access
-                            && (info.name == format!("get{name}")
-                                || info.name == format!("is{name}"))
-                            && info.signature.starts_with("()")
-                        {
-                            "getter"
-                        } else {
-                            continue;
-                        };
-                        if !has_code(info) {
-                            continue;
+                        // No accessor for what is asked: watch the field's
+                        // write/read instructions instead (from the dex files).
+                        let need_write = *modification && !sites.iter().any(|s| s.1 == "setter");
+                        let need_read = *access && !sites.iter().any(|s| s.1 == "getter");
+                        if need_write || need_read {
+                            planned = self
+                                .ensure_dex_plan(id, class, field, need_write, need_read)
+                                .await;
+                            sites.extend(self.plan_sites_in(id, class_id, &class_name).await?);
                         }
-                        let table = self.line_table(class_id, info.method_id).await?;
-                        let index = table.lines.iter().map(|(code, _)| *code).min().unwrap_or(0);
-                        sites.push((
-                            self.line_arm(class_id, info, index),
-                            role,
-                            info.name.clone(),
-                            index,
-                        ));
-                    }
-                    if sites.is_empty() {
-                        let mut state = self.state();
-                        if let Some(b) = state.breakpoints.get_mut(id) {
-                            b.pending_reason = Some("no_accessor");
+                        if sites.is_empty() && !planned {
+                            let mut state = self.state();
+                            if let Some(b) = state.breakpoints.get_mut(id) {
+                                b.pending_reason = Some("no_accessor");
+                            }
+                            return Ok(());
                         }
-                        return Ok(());
                     }
                 }
             }
@@ -484,7 +503,179 @@ impl Session {
                 self.state().owners.remove(&request);
             }
         }
+        if planned {
+            Box::pin(self.bind_plan_elsewhere(id, &class_name)).await;
+        }
         Ok(())
+    }
+
+    /// The app's dex files, read once (via the daemon's loader).
+    async fn dex_files(&self) -> Result<std::sync::Arc<Vec<Vec<u8>>>, String> {
+        let mut cached = self.dex_files.lock().await;
+        if let Some(result) = cached.as_ref() {
+            return result.clone();
+        }
+        let result = match self.dex_loader.get() {
+            Some(loader) => loader().await.map(std::sync::Arc::new),
+            None => Err("no APK source for this session (package unknown)".to_string()),
+        };
+        *cached = Some(result.clone());
+        result
+    }
+
+    /// Find the field's write (and/or read) sites in the dex files and keep
+    /// them on the breakpoint. Returns whether any were found; a failure is
+    /// recorded as `dex_error`.
+    async fn ensure_dex_plan(
+        &self,
+        id: &str,
+        class: &str,
+        field: &str,
+        write: bool,
+        read: bool,
+    ) -> bool {
+        if let Some(b) = self.state().breakpoints.get(id)
+            && (b.dex_sites.is_some() || b.dex_error.is_some())
+        {
+            return b.dex_sites.as_ref().is_some_and(|s| !s.is_empty());
+        }
+        let outcome = self.dex_files().await.map(|files| {
+            super::dex::sites_in(&files, &super::dex::descriptor(class), field)
+                .into_iter()
+                .filter(|site| (site.write && write) || (!site.write && read))
+                .map(|site| SiteState {
+                    class_name: resolve::type_name(&site.class),
+                    site,
+                    line: None,
+                    bound: false,
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut state = self.state();
+        let Some(b) = state.breakpoints.get_mut(id) else {
+            return false;
+        };
+        match outcome {
+            Ok(sites) => {
+                let found = !sites.is_empty();
+                b.dex_sites = Some(sites);
+                found
+            }
+            Err(error) => {
+                b.dex_error = Some(error);
+                false
+            }
+        }
+    }
+
+    /// Line arms for the plan's sites in `class_name`, recording each
+    /// site's line.
+    async fn plan_sites_in(
+        &self,
+        id: &str,
+        class_id: u64,
+        class_name: &str,
+    ) -> RpcResult<Vec<(Arm, &'static str, String, u64)>> {
+        let wanted: Vec<(usize, SiteState)> = match self.state().breakpoints.get(id) {
+            Some(b) => b
+                .dex_sites
+                .iter()
+                .flatten()
+                .enumerate()
+                .filter(|(_, s)| s.class_name == class_name)
+                .map(|(i, s)| (i, s.clone()))
+                .collect(),
+            None => return Ok(Vec::new()),
+        };
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let methods = self.methods(class_id).await?;
+        let mut out = Vec::new();
+        for (index, site) in wanted {
+            let Some(info) = methods
+                .iter()
+                .find(|m| m.name == site.site.method && m.signature == site.site.signature)
+            else {
+                continue;
+            };
+            let line = self
+                .line_table(class_id, info.method_id)
+                .await
+                .ok()
+                .and_then(|table| table.line_at(site.site.index));
+            if let Some(b) = self.state().breakpoints.get_mut(id)
+                && let Some(state) = b.dex_sites.as_mut().and_then(|s| s.get_mut(index))
+            {
+                state.line = line;
+                state.bound = true;
+            }
+            out.push((
+                self.line_arm(class_id, info, site.site.index),
+                if site.site.write {
+                    "write_site"
+                } else {
+                    "read_site"
+                },
+                info.name.clone(),
+                site.site.index,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Bind the plan in every other class it names: loaded ones now, the
+    /// rest through ClassPrepare (exact class match) as they load.
+    async fn bind_plan_elsewhere(&self, id: &str, bound_class: &str) {
+        let classes: Vec<String> = {
+            let state = self.state();
+            let Some(b) = state.breakpoints.get(id) else {
+                return;
+            };
+            let mut classes: Vec<String> = b
+                .dex_sites
+                .iter()
+                .flatten()
+                .map(|s| s.class_name.clone())
+                .filter(|c| c != bound_class)
+                .collect();
+            classes.sort();
+            classes.dedup();
+            classes
+        };
+        for class in classes {
+            if let Ok(request) = self
+                .jdwp
+                .set_event(
+                    event_kind::CLASS_PREPARE,
+                    suspend_policy::EVENT_THREAD,
+                    &[Modifier::ClassMatch(class.clone())],
+                )
+                .await
+            {
+                self.state()
+                    .owners
+                    .insert(request, Owner::MemberPrepare(id.to_string()));
+            }
+            let signature = super::dex::descriptor(&class);
+            if let Ok(loaded) = self.jdwp.classes_by_signature(&signature).await {
+                for found in loaded {
+                    self.cache
+                        .lock()
+                        .expect("cache")
+                        .signatures
+                        .insert(found.type_id, signature.clone());
+                    if let Err(error) = self.bind_member(id, found.type_id, &signature).await {
+                        tracing::warn!("binding field sites in {class}: {}", error.message);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Set how this session reads the app's dex files.
+    pub fn set_dex_loader(&self, loader: DexLoader) {
+        let _ = self.dex_loader.set(loader);
     }
 
     fn line_arm(&self, class_id: u64, method: &MethodInfo, index: u64) -> Arm {
