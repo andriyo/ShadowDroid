@@ -335,21 +335,65 @@ impl DebugArgs {
 /// §4.4: (a) a live jdwp daemon holds the target → jdwp; (b) else the Studio
 /// bridge is reachable → studio; (c) else jdwp. Verbs only one backend serves
 /// go there directly. The reason rides on every result as `backend_reason`.
-pub async fn resolve_auto_backend(args: &mut DebugArgs, device: Option<&str>) {
+pub async fn resolve_auto_backend(
+    args: &mut DebugArgs,
+    device: Option<&str>,
+    config: &crate::config::ShadowDroidConfig,
+) {
     if !matches!(args.backend, None | Some(debugger::DebugBackend::Auto)) {
         return;
     }
-    if let Some((backend, reason)) = auto_backend(args, device).await {
+    if let Some((backend, reason)) = auto_backend(args, device, config).await {
         args.backend = Some(backend);
         crate::events::set_backend_reason(reason);
     }
 }
 
+/// The `--session` a session-bound verb names, if any.
+fn session_arg(cmd: &DebugCmd) -> Option<&str> {
+    let session = match cmd {
+        DebugCmd::Studio(cmd) => match cmd {
+            DebuggerCmd::Pause(s)
+            | DebuggerCmd::Resume(s)
+            | DebuggerCmd::StepIn(s)
+            | DebuggerCmd::StepOver(s)
+            | DebuggerCmd::StepOut(s)
+            | DebuggerCmd::Stop(s)
+            | DebuggerCmd::Detach(s) => &s.session,
+            DebuggerCmd::Stack(a) | DebuggerCmd::Threads(a) => &a.session,
+            DebuggerCmd::Variables(a) => &a.session,
+            DebuggerCmd::Eval(a) => &a.session,
+            DebuggerCmd::Inspect(a) => &a.session,
+            DebuggerCmd::ContinueUntil(a) => &a.session,
+            _ => return None,
+        },
+        DebugCmd::StepUntilScreenChange(a) => &a.session,
+        DebugCmd::StepUntilLog(a) => &a.wait.session,
+        DebugCmd::RunUntilCrash(a) => &a.session,
+        _ => return None,
+    };
+    session.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
 async fn auto_backend(
     args: &DebugArgs,
     device: Option<&str>,
+    config: &crate::config::ShadowDroidConfig,
 ) -> Option<(debugger::DebugBackend, &'static str)> {
     use debugger::DebugBackend::{Jdwp, Studio};
+    // An explicit session id names its backend: jdwp ids are `jdwp:<serial>:<pid>`;
+    // Studio ids (`session_3`) never start with that. A bare index or pid is
+    // ambiguous and follows the rules below.
+    if let Some(session) = session_arg(&args.cmd) {
+        if session.starts_with("jdwp:") {
+            return Some((Jdwp, "session_id"));
+        }
+        if !session.chars().all(|c| c.is_ascii_digit())
+            && debugger::studio_bridge_reachable(args.studio_url.as_deref()).await
+        {
+            return Some((Studio, "session_id"));
+        }
+    }
     let (package, pid) = match &args.cmd {
         // Not debugger verbs.
         DebugCmd::Replay(_) | DebugCmd::Tombstones(_) => return None,
@@ -376,16 +420,42 @@ async fn auto_backend(
         {
             return Some((Jdwp, "jdwp_only_option"));
         }
-        DebugCmd::Studio(DebuggerCmd::Attach { package, pid, .. }) => (package.as_deref(), *pid),
+        DebugCmd::Studio(DebuggerCmd::Attach { package, pid, .. }) => {
+            // `--app` is an alias of `--package`: map a configured alias to
+            // its package, and fall back to the configured app.
+            let package = package
+                .clone()
+                .or_else(|| config.default_app())
+                .map(|app| config.configured_package_for(&app).unwrap_or(app));
+            if package.is_none() && pid.is_none() {
+                // No target to match: a daemon on some other app says nothing.
+                return bridge_or_jdwp(args).await;
+            }
+            return match crate::jdwp::commands::live_session(device, package.as_deref(), *pid).await
+            {
+                Some(_) => Some((Jdwp, "jdwp_session_holds_target")),
+                None => bridge_or_jdwp(args).await,
+            };
+        }
         DebugCmd::Auto(auto) => (auto.package.as_deref(), None),
         _ => (None, None),
     };
-    if crate::jdwp::commands::live_session(device, package, pid)
+    let package = package.map(|p| {
+        config
+            .configured_package_for(p)
+            .unwrap_or_else(|| p.to_string())
+    });
+    if crate::jdwp::commands::live_session(device, package.as_deref(), pid)
         .await
         .is_some()
     {
         return Some((Jdwp, "jdwp_session_holds_target"));
     }
+    bridge_or_jdwp(args).await
+}
+
+async fn bridge_or_jdwp(args: &DebugArgs) -> Option<(debugger::DebugBackend, &'static str)> {
+    use debugger::DebugBackend::{Jdwp, Studio};
     if debugger::studio_bridge_reachable(args.studio_url.as_deref()).await {
         return Some((Studio, "studio_bridge_reachable"));
     }

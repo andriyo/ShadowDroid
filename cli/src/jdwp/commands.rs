@@ -920,10 +920,6 @@ pub async fn debugger_snapshot(serial: &str, depth: u32) -> Json {
     })
 }
 
-/// Studio cannot see a process our daemon holds (its client list keeps
-/// `debugger_attached=false`, spike Q9), and its own attach then fails
-/// asynchronously after the bridge already answered ok. Refuse a Studio
-/// attach to a pid or package a live jdwp session holds, up front.
 /// A live daemon that holds the target: the `--backend auto` rule that
 /// follows the process (design §4.4). A pid or package narrows the match;
 /// without either any live session in scope counts. Dead registries are
@@ -953,6 +949,10 @@ pub async fn live_session(
     None
 }
 
+/// Studio cannot see a process our daemon holds (its client list keeps
+/// `debugger_attached=false`, spike Q9), and its own attach then fails
+/// asynchronously after the bridge already answered ok. Refuse a Studio
+/// attach to a pid or package a live jdwp session holds, up front.
 pub async fn ensure_not_held_by_jdwp(
     device: Option<&str>,
     package: Option<&str>,

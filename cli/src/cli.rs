@@ -2091,7 +2091,20 @@ async fn run_inner() -> Result<()> {
     }
     apply_config_defaults(&mut cmd, &config);
     if let Cmd::Debug(args) = &mut cmd {
-        crate::cmd::debug::resolve_auto_backend(args, selection.explicit_device.as_deref()).await;
+        // Without -d, jdwp registries on several devices would let a daemon
+        // on another device claim this command: scope the auto rule to the
+        // device the command would use. Zero or one registry entry needs no
+        // device round trip.
+        let device = match selection.explicit_device.clone() {
+            Some(device) => Some(device),
+            None if crate::jdwp::paths::entries(None).len() > 1 => selection
+                .resolve_online_raw(&config)
+                .await
+                .ok()
+                .map(|serial| serial.to_string()),
+            None => None,
+        };
+        crate::cmd::debug::resolve_auto_backend(args, device.as_deref(), &config).await;
     }
     if let Cmd::Net(NetCmd::Start { host, .. }) = &cmd {
         crate::net::proxy::validate_capture_host_filters(host)?;

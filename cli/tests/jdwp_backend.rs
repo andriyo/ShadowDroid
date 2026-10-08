@@ -416,6 +416,33 @@ fn auto_follows_the_process_then_studio_then_jdwp() {
             .all(|a| a.contains("--backend jdwp")),
         "{held}"
     );
+    // An explicit --session names its backend, even with a daemon live:
+    // a Studio id goes to Studio, a jdwp id to jdwp.
+    let (studio_session, _) = env.run(&[
+        "debug",
+        "stack",
+        "--session",
+        "session_3",
+        "--studio-url",
+        &bridge_url,
+    ]);
+    assert_eq!(
+        studio_session["backend_reason"], "session_id",
+        "{studio_session}"
+    );
+    assert_ne!(studio_session["backend"], "jdwp", "{studio_session}");
+    let jdwp_session = env.ok(&[
+        "debug",
+        "stack",
+        "--session",
+        "jdwp:fake-serial:4242",
+        "--studio-url",
+        &bridge_url,
+    ]);
+    assert_eq!(
+        jdwp_session["backend_reason"], "session_id",
+        "{jdwp_session}"
+    );
     // An explicit backend wins and carries no reason.
     let explicit = env.ok(&["debug", "sessions", "--backend", "jdwp"]);
     assert!(explicit.get("backend_reason").is_none(), "{explicit}");
