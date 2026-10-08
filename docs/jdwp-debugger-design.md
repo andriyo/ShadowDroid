@@ -237,8 +237,9 @@ errors when it is not running); `--wait-for-launch`, `--break*`,
 `--accept-slowdown` go to jdwp. Results and errors of an `auto` decision
 carry `backend_reason`: `jdwp_session_holds_target`,
 `studio_bridge_reachable`, `studio_bridge_unreachable`, `studio_only_verb`,
-`studio_only_option`, or `jdwp_only_option`. An explicit `--backend` (or
-config `debug_backend`) carries none.
+`studio_only_option`, `jdwp_only_option`, or `jdwp_unsupported_on_host`
+(a non-unix host, where the daemon cannot run, so `auto` stays on Studio).
+An explicit `--backend` (or config `debug_backend`) carries none.
 
 An attach that fails because the other debugger holds the process returns
 `debugger_already_attached` naming the holder and the two ways out

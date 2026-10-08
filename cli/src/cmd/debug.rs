@@ -455,11 +455,23 @@ async fn auto_backend(
 }
 
 async fn bridge_or_jdwp(args: &DebugArgs) -> Option<(debugger::DebugBackend, &'static str)> {
-    use debugger::DebugBackend::{Jdwp, Studio};
+    use debugger::DebugBackend::Studio;
     if debugger::studio_bridge_reachable(args.studio_url.as_deref()).await {
         return Some((Studio, "studio_bridge_reachable"));
     }
-    Some((Jdwp, "studio_bridge_unreachable"))
+    Some(unreachable_studio_fallback())
+}
+
+/// Where `auto` goes when no jdwp session holds the target and Studio is not
+/// reachable. The standalone daemon needs a unix control socket, so other
+/// hosts stay on Studio and keep its "bridge not reachable" guidance instead
+/// of failing with `unsupported_backend`.
+fn unreachable_studio_fallback() -> (debugger::DebugBackend, &'static str) {
+    if cfg!(unix) {
+        (debugger::DebugBackend::Jdwp, "studio_bridge_unreachable")
+    } else {
+        (debugger::DebugBackend::Studio, "jdwp_unsupported_on_host")
+    }
 }
 
 pub async fn run_host_only(args: &DebugArgs, device: Option<&str>) -> Result<()> {
@@ -3501,6 +3513,20 @@ fn duration_millis(duration: Duration) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_falls_back_to_studio_where_the_daemon_cannot_run() {
+        let (backend, reason) = unreachable_studio_fallback();
+        if cfg!(unix) {
+            assert_eq!(backend, debugger::DebugBackend::Jdwp);
+            assert_eq!(reason, "studio_bridge_unreachable");
+        } else {
+            // No unix control socket: keep Studio's guidance, never route
+            // to a backend that can only answer `unsupported_backend`.
+            assert_eq!(backend, debugger::DebugBackend::Studio);
+            assert_eq!(reason, "jdwp_unsupported_on_host");
+        }
+    }
 
     #[test]
     fn jdwp_screen_hashes_ignore_the_status_bar() {
