@@ -2024,6 +2024,7 @@ async fn run_until_crash(
                             args.bundle.as_deref(),
                             args.native_artifacts,
                             args.logs.max(200),
+                            None,
                         )
                         .await,
                     )
@@ -2335,7 +2336,8 @@ async fn run_until_crash_jdwp(
             Err(err) => json!({"attempted": true, "ok": false, "error": err.to_string()}),
         }
     } else {
-        json!({"attempted": false, "ok": true, "reason": "not suspended"})
+        // Already running: nothing to resume.
+        json!({"attempted": false, "ok": true, "needed": false})
     };
     let after_epoch = jdwp::call(&entry, "status", json!({}), rpc_timeout)
         .await
@@ -2511,7 +2513,15 @@ async fn run_until_crash_jdwp(
             });
             crash
         }
-        Some(JdwpCrashOutcome::Logcat(crash)) => {
+        Some(JdwpCrashOutcome::Logcat(mut crash)) => {
+            // An ANR line is logged by system_server and names only the
+            // package: the debugged process supplies the pid.
+            if crash.pid.is_none()
+                && crash.package.is_some()
+                && crash.package.as_deref() == entry.package.as_deref()
+            {
+                crash.pid = i32::try_from(entry.pid).ok();
+            }
             let _ = jdwp::call(
                 &entry,
                 "break_remove",
@@ -2562,6 +2572,7 @@ async fn run_until_crash_jdwp(
             args.bundle.as_deref(),
             args.native_artifacts,
             args.logs.max(200),
+            crash.pid,
         )
         .await;
     }
@@ -3084,6 +3095,7 @@ impl CrashBundle {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_crash_bundle(
     serial: &Serial,
     app: &Option<String>,
@@ -3092,6 +3104,9 @@ async fn write_crash_bundle(
     out: Option<&Path>,
     native_artifacts: bool,
     log_lines: u32,
+    // `logcat_main.txt` keeps only this process's lines (jdwp: the crashed
+    // pid is known exactly).
+    logcat_pid: Option<i32>,
 ) -> Value {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3105,10 +3120,26 @@ async fn write_crash_bundle(
     bundle.write_json("crash.json", &crash_value);
     bundle.write_json("snapshot.json", snapshot);
     bundle.write_json("device_info.json", &adb::device_info(serial).await);
-    bundle.write_text(
-        "logcat_main.txt",
-        &adb::recent_logcat(serial, log_lines).await.join("\n"),
-    );
+    let main_log = match logcat_pid {
+        Some(pid) => {
+            let lines = adb::shell(
+                serial,
+                format!("logcat -d -v threadtime -t {log_lines} --pid={pid}"),
+            )
+            .await
+            .unwrap_or_default();
+            if lines.trim().is_empty() {
+                bundle.errors.push(format!(
+                    "logcat_main.txt: no lines for pid {pid}; kept the unfiltered log"
+                ));
+                adb::recent_logcat(serial, log_lines).await.join("\n")
+            } else {
+                lines
+            }
+        }
+        None => adb::recent_logcat(serial, log_lines).await.join("\n"),
+    };
+    bundle.write_text("logcat_main.txt", &main_log);
     match adb::shell(serial, "logcat -d -b crash -v threadtime -t 300").await {
         Ok(out) if !out.trim().is_empty() => bundle.write_text("logcat_crash.txt", &out),
         Ok(_) => bundle
@@ -3151,6 +3182,7 @@ async fn write_crash_bundle(
             "package": crash.package.clone(),
         },
         "crash_kind": crash.kind.clone(),
+        "logcat_pid": logcat_pid,
         "captured": bundle.captured,
         "errors": bundle.errors,
     });

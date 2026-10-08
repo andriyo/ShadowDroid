@@ -796,3 +796,51 @@ fn invoke_runs_only_on_request_and_only_on_jdwp() {
     assert_eq!(called["result"]["value"], "hello", "{called}");
     assert_eq!(called["mode"], "jdi_invoke");
 }
+
+#[test]
+fn break_line_without_a_session_suggests_setting_it_at_launch() {
+    let env = Env::new();
+    let (error, code) = env.run(&[
+        "debug",
+        "break",
+        "line",
+        "--file",
+        "MainActivity.kt",
+        "--line",
+        "20",
+        "--backend",
+        "jdwp",
+    ]);
+    assert_ne!(code, 0);
+    assert_eq!(error["code"], "debugger_session_not_found", "{error}");
+    assert_eq!(
+        error["detail"]["launch_hint"],
+        "shadowdroid debug attach --backend jdwp --wait-for-launch --package <pkg> --break MainActivity.kt:20",
+        "{error}"
+    );
+    assert!(error["msg"].as_str().unwrap().contains("--wait-for-launch"));
+
+    // With a configured app the follow-up is concrete.
+    std::fs::create_dir_all(env.project.join(".shadowdroid")).unwrap();
+    std::fs::write(
+        env.project.join(".shadowdroid/config.json"),
+        r#"{"app": "io.example.app"}"#,
+    )
+    .unwrap();
+    let (error, _) = env.run(&[
+        "debug",
+        "break",
+        "line",
+        "--file",
+        "MainActivity.kt",
+        "--line",
+        "20",
+        "--backend",
+        "jdwp",
+    ]);
+    assert_eq!(
+        error["next_actions"][0],
+        "shadowdroid debug attach --backend jdwp --wait-for-launch --package io.example.app --break MainActivity.kt:20",
+        "{error}"
+    );
+}

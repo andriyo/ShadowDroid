@@ -132,7 +132,8 @@ pub async fn run(cmd: &DebuggerCmd, ctx: JdwpContext<'_>) -> Result<()> {
             ..
         }) => {
             let target = locate_target(file, *line, ctx.project_root)?;
-            let entry = select(ctx.serial, None)?;
+            let entry = select(ctx.serial, None)
+                .map_err(|error| no_session_for_break(error, file, *line))?;
             let options = BreakpointOptions {
                 enabled: !*disabled,
                 temporary: *temporary,
@@ -1040,6 +1041,46 @@ async fn rpc(entry: &RegistryEntry, method: &str, params: Json, timeout: Duratio
 
 /// Pick the daemon a verb talks to: `--session` (id, pid, or index) or the
 /// only registered one for the device filter.
+/// `break line` with no session: the line may run at startup, so point at
+/// setting it at launch as well as at attaching to the running app.
+fn no_session_for_break(error: anyhow::Error, file: &Path, line: u32) -> anyhow::Error {
+    let Some(diagnostic) = error.downcast_ref::<DiagnosticError>() else {
+        return error;
+    };
+    if diagnostic.code != "debugger_session_not_found"
+        || diagnostic.detail.get("sessions").is_some()
+    {
+        return error;
+    }
+    let spec = format!("{}:{line}", file.display());
+    let launch = format!(
+        "shadowdroid debug attach --backend jdwp --wait-for-launch --package <pkg> --break {spec}"
+    );
+    let mut detail = diagnostic.detail.clone();
+    detail["launch_hint"] = json!(launch);
+    // The configured app fills `<pkg>` in the follow-ups.
+    if let Some(app) = crate::config::ShadowDroidConfig::load()
+        .ok()
+        .and_then(|config| config.default_app())
+    {
+        detail["package"] = json!(app);
+    }
+    DiagnosticError::new(
+        diagnostic.code.clone(),
+        diagnostic.stage.clone(),
+        format!(
+            "{}; set the breakpoint at launch with --wait-for-launch --break {spec}, or attach to the running app",
+            diagnostic.message
+        ),
+    )
+    .detail(detail)
+    .next_actions([
+        launch,
+        "shadowdroid debug attach --backend jdwp --package <pkg>".to_string(),
+    ])
+    .into()
+}
+
 fn select(serial: Option<&str>, session: Option<&str>) -> Result<RegistryEntry> {
     let entries = paths::entries(serial);
     if let Some(wanted) = session.filter(|s| !s.trim().is_empty()) {
