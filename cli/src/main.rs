@@ -10,6 +10,7 @@
 //!   events      — JSON event emission (stdout) + types
 //!   release     — GitHub release asset download + SHA-256 verification
 //!   hostenv     — host home/data directories + env-var toggles
+//!   jdwp        — standalone JDWP debugger backend (`debug --backend jdwp`)
 //!
 //! Each module is documented in the file header. See README.md for the public
 //! command surface.
@@ -50,6 +51,7 @@ mod fault;
 mod fusion;
 mod hostenv;
 mod ids;
+mod jdwp;
 mod net;
 mod proto;
 mod redaction;

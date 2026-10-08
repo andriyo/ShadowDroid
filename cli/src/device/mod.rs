@@ -9,7 +9,7 @@
 //! then `am instrument`s the runner and verifies the HTTP server is up.
 
 pub mod adb;
-mod adb_wire;
+pub(crate) mod adb_wire;
 pub mod client;
 pub mod installer;
 pub mod portmap;

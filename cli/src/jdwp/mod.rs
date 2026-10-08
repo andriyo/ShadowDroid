@@ -1,0 +1,26 @@
+//! Standalone JDWP debugger backend (`debug --backend jdwp`): the CLI speaks
+//! JDWP to the app through the ADB server's `jdwp:<pid>` service, without
+//! Android Studio. Design: `docs/jdwp-debugger-design.md`.
+//!
+//! Layout (mirrors `net/`):
+//!   protocol  — command-set/command/event/tag/error numbers
+//!   codec     — packet framing + IDSizes-aware value encoding
+//!   events    — `Event.Composite` parsing
+//!   conn      — handshake, reply demux by packet id, per-request deadlines
+//!   vm        — typed JDWP commands
+//!   transport — adb `jdwp:<pid>` streams, pid discovery, TCP for tests
+//!   resolve   — source file → package → candidate classes (pure)
+//!   session   — breakpoints, deferred binding, suspension state, event loop
+//!   inspect   — stack/threads/variables/eval/inspect and value renderers
+//!   paths     — `~/.shadowdroid/debug/<serial>/<pid>.*` registry layout
+//!   daemon    — `__debugd`: JSON-RPC over a 0600 unix socket
+//!   control   — client side: spawn, readiness, RPC
+//!   commands  — `debug` verb mapping for the jdwp backend
+
+pub mod codec;
+pub mod conn;
+pub mod events;
+#[allow(dead_code)] // numbered protocol table; not every entry has a caller yet
+pub mod protocol;
+pub mod transport;
+pub mod vm;
