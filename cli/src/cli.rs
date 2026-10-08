@@ -2193,6 +2193,16 @@ async fn run_inner() -> Result<()> {
             .await;
         }
         Cmd::Debug(args) if args.is_host_only() => {
+            // Refuse before touching the device or the bridge: Studio cannot
+            // see a process the jdwp daemon holds and would fail later.
+            if let DebugCmd::Studio(DebuggerCmd::Attach { package, pid, .. }) = &args.cmd {
+                crate::jdwp::commands::ensure_not_held_by_jdwp(
+                    selection.explicit_device.as_deref(),
+                    package.as_deref(),
+                    *pid,
+                )
+                .await?;
+            }
             // Host-only debugger commands skip device resolution / ensure_ready,
             // but still honor an explicit device/target to pick the matching
             // session. Resolve only here so passive commands stay passive even

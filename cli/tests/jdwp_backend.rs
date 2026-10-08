@@ -217,6 +217,27 @@ fn a_held_process_is_reported_as_already_attached() {
 }
 
 #[test]
+fn a_studio_attach_to_a_held_pid_is_refused_up_front() {
+    let env = Env::new();
+    env.ok(&["debug", "attach", "--backend", "jdwp", "--pid", "4242"]);
+    // The bridge URL is dead on purpose: the refusal must not need Studio.
+    let (error, code) = env.run(&[
+        "debug",
+        "attach",
+        "--backend",
+        "studio",
+        "--pid",
+        "4242",
+        "--studio-url",
+        "http://127.0.0.1:9",
+    ]);
+    assert_ne!(code, 0);
+    assert_eq!(error["code"], "debugger_already_attached", "{error}");
+    assert_eq!(error["detail"]["holder"], "jdwp", "{error}");
+    env.ok(&["debug", "detach", "--backend", "jdwp"]);
+}
+
+#[test]
 fn a_silent_handshake_is_a_timeout_not_another_debugger() {
     let env = Env::new();
     env.vm.with_state(|state| state.silent_handshake = true);

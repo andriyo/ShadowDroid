@@ -290,6 +290,53 @@ pub async fn run(cmd: &DebuggerCmd, ctx: JdwpContext<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Studio cannot see a process our daemon holds (its client list keeps
+/// `debugger_attached=false`, spike Q9), and its own attach then fails
+/// asynchronously after the bridge already answered ok. Refuse a Studio
+/// attach to a pid or package a live jdwp session holds, up front.
+pub async fn ensure_not_held_by_jdwp(
+    device: Option<&str>,
+    package: Option<&str>,
+    pid: Option<i32>,
+) -> Result<()> {
+    for entry in paths::entries(device) {
+        let same = match pid.filter(|pid| *pid > 0) {
+            Some(pid) => entry.pid == pid as u32,
+            None => package.is_some() && entry.package.as_deref() == package,
+        };
+        if !same {
+            continue;
+        }
+        if let Err(CallError::Unreachable(_)) =
+            control::call(&entry, "status", json!({}), Duration::from_secs(3)).await
+        {
+            control::prune(&entry);
+            continue;
+        }
+        return Err(DiagnosticError::new(
+            "debugger_already_attached",
+            "debugger",
+            format!(
+                "the jdwp debugger ({}) holds pid {}; a process accepts one debugger at a time",
+                entry.session_id, entry.pid
+            ),
+        )
+        .detail(json!({
+            "backend": "studio",
+            "holder": "jdwp",
+            "session_id": entry.session_id,
+            "serial": entry.serial,
+            "pid": entry.pid,
+        }))
+        .next_actions([format!(
+            "shadowdroid -d {} debug detach --backend jdwp --session {}",
+            entry.serial, entry.session_id
+        )])
+        .into());
+    }
+    Ok(())
+}
+
 fn timeout_for(timeout_ms: u64) -> Duration {
     Duration::from_millis(timeout_ms).max(DEFAULT_CALL_TIMEOUT) + CALL_HEADROOM
 }
