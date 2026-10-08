@@ -273,7 +273,8 @@ fn unsupported_verbs_fail_typed_and_studio_stays_the_default() {
     let (error, code) = env.run(&["debug", "watch", "list", "--backend", "jdwp"]);
     assert_ne!(code, 0);
     assert_eq!(error["code"], "unsupported_by_backend", "{error}");
-    let (error, _) = env.run(&["debug", "snapshot", "--backend", "jdwp"]);
+    // Rejected before any device or server bring-up.
+    let (error, _) = env.run(&["debug", "record", "-o", "t.jsonl", "--backend", "jdwp"]);
     assert_eq!(error["code"], "unsupported_by_backend", "{error}");
 
     // Without --backend nothing reaches the JDWP registry or daemon: the
@@ -281,4 +282,313 @@ fn unsupported_verbs_fail_typed_and_studio_stays_the_default() {
     let (studio, _) = env.run(&["debug", "sessions", "--studio-url", "http://127.0.0.1:9"]);
     assert_ne!(studio["backend"], "jdwp", "{studio}");
     assert!(!env.registry_dir().exists());
+}
+
+// ── P1b ──────────────────────────────────────────────────────────────────
+
+impl Env {
+    /// Every JSON line a command printed.
+    fn run_lines(&self, args: &[&str]) -> Vec<Value> {
+        let output = Command::new(env!("CARGO_BIN_EXE_shadowdroid"))
+            .args(["-d", "fake-serial", "--project-root"])
+            .arg(&self.project)
+            .args(args)
+            .current_dir(&self.project)
+            .env("HOME", &self.home)
+            .env_remove("USERPROFILE")
+            .env("SHADOWDROID_QUIET", "1")
+            .env("SHADOWDROID_JDWP_TCP", self.vm.address())
+            .output()
+            .expect("spawn shadowdroid");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("JSON line"))
+            .collect()
+    }
+}
+
+#[test]
+fn wait_for_launch_installs_breakpoints_before_reporting_ready() {
+    let env = Env::new();
+    // Studio does not take launch-time options; its default path is unchanged.
+    let (studio, code) = env.run(&[
+        "debug",
+        "attach",
+        "--wait-for-launch",
+        "--package",
+        "io.example.app",
+        "--studio-url",
+        "http://127.0.0.1:9",
+    ]);
+    assert_ne!(code, 0);
+    assert_eq!(studio["code"], "unsupported_by_backend", "{studio}");
+
+    let attached = env.ok(&[
+        "debug",
+        "attach",
+        "--backend",
+        "jdwp",
+        "--package",
+        "io.example.app",
+        "--wait-for-launch",
+        "--break",
+        "MainActivity.kt:31",
+        "--break",
+        "Late.kt:7",
+        "--break-exception",
+        "java.lang.IllegalStateException",
+    ]);
+    assert_eq!(attached["launch"]["wait_for_launch"], true, "{attached}");
+    assert_eq!(attached["session"]["launched_under_debugger"], true);
+    let breakpoints = attached["breakpoints"].as_array().unwrap();
+    assert_eq!(breakpoints.len(), 3, "{attached}");
+    assert_eq!(breakpoints[0]["bound"], true);
+    assert_eq!(breakpoints[0]["locations"][0]["method"], "onNewIntent");
+    // Not loaded yet: armed through ClassPrepare + SourceNameMatch.
+    assert_eq!(breakpoints[1]["pending_reason"], "class_not_loaded");
+    assert_eq!(breakpoints[2]["type"], "exception");
+    let prepares = env.vm.with_state(|s| {
+        s.requests
+            .iter()
+            .filter(|r| r.kind == 8)
+            .filter_map(|r| r.source_name.clone())
+            .collect::<Vec<_>>()
+    });
+    assert!(prepares.contains(&"Late.kt".to_string()), "{prepares:?}");
+
+    // A malformed spec is a typed usage error.
+    let (bad, code) = env.run(&[
+        "debug",
+        "attach",
+        "--backend",
+        "jdwp",
+        "--package",
+        "io.example.app",
+        "--break",
+        "MainActivity.kt",
+    ]);
+    assert_ne!(code, 0);
+    assert_eq!(bad["code"], "invalid_arguments", "{bad}");
+}
+
+#[test]
+fn logpoints_round_trip_through_the_cli() {
+    let env = Env::new();
+    env.ok(&["debug", "attach", "--backend", "jdwp", "--pid", "4242"]);
+    let added = env.ok(&[
+        "debug",
+        "logpoint",
+        "add",
+        "--backend",
+        "jdwp",
+        "--file",
+        "MainActivity.kt",
+        "--line",
+        "31",
+        "--expression",
+        "tag",
+        "--owner",
+        "agent",
+    ]);
+    assert_eq!(added["created"], true, "{added}");
+    let id = added["breakpoint"]["id"].as_str().unwrap().to_string();
+
+    env.vm.hit_breakpoint(5);
+    let mut events = Value::Null;
+    wait_until("the logpoint event", || {
+        events = env.ok(&["debug", "logpoint", "events", "--backend", "jdwp"]);
+        events["events"].as_array().is_some_and(|e| !e.is_empty())
+    });
+    assert_eq!(events["events"][0]["message"], "hello", "{events}");
+    let stream = events["stream_id"].as_str().unwrap().to_string();
+    let cursor = events["next_cursor"].as_u64().unwrap();
+
+    // Paging by cursor + stream id, as on Studio.
+    let page = env.ok(&[
+        "debug",
+        "logpoint",
+        "events",
+        "--backend",
+        "jdwp",
+        "--after",
+        &cursor.to_string(),
+        "--stream-id",
+        &stream,
+    ]);
+    assert_eq!(page["events"].as_array().unwrap().len(), 0);
+    let (stale, _) = env.run(&[
+        "debug",
+        "logpoint",
+        "events",
+        "--backend",
+        "jdwp",
+        "--after",
+        "0",
+        "--stream-id",
+        "logpoints_other",
+    ]);
+    assert_eq!(stale["code"], "logpoint_stream_changed", "{stale}");
+
+    let follow = env.run_lines(&[
+        "debug",
+        "logpoint",
+        "follow",
+        "--backend",
+        "jdwp",
+        "--replay-existing",
+        "--max-events",
+        "1",
+        "--duration-ms",
+        "3000",
+    ]);
+    assert_eq!(follow[0]["type"], "logpoint", "{follow:?}");
+    assert_eq!(follow.last().unwrap()["reason"], "max_events", "{follow:?}");
+
+    let listed = env.ok(&[
+        "debug",
+        "logpoint",
+        "list",
+        "--backend",
+        "jdwp",
+        "--owner",
+        "agent",
+    ]);
+    assert_eq!(listed["logpoints"][0]["id"], id.as_str());
+    let (mismatch, _) = env.run(&[
+        "debug",
+        "logpoint",
+        "remove",
+        "--backend",
+        "jdwp",
+        "--id",
+        &id,
+        "--owner",
+        "other",
+    ]);
+    assert_eq!(mismatch["code"], "logpoint_owner_mismatch", "{mismatch}");
+    let cleared = env.ok(&[
+        "debug",
+        "logpoint",
+        "clear",
+        "--backend",
+        "jdwp",
+        "--owner",
+        "agent",
+    ]);
+    assert_eq!(cleared["removed"], 1);
+}
+
+#[test]
+fn breakpoint_lifecycle_through_the_cli() {
+    let env = Env::new();
+    env.ok(&["debug", "attach", "--backend", "jdwp", "--pid", "4242"]);
+    let created = env.ok(&[
+        "debug",
+        "break",
+        "line",
+        "--backend",
+        "jdwp",
+        "--file",
+        "MainActivity.kt",
+        "--line",
+        "31",
+        "--condition",
+        "count > 100",
+    ]);
+    assert_eq!(created["created"], true, "{created}");
+    assert_eq!(created["breakpoint"]["condition"], "count > 100");
+    let id = created["breakpoint"]["id"].as_str().unwrap().to_string();
+    // Idempotent per file:line; --clear-condition on the repeat clears it.
+    let again = env.ok(&[
+        "debug",
+        "break",
+        "line",
+        "--backend",
+        "jdwp",
+        "--file",
+        "MainActivity.kt",
+        "--line",
+        "31",
+        "--clear-condition",
+    ]);
+    assert_eq!(again["created"], false, "{again}");
+    assert_eq!(again["breakpoint"]["id"], id.as_str());
+    assert!(again["breakpoint"]["condition"].is_null(), "{again}");
+
+    let (invalid, _) = env.run(&[
+        "debug",
+        "break",
+        "update",
+        "--backend",
+        "jdwp",
+        "--id",
+        &id,
+        "--condition",
+        "f()",
+    ]);
+    assert_eq!(invalid["code"], "debug_expression_invalid", "{invalid}");
+    let disabled = env.ok(&[
+        "debug",
+        "break",
+        "update",
+        "--backend",
+        "jdwp",
+        "--id",
+        &id,
+        "--enabled",
+        "false",
+        "--pass-count",
+        "2",
+        "--suspend",
+        "thread",
+    ]);
+    assert_eq!(disabled["breakpoint"]["enabled"], false, "{disabled}");
+    assert_eq!(disabled["breakpoint"]["pass_count"], 2);
+    assert_eq!(disabled["breakpoint"]["suspend_policy"], "THREAD");
+    env.ok(&["debug", "break", "remove", "--backend", "jdwp", "--id", &id]);
+
+    // continue-until arms a temporary breakpoint and removes it again.
+    let vm = env.vm.clone();
+    let hitter = std::thread::spawn(move || {
+        for _ in 0..200 {
+            std::thread::sleep(Duration::from_millis(50));
+            if vm.hit_breakpoint(5) > 0 {
+                return true;
+            }
+        }
+        false
+    });
+    let reached = env.ok(&[
+        "debug",
+        "continue-until",
+        "--backend",
+        "jdwp",
+        "--file",
+        "MainActivity.kt",
+        "--line",
+        "31",
+        "--timeout-ms",
+        "8000",
+    ]);
+    assert!(hitter.join().unwrap());
+    assert_eq!(reached["matched"], true, "{reached}");
+    assert_eq!(reached["temporary_breakpoint"], true);
+    let listed = env.ok(&["debug", "breakpoints", "--backend", "jdwp"]);
+    assert!(
+        listed["breakpoints"].as_array().unwrap().is_empty(),
+        "{listed}"
+    );
+    let (condition_only, _) = env.run(&[
+        "debug",
+        "continue-until",
+        "--backend",
+        "jdwp",
+        "--condition",
+        "count > 1",
+    ]);
+    assert_eq!(
+        condition_only["code"], "unsupported_by_backend",
+        "{condition_only}"
+    );
 }
