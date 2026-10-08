@@ -521,6 +521,14 @@ impl<'a> Reader<'a> {
         let count = self.i32()?;
         let count = usize::try_from(count)
             .map_err(|_| CodecError::Malformed(format!("negative array region count {count}")))?;
+        // Every element takes at least one byte; a `void` region takes none
+        // and would let a garbage count spin for billions of iterations.
+        if region_tag == tag::VOID || count > self.remaining() {
+            return Err(CodecError::Malformed(format!(
+                "array region of {count} element(s) tagged {region_tag:#04x} with {} byte(s) left",
+                self.remaining()
+            )));
+        }
         let mut values = Vec::with_capacity(count.min(self.remaining()));
         let primitive = !tag::is_object(region_tag);
         for _ in 0..count {
