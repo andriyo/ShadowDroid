@@ -96,8 +96,11 @@ ends it and resumes the app.
 The default `--backend auto` picks a backend per command: a live standalone
 session that holds the target wins; otherwise a reachable Studio bridge keeps
 the Studio path; otherwise the standalone debugger. Every result says which
-one answered (`backend`) and why (`backend_reason`). Set `debug_backend` in
-config, or pass `--backend studio|jdwp`, to pin one.
+one answered (`backend`) and why (`backend_reason`). When `auto` answers
+`debug sessions` or `debug status` from a standalone session while Android
+Studio is also reachable, Studio's sessions are listed too, each tagged with
+its `backend`. Set `debug_backend` in config, or pass `--backend
+studio|jdwp`, to pin one.
 
 `shadowdroid doctor --json` (add `--app <pkg>` or configure an app) has an
 advisory `debugger` check: whether this host can run the daemon, whether the
@@ -132,6 +135,8 @@ What works:
 - Startup code: `debug attach --wait-for-launch --package <pkg> --break
   File.kt:LINE` (or `debug auto --from-start --break …`) restarts the app
   under the debugger and installs breakpoints before the first line runs.
+  `--break-exception CLASS` there stops only on exceptions app code does not
+  catch (like `break exception --caught false`).
   With several launcher activities, pass `--launch-activity .Main`; otherwise
   the root of the app's last task (else the first launcher) is started and
   the result warns. A process launched this way raises no ANR dialog while
