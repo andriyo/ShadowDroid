@@ -1272,6 +1272,8 @@ async fn method_breakpoints_are_line_breakpoints_at_entry_and_returns() {
         [("onNewIntent", "entry", 0), ("onNewIntent", "exit", 10)],
         "the synthetic bridge is skipped; exit is the DEX return-void"
     );
+    assert_eq!(locations[0]["kind"], "entry");
+    assert_eq!(locations[1]["kind"], "exit");
     assert_eq!(breakpoint["mechanism"], "line_breakpoints");
     // Never MethodEntry/MethodExit (event kinds 40/41).
     assert!(vm.with_state(|s| s.requests.iter().all(|r| r.kind != 40 && r.kind != 41)));
@@ -1302,6 +1304,9 @@ async fn method_breakpoints_are_line_breakpoints_at_entry_and_returns() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(session.breakpoints()[1]["locations"][0]["method"], "run");
+    // Entry-only: the location says what it is, as Studio's does.
+    assert_eq!(session.breakpoints()[1]["locations"][0]["kind"], "entry");
+    assert_eq!(session.breakpoints()[1]["locations"][0]["role"], "entry");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -234,6 +234,10 @@ pub struct BoundLocation {
     /// `field_access`, `field_modification` (method/field breakpoints).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<&'static str>,
+    /// The same as `role`, under the name the Studio bridge's method
+    /// breakpoints use (`entry`/`exit`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<&'static str>,
     /// Inside a Kotlin lambda (`$lambda$` body, `invoke`/`invokeSuspend`
     /// of a lambda class) rather than the outer call site.
     pub lambda: bool,
@@ -1112,6 +1116,7 @@ impl Session {
                 method: method.name.clone(),
                 code_index: index,
                 role: None,
+                kind: None,
                 lambda: depth > 0,
                 lambda_depth: depth,
                 class_id,
@@ -1248,6 +1253,7 @@ impl Session {
             method: String::new(),
             code_index: 0,
             role: None,
+            kind: None,
             lambda: false,
             lambda_depth: 0,
             class_id: type_id,

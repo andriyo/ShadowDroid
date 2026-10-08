@@ -90,6 +90,8 @@ fn serve(mut stream: TcpStream, serial: &str, online: bool) -> std::io::Result<(
                 format!("{BOOT_ID}\n")
             } else if command.contains("/data/local/tmp/shadowdroid-authority") {
                 authority_marker(command)
+            } else if command.contains("/cmdline") {
+                process_names(command)
             } else {
                 String::new()
             };
@@ -102,6 +104,19 @@ fn serve(mut stream: TcpStream, serial: &str, online: bool) -> std::io::Result<(
         return okay_with_body(&mut stream, "");
     }
     fail(&mut stream, "unsupported request")
+}
+
+/// `<pid> <name>` for each pid of the process-name script
+/// (`for p in 1 2; do … /proc/$p/cmdline …`): every pid is the sample app.
+fn process_names(command: &str) -> String {
+    let pids = command
+        .split("for p in ")
+        .nth(1)
+        .and_then(|rest| rest.split(';').next())
+        .unwrap_or_default();
+    pids.split_whitespace()
+        .map(|pid| format!("{pid} io.example.app \n"))
+        .collect()
 }
 
 /// The device-side authority marker as a fresh device answers it: a read

@@ -596,10 +596,12 @@ pub fn initial_breakpoints_from(
             line,
         });
     }
+    // Like `break exception --caught false`: stop on exceptions that escape
+    // app code, not on the many the framework throws and catches at startup.
     for class in exceptions {
         init.exceptions.push(InitialException {
             class: class.clone(),
-            caught: true,
+            caught: false,
             uncaught: true,
         });
     }
@@ -1317,6 +1319,13 @@ async fn attach(
         }
     };
 
+    // A `--pid` attach records the app's package too (`/proc/<pid>/cmdline`,
+    // read once), so auto routing and the Studio-attach refusal see it.
+    let package: Option<String> = match package {
+        Some(package) => Some(package.to_string()),
+        None => package_of_pid(serial, pid).await,
+    };
+    let package = package.as_deref();
     let registry = paths::registry_path(serial, pid)?;
     if let Some(entry) = paths::read_entry(&registry) {
         match control::call(&entry, "status", json!({}), Duration::from_secs(3)).await {
@@ -1341,7 +1350,11 @@ async fn attach(
                         rpc(
                             &entry,
                             "break_exception",
-                            json!({"class": exception.class}),
+                            json!({
+                                "class": exception.class,
+                                "caught": exception.caught,
+                                "uncaught": exception.uncaught,
+                            }),
                             DEFAULT_CALL_TIMEOUT,
                         )
                         .await
@@ -1412,6 +1425,28 @@ async fn attach(
             .into())
         }
     }
+}
+
+/// The package of `pid`: its process name without a `:subprocess`
+/// suffix. Best effort and bounded; `None` when it cannot be read.
+async fn package_of_pid(serial: &str, pid: u32) -> Option<String> {
+    let names = tokio::time::timeout(
+        Duration::from_secs(3),
+        transport::process_names(serial, &[pid]),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    names
+        .into_iter()
+        .find(|(found, _)| *found == pid)
+        .and_then(|(_, name)| package_from_process_name(&name))
+}
+
+/// `com.example.app:remote` → `com.example.app`; non-app names → `None`.
+pub fn package_from_process_name(name: &str) -> Option<String> {
+    let package = name.split(':').next()?.trim();
+    (package.contains('.') && !package.starts_with('/')).then(|| package.to_string())
 }
 
 fn adb_error(error: anyhow::Error) -> anyhow::Error {
@@ -1513,5 +1548,27 @@ mod tests {
         assert!(mine.iter().all(|s| s["backend"] == "studio"));
         assert_eq!(studio_sessions_on(&reply, None).len(), 3);
         assert!(studio_sessions_on(&json!({}), None).is_empty());
+    }
+
+    #[test]
+    fn a_process_name_gives_its_package() {
+        assert_eq!(
+            package_from_process_name("io.example.app").as_deref(),
+            Some("io.example.app")
+        );
+        assert_eq!(
+            package_from_process_name("io.example.app:remote").as_deref(),
+            Some("io.example.app")
+        );
+        assert_eq!(package_from_process_name("/system/bin/app_process"), None);
+        assert_eq!(package_from_process_name("zygote"), None);
+    }
+
+    #[test]
+    fn launch_exceptions_stop_only_when_app_code_does_not_catch() {
+        let init = initial_breakpoints_from(&[], &["java.lang.IllegalStateException".into()], None)
+            .unwrap();
+        assert!(!init.exceptions[0].caught);
+        assert!(init.exceptions[0].uncaught);
     }
 }

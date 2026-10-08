@@ -454,6 +454,7 @@ impl Session {
                 method,
                 code_index: index,
                 role: Some(role),
+                kind: Some(role),
                 lambda: false,
                 lambda_depth: 0,
                 class_id,

@@ -402,6 +402,24 @@ fn auto_follows_the_process_then_studio_then_jdwp() {
         "http://127.0.0.1:9",
     ]);
     assert_eq!(attached["backend_reason"], "studio_bridge_unreachable");
+    // A --pid attach records the app's package (/proc/<pid>/cmdline) ...
+    assert_eq!(
+        attached["session"]["package"], "io.example.app",
+        "{attached}"
+    );
+    // ... so a Studio attach to that package is refused up front.
+    let (refused, code) = env.run(&[
+        "debug",
+        "attach",
+        "--package",
+        "io.example.app",
+        "--backend",
+        "studio",
+        "--studio-url",
+        &bridge_url,
+    ]);
+    assert_ne!(code, 0);
+    assert_eq!(refused["code"], "debugger_already_attached", "{refused}");
     let held = env.ok(&["debug", "sessions", "--studio-url", &bridge_url]);
     assert_eq!(
         held["backend_reason"], "jdwp_session_holds_target",
@@ -551,6 +569,9 @@ fn wait_for_launch_installs_breakpoints_before_reporting_ready() {
     // Not loaded yet: armed through ClassPrepare + SourceNameMatch.
     assert_eq!(breakpoints[1]["pending_reason"], "class_not_loaded");
     assert_eq!(breakpoints[2]["type"], "exception");
+    // Launch-time exception breakpoints stop on what app code does not catch.
+    assert_eq!(breakpoints[2]["caught"], false, "{attached}");
+    assert_eq!(breakpoints[2]["uncaught"], true);
     let prepares = env.vm.with_state(|s| {
         s.requests
             .iter()
