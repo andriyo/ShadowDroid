@@ -162,9 +162,18 @@ not by `debug pause`.
 
 Limits:
 
-- Attaching to an app that is already running keeps Android's ANR timers.
-  A session suspended for more than about 4 s warns, and pending input will
-  raise an ANR dialog; use `--wait-for-launch` for long inspection.
+- Attaching to an app that is already running keeps Android's ANR timers:
+  with input pending, a stop raises "Application Not Responding" about 15 s
+  later, and nothing on the device suppresses it safely. A session suspended
+  for more than about 4 s warns; while it stays suspended the daemon checks
+  `dumpsys window`/`dumpsys activity processes` every 2 s and reports
+  `anr: {dialog, not_responding, since}` with a warning in `status`, `stack`,
+  and `variables`. It never taps the dialog (Close App kills the app). For a
+  long inspection run `debug attach --relaunch --package <pkg>`: it detaches,
+  force-stops the app, and starts it again under the debugger with the
+  session's line and exception breakpoints (plus any `--break` flags). That
+  resets the app's state (`relaunch.app_state_reset`), and a process started
+  that way has no ANR timers.
 - Not available standalone: native/mixed debugging (`debug native`,
   `attach --mode native|mixed`), `debug record`, `debug clients`, and Layout
   Inspector data (`layout`, `ui dump --deep`). These stay on Studio.

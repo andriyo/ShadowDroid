@@ -101,22 +101,36 @@ pub async fn run(cmd: &DebuggerCmd, ctx: JdwpContext<'_>) -> Result<()> {
                     "jdwp attach needs a device; pass -d <serial>",
                 )
             })?;
+            let mut init = initial_breakpoints(launch, ctx.project_root)?;
+            let relaunch = if launch.relaunch {
+                Some(prepare_relaunch(serial, package.as_deref(), *pid, &mut init).await?)
+            } else {
+                None
+            };
+            let package = match &relaunch {
+                Some(prepared) => Some(prepared.package.clone()),
+                None => package.clone(),
+            };
             let request = AttachRequest {
                 serial,
                 package: package.as_deref(),
-                pid: *pid,
-                init: initial_breakpoints(launch, ctx.project_root)?,
-                wait_for_launch: launch.wait_for_launch,
+                pid: if relaunch.is_some() { None } else { *pid },
+                init,
+                wait_for_launch: launch.wait_for_launch || relaunch.is_some(),
                 launch_timeout: Duration::from_millis(launch.launch_timeout_ms),
             };
             let host = super::launch::AdbHost {
                 serial: serial.to_string(),
             };
             let activity = launch.launch_activity.clone();
-            attach_with(request, |package| async move {
+            let mut value = attach_with(request, |package| async move {
                 super::launch::launcher_launch(&host, &package, activity.as_deref()).await
             })
-            .await?
+            .await?;
+            if let Some(prepared) = relaunch {
+                value["relaunch"] = prepared.report();
+            }
+            value
         }
         DebuggerCmd::Detach(selector) | DebuggerCmd::Stop(selector) => {
             let entry = select(ctx.serial, selector.session.as_deref())?;
@@ -613,6 +627,96 @@ fn initial_breakpoints(
     project_root: Option<&Path>,
 ) -> Result<InitialBreakpoints> {
     initial_breakpoints_from(&launch.break_at, &launch.break_exception, project_root)
+}
+
+/// What `debug attach --relaunch` did before the launch.
+struct PreparedRelaunch {
+    package: String,
+    previous_session: Option<String>,
+    carried_lines: usize,
+    carried_exceptions: usize,
+}
+
+impl PreparedRelaunch {
+    fn report(&self) -> Json {
+        json!({
+            "app_state_reset": true,
+            "note": "the app was force-stopped and started again under the debugger: its in-memory state, back stack, and unsaved input are gone; it raises no ANR while suspended",
+            "package": self.package,
+            "previous_session": self.previous_session,
+            "carried_breakpoints": {
+                "lines": self.carried_lines,
+                "exceptions": self.carried_exceptions,
+            },
+        })
+    }
+}
+
+/// `debug attach --relaunch`: find the app, take the line and exception
+/// breakpoints of a live session on it into `init` (after the `--break`
+/// flags, without duplicates), and detach that session. The launch that
+/// follows force-stops the app and starts it under `set-debug-app -w`.
+async fn prepare_relaunch(
+    serial: &str,
+    package: Option<&str>,
+    pid: Option<i32>,
+    init: &mut InitialBreakpoints,
+) -> Result<PreparedRelaunch> {
+    let existing = match (package, pid) {
+        (None, None) => None,
+        _ => live_session(Some(serial), package, pid).await,
+    };
+    let package = package
+        .map(str::to_string)
+        .or_else(|| existing.as_ref().and_then(|entry| entry.package.clone()))
+        .ok_or_else(|| {
+            DiagnosticError::new(
+                "invalid_arguments",
+                "debugger",
+                "--relaunch needs --package (or a session or --pid whose package is known)",
+            )
+            .next_actions(["shadowdroid debug attach --relaunch --backend jdwp --package <pkg>"])
+        })?;
+    let mut prepared = PreparedRelaunch {
+        package,
+        previous_session: None,
+        carried_lines: 0,
+        carried_exceptions: 0,
+    };
+    if let Some(entry) = existing {
+        let exported = rpc(
+            &entry,
+            "export_breakpoints",
+            json!({}),
+            DEFAULT_CALL_TIMEOUT,
+        )
+        .await?;
+        let carried: InitialBreakpoints = serde_json::from_value(exported).unwrap_or_default();
+        prepared.carried_lines = carried.lines.len();
+        prepared.carried_exceptions = carried.exceptions.len();
+        merge_initial(init, carried);
+        rpc(&entry, "detach", json!({}), DEFAULT_CALL_TIMEOUT).await?;
+        prepared.previous_session = Some(entry.session_id);
+    }
+    Ok(prepared)
+}
+
+/// Add `carried` to `init`, skipping what `init` already has.
+fn merge_initial(init: &mut InitialBreakpoints, carried: InitialBreakpoints) {
+    for line in carried.lines {
+        if !init
+            .lines
+            .iter()
+            .any(|l| l.line == line.line && l.target.basename == line.target.basename)
+        {
+            init.lines.push(line);
+        }
+    }
+    for exception in carried.exceptions {
+        if !init.exceptions.iter().any(|e| e.class == exception.class) {
+            init.exceptions.push(exception);
+        }
+    }
 }
 
 /// Everything `debug attach --backend jdwp` (and `debug auto`) needs.

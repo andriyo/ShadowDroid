@@ -29,6 +29,7 @@
 // Unreachable on non-unix hosts by design (see above), not forgotten code.
 #![cfg_attr(not(unix), allow(dead_code))]
 
+pub mod anr;
 pub mod breakpoints;
 pub mod codec;
 pub mod commands;

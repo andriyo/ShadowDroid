@@ -386,6 +386,9 @@ async fn serve(
             _ = tick.tick() => {
                 session.rearm_due().await;
                 session.expire_slow_watches().await;
+                if session.begin_anr_check() {
+                    spawn_anr_probe(session.clone());
+                }
                 if let Some(reason) = session.closed_reason() {
                     tracing::info!("debugd exiting: {reason}");
                     break;
@@ -524,7 +527,37 @@ fn invoke_param(params: &Json) -> Option<Duration> {
         .then(|| super::inspect::read_timeout(u64_param(params, "timeout_ms", 5_000)))
 }
 
+/// One ANR probe (read-only system_server dumps), bounded; a probe that
+/// fails or times out records "nothing seen" so the next one can run.
+#[cfg(unix)]
+fn spawn_anr_probe(session: Arc<Session>) {
+    tokio::spawn(async move {
+        let command = super::anr::probe_command(session.info.package.as_deref());
+        let text = tokio::time::timeout(
+            Duration::from_secs(5),
+            super::transport::shell_line(&session.info.serial, &command),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+        session.record_anr(super::anr::parse_probe(
+            &text,
+            session.info.pid,
+            session.info.package.as_deref(),
+        ));
+    });
+}
+
 pub async fn dispatch(session: &Arc<Session>, method: &str, params: &Json) -> RpcResult<Json> {
+    let mut reply = dispatch_method(session, method, params).await?;
+    if matches!(method, "status" | "stack" | "variables") {
+        session.annotate_anr(&mut reply);
+    }
+    Ok(reply)
+}
+
+async fn dispatch_method(session: &Arc<Session>, method: &str, params: &Json) -> RpcResult<Json> {
     let thread = str_param(params, "thread");
     let frame = params
         .get("frame")
@@ -538,6 +571,7 @@ pub async fn dispatch(session: &Arc<Session>, method: &str, params: &Json) -> Rp
             "details": session.details(),
             "initial_breakpoints": session.initial_breakpoints(),
         })),
+        "export_breakpoints" => Ok(json!(session.export_initial_breakpoints())),
         "detach" => {
             session.release_handles().await;
             session.dispose().await?;

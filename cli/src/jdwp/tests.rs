@@ -970,7 +970,7 @@ async fn status_warns_about_anr_after_a_long_stop_in_an_attached_process() {
         status["warning"]
             .as_str()
             .unwrap()
-            .contains("wait-for-launch"),
+            .contains("debug attach --relaunch"),
         "{status}"
     );
     let stack = session.stack(None, 4).await.unwrap();
@@ -1891,4 +1891,98 @@ async fn invoke_watches_run_only_on_event_stops() {
     let watches = paused["watches"].as_array().unwrap();
     assert_eq!(watches[0]["value"]["code"], "needs_event_stop", "{paused}");
     assert_eq!(vm.with_state(|s| s.invokes.len()), before);
+}
+
+// ── ANR detection (attach-to-running) ─────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_anr_on_a_stopped_running_app_is_reported_with_the_way_out() {
+    use super::anr::{AnrObservation, parse_probe};
+    let vm = FakeVm::start();
+    let session = stopped_at_line_31(&vm).await;
+    // Checks run only while suspended, at most every 2 s.
+    assert!(session.begin_anr_check());
+    assert!(!session.begin_anr_check(), "one probe at a time");
+    let dump = "Window{4e1f2a u0 Application Not Responding: io.example.app}\n---\n  *APP* UID 10123 ProcessRecord{9f3a1b2 1:io.example.app/u0a123}\n    notResponding=true\n";
+    session.record_anr(parse_probe(dump, 1, Some("io.example.app")));
+    assert!(!session.begin_anr_check(), "the next probe waits 2 s");
+
+    let status = session.status().await;
+    assert_eq!(status["anr"]["dialog"], true, "{status}");
+    assert_eq!(status["anr"]["not_responding"], true);
+    assert!(status["anr"]["since"].is_number());
+    assert!(
+        status["warning"]
+            .as_str()
+            .unwrap()
+            .contains("debug attach --relaunch")
+    );
+    // stack/variables replies carry it too, with the relaunch follow-up.
+    let mut stack = session.stack(None, 8).await.unwrap();
+    session.annotate_anr(&mut stack);
+    assert_eq!(stack["anr"]["dialog"], true);
+    assert_eq!(
+        stack["next_actions"][0],
+        "shadowdroid debug attach --relaunch --backend jdwp --package io.example.app"
+    );
+    // Nothing was tapped or sent to the app.
+    assert!(vm.with_state(|s| s.invokes.is_empty()));
+
+    // Resumed: no report; a new stop starts clean.
+    session.resume().await.unwrap();
+    assert!(session.anr_report().is_none());
+    assert!(!session.begin_anr_check());
+    vm.hit_breakpoint(5);
+    wait_suspended(&session).await;
+    assert!(session.anr_report().is_none());
+    assert!(session.begin_anr_check());
+    session.record_anr(AnrObservation::default());
+    assert!(session.status().await["anr"].is_null());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relaunch_exports_enabled_line_and_exception_breakpoints_only() {
+    let vm = FakeVm::start();
+    let session = attach(&vm, WAIT).await;
+    session
+        .break_line(target("MainActivity.kt"), 31, Default::default())
+        .await
+        .unwrap();
+    session
+        .break_line_with(
+            target("MainActivity.kt"),
+            21,
+            BreakpointOptions {
+                enabled: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    session
+        .break_exception(
+            "java.lang.IllegalStateException",
+            false,
+            true,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    session
+        .break_method(
+            "io.example.app.MainActivity",
+            "onCreate",
+            true,
+            false,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    let exported = session.export_initial_breakpoints();
+    assert_eq!(exported.lines.len(), 1);
+    assert_eq!(exported.lines[0].line, 31);
+    assert_eq!(exported.lines[0].target.basename, "MainActivity.kt");
+    assert_eq!(exported.exceptions.len(), 1);
+    assert!(!exported.exceptions[0].caught);
+    assert!(exported.exceptions[0].uncaught);
 }

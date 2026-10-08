@@ -57,6 +57,13 @@
 >   only, `--uncaught` meaning "not caught by app code", keep-alive Version
 >   pings during wait-for-launch, suspending hits capped at 20/s by default
 >   (ceiling 100/s), ANR warning after 4 s for attach-to-running sessions.
+> - **ANR on attach-to-running stops** cannot be suppressed safely
+>   (`hide_error_dialogs` makes the system kill the app; "Wait" lasts until
+>   the next input; `am monitor` can hang system_server; `isDebugging` cannot
+>   be set on a running process). The daemon detects it (every 2 s while
+>   suspended, from `dumpsys window` and `dumpsys activity processes`; never
+>   taps) and reports `anr`; `debug attach --relaunch` restarts the app under
+>   `set-debug-app -w` with the session's line/exception breakpoints.
 >
 > Not done: `debug record`, `debug native`/mixed mode, and `debug clients`
 > (Studio only); SMAP inline-body resolution;

@@ -535,6 +535,7 @@ fn leaf_contract(path: &str) -> Option<LeafEffectContract> {
         | "debug coroutines continuation"
         | "debug coroutines flow"
         | "debug watch list" => leaf(DEBUGGER_READ, CONFIG),
+        // --wait-for-launch and --relaunch force-stop and restart the app.
         "debug attach" => leaf(
             &[
                 E::HostRead,
@@ -542,6 +543,7 @@ fn leaf_contract(path: &str) -> Option<LeafEffectContract> {
                 E::DeviceRead,
                 E::DeviceMutate,
                 E::ProcessStart,
+                E::ProcessStop,
             ],
             &[D::ConfigLoad, D::ManagedProcessStart],
         ),

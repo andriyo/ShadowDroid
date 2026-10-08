@@ -531,6 +531,8 @@ pub struct Session {
     coroutine_classes: Mutex<Option<super::coroutines::CoroutineClasses>>,
     /// Classes loaded since the coroutine class scan, classified lazily.
     pub(super) coroutine_pending: Mutex<Vec<(u64, String)>>,
+    /// ANR detection for attach-to-running sessions.
+    pub(super) anr: Mutex<super::anr::AnrState>,
 }
 
 impl Session {
@@ -554,6 +556,7 @@ impl Session {
             watches: Mutex::new((Vec::new(), HashMap::new())),
             coroutine_classes: Mutex::new(None),
             coroutine_pending: Mutex::new(Vec::new()),
+            anr: Mutex::new(Default::default()),
             logpoint_log: super::logpoints::LogpointLog::new(
                 format!(
                     "logpoints_jdwp_{}_{}",
@@ -618,6 +621,46 @@ impl Session {
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.changed.subscribe()
+    }
+
+    /// The enabled line and exception breakpoints, as launch-time
+    /// breakpoints for `debug attach --relaunch` (logpoints and conditions
+    /// stay behind).
+    pub fn export_initial_breakpoints(&self) -> super::daemon::InitialBreakpoints {
+        let state = self.state();
+        let mut out = super::daemon::InitialBreakpoints::default();
+        for breakpoint in state.breakpoints.values() {
+            if !breakpoint.opts.enabled || breakpoint.opts.is_logpoint() {
+                continue;
+            }
+            match &breakpoint.kind {
+                BreakpointKind::Line { target, line } => {
+                    out.lines.push(super::daemon::InitialLine {
+                        target: target.clone(),
+                        line: *line,
+                    });
+                }
+                BreakpointKind::Exception {
+                    class,
+                    caught,
+                    uncaught,
+                } => out.exceptions.push(super::daemon::InitialException {
+                    class: class.clone(),
+                    caught: *caught,
+                    uncaught: *uncaught,
+                }),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Attached while running and suspended long enough to risk an ANR.
+    pub fn risks_anr(&self) -> bool {
+        !self.info.launched_under_debugger
+            && self
+                .suspension()
+                .is_some_and(|s| crate::events::now_ts() - s.at > ANR_WARNING_SECS)
     }
 
     pub fn suspension(&self) -> Option<Suspension> {
@@ -823,21 +866,28 @@ impl Session {
         };
         let slow_requests = self.slow_requests();
         // An attach-to-running process still has ANR timers: a stop with
-        // pending input shows "Application Not Responding" after ~5 s.
-        let anr_warning = suspension.as_ref().and_then(|s| {
-            let held = crate::events::now_ts() - s.at;
-            (!self.info.launched_under_debugger && held > ANR_WARNING_SECS).then(|| {
-                format!(
-                    "suspended for {held:.0} s in a process attached while running: Android shows an ANR dialog for pending input; use `debug attach --wait-for-launch` for long inspection"
-                )
+        // pending input shows "Application Not Responding" after ~15 s.
+        let anr = self.anr_report();
+        let anr_warning = if anr.is_some() {
+            Some(self.anr_warning())
+        } else {
+            suspension.as_ref().and_then(|s| {
+                let held = crate::events::now_ts() - s.at;
+                (!self.info.launched_under_debugger && held > ANR_WARNING_SECS).then(|| {
+                    format!(
+                        "suspended for {held:.0} s in a process attached while running: Android shows an ANR dialog for pending input; for a long inspection restart it under the debugger: {}",
+                        super::anr::relaunch_action(self.info.package.as_deref())
+                    )
+                })
             })
-        });
+        };
         let state = self.state();
         json!({
             "id": self.info.session_id,
             "epoch": state.epoch,
             "launched_under_debugger": self.info.launched_under_debugger,
             "warning": anr_warning,
+            "anr": anr,
             "index": 0,
             "name": self.info.package.clone().unwrap_or_else(|| format!("pid {}", self.info.pid)),
             "backend": "jdwp",

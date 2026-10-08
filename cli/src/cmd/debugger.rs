@@ -184,6 +184,11 @@ pub struct LaunchArgs {
     /// Restart the app under `am set-debug-app -w` and attach before its code runs.
     #[arg(long)]
     pub wait_for_launch: bool,
+    /// Restart an already running app under the debugger, carrying over the
+    /// session's line and exception breakpoints: long stops then raise no
+    /// ANR. Resets the app's state (force-stop).
+    #[arg(long)]
+    pub relaunch: bool,
     /// Line breakpoint set at attach, as FILE:LINE (repeatable).
     #[arg(long = "break", value_name = "FILE:LINE")]
     pub break_at: Vec<String>,
@@ -206,7 +211,7 @@ impl DebuggerCmd {
     pub fn jdwp_only_flag(&self) -> Option<&'static str> {
         match self {
             DebuggerCmd::Attach { launch, .. } if launch.is_requested() => {
-                Some("--wait-for-launch, --break, and --break-exception")
+                Some("--wait-for-launch, --relaunch, --break, and --break-exception")
             }
             DebuggerCmd::Eval(args) if args.invoke => Some("--invoke"),
             DebuggerCmd::Inspect(args) if args.invoke => Some("--invoke"),
@@ -239,7 +244,10 @@ impl DebuggerCmd {
 
 impl LaunchArgs {
     pub fn is_requested(&self) -> bool {
-        self.wait_for_launch || !self.break_at.is_empty() || !self.break_exception.is_empty()
+        self.wait_for_launch
+            || self.relaunch
+            || !self.break_at.is_empty()
+            || !self.break_exception.is_empty()
     }
 }
 

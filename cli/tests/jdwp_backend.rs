@@ -938,3 +938,88 @@ fn device_changing_verbs_are_admitted_and_reads_stay_passive() {
     env.ok(&["debug", "pause", "--backend", "jdwp"]);
     env.ok(&["debug", "detach", "--backend", "jdwp"]);
 }
+
+#[test]
+fn relaunch_restarts_under_the_debugger_and_carries_breakpoints_over() {
+    let env = Env::new();
+    env.ok(&["debug", "attach", "--backend", "jdwp", "--pid", "4242"]);
+    env.ok(&[
+        "debug",
+        "break",
+        "line",
+        "--file",
+        "MainActivity.kt",
+        "--line",
+        "31",
+        "--backend",
+        "jdwp",
+    ]);
+    env.ok(&[
+        "debug",
+        "break",
+        "exception",
+        "java.lang.IllegalStateException",
+        "--caught",
+        "false",
+        "--backend",
+        "jdwp",
+    ]);
+    // A logpoint is instrumentation, not a breakpoint: it stays behind.
+    env.ok(&[
+        "debug",
+        "logpoint",
+        "add",
+        "--file",
+        "MainActivity.kt",
+        "--line",
+        "32",
+        "--expression",
+        "tag",
+        "--backend",
+        "jdwp",
+    ]);
+
+    // The session is found by --pid; its package comes from the registry.
+    let relaunched = env.ok(&[
+        "debug",
+        "attach",
+        "--relaunch",
+        "--pid",
+        "4242",
+        "--break",
+        "MainActivity.kt:31",
+        "--backend",
+        "jdwp",
+    ]);
+    let relaunch = &relaunched["relaunch"];
+    assert_eq!(relaunch["app_state_reset"], true, "{relaunched}");
+    assert_eq!(relaunch["package"], "io.example.app");
+    assert_eq!(relaunch["previous_session"], "jdwp:fake-serial:4242");
+    assert_eq!(relaunch["carried_breakpoints"]["lines"], 1);
+    assert_eq!(relaunch["carried_breakpoints"]["exceptions"], 1);
+    assert_eq!(relaunched["launch"]["wait_for_launch"], true);
+    assert_eq!(relaunched["session"]["launched_under_debugger"], true);
+    // --break MainActivity.kt:31 and the carried one are the same: one each.
+    let breakpoints = relaunched["breakpoints"].as_array().unwrap();
+    assert_eq!(breakpoints.len(), 2, "{relaunched}");
+    assert_eq!(breakpoints[0]["line"], 31);
+    assert_eq!(breakpoints[1]["type"], "exception");
+    assert_eq!(breakpoints[1]["caught"], false);
+    // The old session is gone.
+    wait_until("old daemon exit", || {
+        !registry_files(&env.registry_dir()).contains(&"4242.json".to_string())
+    });
+
+    // Studio cannot relaunch: refused before any device work.
+    let (studio, code) = env.run(&[
+        "debug",
+        "attach",
+        "--relaunch",
+        "--package",
+        "io.example.app",
+        "--backend",
+        "studio",
+    ]);
+    assert_ne!(code, 0);
+    assert_eq!(studio["code"], "unsupported_by_backend", "{studio}");
+}
