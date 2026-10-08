@@ -1487,7 +1487,10 @@ impl Session {
                     })
                 );
                 if uncaught_only {
-                    if self.caught_by_app(catch_location.as_ref()).await {
+                    if !self
+                        .escapes_app_code(*thread, catch_location.as_ref())
+                        .await
+                    {
                         return Ok(false);
                     }
                     if let Some(object) = exception.object_id() {
@@ -1573,15 +1576,44 @@ impl Session {
     /// Whether an app frame catches the exception. A catch in framework or
     /// library code (the same packages step-into skips) still lets it crash
     /// the app on Android, so it counts as uncaught.
-    async fn caught_by_app(&self, catch_location: Option<&Location>) -> bool {
-        let Some(location) = catch_location else {
-            return false;
+    /// Whether an exception escapes app code: an uncaught-only breakpoint's
+    /// "uncaught". On Android a crash is always caught somewhere in framework
+    /// code that rethrows it (Looper.loopOnce, Compose pointer dispatch,
+    /// AccessibilityInteractionController), so "no catch location" is not
+    /// enough; but framework code also throws and catches internally all the
+    /// time (`ErrnoException` inside `File.exists`). The rule: no catcher, or
+    /// a catcher in app code is decided directly; a framework catcher counts
+    /// only when the exception unwinds through at least one app frame on the
+    /// way to it.
+    async fn escapes_app_code(&self, thread: u64, catch_location: Option<&Location>) -> bool {
+        let Some(catch) = catch_location else {
+            return true;
         };
-        match self.signature(location.class_id).await {
+        let catcher_is_app = match self.signature(catch.class_id).await {
             Ok(signature) => !is_framework_class(&resolve::type_name(&signature)),
             // Unknown catcher: report the stop rather than hide a crash.
-            Err(_) => false,
+            Err(_) => return true,
+        };
+        if catcher_is_app {
+            return false;
         }
+        let Ok(frames) = self.jdwp.frames(thread, 0, -1).await else {
+            return true;
+        };
+        let catching = frames.iter().position(|(_, location)| {
+            location.class_id == catch.class_id && location.method_id == catch.method_id
+        });
+        let Some(catching) = catching else {
+            return true;
+        };
+        for (_, location) in &frames[..catching] {
+            match self.signature(location.class_id).await {
+                Ok(signature) if is_framework_class(&resolve::type_name(&signature)) => {}
+                // An app frame (or one we cannot name) unwinds.
+                _ => return true,
+            }
+        }
+        false
     }
 
     pub(super) fn record_stop(

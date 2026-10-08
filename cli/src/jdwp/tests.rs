@@ -954,3 +954,26 @@ async fn status_warns_about_anr_after_a_long_stop_in_an_attached_process() {
     let stack = session.stack(None, 4).await.unwrap();
     assert!(stack["warning"].is_string());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn framework_internal_exceptions_are_not_crashes() {
+    let vm = FakeVm::start();
+    let session = attach(&vm, WAIT).await;
+    session
+        .break_exception("java.lang.String", false, true, Default::default())
+        .await
+        .unwrap();
+    // `ErrnoException` inside `File.exists`: thrown in framework code (String
+    // 103 stands in) and caught by framework code (Object 104) above the app
+    // frame that called it. Never reaches app code: resumed, not a stop.
+    vm.with_state(|s| s.main_frames = Some(vec![(103, 5000, 0), (104, 6000, 3), (100, 1001, 5)]));
+    assert_eq!(vm.throw_exception_at(Some((104, 6000))), 1);
+    vm.wait_for(WAIT, "the internal exception to resume", |s| s.resumes == 1);
+    assert!(session.suspension().is_none());
+
+    // A crash: thrown in app code, caught by a framework rethrower below it.
+    vm.with_state(|s| s.main_frames = Some(vec![(100, 1001, 5), (104, 6000, 3)]));
+    assert_eq!(vm.throw_exception_at(Some((104, 6000))), 1);
+    wait_suspended(&session).await;
+    assert_eq!(session.status().await["suspend_reason"], "exception");
+}

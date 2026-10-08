@@ -69,6 +69,8 @@ pub struct State {
     /// Load `Late` while answering AllClassesWithGeneric: its ClassPrepare
     /// goes out before the reply, which already lists it (the bind race).
     pub prepare_late_during_scan: bool,
+    /// Main-thread stack override as `(class, method, index)`, top first.
+    pub main_frames: Option<Vec<(u64, u64, u64)>>,
     pub connections: u32,
     pub step_line_index: u64,
     /// Breakpoint composites sent.
@@ -196,6 +198,12 @@ impl FakeVm {
     /// uncaught). Fires every exception request whose flags match as one
     /// composite (suspend policy ALL), as ART does.
     pub fn throw_exception(&self, catch_class: Option<u64>) -> usize {
+        self.throw_exception_at(catch_class.map(|class| (class, 0)))
+    }
+
+    /// Like [`throw_exception`], caught in `(class, method)`.
+    pub fn throw_exception_at(&self, catch: Option<(u64, u64)>) -> usize {
+        let catch_class = catch.map(|(class, _)| class);
         let matching: Vec<i32> = self.with_state(|state| {
             state
                 .requests
@@ -226,8 +234,8 @@ impl FakeVm {
             put_location(&mut body, ACTIVITY_CLASS, ON_NEW_INTENT, 5);
             body.push(b'L');
             put_u64(&mut body, ACTIVITY_OBJECT);
-            match catch_class {
-                Some(class) => put_location(&mut body, class, 0, 0),
+            match catch {
+                Some((class, method)) => put_location(&mut body, class, method, 0),
                 None => {
                     body.push(0);
                     put_u64(&mut body, 0);
@@ -803,15 +811,24 @@ fn handle(shared: &Shared, set: u8, cmd: u8, body: &[u8]) -> (u16, Vec<u8>, Afte
             if !suspended {
                 return (13, out, After::Nothing);
             }
-            let all: Vec<(u64, u64, u64)> = if thread == MAIN_THREAD {
+            let all: Vec<(u64, u64, u64, u64)> = if thread != MAIN_THREAD {
+                Vec::new()
+            } else if let Some(frames) = &state.main_frames {
+                frames
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (class, method, index))| (900 + i as u64, *class, *method, *index))
+                    .collect()
+            } else {
                 let index = if state.resumes > 0 && state.suspend_count > 0 {
                     state.step_line_index
                 } else {
                     5
                 };
-                vec![(900, ON_NEW_INTENT, index), (901, 1000, 4)]
-            } else {
-                Vec::new()
+                vec![
+                    (900, ACTIVITY_CLASS, ON_NEW_INTENT, index),
+                    (901, ACTIVITY_CLASS, 1000, 4),
+                ]
             };
             let start = start.max(0) as usize;
             let end = if length < 0 {
@@ -821,9 +838,9 @@ fn handle(shared: &Shared, set: u8, cmd: u8, body: &[u8]) -> (u16, Vec<u8>, Afte
             };
             let frames = all.get(start..end).unwrap_or(&[]);
             put_i32(&mut out, frames.len() as i32);
-            for (frame, method, index) in frames {
+            for (frame, class, method, index) in frames {
                 put_u64(&mut out, *frame);
-                put_location(&mut out, ACTIVITY_CLASS, *method, *index);
+                put_location(&mut out, *class, *method, *index);
             }
         }
         // ArrayReference
