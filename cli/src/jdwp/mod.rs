@@ -20,6 +20,14 @@
 //!   daemon    — `__debugd`: JSON-RPC over a 0600 unix socket
 //!   control   — client side: spawn, readiness, RPC
 //!   commands  — `debug` verb mapping for the jdwp backend
+//!
+//! The daemon's control channel is a unix socket, so on other hosts the
+//! session engine is compiled (it shares types with the CLI) but never
+//! reached: every verb fails early with `unsupported_backend`, and
+//! `--backend auto` keeps such hosts on Android Studio.
+
+// Unreachable on non-unix hosts by design (see above), not forgotten code.
+#![cfg_attr(not(unix), allow(dead_code))]
 
 pub mod breakpoints;
 pub mod codec;
