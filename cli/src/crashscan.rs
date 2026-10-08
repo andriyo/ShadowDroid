@@ -483,7 +483,9 @@ fn frame_file_re() -> &'static regex::Regex {
 
 /// filename → project-relative paths for every .kt/.java under src/ dirs.
 /// Bounded (depth + file count) so a pathological tree can't stall a probe.
-fn source_index(root: &std::path::Path) -> std::collections::HashMap<String, Vec<String>> {
+pub(crate) fn source_index(
+    root: &std::path::Path,
+) -> std::collections::HashMap<String, Vec<String>> {
     const MAX_FILES: usize = 30_000;
     const MAX_DEPTH: usize = 14;
     let mut index: std::collections::HashMap<String, Vec<String>> = Default::default();

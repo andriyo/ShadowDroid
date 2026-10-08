@@ -20,7 +20,16 @@
 pub mod codec;
 pub mod conn;
 pub mod events;
+pub mod inspect;
 #[allow(dead_code)] // numbered protocol table; not every entry has a caller yet
 pub mod protocol;
+pub mod resolve;
+pub mod session;
 pub mod transport;
 pub mod vm;
+
+#[cfg(test)]
+#[path = "../../tests/support/fake_jdwp.rs"]
+mod fake_jdwp;
+#[cfg(test)]
+mod tests;
