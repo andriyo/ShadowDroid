@@ -623,6 +623,20 @@ const CLASSES: &[Class] = &[
         source: Some("DebugProbesImpl.kt"),
         methods: &[],
     },
+    // A second, unnamed framework coroutine (720) whose job state is a single
+    // completion handler: ChildContinuation extends JobNode (Incomplete).
+    Class {
+        id: 129,
+        signature: "Lkotlinx/coroutines/JobNode;",
+        source: Some("JobSupport.kt"),
+        methods: &[],
+    },
+    Class {
+        id: 130,
+        signature: "Lkotlinx/coroutines/ChildContinuation;",
+        source: Some("JobSupport.kt"),
+        methods: &[],
+    },
 ];
 
 /// `(object, class)` of the coroutine world.
@@ -635,6 +649,8 @@ const WORLD_OBJECTS: &[(u64, u64)] = &[
     (705, 103),
     (710, 123),
     (711, 128),
+    (720, 121),
+    (721, 130),
 ];
 
 /// `(object, field, tag, value)` of the coroutine world.
@@ -648,6 +664,7 @@ const WORLD_FIELDS: &[(u64, u64, u8, u64)] = &[
     (710, 2103, b'I', 2),
     (710, 2104, b's', 501),
     (711, 2108, b'L', 700),
+    (720, 2101, b'L', 721),
 ];
 
 /// `(class, field id, name, signature)` of the coroutine world.
@@ -673,6 +690,7 @@ fn superclass_of(type_id: u64) -> u64 {
         104 => 0,
         121 => 120,
         123 => 122,
+        130 => 129,
         _ => 104,
     }
 }
@@ -991,7 +1009,8 @@ fn handle(shared: &Shared, set: u8, cmd: u8, body: &[u8]) -> (u16, Vec<u8>, Afte
         (2, 16) => {
             let type_id = c.u64();
             let instances: &[u64] = match type_id {
-                121 => &[700],
+                // The framework coroutine first: ranking, not discovery order, decides.
+                121 => &[720, 700],
                 123 => &[710],
                 _ => &[],
             };

@@ -1555,8 +1555,15 @@ async fn coroutines_are_discovered_process_wide_through_instances() {
     assert_eq!(snapshot["available"], true);
     assert_eq!(snapshot["type"], "coroutine_snapshot");
     let coroutines = snapshot["coroutines"].as_array().unwrap();
-    assert_eq!(coroutines.len(), 1, "{snapshot}");
+    assert_eq!(coroutines.len(), 2, "{snapshot}");
+    // The coroutine running app code sorts first.
     let worker = &coroutines[0];
+    // A job whose state is one JobNode (ChildContinuation) is still active.
+    assert_eq!(
+        coroutines[1]["state_class"],
+        "kotlinx.coroutines.ChildContinuation"
+    );
+    assert_eq!(coroutines[1]["state"], "active", "{snapshot}");
     assert_eq!(worker["class"], "kotlinx.coroutines.StandaloneCoroutine");
     assert_eq!(worker["name"], "worker");
     assert_eq!(worker["dispatcher"], "Dispatchers.Default");
@@ -1584,6 +1591,11 @@ async fn coroutines_are_discovered_process_wide_through_instances() {
         .await
         .unwrap();
     assert_eq!(continuation["type"], "coroutine_continuation");
+
+    // A tight limit keeps the app's coroutine, not discovery order.
+    let capped = session.coroutine_snapshot(1, OPTIONS).await.unwrap();
+    assert_eq!(capped["coroutines"][0]["name"], "worker", "{capped}");
+    assert_eq!(capped["discovery"]["truncated"], true);
 
     session.resume().await.unwrap();
     let running = session.coroutine_snapshot(8, OPTIONS).await.unwrap();

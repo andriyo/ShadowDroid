@@ -24,6 +24,8 @@ use super::session::{RpcError, RpcResult, Session, is_framework_class};
 
 /// Instances read per class (device default cap).
 const MAX_INSTANCES_PER_CLASS: i32 = 100;
+/// Base of every single-handler job state (`Incomplete`).
+const JOB_NODE: &str = "Lkotlinx/coroutines/JobNode;";
 const ABSTRACT_COROUTINE: &str = "Lkotlinx/coroutines/AbstractCoroutine;";
 const BASE_CONTINUATION: &str = "Lkotlin/coroutines/jvm/internal/BaseContinuationImpl;";
 const COROUTINE_OWNER: &str = "Lkotlinx/coroutines/debug/internal/DebugProbesImpl$CoroutineOwner;";
@@ -383,10 +385,6 @@ impl Session {
                 .await?;
             truncated |= instances.len() as i32 >= MAX_INSTANCES_PER_CLASS;
             for object in instances {
-                if coroutines.len() >= limit {
-                    truncated = true;
-                    break;
-                }
                 coroutines.insert(object, self.coroutine_info(object, class_name).await);
             }
         }
@@ -429,6 +427,24 @@ impl Session {
         for (object, mut info) in coroutines {
             info["continuations"] = json!(chains.remove(&object).unwrap_or_default());
             out.push(info);
+        }
+        // `limit` keeps the coroutines an agent is after: ones running app
+        // code first, then named, then live ones; framework coroutines
+        // (Compose, lifecycle) fill the rest. Capping in discovery order
+        // dropped app coroutines behind dozens of Compose ones.
+        out.sort_by_key(|info| {
+            let has_app_code = info["continuations"]
+                .as_array()
+                .is_some_and(|c| !c.is_empty());
+            (
+                !has_app_code,
+                info["name"].is_null(),
+                info["state"] != "active",
+            )
+        });
+        if out.len() > limit {
+            out.truncate(limit);
+            truncated = true;
         }
         Ok((
             out,
@@ -473,12 +489,16 @@ impl Session {
         if let Some(Value::Object { id, .. }) = self.field_by_name(object, "context").await {
             self.walk_context(id, &mut name, &mut dispatcher, 0).await;
         }
-        let state = match self.state_object(object).await {
+        let (state, incomplete) = match self.state_object(object).await {
             Some(state) => {
-                let (_, signature) = self.runtime_type(state).await.unwrap_or((0, String::new()));
-                resolve::type_name(&signature)
+                let (type_id, signature) =
+                    self.runtime_type(state).await.unwrap_or((0, String::new()));
+                (
+                    resolve::type_name(&signature),
+                    self.is_job_node(type_id).await,
+                )
             }
-            None => "unknown".to_string(),
+            None => ("unknown".to_string(), false),
         };
         json!({
             "object_id": object,
@@ -486,9 +506,28 @@ impl Session {
             "class": class_name,
             "name": name,
             "dispatcher": dispatcher,
-            "state": coarse_state(&state),
+            "state": if incomplete { "active" } else { coarse_state(&state) },
             "state_class": state,
         })
+    }
+
+    /// A job whose state is a `JobNode` (one completion handler such as
+    /// `ChildContinuation`, `ChildHandleNode`, `InvokeOnCompletion`) is
+    /// still incomplete: `JobNode` implements `Incomplete`. Only the class
+    /// name was checked before, so a suspended worker read as "completed".
+    async fn is_job_node(&self, type_id: u64) -> bool {
+        if type_id == 0 {
+            return false;
+        }
+        let Ok(chain) = self.hierarchy(type_id).await else {
+            return false;
+        };
+        for class in chain {
+            if self.signature(class).await.ok().as_deref() == Some(JOB_NODE) {
+                return true;
+            }
+        }
+        false
     }
 
     /// The job state object (`_state`, or `_state$volatile` in newer
