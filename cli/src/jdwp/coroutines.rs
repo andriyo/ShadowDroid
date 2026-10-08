@@ -32,13 +32,15 @@ const COROUTINE_OWNER: &str = "Lkotlinx/coroutines/debug/internal/DebugProbesImp
 
 /// Thread-name dispatcher hint, as the Studio bridge derives it.
 pub fn dispatcher_hint(thread: &str) -> Json {
+    // Substring matches mislabelled "ADB-JDWP Connection Control Thread"
+    // as IO ("connectIOn") and anything with "main" in it as Main. The UI
+    // thread is literally `main`; Default and IO share the
+    // `DefaultDispatcher-worker-N` pool, so the name cannot tell them apart.
     let lower = thread.to_lowercase();
-    if lower.contains("main") {
+    if lower == "main" {
         json!({"name": "Dispatchers.Main", "confidence": "medium"})
-    } else if lower.contains("defaultdispatcher") || lower.contains("default") {
-        json!({"name": "Dispatchers.Default", "confidence": "low"})
-    } else if lower.contains("io") {
-        json!({"name": "Dispatchers.IO", "confidence": "low"})
+    } else if lower.starts_with("defaultdispatcher-worker") {
+        json!({"name": "Dispatchers.Default", "confidence": "low", "note": "Dispatchers.IO shares this pool"})
     } else {
         json!({"name": null, "confidence": "none"})
     }
@@ -627,6 +629,8 @@ mod tests {
         assert_eq!(flow_kind("x.MyFlow"), Some("Flow"));
         assert_eq!(flow_kind("java.lang.String"), None);
         assert_eq!(dispatcher_hint("main")["name"], "Dispatchers.Main");
+        assert!(dispatcher_hint("ADB-JDWP Connection Control Thread")["name"].is_null());
+        assert!(dispatcher_hint("domain-sync")["name"].is_null());
         assert_eq!(
             dispatcher_hint("DefaultDispatcher-worker-1")["name"],
             "Dispatchers.Default"
