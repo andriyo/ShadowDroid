@@ -99,6 +99,12 @@ the Studio path; otherwise the standalone debugger. Every result says which
 one answered (`backend`) and why (`backend_reason`). Set `debug_backend` in
 config, or pass `--backend studio|jdwp`, to pin one.
 
+`shadowdroid doctor --json` (add `--app <pkg>` or configure an app) has an
+advisory `debugger` check: whether this host can run the daemon, whether the
+device's adb `jdwp` service answers, the API level, whether the app is
+debuggable and who holds it, and which backend `auto` would pick and why. It
+attaches nothing, and missing Android Studio is reported as optional.
+
 What works:
 
 - `attach`/`detach`/`sessions`/`status`, `pause`/`resume`/`step-*`,

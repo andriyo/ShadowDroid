@@ -939,6 +939,17 @@ pub async fn live_session(
     package: Option<&str>,
     pid: Option<i32>,
 ) -> Option<RegistryEntry> {
+    live_session_with(device, package, pid, true).await
+}
+
+/// [`live_session`]; `prune: false` leaves dead registries in place for
+/// read-only callers (`doctor`).
+pub async fn live_session_with(
+    device: Option<&str>,
+    package: Option<&str>,
+    pid: Option<i32>,
+    prune: bool,
+) -> Option<RegistryEntry> {
     for entry in paths::entries(device) {
         let same = match (pid.filter(|pid| *pid > 0), package) {
             (Some(pid), _) => entry.pid == pid as u32,
@@ -951,7 +962,9 @@ pub async fn live_session(
         if let Err(CallError::Unreachable(_)) =
             control::call(&entry, "status", json!({}), Duration::from_secs(2)).await
         {
-            control::prune(&entry);
+            if prune {
+                control::prune(&entry);
+            }
             continue;
         }
         return Some(entry);

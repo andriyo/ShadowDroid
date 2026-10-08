@@ -56,7 +56,7 @@
 >   (ceiling 100/s), ANR warning after 4 s for attach-to-running sessions.
 >
 > Not done: `debug record`, `debug native`/mixed mode, and `debug clients`
-> (Studio only); the doctor check; SMAP inline-body resolution; coroutine
+> (Studio only); SMAP inline-body resolution; coroutine
 > source lines; `step-until-screen-change --stop-at frame`; Windows hosts.
 
 Design and phased plan for a debugger that needs **no Android Studio**: the CLI

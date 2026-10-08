@@ -92,6 +92,8 @@ const ADVISORY_CODES: &[&str] = &[
     "clock",
     // Injected faults are deliberate; they change the device, not the pipe.
     "faults",
+    // The standalone debugger is an optional capability like Studio's.
+    "debugger",
 ];
 
 /// `healthy` iff every non-advisory check is `ok`. Single source of truth so the
@@ -537,6 +539,25 @@ pub async fn run(
         report.healthy = is_healthy(&report.checks);
     }
 
+    // Standalone debugger readiness (read-only; advisory).
+    if let Some(serial) = report.target.clone() {
+        let package = match app {
+            Some(app) => Some(
+                config
+                    .resolve_app(Some(serial.as_str()), Some(app))
+                    .await
+                    .ok()
+                    .and_then(|r| r.package)
+                    .unwrap_or_else(|| app.to_string()),
+            ),
+            None => None,
+        };
+        report
+            .checks
+            .push(debugger_check(&serial, package.as_deref(), config).await);
+        report.healthy = is_healthy(&report.checks);
+    }
+
     // `--project-root <path>` (or config `project`): append the in-app debug-agent
     // wiring status (the same thing `aar status` reports). Source-side and
     // read-only — independent of the device, sits outside the fix flow.
@@ -787,8 +808,8 @@ fn studio_checks() -> Vec<Check> {
                 checks.push(Check {
                     code: "studio",
                     status: Status::Warn,
-                    detail: "Android Studio was not detected.".into(),
-                    remedy: Some("run `shadowdroid init` after installing Android Studio, or configure android_studio in .shadowdroid/config.json".into()),
+                    detail: format!("Android Studio was not detected. It is optional: {STUDIO_OPTIONAL}"),
+                    remedy: Some("optional: for Layout Inspector or native/mixed debugging, install Android Studio and run `shadowdroid init` (or set android_studio in .shadowdroid/config.json)".into()),
                 });
             } else {
                 let installed = report
@@ -809,7 +830,9 @@ fn studio_checks() -> Vec<Check> {
                     checks.push(Check {
                         code: "studio_plugin",
                         status: Status::Warn,
-                        detail: "ShadowDroid Android Studio plugin is not installed.".into(),
+                        detail: format!(
+                            "ShadowDroid Android Studio plugin is not installed. {STUDIO_OPTIONAL}"
+                        ),
                         remedy: Some(
                             "run `shadowdroid init` to install the plugin and skills".into(),
                         ),
@@ -852,8 +875,8 @@ fn studio_checks() -> Vec<Check> {
                 checks.push(Check {
                     code: "debugger_bridge",
                     status: Status::Warn,
-                    detail: "debugger bridge is not registered.".into(),
-                    remedy: Some("run `shadowdroid init`, restart Android Studio, and open an Android project".into()),
+                    detail: format!("Android Studio debugger bridge is not registered. {STUDIO_OPTIONAL}"),
+                    remedy: Some("optional: to use Studio's debugger, run `shadowdroid init`, restart Android Studio, and open an Android project".into()),
                 });
             }
         }
@@ -865,6 +888,204 @@ fn studio_checks() -> Vec<Check> {
         }),
     }
     checks
+}
+
+/// Android Studio is optional for debugging: what it adds, and what works
+/// without it.
+const STUDIO_OPTIONAL: &str = "`debug` works without it through the standalone debugger (`debug --backend jdwp`); Studio adds Layout Inspector data and native/mixed debugging.";
+
+/// Minimum API level of the standalone debugger.
+const JDWP_MIN_API: u32 = 28;
+
+/// What the standalone-debugger probe observed: the pure input of
+/// [`debugger_check_from`].
+#[derive(Debug, Default)]
+struct DebuggerProbe {
+    host_unix: bool,
+    api_level: Option<u32>,
+    /// Debuggable pids the adb `jdwp` service listed, or why it failed.
+    jdwp_service: Option<Result<usize, String>>,
+    app: Option<AppDebugProbe>,
+    /// `--backend auto`'s choice for `debug attach` of the app: (backend, reason).
+    auto: Option<(&'static str, &'static str)>,
+}
+
+#[derive(Debug, Default)]
+struct AppDebugProbe {
+    package: String,
+    /// `dumpsys package` flags: `None` when the package is not installed.
+    debuggable_flag: Option<bool>,
+    ro_debuggable: bool,
+    /// A live standalone session holding the app.
+    jdwp_session: Option<String>,
+    /// Studio's client list says a debugger is attached (`None`: not asked).
+    studio_attached: Option<bool>,
+}
+
+/// `getprop ro.build.version.sdk` → API level.
+fn parse_api_level(getprop: &str) -> Option<u32> {
+    getprop.trim().parse().ok()
+}
+
+/// `dumpsys package <pkg>`: whether its `flags=[…]`/`pkgFlags=[…]` contain
+/// `DEBUGGABLE`; `None` when the package is not installed.
+fn package_debuggable(dumpsys: &str) -> Option<bool> {
+    if !dumpsys.contains("Package [") {
+        return None;
+    }
+    Some(dumpsys.lines().map(str::trim).any(|line| {
+        (line.starts_with("flags=[") || line.starts_with("pkgFlags=["))
+            && line.split_whitespace().any(|flag| flag == "DEBUGGABLE")
+    }))
+}
+
+fn debugger_check_from(probe: &DebuggerProbe) -> Check {
+    let mut problems: Vec<String> = Vec::new();
+    let mut facts: Vec<String> = Vec::new();
+    let mut remedy = None;
+    if !probe.host_unix {
+        problems.push("this host cannot run the standalone debugger daemon (unix only); `--backend auto` stays on Android Studio".into());
+    }
+    match probe.api_level {
+        Some(level) if level < JDWP_MIN_API => {
+            problems.push(format!(
+                "unsupported_api_level: the device runs API {level}; the standalone debugger needs API {JDWP_MIN_API}+"
+            ));
+            remedy = Some("use an API 28+ device or `debug --backend studio`".to_string());
+        }
+        Some(level) => facts.push(format!("API {level}")),
+        None => problems.push("could not read the device API level".into()),
+    }
+    match &probe.jdwp_service {
+        Some(Ok(count)) => facts.push(format!(
+            "adb jdwp service reachable ({count} debuggable pid(s))"
+        )),
+        Some(Err(error)) => problems.push(format!("adb jdwp service not reachable: {error}")),
+        None => {}
+    }
+    if let Some(app) = &probe.app {
+        match app.debuggable_flag {
+            None => problems.push(format!("{} is not installed", app.package)),
+            Some(true) => facts.push(format!("{} is debuggable", app.package)),
+            Some(false) if app.ro_debuggable => facts.push(format!(
+                "{} is not debuggable, but ro.debuggable=1 exposes every process",
+                app.package
+            )),
+            Some(false) => {
+                problems.push(format!(
+                    "process_not_debuggable: {} is a release build on a production image",
+                    app.package
+                ));
+                remedy.get_or_insert_with(|| {
+                    "install a debuggable build (android:debuggable=true) or use an emulator/userdebug image".to_string()
+                });
+            }
+        }
+        match (&app.jdwp_session, app.studio_attached) {
+            (Some(session), _) => facts.push(format!("held by standalone session {session}")),
+            (None, Some(true)) => facts.push("Android Studio's debugger is attached to it".into()),
+            (None, _) => facts.push("no debugger holds it".into()),
+        }
+    }
+    if let Some((backend, reason)) = probe.auto {
+        facts.push(format!(
+            "`debug --backend auto` would use {backend} ({reason})"
+        ));
+    }
+    let detail = problems
+        .iter()
+        .chain(facts.iter())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
+    Check {
+        code: "debugger",
+        status: if problems.is_empty() {
+            Status::Ok
+        } else {
+            Status::Warn
+        },
+        detail: format!("standalone debugger: {detail}"),
+        remedy,
+    }
+}
+
+/// Read-only probe of the standalone debugger for `serial` and `package`.
+async fn debugger_check(
+    serial: &Serial,
+    package: Option<&str>,
+    config: &crate::config::ShadowDroidConfig,
+) -> Check {
+    let api_level = adb::shell(serial, "getprop ro.build.version.sdk")
+        .await
+        .ok()
+        .and_then(|out| parse_api_level(&out));
+    let jdwp_service = Some(
+        crate::jdwp::transport::debuggable_pids(serial.as_str(), std::time::Duration::from_secs(3))
+            .await
+            .map(|pids| pids.len())
+            .map_err(|error| format!("{error:#}")),
+    );
+    let app = match package {
+        Some(package) => {
+            let quoted = crate::config::quote_device_shell_arg(package);
+            let dumpsys = adb::shell(serial, format!("dumpsys package {quoted}"))
+                .await
+                .unwrap_or_default();
+            let ro_debuggable = adb::shell(serial, "getprop ro.debuggable")
+                .await
+                .is_ok_and(|out| out.trim() == "1");
+            let jdwp_session = crate::jdwp::commands::live_session_with(
+                Some(serial.as_str()),
+                Some(package),
+                None,
+                false,
+            )
+            .await
+            .map(|entry| entry.session_id);
+            let studio_attached =
+                studio_debugger_attached(serial.as_str(), package, config.studio_url.as_deref())
+                    .await;
+            Some(AppDebugProbe {
+                package: package.to_string(),
+                debuggable_flag: package_debuggable(&dumpsys),
+                ro_debuggable,
+                jdwp_session,
+                studio_attached,
+            })
+        }
+        None => None,
+    };
+    let (backend, reason) = crate::cmd::debug::auto_attach_choice(
+        Some(serial.as_str()),
+        package,
+        None,
+        config.studio_url.as_deref(),
+        config,
+        false,
+    )
+    .await;
+    let backend = match backend {
+        crate::cmd::debugger::DebugBackend::Jdwp => "jdwp",
+        _ => "studio",
+    };
+    debugger_check_from(&DebuggerProbe {
+        host_unix: cfg!(unix),
+        api_level,
+        jdwp_service,
+        app,
+        auto: Some((backend, reason)),
+    })
+}
+
+/// Whether Studio's client list shows a debugger attached to `package` on
+/// `serial`; `None` when the bridge is not reachable or did not answer.
+async fn studio_debugger_attached(
+    serial: &str,
+    package: &str,
+    studio_url: Option<&str>,
+) -> Option<bool> {
+    crate::cmd::debugger::studio_clients_attached(serial, package, studio_url).await
 }
 
 fn print_human(report: &DoctorReport, fix: bool) {
@@ -1004,5 +1225,136 @@ mod tests {
             ),
             OwnerClass::Foreign
         );
+    }
+
+    const DUMPSYS_DEBUGGABLE: &str = "Packages:\n  Package [io.example.app] (1a2b):\n    userId=10123\n    pkg=Package{9f io.example.app}\n    flags=[ DEBUGGABLE HAS_CODE ALLOW_CLEAR_USER_DATA ALLOW_BACKUP ]\n    privateFlags=[ PRIVATE_FLAG_ACTIVITIES_RESIZE_MODE_RESIZEABLE ]\n";
+    const DUMPSYS_RELEASE: &str = "Packages:\n  Package [io.example.app] (1a2b):\n    flags=[ HAS_CODE ALLOW_CLEAR_USER_DATA ]\n    pkgFlags=[ HAS_CODE ALLOW_CLEAR_USER_DATA ]\n";
+
+    fn ready_probe() -> DebuggerProbe {
+        DebuggerProbe {
+            host_unix: true,
+            api_level: parse_api_level("34\n"),
+            jdwp_service: Some(Ok(3)),
+            app: Some(AppDebugProbe {
+                package: "io.example.app".into(),
+                debuggable_flag: package_debuggable(DUMPSYS_DEBUGGABLE),
+                ro_debuggable: false,
+                jdwp_session: None,
+                studio_attached: None,
+            }),
+            auto: Some(("jdwp", "studio_bridge_unreachable")),
+        }
+    }
+
+    #[test]
+    fn package_flags_decide_debuggability() {
+        assert_eq!(package_debuggable(DUMPSYS_DEBUGGABLE), Some(true));
+        assert_eq!(package_debuggable(DUMPSYS_RELEASE), Some(false));
+        assert_eq!(
+            package_debuggable("Unable to find package: io.example.app\n"),
+            None
+        );
+        assert_eq!(package_debuggable(""), None);
+        // A flag name containing DEBUGGABLE is not the flag.
+        assert_eq!(
+            package_debuggable("  Package [p] (1):\n    flags=[ NATIVE_DEBUGGABLE_X ]\n"),
+            Some(false)
+        );
+        assert_eq!(parse_api_level(" 27 \n"), Some(27));
+        assert_eq!(parse_api_level("error: closed"), None);
+    }
+
+    #[test]
+    fn a_ready_device_and_debuggable_app_is_ok_and_names_the_auto_choice() {
+        let check = debugger_check_from(&ready_probe());
+        assert_eq!(check.code, "debugger");
+        assert_eq!(check.status, Status::Ok, "{}", check.detail);
+        assert!(check.detail.contains("API 34"), "{}", check.detail);
+        assert!(check.detail.contains("io.example.app is debuggable"));
+        assert!(check.detail.contains("no debugger holds it"));
+        assert!(
+            check
+                .detail
+                .contains("would use jdwp (studio_bridge_unreachable)")
+        );
+        assert!(ADVISORY_CODES.contains(&"debugger"));
+        // Advisory: a warning never makes the pipe unhealthy.
+        let mut warn = check.clone();
+        warn.status = Status::Warn;
+        assert!(is_healthy(&[warn]));
+    }
+
+    #[test]
+    fn old_api_release_builds_and_unreachable_jdwp_warn_with_reasons() {
+        let mut probe = ready_probe();
+        probe.api_level = Some(27);
+        let check = debugger_check_from(&probe);
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check.detail.contains("unsupported_api_level"),
+            "{}",
+            check.detail
+        );
+
+        let mut probe = ready_probe();
+        probe.app.as_mut().unwrap().debuggable_flag = package_debuggable(DUMPSYS_RELEASE);
+        let check = debugger_check_from(&probe);
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("process_not_debuggable"));
+        assert!(check.remedy.unwrap().contains("debuggable"));
+
+        // ro.debuggable=1 (emulators, userdebug) exposes release builds too.
+        probe.app.as_mut().unwrap().ro_debuggable = true;
+        assert_eq!(debugger_check_from(&probe).status, Status::Ok);
+
+        let mut probe = ready_probe();
+        probe.jdwp_service = Some(Err("device offline".into()));
+        let check = debugger_check_from(&probe);
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check
+                .detail
+                .contains("adb jdwp service not reachable: device offline")
+        );
+
+        let mut probe = ready_probe();
+        probe.app.as_mut().unwrap().debuggable_flag = None;
+        assert!(
+            debugger_check_from(&probe)
+                .detail
+                .contains("is not installed")
+        );
+
+        let mut probe = ready_probe();
+        probe.host_unix = false;
+        probe.auto = Some(("studio", "jdwp_unsupported_on_host"));
+        let check = debugger_check_from(&probe);
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("unix only"));
+    }
+
+    #[test]
+    fn holders_are_reported() {
+        let mut probe = ready_probe();
+        probe.app.as_mut().unwrap().jdwp_session = Some("jdwp:emulator-5554:4242".into());
+        assert!(
+            debugger_check_from(&probe)
+                .detail
+                .contains("held by standalone session jdwp:emulator-5554:4242")
+        );
+        let mut probe = ready_probe();
+        probe.app.as_mut().unwrap().studio_attached = Some(true);
+        assert!(
+            debugger_check_from(&probe)
+                .detail
+                .contains("Android Studio's debugger is attached")
+        );
+    }
+
+    #[test]
+    fn missing_studio_points_at_the_standalone_debugger() {
+        assert!(STUDIO_OPTIONAL.contains("--backend jdwp"));
+        assert!(STUDIO_OPTIONAL.contains("Layout Inspector"));
+        assert!(STUDIO_OPTIONAL.contains("native/mixed"));
     }
 }

@@ -421,21 +421,17 @@ async fn auto_backend(
             return Some((Jdwp, "jdwp_only_option"));
         }
         DebugCmd::Studio(DebuggerCmd::Attach { package, pid, .. }) => {
-            // `--app` is an alias of `--package`: map a configured alias to
-            // its package, and fall back to the configured app.
-            let package = package
-                .clone()
-                .or_else(|| config.default_app())
-                .map(|app| config.configured_package_for(&app).unwrap_or(app));
-            if package.is_none() && pid.is_none() {
-                // No target to match: a daemon on some other app says nothing.
-                return bridge_or_jdwp(args).await;
-            }
-            return match crate::jdwp::commands::live_session(device, package.as_deref(), *pid).await
-            {
-                Some(_) => Some((Jdwp, "jdwp_session_holds_target")),
-                None => bridge_or_jdwp(args).await,
-            };
+            return Some(
+                auto_attach_choice(
+                    device,
+                    package.as_deref(),
+                    *pid,
+                    args.studio_url.as_deref(),
+                    config,
+                    true,
+                )
+                .await,
+            );
         }
         DebugCmd::Auto(auto) => (auto.package.as_deref(), None),
         _ => (None, None),
@@ -454,12 +450,43 @@ async fn auto_backend(
     bridge_or_jdwp(args).await
 }
 
-async fn bridge_or_jdwp(args: &DebugArgs) -> Option<(debugger::DebugBackend, &'static str)> {
-    use debugger::DebugBackend::Studio;
-    if debugger::studio_bridge_reachable(args.studio_url.as_deref()).await {
-        return Some((Studio, "studio_bridge_reachable"));
+/// The backend `debug attach [--package P] [--pid N]` would get under
+/// `--backend auto`, and why. `doctor` asks with `prune: false` so it stays
+/// read-only.
+pub async fn auto_attach_choice(
+    device: Option<&str>,
+    package: Option<&str>,
+    pid: Option<i32>,
+    studio_url: Option<&str>,
+    config: &crate::config::ShadowDroidConfig,
+    prune: bool,
+) -> (debugger::DebugBackend, &'static str) {
+    // `--app` is an alias of `--package`: map a configured alias to its
+    // package, and fall back to the configured app.
+    let package = package
+        .map(str::to_string)
+        .or_else(|| config.default_app())
+        .map(|app| config.configured_package_for(&app).unwrap_or(app));
+    if (package.is_some() || pid.is_some())
+        && crate::jdwp::commands::live_session_with(device, package.as_deref(), pid, prune)
+            .await
+            .is_some()
+    {
+        return (debugger::DebugBackend::Jdwp, "jdwp_session_holds_target");
     }
-    Some(unreachable_studio_fallback())
+    // No target, or nobody holds it: a daemon on some other app says nothing.
+    studio_or_fallback(studio_url).await
+}
+
+async fn bridge_or_jdwp(args: &DebugArgs) -> Option<(debugger::DebugBackend, &'static str)> {
+    Some(studio_or_fallback(args.studio_url.as_deref()).await)
+}
+
+async fn studio_or_fallback(studio_url: Option<&str>) -> (debugger::DebugBackend, &'static str) {
+    if debugger::studio_bridge_reachable(studio_url).await {
+        return (debugger::DebugBackend::Studio, "studio_bridge_reachable");
+    }
+    unreachable_studio_fallback()
 }
 
 /// Where `auto` goes when no jdwp session holds the target and Studio is not

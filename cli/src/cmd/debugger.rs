@@ -2538,6 +2538,49 @@ fn route_is_session_scoped(path: &str) -> bool {
         || path == route::LOGPOINT_EVENTS
 }
 
+/// Whether Studio's client list (`/v1/clients`) shows a debugger attached to
+/// `package` on `serial`. `None` when the bridge is unreachable or the reply
+/// has no matching client. Read-only; bounded to 2 s.
+pub(crate) async fn studio_clients_attached(
+    serial: &str,
+    package: &str,
+    explicit_url: Option<&str>,
+) -> Option<bool> {
+    if !studio_bridge_reachable(explicit_url).await {
+        return None;
+    }
+    let bridge = BridgeClient::with_timeout(explicit_url, Duration::from_secs(2)).ok()?;
+    let reply = bridge
+        .get(
+            route::CLIENTS,
+            &[
+                (query::PACKAGE, Some(package)),
+                (query::DEVICE, Some(serial)),
+            ],
+        )
+        .await
+        .ok()?;
+    clients_debugger_attached(&reply, package)
+}
+
+/// `/v1/clients` reply → whether any client of `package` has a debugger.
+pub(crate) fn clients_debugger_attached(reply: &Value, package: &str) -> Option<bool> {
+    let clients: Vec<&Value> = reply
+        .get("clients")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter(|client| client.get("package").and_then(Value::as_str) == Some(package))
+        .collect();
+    if clients.is_empty() {
+        return None;
+    }
+    Some(
+        clients
+            .iter()
+            .any(|client| client.get("debugger_attached") == Some(&Value::Bool(true))),
+    )
+}
+
 /// Whether the Studio bridge accepts connections (a bare TCP connect; the
 /// IDE's UI thread is not involved, so a busy Studio still counts).
 pub(crate) async fn studio_bridge_reachable(explicit_url: Option<&str>) -> bool {
@@ -2602,6 +2645,29 @@ mod tests {
             .find_map(|cause| cause.downcast_ref::<crate::diagnostic::DiagnosticError>())
             .expect("typed bridge error");
         (diagnostic.code.clone(), diagnostic.retryable)
+    }
+
+    #[test]
+    fn studio_clients_report_an_attached_debugger_per_package() {
+        let reply = json!({"ok": true, "clients": [
+            {"package": "io.example.app", "pid": 1, "debugger_attached": false},
+            {"package": "io.example.app", "pid": 2, "debugger_attached": true},
+            {"package": "io.example.other", "pid": 3, "debugger_attached": true},
+        ]});
+        assert_eq!(
+            clients_debugger_attached(&reply, "io.example.app"),
+            Some(true)
+        );
+        let idle = json!({"clients": [{"package": "io.example.app", "debugger_attached": false}]});
+        assert_eq!(
+            clients_debugger_attached(&idle, "io.example.app"),
+            Some(false)
+        );
+        assert_eq!(clients_debugger_attached(&idle, "io.example.none"), None);
+        assert_eq!(
+            clients_debugger_attached(&json!({}), "io.example.app"),
+            None
+        );
     }
 
     #[tokio::test]
