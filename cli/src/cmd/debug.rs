@@ -851,7 +851,10 @@ async fn snapshot_cmd(
     args: SnapshotArgs,
     dbg: Dbg<'_>,
 ) -> Result<()> {
-    let value = snapshot_value(serial, client, &args, dbg).await?;
+    let mut value = snapshot_value(serial, client, &args, dbg).await?;
+    // Like every debug result: names the backend, which also keeps catalog
+    // next_actions on it.
+    value["backend"] = json!(dbg.backend());
     if let Some(path) = args.out {
         crate::cmd::artifact::write_json_and_emit("debug_snapshot", &path, &value)?;
     } else {
