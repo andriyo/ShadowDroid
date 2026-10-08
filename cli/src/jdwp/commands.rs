@@ -108,8 +108,9 @@ pub async fn run(cmd: &DebuggerCmd, ctx: JdwpContext<'_>) -> Result<()> {
             let host = super::launch::AdbHost {
                 serial: serial.to_string(),
             };
+            let activity = launch.launch_activity.clone();
             attach_with(request, |package| async move {
-                super::launch::monkey_launch(&host, &package).await
+                super::launch::launcher_launch(&host, &package, activity.as_deref()).await
             })
             .await?
         }
@@ -523,11 +524,16 @@ where
         &mut steps,
         || launch(package.to_string()),
         |pid| attach(serial, Some(package), Some(pid as i32), init, true),
+        super::launch::interrupted(),
     )
     .await;
     match outcome {
         Ok(mut value) => {
-            value["launch"] = json!({"wait_for_launch": true, "steps": steps});
+            // Surface launch warnings (several launcher activities, ...).
+            let warning = steps
+                .iter()
+                .find_map(|step| step.pointer("/result/warning").cloned());
+            value["launch"] = json!({"wait_for_launch": true, "steps": steps, "warning": warning});
             Ok(value)
         }
         Err(error) => match error.downcast::<DiagnosticError>() {

@@ -74,10 +74,201 @@ pub async fn monkey_launch<H: LaunchHost>(host: &H, package: &str) -> Result<Jso
     Ok(json!({"launcher": "monkey", "output": output.trim()}))
 }
 
+/// Start `package` for a launch-time attach without waiting (`am start` with
+/// no `-W` returns while the app sits in `waitForDebugger`).
+///
+/// The activity is `activity` when given (`.Main`, `pkg/.Main`, or a class
+/// name). Otherwise the app's only launcher activity; with several, the root
+/// of the app's most recent task if that is one of them, else the first in
+/// manifest order, with a warning. `monkey -c LAUNCHER` is not used: with
+/// several launcher activities it picks one at random, so a `--break` in the
+/// main activity would hit on one run and never on the next.
+pub async fn launcher_launch<H: LaunchHost>(
+    host: &H,
+    package: &str,
+    activity: Option<&str>,
+) -> Result<Json> {
+    let (component, chosen_by, candidates) = match activity {
+        Some(activity) => (component_name(package, activity), "explicit", Vec::new()),
+        None => {
+            let quoted = crate::config::quote_device_shell_arg(package);
+            let listing = host
+                .shell(&format!(
+                    "cmd package query-activities --brief -a android.intent.action.MAIN -c android.intent.category.LAUNCHER {quoted}"
+                ))
+                .await?;
+            let candidates = launcher_components(&listing, package);
+            match candidates.as_slice() {
+                [] => return monkey_launch(host, package).await,
+                [only] => (only.clone(), "only_launcher", candidates.clone()),
+                [first, ..] => {
+                    let recents = host
+                        .shell("dumpsys activity recents")
+                        .await
+                        .unwrap_or_default();
+                    match recent_root(&recents, package)
+                        .filter(|root| candidates.iter().any(|c| same_component(c, root)))
+                    {
+                        Some(root) => (root, "recent_task_root", candidates.clone()),
+                        None => (first.clone(), "first_launcher", candidates.clone()),
+                    }
+                }
+            }
+        }
+    };
+    let output = host
+        .shell(&format!(
+            "am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n {}",
+            crate::config::quote_device_shell_arg(&component)
+        ))
+        .await?;
+    if output.contains("Error") || output.contains("Exception") {
+        bail!("could not launch {component}: {}", output.trim());
+    }
+    let mut value = json!({
+        "launcher": "am_start",
+        "component": component,
+        "chosen_by": chosen_by,
+        "output": output.trim(),
+    });
+    if candidates.len() > 1 {
+        value["candidates"] = json!(candidates);
+        value["warning"] = json!(format!(
+            "{package} has {} launcher activities; started {component} ({chosen_by}); pass --launch-activity to choose",
+            candidates.len()
+        ));
+    }
+    Ok(value)
+}
+
+/// `pkg/.Main` from `.Main`, `Main`, `pkg/.Main`, or `pkg.Main`.
+fn component_name(package: &str, activity: &str) -> String {
+    if activity.contains('/') {
+        activity.to_string()
+    } else if activity.starts_with('.') || activity.contains('.') {
+        format!("{package}/{activity}")
+    } else {
+        format!("{package}/.{activity}")
+    }
+}
+
+/// Launcher components of `package` from `cmd package query-activities --brief`.
+fn launcher_components(listing: &str, package: &str) -> Vec<String> {
+    let prefix = format!("{package}/");
+    listing
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with(&prefix))
+        .map(str::to_string)
+        .collect()
+}
+
+/// `realActivity` of the most recent task rooted in `package`.
+fn recent_root(recents: &str, package: &str) -> Option<String> {
+    let needle = format!("realActivity={{{package}/");
+    recents.split("* Recent #").find_map(|task| {
+        let start = task.find(&needle)? + "realActivity={".len();
+        let end = task[start..].find('}')?;
+        Some(task[start..start + end].to_string())
+    })
+}
+
+/// `pkg/.Main` and `pkg/pkg.Main` name the same activity.
+fn same_component(a: &str, b: &str) -> bool {
+    let full = |c: &str| match c.split_once('/') {
+        Some((pkg, class)) if class.starts_with('.') => format!("{pkg}/{pkg}{class}"),
+        _ => c.to_string(),
+    };
+    full(a) == full(b)
+}
+
+/// The persistent debug-app setting found before the launch (Developer
+/// options "Select debug app" / "Wait for debugger", or `am set-debug-app
+/// --persistent`). `am clear-debug-app` clears it, so it is restored instead.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PreviousDebugApp {
+    pub package: Option<String>,
+    pub wait_for_debugger: bool,
+}
+
+async fn read_debug_app<H: LaunchHost>(host: &H) -> PreviousDebugApp {
+    let get = |key: &'static str| async move {
+        host.shell(&format!("settings get global {key}"))
+            .await
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty() && value != "null")
+    };
+    PreviousDebugApp {
+        package: get("debug_app").await,
+        wait_for_debugger: get("wait_for_debugger").await.as_deref() == Some("1"),
+    }
+}
+
+/// Put the debug-app setting back: clear it, or restore what was there.
+async fn restore_debug_app<H: LaunchHost>(
+    host: &H,
+    previous: &PreviousDebugApp,
+    steps: &mut Vec<Json>,
+) {
+    let command = match &previous.package {
+        Some(package) => format!(
+            "am set-debug-app{} --persistent {}",
+            if previous.wait_for_debugger {
+                " -w"
+            } else {
+                ""
+            },
+            crate::config::quote_device_shell_arg(package)
+        ),
+        None => "am clear-debug-app".to_string(),
+    };
+    let result = host.shell(&command).await;
+    steps.push(json!({
+        "step": if previous.package.is_some() { "restore_debug_app" } else { "clear_debug_app" },
+        "ok": result.is_ok(),
+        "command": command,
+        "error": result.as_ref().err().map(|e| e.to_string()),
+    }));
+}
+
+/// Resolves when the CLI is asked to stop (Ctrl-C, or SIGTERM on unix).
+/// Never resolves if the handlers cannot be installed.
+pub async fn interrupted() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 /// Run `attach` against a fresh process of `package` started by `launch`
 /// under `am set-debug-app -w`. Steps are appended to `steps` (also on
 /// failure) for the reply.
-pub async fn launch_for_debug<H, L, LFut, A, AFut, T>(
+///
+/// Every exit path, including `interrupt` resolving (Ctrl-C/SIGTERM),
+/// restores the debug-app setting; an interrupted launch also force-stops
+/// the new process, which would otherwise wait for a debugger forever.
+#[allow(clippy::too_many_arguments)]
+pub async fn launch_for_debug<H, L, LFut, A, AFut, T, I>(
     host: &H,
     package: &str,
     timeout: Duration,
@@ -85,6 +276,7 @@ pub async fn launch_for_debug<H, L, LFut, A, AFut, T>(
     steps: &mut Vec<Json>,
     launch: L,
     attach: A,
+    interrupt: I,
 ) -> Result<T>
 where
     H: LaunchHost,
@@ -92,8 +284,10 @@ where
     LFut: Future<Output = Result<Json>>,
     A: FnOnce(u32) -> AFut,
     AFut: Future<Output = Result<T>>,
+    I: Future<Output = ()>,
 {
     let quoted = crate::config::quote_device_shell_arg(package);
+    let previous = read_debug_app(host).await;
     let before = package_pids(host, package).await.unwrap_or_default();
     if !before.is_empty() {
         // The debug-app setting only applies to a new process.
@@ -104,25 +298,64 @@ where
     if set.contains("Error") || set.contains("Exception") {
         bail!("am set-debug-app failed: {}", set.trim());
     }
-    steps.push(json!({"step": "set_debug_app", "ok": true, "wait": true, "persistent": false}));
+    steps.push(json!({
+        "step": "set_debug_app",
+        "ok": true,
+        "wait": true,
+        "persistent": false,
+        "previous_debug_app": previous.package,
+        "previous_wait_for_debugger": previous.wait_for_debugger,
+    }));
 
-    let outcome = async {
-        let launched = launch().await?;
-        steps.push(json!({"step": "launch", "ok": true, "result": launched}));
-        let pid = wait_for_new_pid(host, package, &before, timeout, poll).await?;
-        steps.push(json!({"step": "process_started", "ok": true, "pid": pid}));
-        attach(pid).await
-    }
-    .await;
+    let mut work_steps = Vec::new();
+    let outcome = {
+        let work = async {
+            let launched = launch().await?;
+            work_steps.push(json!({"step": "launch", "ok": true, "result": launched}));
+            let pid = wait_for_new_pid(host, package, &before, timeout, poll).await?;
+            work_steps.push(json!({"step": "process_started", "ok": true, "pid": pid}));
+            attach(pid).await
+        };
+        tokio::select! {
+            result = work => Some(result),
+            () = interrupt => None,
+        }
+    };
+    steps.append(&mut work_steps);
 
     // Every exit path: a leftover `-w` would freeze the next launch.
-    let cleared = host.shell("am clear-debug-app").await;
-    steps.push(json!({
-        "step": "clear_debug_app",
-        "ok": cleared.is_ok(),
-        "error": cleared.as_ref().err().map(|e| e.to_string()),
-    }));
-    outcome
+    restore_debug_app(host, &previous, steps).await;
+    match outcome {
+        Some(result) => result,
+        None => {
+            steps.push(json!({"step": "interrupted", "ok": false}));
+            // The new process waits in waitForDebugger with no one coming.
+            let started: Vec<u32> = package_pids(host, package)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|pid| !before.contains(pid))
+                .collect();
+            if !started.is_empty() {
+                let stopped = host.shell(&format!("am force-stop {quoted}")).await;
+                steps.push(json!({
+                    "step": "force_stop_waiting_process",
+                    "ok": stopped.is_ok(),
+                    "pids": started,
+                }));
+            }
+            Err(crate::diagnostic::DiagnosticError::new(
+                "debug_launch_interrupted",
+                "debugger",
+                format!("the launch of {package} under the debugger was interrupted"),
+            )
+            .detail(json!({"backend": "jdwp", "package": package, "launch_steps": steps}))
+            .next_actions([
+                "shadowdroid debug attach --backend jdwp --wait-for-launch --package <pkg>",
+            ])
+            .into())
+        }
+    }
 }
 
 async fn wait_for_new_pid<H: LaunchHost>(
@@ -173,6 +406,8 @@ mod tests {
         running: Mutex<Vec<(u32, String)>>,
         polls_until_up: Mutex<u32>,
         launched: Mutex<bool>,
+        /// `(command prefix, reply)` for shell commands that print something.
+        replies: Mutex<Vec<(String, String)>>,
     }
 
     impl FakeHost {
@@ -182,7 +417,16 @@ mod tests {
                 running: Mutex::new(running.into_iter().map(|(p, n)| (p, n.into())).collect()),
                 polls_until_up: Mutex::new(2),
                 launched: Mutex::new(false),
+                replies: Mutex::new(Vec::new()),
             }
+        }
+
+        fn reply(self, prefix: &str, output: &str) -> Self {
+            self.replies
+                .lock()
+                .unwrap()
+                .push((prefix.to_string(), output.to_string()));
+            self
         }
 
         fn commands(&self) -> Vec<String> {
@@ -196,7 +440,14 @@ mod tests {
             if command.starts_with("am force-stop") {
                 self.running.lock().unwrap().clear();
             }
-            Ok(String::new())
+            Ok(self
+                .replies
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(prefix, _)| command.starts_with(prefix.as_str()))
+                .map(|(_, reply)| reply.clone())
+                .unwrap_or_default())
         }
 
         async fn debuggable_pids(&self) -> Result<Vec<u32>> {
@@ -252,6 +503,7 @@ mod tests {
                 Ok(json!({"launcher": "test"}))
             },
             |pid| async move { Ok(pid) },
+            std::future::pending(),
         )
         .await
         .unwrap();
@@ -259,6 +511,8 @@ mod tests {
         assert_eq!(
             host.commands(),
             [
+                "settings get global debug_app",
+                "settings get global wait_for_debugger",
                 "am force-stop 'io.example.app'",
                 "am set-debug-app -w 'io.example.app'",
                 "am clear-debug-app",
@@ -292,6 +546,7 @@ mod tests {
                 Ok(json!({}))
             },
             |_pid| async { Err::<(), _>(anyhow::anyhow!("attach failed")) },
+            std::future::pending(),
         )
         .await
         .unwrap_err();
@@ -310,6 +565,7 @@ mod tests {
             &mut steps,
             || async { Ok(json!({})) },
             |pid| async move { Ok(pid) },
+            std::future::pending(),
         )
         .await
         .unwrap_err();
@@ -350,10 +606,149 @@ mod tests {
             &mut steps,
             || monkey_launch(&host, "io.example.app"),
             |pid| async move { Ok(pid) },
+            std::future::pending(),
         )
         .await
         .unwrap_err();
         assert!(error.to_string().contains("could not launch"), "{error}");
         assert_eq!(host.0.commands().last().unwrap(), "am clear-debug-app");
+    }
+
+    #[tokio::test]
+    async fn a_previous_debug_app_setting_is_restored_not_cleared() {
+        let host = FakeHost::new(vec![])
+            .reply("settings get global debug_app", "com.other.app\n")
+            .reply("settings get global wait_for_debugger", "1\n");
+        let mut steps = Vec::new();
+        launch_for_debug(
+            &host,
+            "io.example.app",
+            Duration::from_secs(5),
+            FAST,
+            &mut steps,
+            || async {
+                *host.launched.lock().unwrap() = true;
+                Ok(json!({}))
+            },
+            |pid| async move { Ok(pid) },
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+        let commands = host.commands();
+        assert_eq!(
+            commands.last().unwrap(),
+            "am set-debug-app -w --persistent 'com.other.app'"
+        );
+        assert!(!commands.iter().any(|c| c == "am clear-debug-app"));
+        assert_eq!(steps[0]["previous_debug_app"], "com.other.app");
+        assert_eq!(steps[0]["previous_wait_for_debugger"], true);
+        assert_eq!(steps.last().unwrap()["step"], "restore_debug_app");
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_launch_clears_and_stops_the_waiting_process() {
+        let host = FakeHost::new(vec![]);
+        *host.polls_until_up.lock().unwrap() = 0;
+        let mut steps = Vec::new();
+        let error = launch_for_debug(
+            &host,
+            "io.example.app",
+            Duration::from_secs(5),
+            FAST,
+            &mut steps,
+            || async {
+                *host.launched.lock().unwrap() = true;
+                Ok(json!({}))
+            },
+            // The attach never completes; Ctrl-C arrives meanwhile.
+            |_pid| std::future::pending::<Result<u32>>(),
+            tokio::time::sleep(Duration::from_millis(50)),
+        )
+        .await
+        .unwrap_err();
+        let diagnostic = error
+            .downcast_ref::<crate::diagnostic::DiagnosticError>()
+            .unwrap();
+        assert_eq!(diagnostic.code, "debug_launch_interrupted");
+        let commands = host.commands();
+        let clear = commands
+            .iter()
+            .position(|c| c == "am clear-debug-app")
+            .unwrap();
+        let stop = commands
+            .iter()
+            .rposition(|c| c == "am force-stop 'io.example.app'")
+            .unwrap();
+        assert!(clear < stop, "{commands:?}");
+        let names: Vec<_> = steps.iter().map(|s| s["step"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            [
+                "set_debug_app",
+                "launch",
+                "process_started",
+                "clear_debug_app",
+                "interrupted",
+                "force_stop_waiting_process"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_launch_activity_is_chosen_deterministically() {
+        const LISTING: &str = "2 activities found:\n  Activity #0:\n    priority=0\n    io.example.app/.AltLauncher\n  Activity #1:\n    priority=0\n    io.example.app/.MainActivity\n";
+        // Several launchers, the last task was rooted in MainActivity.
+        let host = FakeHost::new(vec![])
+            .reply("cmd package query-activities", LISTING)
+            .reply(
+                "dumpsys activity recents",
+                "* Recent #0: Task{1 #9 type=standard A=10341:io.example.app}\n    realActivity={io.example.app/io.example.app.MainActivity}\n",
+            );
+        let value = launcher_launch(&host, "io.example.app", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            value["component"],
+            "io.example.app/io.example.app.MainActivity"
+        );
+        assert_eq!(value["chosen_by"], "recent_task_root");
+        assert!(
+            value["warning"]
+                .as_str()
+                .unwrap()
+                .contains("--launch-activity")
+        );
+        assert!(
+            host.commands()
+                .last()
+                .unwrap()
+                .starts_with("am start -a android.intent.action.MAIN")
+        );
+        assert!(!host.commands().iter().any(|c| c.starts_with("monkey")));
+
+        // No recent task: the first launcher in manifest order, never random.
+        let host = FakeHost::new(vec![]).reply("cmd package query-activities", LISTING);
+        let value = launcher_launch(&host, "io.example.app", None)
+            .await
+            .unwrap();
+        assert_eq!(value["component"], "io.example.app/.AltLauncher");
+        assert_eq!(value["chosen_by"], "first_launcher");
+
+        // Explicit wins, in any spelling.
+        let host = FakeHost::new(vec![]);
+        let value = launcher_launch(&host, "io.example.app", Some(".MainActivity"))
+            .await
+            .unwrap();
+        assert_eq!(value["component"], "io.example.app/.MainActivity");
+        assert_eq!(value["chosen_by"], "explicit");
+        assert_eq!(
+            component_name("io.example.app", "MainActivity"),
+            "io.example.app/.MainActivity"
+        );
+        assert_eq!(
+            component_name("io.example.app", "io.example.app.Main"),
+            "io.example.app/io.example.app.Main"
+        );
     }
 }

@@ -192,6 +192,11 @@ pub struct LaunchArgs {
     /// How long to wait for the launched process.
     #[arg(long, default_value_t = 20_000)]
     pub launch_timeout_ms: u64,
+    /// Activity to start with --wait-for-launch (`.Main`, `pkg/.Main`, or a
+    /// class name). Default: the only launcher activity, else the root of the
+    /// app's most recent task, else the first launcher in manifest order.
+    #[arg(long, value_name = "ACTIVITY")]
+    pub launch_activity: Option<String>,
 }
 
 impl LaunchArgs {
