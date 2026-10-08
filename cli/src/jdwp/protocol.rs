@@ -48,6 +48,7 @@ pub mod reference_type {
     pub const SOURCE_DEBUG_EXTENSION: u8 = 12;
     pub const FIELDS_WITH_GENERIC: u8 = 14;
     pub const METHODS_WITH_GENERIC: u8 = 15;
+    pub const INSTANCES: u8 = 16;
 }
 
 pub mod class_type {
@@ -323,6 +324,7 @@ pub fn command_name(command_set: u8, command: u8) -> String {
         (set::REFERENCE_TYPE, reference_type::GET_VALUES) => "ReferenceType.GetValues",
         (set::REFERENCE_TYPE, reference_type::SOURCE_FILE) => "ReferenceType.SourceFile",
         (set::REFERENCE_TYPE, reference_type::STATUS) => "ReferenceType.Status",
+        (set::REFERENCE_TYPE, reference_type::INSTANCES) => "ReferenceType.Instances",
         (set::REFERENCE_TYPE, reference_type::SOURCE_DEBUG_EXTENSION) => {
             "ReferenceType.SourceDebugExtension"
         }

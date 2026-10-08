@@ -562,7 +562,116 @@ const CLASSES: &[Class] = &[
         source: None,
         methods: &[],
     },
+    // A coroutine world (DebugProbes installed): StandaloneCoroutine 700
+    // named "worker" on Dispatchers.Default; continuation 710
+    // (Work$run$1, label 2) whose completion is CoroutineOwner 711 → 700.
+    Class {
+        id: 120,
+        signature: "Lkotlinx/coroutines/AbstractCoroutine;",
+        source: Some("AbstractCoroutine.kt"),
+        methods: &[],
+    },
+    Class {
+        id: 121,
+        signature: "Lkotlinx/coroutines/StandaloneCoroutine;",
+        source: Some("Builders.common.kt"),
+        methods: &[],
+    },
+    Class {
+        id: 122,
+        signature: "Lkotlin/coroutines/jvm/internal/BaseContinuationImpl;",
+        source: Some("ContinuationImpl.kt"),
+        methods: &[],
+    },
+    Class {
+        id: 123,
+        signature: "Lio/example/app/Work$run$1;",
+        source: Some("Work.kt"),
+        methods: &[],
+    },
+    Class {
+        id: 124,
+        signature: "Lkotlinx/coroutines/CoroutineName;",
+        source: Some("CoroutineName.kt"),
+        methods: &[],
+    },
+    Class {
+        id: 125,
+        signature: "Lkotlinx/coroutines/scheduling/DefaultScheduler;",
+        source: Some("Dispatcher.kt"),
+        methods: &[],
+    },
+    Class {
+        id: 126,
+        signature: "Lkotlin/coroutines/CombinedContext;",
+        source: Some("CoroutineContextImpl.kt"),
+        methods: &[],
+    },
+    Class {
+        id: 127,
+        signature: "Lkotlinx/coroutines/Empty;",
+        source: Some("JobSupport.kt"),
+        methods: &[],
+    },
+    Class {
+        id: 128,
+        signature: "Lkotlinx/coroutines/debug/internal/DebugProbesImpl$CoroutineOwner;",
+        source: Some("DebugProbesImpl.kt"),
+        methods: &[],
+    },
 ];
+
+/// `(object, class)` of the coroutine world.
+const WORLD_OBJECTS: &[(u64, u64)] = &[
+    (700, 121),
+    (701, 126),
+    (702, 124),
+    (703, 125),
+    (704, 127),
+    (705, 103),
+    (710, 123),
+    (711, 128),
+];
+
+/// `(object, field, tag, value)` of the coroutine world.
+const WORLD_FIELDS: &[(u64, u64, u8, u64)] = &[
+    (700, 2100, b'L', 701),
+    (700, 2101, b'L', 704),
+    (701, 2106, b'L', 702),
+    (701, 2107, b'L', 703),
+    (702, 2105, b's', 705),
+    (710, 2102, b'L', 711),
+    (710, 2103, b'I', 2),
+    (710, 2104, b's', 501),
+    (711, 2108, b'L', 700),
+];
+
+/// `(class, field id, name, signature)` of the coroutine world.
+const WORLD_CLASS_FIELDS: &[(u64, u64, &str, &str)] = &[
+    (120, 2100, "context", "Lkotlin/coroutines/CoroutineContext;"),
+    (120, 2101, "_state$volatile", "Ljava/lang/Object;"),
+    (122, 2102, "completion", "Lkotlin/coroutines/Continuation;"),
+    (123, 2103, "label", "I"),
+    (123, 2104, "L$0", "Ljava/lang/Object;"),
+    (124, 2105, "name", "Ljava/lang/String;"),
+    (126, 2106, "left", "Lkotlin/coroutines/CoroutineContext;"),
+    (
+        126,
+        2107,
+        "element",
+        "Lkotlin/coroutines/CoroutineContext$Element;",
+    ),
+    (128, 2108, "delegate", "Lkotlin/coroutines/Continuation;"),
+];
+
+fn superclass_of(type_id: u64) -> u64 {
+    match type_id {
+        104 => 0,
+        121 => 120,
+        123 => 122,
+        _ => 104,
+    }
+}
 
 fn class(id: u64) -> Option<&'static Class> {
     CLASSES.iter().find(|c| c.id == id)
@@ -677,6 +786,13 @@ enum After {
     Trap,
     /// `hang()`: reply only once the test sets `release_hang`.
     Hang,
+}
+
+/// The first id-sized value of a command body (the object or type id).
+fn body_u64(body: &[u8]) -> u64 {
+    body.get(..8)
+        .map(|b| u64::from_be_bytes(b.try_into().unwrap()))
+        .unwrap_or(0)
 }
 
 fn new_string(state: &mut State, text: String) -> u64 {
@@ -852,6 +968,35 @@ fn handle(shared: &Shared, set: u8, cmd: u8, body: &[u8]) -> (u16, Vec<u8>, Afte
                 );
             }
         }
+        (2, 14) if WORLD_CLASS_FIELDS.iter().any(|f| f.0 == body_u64(body)) => {
+            let type_id = c.u64();
+            let fields: Vec<_> = WORLD_CLASS_FIELDS
+                .iter()
+                .filter(|f| f.0 == type_id)
+                .collect();
+            put_i32(&mut out, fields.len() as i32);
+            for (_, id, name, signature) in fields {
+                put_u64(&mut out, *id);
+                put_str(&mut out, name);
+                put_str(&mut out, signature);
+                put_str(&mut out, "");
+                put_i32(&mut out, 2);
+            }
+        }
+        // ReferenceType.Instances
+        (2, 16) => {
+            let type_id = c.u64();
+            let instances: &[u64] = match type_id {
+                121 => &[700],
+                123 => &[710],
+                _ => &[],
+            };
+            put_i32(&mut out, instances.len() as i32);
+            for id in instances {
+                out.push(b'L');
+                put_u64(&mut out, *id);
+            }
+        }
         (2, 14) => {
             let type_id = c.u64();
             let fields: &[(u64, &str, &str)] = if type_id == ACTIVITY_CLASS {
@@ -883,7 +1028,7 @@ fn handle(shared: &Shared, set: u8, cmd: u8, body: &[u8]) -> (u16, Vec<u8>, Afte
         // ClassType.Superclass
         (3, 1) => {
             let type_id = c.u64();
-            put_u64(&mut out, if type_id == 104 { 0 } else { 104 });
+            put_u64(&mut out, superclass_of(type_id));
         }
         // Method
         (6, 1) => {
@@ -950,6 +1095,34 @@ fn handle(shared: &Shared, set: u8, cmd: u8, body: &[u8]) -> (u16, Vec<u8>, Afte
             }
         }
         // ObjectReference
+        (9, 1) if WORLD_OBJECTS.iter().any(|o| o.0 == body_u64(body)) => {
+            let object = c.u64();
+            let class = WORLD_OBJECTS.iter().find(|o| o.0 == object).unwrap().1;
+            out.push(1);
+            put_u64(&mut out, class);
+        }
+        (9, 2) if WORLD_OBJECTS.iter().any(|o| o.0 == body_u64(body)) => {
+            let object = c.u64();
+            let count = c.i32();
+            put_i32(&mut out, count);
+            for _ in 0..count {
+                let field = c.u64();
+                match WORLD_FIELDS.iter().find(|f| f.0 == object && f.1 == field) {
+                    Some((_, _, b'I', value)) => {
+                        out.push(b'I');
+                        put_i32(&mut out, *value as i32);
+                    }
+                    Some((_, _, tag, value)) => {
+                        out.push(*tag);
+                        put_u64(&mut out, *value);
+                    }
+                    None => {
+                        out.push(b'L');
+                        put_u64(&mut out, 0);
+                    }
+                }
+            }
+        }
         (9, 1) => {
             let object = c.u64();
             let type_id = match object {
@@ -1020,12 +1193,13 @@ fn handle(shared: &Shared, set: u8, cmd: u8, body: &[u8]) -> (u16, Vec<u8>, Afte
         (9, 9) => {
             let object = c.u64();
             out.push(u8::from(
-                !matches!(object, 500..=504) && !state.strings.contains_key(&object),
+                !matches!(object, 500..=504 | 700..=711) && !state.strings.contains_key(&object),
             ));
         }
         (10, 1) => match c.u64() {
             501 => put_str(&mut out, "hello"),
             504 => put_str(&mut out, "kaboom"),
+            705 => put_str(&mut out, "worker"),
             id => match state.strings.get(&id) {
                 Some(text) => put_str(&mut out, &text.clone()),
                 None => return (20, out, After::Nothing),

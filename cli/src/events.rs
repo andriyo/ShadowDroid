@@ -842,6 +842,8 @@ const JDWP_DEBUG_VERBS: &[&str] = &[
     "run-until-crash",
     "step-until-screen-change",
     "step-until-log",
+    "watch",
+    "coroutines",
 ];
 const JDWP_BREAK_KINDS: &[&str] = &["line", "exception", "method", "field", "update", "remove"];
 
@@ -1735,8 +1737,11 @@ mod tests {
             keep("shadowdroid debug snapshot").as_deref(),
             Some("shadowdroid debug snapshot --backend jdwp")
         );
-        assert_eq!(keep("shadowdroid debug watch list"), None);
-        assert_eq!(keep("shadowdroid debug coroutines threads"), None);
+        assert_eq!(keep("shadowdroid debug clients"), None);
+        assert_eq!(
+            keep("shadowdroid debug coroutines threads").as_deref(),
+            Some("shadowdroid debug coroutines threads --backend jdwp")
+        );
         assert_eq!(
             keep("shadowdroid debug break method --class A").as_deref(),
             Some("shadowdroid debug break method --class A --backend jdwp")

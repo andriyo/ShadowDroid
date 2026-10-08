@@ -512,6 +512,9 @@ pub struct Session {
     pub(super) logpoint_log: super::logpoints::LogpointLog,
     initial_breakpoints: Mutex<Vec<Json>>,
     pub(super) invoke_state: super::invoke::SharedInvokeState,
+    /// Watch specs and their cached values (by watch id).
+    pub(super) watches: Mutex<(Vec<super::watches::WatchSpec>, HashMap<String, Json>)>,
+    coroutine_classes: Mutex<Option<super::coroutines::CoroutineClasses>>,
 }
 
 impl Session {
@@ -532,6 +535,8 @@ impl Session {
             ),
             initial_breakpoints: Mutex::new(Vec::new()),
             invoke_state: Default::default(),
+            watches: Mutex::new((Vec::new(), HashMap::new())),
+            coroutine_classes: Mutex::new(None),
             logpoint_log: super::logpoints::LogpointLog::new(
                 format!(
                     "logpoints_jdwp_{}_{}",
@@ -545,6 +550,17 @@ impl Session {
 
     pub(super) fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().expect("session state lock")
+    }
+
+    pub(super) fn coroutine_classes_cache(&self) -> Option<super::coroutines::CoroutineClasses> {
+        self.coroutine_classes
+            .lock()
+            .expect("coroutine cache")
+            .clone()
+    }
+
+    pub(super) fn set_coroutine_classes_cache(&self, classes: super::coroutines::CoroutineClasses) {
+        *self.coroutine_classes.lock().expect("coroutine cache") = Some(classes);
     }
 
     /// Results of the launch-time breakpoints (`__debugd --init`).
@@ -1636,6 +1652,9 @@ impl Session {
         }
         if stopped {
             self.bump();
+            // Watches are evaluated on every stop, as in Studio.
+            self.refresh_watches(super::inspect::RenderOptions::new(1, 48, 24))
+                .await;
         } else {
             let result = match composite.suspend_policy {
                 suspend_policy::ALL => self.jdwp.resume().await,

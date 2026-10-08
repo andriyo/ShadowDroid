@@ -20,8 +20,8 @@ use super::resolve::{self, LocateError, SourceTarget};
 use super::session::RpcError;
 use super::transport;
 use crate::cmd::debugger::{
-    BreakCmd, DebugMode, DebuggerCmd, LaunchArgs, LogpointCmd, LogpointEventFilters,
-    LogpointReader, SuspendArg, follow_logpoint_events, validate_logpoint_stream,
+    BreakCmd, CoroutinesCmd, DebugMode, DebuggerCmd, LaunchArgs, LogpointCmd, LogpointEventFilters,
+    LogpointReader, SuspendArg, WatchCmd, follow_logpoint_events, validate_logpoint_stream,
 };
 use crate::diagnostic::DiagnosticError;
 
@@ -429,8 +429,88 @@ pub async fn run(cmd: &DebuggerCmd, ctx: JdwpContext<'_>) -> Result<()> {
             .await?
         }
         DebuggerCmd::Clients(_) => return Err(unsupported("clients")),
-        DebuggerCmd::Coroutines(_) => return Err(unsupported("coroutines")),
-        DebuggerCmd::Watch(_) => return Err(unsupported("watch")),
+        DebuggerCmd::Coroutines(cmd) => {
+            let (session, method, params, timeout_ms) = match cmd {
+                CoroutinesCmd::Snapshot(args) => (
+                    &args.session,
+                    "coroutines_snapshot",
+                    json!({"limit": args.limit, "depth": args.depth}),
+                    args.timeout_ms,
+                ),
+                CoroutinesCmd::Threads(args) => (
+                    &args.session,
+                    "coroutines_threads",
+                    json!({"limit": args.limit}),
+                    args.timeout_ms,
+                ),
+                CoroutinesCmd::Continuation(args) => (
+                    &args.session,
+                    "coroutines_continuation",
+                    json!({"thread": args.thread, "frame": args.frame, "depth": args.depth}),
+                    args.timeout_ms,
+                ),
+                CoroutinesCmd::Flow(args) => (
+                    &args.session,
+                    "coroutines_flow",
+                    json!({
+                        "expression": args.expr,
+                        "thread": args.thread,
+                        "frame": args.frame,
+                        "depth": args.depth,
+                    }),
+                    args.timeout_ms,
+                ),
+            };
+            let entry = select(ctx.serial, session.as_deref())?;
+            let mut value = rpc(&entry, method, params, timeout_for(u64::from(timeout_ms))).await?;
+            if method == "coroutines_snapshot" {
+                value["next_actions"] = json!([
+                    "shadowdroid aar coroutines",
+                    "shadowdroid debug coroutines continuation --backend jdwp",
+                ]);
+            }
+            value
+        }
+        DebuggerCmd::Watch(WatchCmd::Add {
+            expression, name, ..
+        }) => {
+            let entry = select(ctx.serial, None)?;
+            rpc(
+                &entry,
+                "watch_add",
+                json!({"expression": expression, "name": name}),
+                DEFAULT_CALL_TIMEOUT,
+            )
+            .await?
+        }
+        DebuggerCmd::Watch(WatchCmd::List(args)) => {
+            let entry = select(ctx.serial, args.session.as_deref())?;
+            rpc(
+                &entry,
+                "watch_list",
+                json!({
+                    "depth": args.depth,
+                    "max_fields": args.max_fields,
+                    "max_array_items": args.max_array_items,
+                }),
+                timeout_for(u64::from(args.timeout_ms)),
+            )
+            .await?
+        }
+        DebuggerCmd::Watch(WatchCmd::Remove { id }) => {
+            let entry = select(ctx.serial, None)?;
+            rpc(
+                &entry,
+                "watch_remove",
+                json!({"id": id}),
+                DEFAULT_CALL_TIMEOUT,
+            )
+            .await?
+        }
+        DebuggerCmd::Watch(WatchCmd::Clear) => {
+            let entry = select(ctx.serial, None)?;
+            rpc(&entry, "watch_clear", json!({}), DEFAULT_CALL_TIMEOUT).await?
+        }
     };
     emit(value);
     Ok(())

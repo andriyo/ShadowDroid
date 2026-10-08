@@ -1493,3 +1493,99 @@ async fn line_variants_choose_outer_or_the_innermost_lambda() {
         .collect();
     assert_eq!(methods, ["onNewIntent"]);
 }
+
+// ── P1c: watches and coroutines ─────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watches_are_evaluated_on_every_stop_and_on_list() {
+    let vm = FakeVm::start();
+    let session = attach(&vm, WAIT).await;
+    let added = session.watch_add("tag", None).unwrap();
+    assert_eq!(added["watch"]["id"], super::watches::watch_id("tag", "tag"));
+    session.watch_add("this.counter", Some("counter")).unwrap();
+    session.watch_add("nope", None).unwrap();
+    let refused = session.watch_add("this.getLabel()", None).unwrap_err();
+    assert_eq!(refused.code, "invoke_not_allowed");
+
+    // Running: cached (empty) values and a warning.
+    let running = session.watch_list(OPTIONS).await.unwrap();
+    assert_eq!(
+        running["warning"],
+        "session is not suspended; returning cached watch values"
+    );
+    assert!(running["watches"][0]["value"].is_null());
+
+    session
+        .break_line(target("MainActivity.kt"), 31, Default::default())
+        .await
+        .unwrap();
+    vm.hit_breakpoint(5);
+    wait_suspended(&session).await;
+    // Refreshed by the stop itself (before any list).
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while session.watches.lock().unwrap().1.len() < 3 {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let listed = session.watch_list(OPTIONS).await.unwrap();
+    let watches = listed["watches"].as_array().unwrap();
+    assert_eq!(watches[0]["value"]["value"], "hello");
+    assert_eq!(watches[1]["name"], "counter");
+    assert_eq!(watches[1]["value"]["value"], "7");
+    assert!(
+        watches[2]["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown local")
+    );
+    assert!(watches[0]["updated_at"].is_number());
+    assert_eq!(watches[0]["selected_frame"]["thread_name"], "main");
+    assert!(listed["warning"].is_null());
+
+    let id = watches[2]["id"].as_str().unwrap().to_string();
+    assert_eq!(session.watch_remove(&id)["removed"], true);
+    assert_eq!(session.watch_clear()["removed"], 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coroutines_are_discovered_process_wide_through_instances() {
+    let vm = FakeVm::start();
+    let session = stopped_at_line_31(&vm).await;
+    let snapshot = session.coroutine_snapshot(64, OPTIONS).await.unwrap();
+    assert_eq!(snapshot["available"], true);
+    assert_eq!(snapshot["type"], "coroutine_snapshot");
+    let coroutines = snapshot["coroutines"].as_array().unwrap();
+    assert_eq!(coroutines.len(), 1, "{snapshot}");
+    let worker = &coroutines[0];
+    assert_eq!(worker["class"], "kotlinx.coroutines.StandaloneCoroutine");
+    assert_eq!(worker["name"], "worker");
+    assert_eq!(worker["dispatcher"], "Dispatchers.Default");
+    assert_eq!(worker["state"], "active");
+    // Through DebugProbesImpl$CoroutineOwner.delegate to the coroutine.
+    assert_eq!(
+        worker["continuations"][0]["class"],
+        "io.example.app.Work$run$1"
+    );
+    assert_eq!(worker["continuations"][0]["label"], 2);
+    assert_eq!(snapshot["discovery"]["coroutine_classes"], 1);
+    assert_eq!(snapshot["discovery"]["continuation_classes"], 1);
+    assert!(snapshot["threads"][0]["dispatcher"]["name"] == "Dispatchers.Main");
+
+    let threads = session.coroutine_threads(8).await.unwrap();
+    assert_eq!(threads["type"], "coroutine_threads");
+    let flow = session
+        .coroutine_flow("this.label", None, None, OPTIONS)
+        .await
+        .unwrap();
+    assert_eq!(flow["type"], "coroutine_flow");
+    assert!(flow["kind"].is_null());
+    let continuation = session
+        .coroutine_continuation(None, None, OPTIONS)
+        .await
+        .unwrap();
+    assert_eq!(continuation["type"], "coroutine_continuation");
+
+    session.resume().await.unwrap();
+    let running = session.coroutine_snapshot(8, OPTIONS).await.unwrap();
+    assert_eq!(running["available"], false);
+}

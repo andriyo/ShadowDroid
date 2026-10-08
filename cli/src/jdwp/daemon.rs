@@ -664,6 +664,43 @@ pub async fn dispatch(session: &Arc<Session>, method: &str, params: &Json) -> Rp
                 )
                 .await
         }
+        "watch_add" => {
+            let expression = str_param(params, "expression")
+                .ok_or_else(|| RpcError::new("invalid_expression", "missing expression"))?;
+            session.watch_add(expression, str_param(params, "name"))
+        }
+        "watch_remove" => {
+            let id = str_param(params, "id")
+                .ok_or_else(|| RpcError::new("invalid_request", "missing id"))?;
+            Ok(session.watch_remove(id))
+        }
+        "watch_clear" => Ok(session.watch_clear()),
+        "watch_list" => session.watch_list(render_options(params, 1)).await,
+        "coroutines_snapshot" => {
+            session
+                .coroutine_snapshot(
+                    u64_param(params, "limit", 64).clamp(1, 256) as u32,
+                    render_options(params, 1),
+                )
+                .await
+        }
+        "coroutines_threads" => {
+            session
+                .coroutine_threads(u64_param(params, "limit", 32).clamp(1, 128) as u32)
+                .await
+        }
+        "coroutines_continuation" => {
+            session
+                .coroutine_continuation(thread, frame, render_options(params, 2))
+                .await
+        }
+        "coroutines_flow" => {
+            let expression = str_param(params, "expression")
+                .ok_or_else(|| RpcError::new("invalid_expression", "missing expression"))?;
+            session
+                .coroutine_flow(expression, thread, frame, render_options(params, 2))
+                .await
+        }
         "wait_stop" => {
             let timeout = Duration::from_millis(u64_param(params, "timeout_ms", 1_000).min(30_000));
             Ok(session

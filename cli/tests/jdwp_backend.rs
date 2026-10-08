@@ -309,7 +309,7 @@ fn studio_launch_flags_are_refused_before_any_device_work() {
 #[test]
 fn unsupported_verbs_fail_typed_and_studio_stays_the_default() {
     let env = Env::new();
-    let (error, code) = env.run(&["debug", "watch", "list", "--backend", "jdwp"]);
+    let (error, code) = env.run(&["debug", "clients", "--backend", "jdwp"]);
     assert_ne!(code, 0);
     assert_eq!(error["code"], "unsupported_by_backend", "{error}");
     // Rejected before any device or server bring-up.

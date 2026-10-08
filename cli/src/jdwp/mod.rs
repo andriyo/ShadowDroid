@@ -26,6 +26,7 @@ pub mod codec;
 pub mod commands;
 pub mod conn;
 pub mod control;
+pub mod coroutines;
 pub mod daemon;
 pub mod eval;
 pub mod events;
@@ -43,6 +44,7 @@ pub mod resolve;
 pub mod session;
 pub mod transport;
 pub mod vm;
+pub mod watches;
 
 #[cfg(test)]
 #[path = "../../tests/support/fake_jdwp.rs"]

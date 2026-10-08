@@ -640,6 +640,26 @@ impl Jdwp {
         }
     }
 
+    /// Live instances of exactly `type_id`, at most `max`.
+    pub async fn instances(&self, type_id: u64, max: i32) -> Result<Vec<u64>, JdwpError> {
+        let mut w = self.writer();
+        w.reference_type_id(type_id).i32(max);
+        let data = self
+            .call(
+                set::REFERENCE_TYPE,
+                reference_type::INSTANCES,
+                w.into_bytes(),
+            )
+            .await?;
+        decode("ReferenceType.Instances", || {
+            let mut r = Reader::new(&data, self.sizes());
+            let count = r.count()?;
+            (0..count)
+                .map(|_| r.tagged_object_id().map(|v| v.object_id().unwrap_or(0)))
+                .collect()
+        })
+    }
+
     /// The method's code: DEX bytecode on ART (16-bit little-endian units).
     pub async fn bytecodes(&self, type_id: u64, method_id: u64) -> Result<Vec<u8>, JdwpError> {
         let data = self
