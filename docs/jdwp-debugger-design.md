@@ -28,7 +28,11 @@
 > the flat `debug_backend` (like `debug_mode`), not `debug.backend`; the jdwp
 > backend needs a unix host; method breakpoints must become line breakpoints
 > at each method's first line (the spike measured MethodEntry as far too
-> costly on ART), never MethodEntry.
+> costly on ART), never MethodEntry. Live validation added: on Android a
+> crash is never "uncaught" to JDWP (Looper and Compose input dispatch catch
+> and rethrow), so `--uncaught` means "not caught by app code": the request
+> asks for caught events too and the daemon drops those an app frame
+> catches; the thrown object is reachable as `$exception`.
 
 Design and phased plan for a debugger that needs **no Android Studio**: the CLI
 speaks JDWP to the app itself, through the same adb connection it already owns,
