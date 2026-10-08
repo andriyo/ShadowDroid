@@ -545,7 +545,7 @@ fn leaf_contract(path: &str) -> Option<LeafEffectContract> {
             ],
             &[D::ConfigLoad, D::ManagedProcessStart],
         ),
-        "debug stop" => leaf(
+        "debug stop" | "debug detach" => leaf(
             &[
                 E::HostRead,
                 E::HostWrite,
@@ -1273,6 +1273,7 @@ mod tests {
             | "debug step-over"
             | "debug step-out"
             | "debug stop"
+            | "debug detach"
             | "debug stack"
             | "debug threads"
             | "debug variables"
@@ -1321,7 +1322,10 @@ mod tests {
         for (call, expected_count) in [
             ("selection.resolve(&config)", 16),
             ("selection.resolve_existing(&config)", 4),
-            ("selection.resolve_online(&config)", 5),
+            // +1: `debug attach --backend jdwp` without -d resolves an online
+            // device (opt-in backend; the leaf's default Studio contract is
+            // unchanged, like the conditional Studio resolve above it).
+            ("selection.resolve_online(&config)", 6),
         ] {
             assert_eq!(
                 cli_source.matches(call).count(),

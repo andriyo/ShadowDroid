@@ -76,6 +76,30 @@ impl DebugMode {
     }
 }
 
+/// Which debugger serves a `debug` verb. `auto` follows Studio until the
+/// registry-driven selection of design §4.4 lands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum DebugBackend {
+    Auto,
+    Studio,
+    Jdwp,
+}
+
+impl DebugBackend {
+    pub fn from_config(value: &str) -> Option<Self> {
+        <Self as clap::ValueEnum>::from_str(value.trim(), true).ok()
+    }
+
+    pub fn allowed_values() -> String {
+        <Self as clap::ValueEnum>::value_variants()
+            .iter()
+            .filter_map(|v| v.to_possible_value())
+            .map(|p| p.get_name().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 #[derive(Subcommand)]
 pub enum DebuggerCmd {
     /// Show bridge status, open projects, and active debugger sessions.
@@ -128,6 +152,8 @@ pub enum DebuggerCmd {
     StepOut(SessionSelector),
     /// Stop the selected debug session.
     Stop(SessionSelector),
+    /// Detach the debugger and resume the app (Studio: same as stop).
+    Detach(SessionSelector),
     /// Print stack frames for the selected suspended session.
     Stack(StackArgs),
     /// Print debugger threads and their stack frames.
@@ -1036,7 +1062,9 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
         DebuggerCmd::StepOut(selector) => {
             control(&bridge, session_action::STEP_OUT, selector).await?
         }
-        DebuggerCmd::Stop(selector) => control(&bridge, session_action::STOP, selector).await?,
+        DebuggerCmd::Stop(selector) | DebuggerCmd::Detach(selector) => {
+            control(&bridge, session_action::STOP, selector).await?
+        }
         DebuggerCmd::Stack(args) => {
             let session_s = args.session.clone();
             let limit_s = args.limit.to_string();
@@ -1307,6 +1335,11 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
             "run `shadowdroid studio status --json` before retrying",
         ])
         .into());
+    }
+    let mut value = value;
+    if let Value::Object(map) = &mut value {
+        map.entry("backend")
+            .or_insert_with(|| Value::from("studio"));
     }
     emit(&value)?;
     Ok(())

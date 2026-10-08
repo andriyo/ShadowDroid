@@ -39,6 +39,12 @@ pub struct DebugArgs {
     )]
     pub studio_url: Option<String>,
 
+    /// Debugger backend: studio (Android Studio bridge), jdwp (standalone), or
+    /// auto (currently studio). Defaults to config `debug_backend`.
+    // Distinct id: no `debug` subcommand may define a `debug_backend` arg.
+    #[arg(long = "backend", id = "debug_backend", global = true, value_enum)]
+    pub backend: Option<debugger::DebugBackend>,
+
     #[command(subcommand)]
     pub cmd: DebugCmd,
 }
@@ -298,6 +304,11 @@ pub struct TombstonePullArgs {
 impl DebugArgs {
     pub fn is_host_only(&self) -> bool {
         matches!(self.cmd, DebugCmd::Studio(_))
+    }
+
+    /// Whether this invocation runs on the standalone JDWP backend.
+    pub fn uses_jdwp(&self) -> bool {
+        self.backend == Some(debugger::DebugBackend::Jdwp)
     }
 }
 

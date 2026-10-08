@@ -311,6 +311,9 @@ pub enum Cmd {
     Studio(crate::cmd::studio::StudioArgs),
     /// Agent-first debug snapshots, timelines, replays, and Studio-backed debugger control.
     Debug(crate::cmd::debug::DebugArgs),
+    /// Internal: the standalone debugger daemon (spawned by `debug attach --backend jdwp`).
+    #[command(name = "__debugd", hide = true)]
+    Debugd(crate::jdwp::daemon::DebugdArgs),
     /// Screen-record a device into a timestamped, crash-safe evidence bundle.
     Video(crate::video::VideoArgs),
     /// Watch the app timeline: UI changes, crashes, toasts, watchers, and network events when available.
@@ -2029,6 +2032,8 @@ async fn run_inner() -> Result<()> {
         }
         Cmd::Skill(args) => return crate::cmd::skill::run(args),
         Cmd::Usage(args) => return crate::cmd::usage::run(args),
+        // The detached debugger daemon carries everything it needs in args.
+        Cmd::Debugd(args) => return crate::jdwp::daemon::run(args.clone()).await,
         Cmd::Update { check, json } => return crate::update::cmd_update(*check, *json).await,
         _ => {}
     }
@@ -2137,6 +2142,7 @@ async fn run_inner() -> Result<()> {
         | Cmd::Config(_)
         | Cmd::Skill(_)
         | Cmd::Verify(_)
+        | Cmd::Debugd(_)
         | Cmd::Usage(_) => {
             unreachable!("recovery command handled before config load")
         }
@@ -2154,6 +2160,35 @@ async fn run_inner() -> Result<()> {
                 c,
                 project.as_deref(),
                 serial.as_ref().map(Serial::as_str),
+            )
+            .await;
+        }
+        Cmd::Debug(args) if args.uses_jdwp() => {
+            let DebugCmd::Studio(debugger_cmd) = &args.cmd else {
+                return Err(crate::diagnostic::DiagnosticError::new(
+                    "unsupported_by_backend",
+                    "debugger",
+                    "this `debug` workflow is not available on the jdwp backend yet",
+                )
+                .detail(json!({"backend": "jdwp"}))
+                .next_actions(["re-run with --backend studio"])
+                .into());
+            };
+            // Only attach needs a device; the other verbs find their daemon
+            // in the registry (scoped by an explicit device when given).
+            let serial = match selection.explicit_device.clone() {
+                Some(device) => Some(device),
+                None if matches!(debugger_cmd, DebuggerCmd::Attach { .. }) => {
+                    Some(selection.resolve_online(&config).await?.to_string())
+                }
+                None => None,
+            };
+            return crate::jdwp::commands::run(
+                debugger_cmd,
+                crate::jdwp::commands::JdwpContext {
+                    serial: serial.as_deref(),
+                    project_root: project.as_deref(),
+                },
             )
             .await;
         }
@@ -2403,6 +2438,7 @@ async fn run_inner() -> Result<()> {
         | Cmd::Commands { .. }
         | Cmd::Log(_)
         | Cmd::Why(_)
+        | Cmd::Debugd(_)
         | Cmd::Usage(_)
         | Cmd::Config(_)
         | Cmd::Skill(_)
@@ -3066,6 +3102,12 @@ fn apply_layout_config(args: &mut LayoutArgs, config: &ShadowDroidConfig) {
 
 fn apply_debug_config(args: &mut DebugArgs, config: &ShadowDroidConfig) {
     fill_studio_url(&mut args.studio_url, config);
+    if args.backend.is_none() {
+        args.backend = config
+            .debug_backend
+            .as_deref()
+            .and_then(crate::cmd::debugger::DebugBackend::from_config);
+    }
     match &mut args.cmd {
         DebugCmd::Auto(args) => {
             if args.package.is_none() && args.app.is_none() && args.target.is_none() {

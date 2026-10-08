@@ -706,6 +706,12 @@ pub(super) fn agent_metadata(path: &[String]) -> Option<serde_json::Value> {
             "side_effects": ["stops the selected Android Studio debugger session"],
             "next_actions": ["debug sessions", "debug attach", "debug snapshot"]
         })),
+        "debug detach" => Some(serde_json::json!({
+            "use_when": ["Need to release the debugger and resume the app; with --backend jdwp this disposes the standalone session."],
+            "output": "detach result JSON with backend",
+            "side_effects": ["clears the session's breakpoints and resumes the debugged process"],
+            "next_actions": ["debug sessions", "debug attach"]
+        })),
         "debug stack" => Some(serde_json::json!({
             "use_when": ["Need call stack frames for the selected suspended debug session."],
             "output": "stack/frame JSON",

@@ -567,6 +567,7 @@ fn schema_value() -> Value {
             "studio_plugin": {"type": "string", "optional": true, "description": "Local Studio plugin ZIP path."},
             "debugger": {"type": "string", "optional": true, "description": "Default Android debugger id/display name."},
             "debug_mode": {"type": "string", "optional": true, "enum": ["auto", "java", "native", "mixed"], "description": "Default semantic debugger mode."},
+            "debug_backend": {"type": "string", "optional": true, "enum": ["auto", "studio", "jdwp"], "description": "Default debugger backend for `debug` verbs (auto currently means studio)."},
             "run_configuration": {"type": "string", "optional": true, "description": "Default Android Studio run configuration."},
             "usage_log": {"type": "boolean", "optional": true, "description": "Opt-in local usage log (verb, duration, error code — never argument values) at ~/.shadowdroid/usage.jsonl; see `shadowdroid usage`."},
             "redaction": {
@@ -761,6 +762,15 @@ fn validate_config(
     }
     if let Some(mode) = config.debug_mode.as_deref() {
         validate_debug_mode(path, "debug_mode", mode, errors);
+    }
+    if let Some(backend) = config.debug_backend.as_deref()
+        && crate::cmd::debugger::DebugBackend::from_config(backend).is_none()
+    {
+        errors.push(format!(
+            "{}: debug_backend must be one of {}",
+            path.display(),
+            crate::cmd::debugger::DebugBackend::allowed_values()
+        ));
     }
     for (alias, entry) in &config.apps {
         if alias.trim().is_empty() {

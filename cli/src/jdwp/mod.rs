@@ -18,9 +18,13 @@
 //!   commands  — `debug` verb mapping for the jdwp backend
 
 pub mod codec;
+pub mod commands;
 pub mod conn;
+pub mod control;
+pub mod daemon;
 pub mod events;
 pub mod inspect;
+pub mod paths;
 #[allow(dead_code)] // numbered protocol table; not every entry has a caller yet
 pub mod protocol;
 pub mod resolve;

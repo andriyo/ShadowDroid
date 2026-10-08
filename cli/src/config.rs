@@ -48,6 +48,9 @@ pub struct ShadowDroidConfig {
     pub debugger: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub debug_mode: Option<String>,
+    /// Default `debug --backend`: `auto`, `studio`, or `jdwp`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug_backend: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_configuration: Option<String>,
     /// Opt-in local usage log (`shadowdroid usage`): verb + duration + error
@@ -394,6 +397,7 @@ impl ShadowDroidConfig {
         self.studio_plugin = other.studio_plugin.or(self.studio_plugin.take());
         self.debugger = other.debugger.or(self.debugger.take());
         self.debug_mode = other.debug_mode.or(self.debug_mode.take());
+        self.debug_backend = other.debug_backend.or(self.debug_backend.take());
         self.run_configuration = other.run_configuration.or(self.run_configuration.take());
         self.usage_log = other.usage_log.or(self.usage_log.take());
         self.redaction = merge_redaction(self.redaction.take(), other.redaction);
@@ -959,7 +963,7 @@ mod tests {
 
     fn config() -> impl Strategy<Value = ShadowDroidConfig> {
         (
-            prop::collection::vec(optional_name(), 10),
+            prop::collection::vec(optional_name(), 11),
             prop::option::of(any::<bool>()),
             redaction_config(),
             proxy_config(),
@@ -978,6 +982,7 @@ mod tests {
                     studio_plugin: scalars.next().expect("studio plugin scalar exists"),
                     debugger: scalars.next().expect("debugger scalar exists"),
                     debug_mode: scalars.next().expect("debug mode scalar exists"),
+                    debug_backend: scalars.next().expect("debug backend scalar exists"),
                     run_configuration: scalars.next().expect("run configuration scalar exists"),
                     usage_log,
                     redaction,
