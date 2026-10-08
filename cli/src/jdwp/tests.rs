@@ -1621,3 +1621,36 @@ async fn a_slow_watch_on_a_delegated_property_breaks_on_its_setter_instead() {
     assert_eq!(session.slow_requests(), 0);
     assert!(vm.with_state(|s| s.requests.iter().all(|r| r.kind != 20 && r.kind != 21)));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_variant_of_a_line_is_its_own_breakpoint() {
+    use super::lambdas::LineVariant;
+    let vm = FakeVm::start();
+    let session = attach(&vm, WAIT).await;
+    let add = |variant| {
+        let session = session.clone();
+        async move {
+            session
+                .break_line_with(
+                    target("MainActivity.kt"),
+                    33,
+                    BreakpointOptions {
+                        variant,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let lambda = add(LineVariant::Lambda).await;
+    let outer = add(LineVariant::Outer).await;
+    assert_eq!(outer["created"], true, "{outer}");
+    assert_ne!(lambda["breakpoint"]["id"], outer["breakpoint"]["id"]);
+    assert_eq!(outer["breakpoint"]["variant"], "outer");
+    assert_eq!(outer["breakpoint"]["locations"][0]["method"], "onNewIntent");
+    // The same variant again is idempotent.
+    let again = add(LineVariant::Lambda).await;
+    assert_eq!(again["created"], false);
+    assert_eq!(again["breakpoint"]["id"], lambda["breakpoint"]["id"]);
+}

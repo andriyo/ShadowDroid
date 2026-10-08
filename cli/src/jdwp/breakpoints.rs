@@ -371,7 +371,12 @@ impl Session {
         opts: BreakpointOptions,
     ) -> RpcResult<Json> {
         opts.validate()?;
-        if let Some(existing) = self.breakpoint_at(&target, line) {
+        // Idempotent per file:line *and* variant: `--variant lambda` and
+        // `--variant outer` on one line are different breakpoints.
+        if let Some(existing) = self
+            .breakpoint_at(&target, line)
+            .filter(|b| b.opts.variant == opts.variant || b.opts.is_logpoint())
+        {
             if existing.opts.owner.is_some() || existing.opts.is_logpoint() {
                 return Err(conflict(&existing, &target, line));
             }
