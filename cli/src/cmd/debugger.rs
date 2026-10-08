@@ -213,6 +213,7 @@ impl DebuggerCmd {
             DebuggerCmd::Coroutines(CoroutinesCmd::Snapshot(args)) if args.invoke => {
                 Some("--invoke")
             }
+            DebuggerCmd::Watch(WatchCmd::Add { invoke: true, .. }) => Some("--invoke"),
             DebuggerCmd::Break(BreakCmd::Line { invoke: true, .. }) => Some("--invoke"),
             DebuggerCmd::Break(BreakCmd::Line {
                 variant: Some(variant),
@@ -821,6 +822,10 @@ pub enum WatchCmd {
         /// Project name or absolute project path when multiple projects are open.
         #[arg(long)]
         project: Option<String>,
+        /// Allow method calls in the watch (runs app code on every breakpoint or
+        /// step stop; jdwp backend).
+        #[arg(long)]
+        invoke: bool,
     },
     /// List watches and evaluate them if a session is suspended.
     List(WatchListArgs),
@@ -1412,6 +1417,7 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
             expression,
             name,
             project,
+            ..
         }) => {
             let params = [
                 (query::EXPRESSION, Some(expression.as_str())),

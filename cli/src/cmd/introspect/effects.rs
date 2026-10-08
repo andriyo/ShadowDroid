@@ -862,6 +862,7 @@ pub(super) fn command_effect_contract(
 const INVOKE_COMMANDS: &[&str] = &[
     "debug eval",
     "debug coroutines snapshot",
+    "debug watch add",
     "debug inspect",
     "debug break line",
     "debug break update",

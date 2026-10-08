@@ -109,7 +109,8 @@ What works:
 
 - `attach`/`detach`/`sessions`/`status`, `pause`/`resume`/`step-*`,
   `continue-until`, `stack`, `threads`, `variables`, `eval`, `inspect`, object
-  handles, `watch` (path expressions; watches do not take `--invoke`), and the
+  handles, `watch` (path expressions; `watch add --invoke` allows method
+  calls, evaluated only at breakpoint or step stops), and the
   composed `auto`, `snapshot`, `run-until-crash`, `step-until-log`, and
   `step-until-screen-change`. Stepping the main thread cannot redraw the
   screen, so on this backend `step-until-screen-change` steps out to

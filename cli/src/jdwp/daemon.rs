@@ -667,7 +667,14 @@ pub async fn dispatch(session: &Arc<Session>, method: &str, params: &Json) -> Rp
         "watch_add" => {
             let expression = str_param(params, "expression")
                 .ok_or_else(|| RpcError::new("invalid_expression", "missing expression"))?;
-            session.watch_add(expression, str_param(params, "name"))
+            session.watch_add(
+                expression,
+                str_param(params, "name"),
+                params
+                    .get("invoke")
+                    .and_then(Json::as_bool)
+                    .unwrap_or(false),
+            )
         }
         "watch_remove" => {
             let id = str_param(params, "id")

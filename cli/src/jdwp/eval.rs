@@ -75,6 +75,11 @@ impl EvalCtx {
         self
     }
 
+    /// An invoke ran: frame ids read before it are no longer valid.
+    pub fn is_stale(&self) -> bool {
+        self.stale.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub fn selected(&self) -> Option<SelectedFrame> {
         *self.frame.lock().expect("frame lock")
     }

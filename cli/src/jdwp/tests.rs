@@ -1500,11 +1500,15 @@ async fn line_variants_choose_outer_or_the_innermost_lambda() {
 async fn watches_are_evaluated_on_every_stop_and_on_list() {
     let vm = FakeVm::start();
     let session = attach(&vm, WAIT).await;
-    let added = session.watch_add("tag", None).unwrap();
+    let added = session.watch_add("tag", None, false).unwrap();
     assert_eq!(added["watch"]["id"], super::watches::watch_id("tag", "tag"));
-    session.watch_add("this.counter", Some("counter")).unwrap();
-    session.watch_add("nope", None).unwrap();
-    let refused = session.watch_add("this.getLabel()", None).unwrap_err();
+    session
+        .watch_add("this.counter", Some("counter"), false)
+        .unwrap();
+    session.watch_add("nope", None, false).unwrap();
+    let refused = session
+        .watch_add("this.getLabel()", None, false)
+        .unwrap_err();
     assert_eq!(refused.code, "invoke_not_allowed");
 
     // Running: cached (empty) values and a warning.
@@ -1842,4 +1846,44 @@ async fn coroutine_source_lines_need_invoke_and_an_event_stop() {
         paused["source_lines"]
     );
     assert_eq!(vm.with_state(|s| s.invokes.len()), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invoke_watches_run_only_on_event_stops() {
+    let vm = FakeVm::start();
+    let session = attach(&vm, WAIT).await;
+    let refused = session
+        .watch_add("this.getLabel()", None, false)
+        .unwrap_err();
+    assert_eq!(refused.code, "invoke_not_allowed");
+    let added = session
+        .watch_add("this.getLabel()", Some("label"), true)
+        .unwrap();
+    assert_eq!(added["watch"]["invoke"], true);
+    // A plain path keeps invoke off even when asked.
+    let plain = session.watch_add("tag", None, true).unwrap();
+    assert_eq!(plain["watch"]["invoke"], false);
+
+    session
+        .break_line(target("MainActivity.kt"), 31, Default::default())
+        .await
+        .unwrap();
+    vm.hit_breakpoint(5);
+    wait_suspended(&session).await;
+    let listed = session.watch_list(OPTIONS).await.unwrap();
+    let watches = listed["watches"].as_array().unwrap();
+    assert_eq!(watches[0]["name"], "label");
+    assert_eq!(watches[0]["value"]["value"], "hello", "{listed}");
+    // The invoke watch ran, and the next watch still read its frame.
+    assert_eq!(watches[1]["value"]["value"], "hello", "{listed}");
+    assert!(vm.with_state(|s| s.invokes.iter().any(|(m, _)| *m == 1002)));
+
+    // A `debug pause` stop: the invoke watch says why, the plain one reads.
+    session.resume().await.unwrap();
+    let before = vm.with_state(|s| s.invokes.len());
+    session.pause().await.unwrap();
+    let paused = session.watch_list(OPTIONS).await.unwrap();
+    let watches = paused["watches"].as_array().unwrap();
+    assert_eq!(watches[0]["value"]["code"], "needs_event_stop", "{paused}");
+    assert_eq!(vm.with_state(|s| s.invokes.len()), before);
 }

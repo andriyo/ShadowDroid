@@ -473,13 +473,16 @@ pub async fn run(cmd: &DebuggerCmd, ctx: JdwpContext<'_>) -> Result<()> {
             value
         }
         DebuggerCmd::Watch(WatchCmd::Add {
-            expression, name, ..
+            expression,
+            name,
+            invoke,
+            ..
         }) => {
             let entry = select(ctx.serial, None)?;
             rpc(
                 &entry,
                 "watch_add",
-                json!({"expression": expression, "name": name}),
+                json!({"expression": expression, "name": name, "invoke": invoke}),
                 DEFAULT_CALL_TIMEOUT,
             )
             .await?
