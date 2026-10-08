@@ -629,7 +629,12 @@ const CLASSES: &[Class] = &[
         id: 122,
         signature: "Lkotlin/coroutines/jvm/internal/BaseContinuationImpl;",
         source: Some("ContinuationImpl.kt"),
-        methods: &[],
+        methods: &[(
+            1020,
+            "getStackTraceElement",
+            "()Ljava/lang/StackTraceElement;",
+            &[],
+        )],
     },
     Class {
         id: 123,
@@ -689,6 +694,12 @@ const CLASSES: &[Class] = &[
         source: Some("Work.kt"),
         methods: &[],
     },
+    Class {
+        id: 133,
+        signature: "Ljava/lang/StackTraceElement;",
+        source: Some("StackTraceElement.java"),
+        methods: &[],
+    },
     // A coroutine class with no live instance (InstanceCounts skips it).
     Class {
         id: 132,
@@ -711,6 +722,7 @@ const WORLD_OBJECTS: &[(u64, u64)] = &[
     (720, 121),
     (721, 130),
     (712, 131),
+    (730, 133),
 ];
 
 /// `(object, field, tag, value)` of the coroutine world.
@@ -727,6 +739,10 @@ const WORLD_FIELDS: &[(u64, u64, u8, u64)] = &[
     (720, 2101, b'L', 721),
     (712, 2102, b'L', 711),
     (712, 2109, b'I', 5),
+    (730, 2110, b's', 731),
+    (730, 2111, b's', 732),
+    (730, 2112, b's', 733),
+    (730, 2113, b'I', 17),
 ];
 
 /// `(class, field id, name, signature)` of the coroutine world.
@@ -746,6 +762,10 @@ const WORLD_CLASS_FIELDS: &[(u64, u64, &str, &str)] = &[
     ),
     (128, 2108, "delegate", "Lkotlin/coroutines/Continuation;"),
     (131, 2109, "label", "I"),
+    (133, 2110, "declaringClass", "Ljava/lang/String;"),
+    (133, 2111, "methodName", "Ljava/lang/String;"),
+    (133, 2112, "fileName", "Ljava/lang/String;"),
+    (133, 2113, "lineNumber", "I"),
 ];
 
 /// Live instances of exactly `type_id`.
@@ -1305,6 +1325,9 @@ fn handle(shared: &Shared, set: u8, cmd: u8, body: &[u8]) -> (u16, Vec<u8>, Afte
             501 => put_str(&mut out, "hello"),
             504 => put_str(&mut out, "kaboom"),
             705 => put_str(&mut out, "worker"),
+            731 => put_str(&mut out, "io.example.app.Work"),
+            732 => put_str(&mut out, "run"),
+            733 => put_str(&mut out, "Work.kt"),
             id => match state.strings.get(&id) {
                 Some(text) => put_str(&mut out, &text.clone()),
                 None => return (20, out, After::Nothing),
@@ -1357,6 +1380,11 @@ fn handle(shared: &Shared, set: u8, cmd: u8, body: &[u8]) -> (u16, Vec<u8>, Afte
                     out.push(b'L');
                     put_u64(&mut out, 503);
                     return (0, out, After::Nothing);
+                }
+                // BaseContinuationImpl.getStackTraceElement()
+                1020 => {
+                    out.push(b'L');
+                    put_u64(&mut out, 730);
                 }
                 1006 => return (0, Vec::new(), After::Trap),
                 1007 => return (0, Vec::new(), After::Hang),

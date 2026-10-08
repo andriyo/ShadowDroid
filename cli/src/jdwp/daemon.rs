@@ -681,6 +681,10 @@ pub async fn dispatch(session: &Arc<Session>, method: &str, params: &Json) -> Rp
                 .coroutine_snapshot(
                     u64_param(params, "limit", 64).clamp(1, 256) as u32,
                     render_options(params, 1),
+                    params
+                        .get("invoke")
+                        .and_then(Json::as_bool)
+                        .unwrap_or(false),
                 )
                 .await
         }

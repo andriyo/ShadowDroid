@@ -1551,7 +1551,10 @@ async fn watches_are_evaluated_on_every_stop_and_on_list() {
 async fn coroutines_are_discovered_process_wide_through_instances() {
     let vm = FakeVm::start();
     let session = stopped_at_line_31(&vm).await;
-    let snapshot = session.coroutine_snapshot(64, OPTIONS).await.unwrap();
+    let snapshot = session
+        .coroutine_snapshot(64, OPTIONS, false)
+        .await
+        .unwrap();
     assert_eq!(snapshot["available"], true);
     assert_eq!(snapshot["type"], "coroutine_snapshot");
     let coroutines = snapshot["coroutines"].as_array().unwrap();
@@ -1594,12 +1597,12 @@ async fn coroutines_are_discovered_process_wide_through_instances() {
     assert_eq!(continuation["type"], "coroutine_continuation");
 
     // A tight limit keeps the app's coroutine, not discovery order.
-    let capped = session.coroutine_snapshot(1, OPTIONS).await.unwrap();
+    let capped = session.coroutine_snapshot(1, OPTIONS, false).await.unwrap();
     assert_eq!(capped["coroutines"][0]["name"], "worker", "{capped}");
     assert_eq!(capped["discovery"]["truncated"], true);
 
     session.resume().await.unwrap();
-    let running = session.coroutine_snapshot(8, OPTIONS).await.unwrap();
+    let running = session.coroutine_snapshot(8, OPTIONS, false).await.unwrap();
     assert_eq!(running["available"], false);
 }
 
@@ -1701,7 +1704,10 @@ async fn a_variant_with_no_location_on_the_line_says_so() {
 async fn coroutine_discovery_is_cached_kept_current_and_skips_empty_classes() {
     let vm = FakeVm::start();
     let session = stopped_at_line_31(&vm).await;
-    let cold = session.coroutine_snapshot(64, OPTIONS).await.unwrap();
+    let cold = session
+        .coroutine_snapshot(64, OPTIONS, false)
+        .await
+        .unwrap();
     let discovery = &cold["discovery"];
     assert_eq!(discovery["cached"], false, "{discovery}");
     assert_eq!(discovery["class_discovery"]["class_load_watch"], true);
@@ -1721,7 +1727,10 @@ async fn coroutine_discovery_is_cached_kept_current_and_skips_empty_classes() {
     assert_eq!(policy, 0);
     assert!(modifiers.iter().all(|m| *m == 6), "{modifiers:?}");
 
-    let warm = session.coroutine_snapshot(64, OPTIONS).await.unwrap();
+    let warm = session
+        .coroutine_snapshot(64, OPTIONS, false)
+        .await
+        .unwrap();
     assert_eq!(warm["discovery"]["cached"], true);
     assert_eq!(warm["discovery"]["class_discovery"]["classes_added"], 0);
     assert_eq!(warm["coroutines"], cold["coroutines"]);
@@ -1737,7 +1746,10 @@ async fn coroutine_discovery_is_cached_kept_current_and_skips_empty_classes() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let scans = vm.with_state(|s| s.commands.iter().filter(|c| **c == (1, 20)).count());
-    let later = session.coroutine_snapshot(64, OPTIONS).await.unwrap();
+    let later = session
+        .coroutine_snapshot(64, OPTIONS, false)
+        .await
+        .unwrap();
     assert_eq!(
         later["discovery"]["class_discovery"]["classes_added"], 1,
         "{later}"
@@ -1768,4 +1780,66 @@ async fn coroutine_discovery_is_cached_kept_current_and_skips_empty_classes() {
     );
     // A SUSPEND_NONE event never resumes anything.
     assert!(session.suspension().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coroutine_source_lines_need_invoke_and_an_event_stop() {
+    let vm = FakeVm::start();
+    let session = stopped_at_line_31(&vm).await;
+    let plain = session
+        .coroutine_snapshot(64, OPTIONS, false)
+        .await
+        .unwrap();
+    assert_eq!(plain["source_lines"]["reason"], "needs_invoke");
+    assert!(vm.with_state(|s| s.invokes.is_empty()));
+    let armed_before = vm.with_state(|s| {
+        s.requests
+            .iter()
+            .filter(|r| r.kind == 2 && !s.cleared.contains(&r.id))
+            .count()
+    });
+
+    let lines = session.coroutine_snapshot(64, OPTIONS, true).await.unwrap();
+    assert_eq!(
+        lines["source_lines"]["available"], true,
+        "{}",
+        lines["source_lines"]
+    );
+    assert_eq!(lines["source_lines"]["read"], 1);
+    let worker = lines["coroutines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "worker")
+        .unwrap()
+        .clone();
+    let source = &worker["continuations"][0]["source"];
+    assert_eq!(source["file"], "Work.kt", "{worker}");
+    assert_eq!(source["line"], 17);
+    assert_eq!(source["class"], "io.example.app.Work");
+    assert_eq!(source["method"], "run");
+    // One getStackTraceElement() per continuation, our breakpoints re-armed.
+    assert_eq!(
+        vm.with_state(|s| s.invokes.iter().filter(|(m, _)| *m == 1020).count()),
+        1
+    );
+    let armed_after = vm.with_state(|s| {
+        s.requests
+            .iter()
+            .filter(|r| r.kind == 2 && !s.cleared.contains(&r.id))
+            .count()
+    });
+    assert_eq!(armed_after, armed_before);
+    assert!(session.suspension().is_some());
+
+    // A `debug pause` stop cannot invoke: say so instead of failing.
+    session.resume().await.unwrap();
+    session.pause().await.unwrap();
+    let paused = session.coroutine_snapshot(64, OPTIONS, true).await.unwrap();
+    assert_eq!(
+        paused["source_lines"]["reason"], "needs_event_stop",
+        "{}",
+        paused["source_lines"]
+    );
+    assert_eq!(vm.with_state(|s| s.invokes.len()), 1);
 }

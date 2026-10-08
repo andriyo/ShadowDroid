@@ -141,8 +141,11 @@ What works:
 - `debug coroutines snapshot` lists coroutines process-wide (name,
   dispatcher, state, suspended continuations) from a stopped session (pause
   first), read from fields only; coroutines running app code are listed
-  first under `--limit`. It walks the heap, so expect several seconds on an
-  emulator. Source lines need `aar coroutines`.
+  first under `--limit`. The first snapshot of a session scans the loaded
+  classes; later ones reuse that scan (`discovery.cached`). Add `--invoke`,
+  at a breakpoint or step stop, to read each continuation's source line
+  through `getStackTraceElement()` (bounded to 64 calls and 2 s; a `debug
+  pause` stop reports `needs_event_stop`).
 
 Method calls are opt-in. Reads (fields, locals, array items, Kotlin
 properties with a backing field) never run app code. `--invoke` on `eval`,

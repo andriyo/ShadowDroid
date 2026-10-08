@@ -120,18 +120,8 @@ impl Session {
     }
 
     /// Run one invoke on `thread`, bounded by `timeout`.
-    pub(super) async fn invoke_on(
-        &self,
-        thread: u64,
-        call: InvokeCall,
-        timeout: Duration,
-    ) -> RpcResult<InvokeResult> {
-        if thread == 0 {
-            return Err(RpcError::new(
-                "invalid_expression",
-                "an invoke needs a suspended thread; select a frame",
-            ));
-        }
+    /// Why an invoke on `thread` cannot run now, if it cannot.
+    pub(super) fn invoke_preflight(&self, thread: u64) -> RpcResult<()> {
         if self.suspension().is_some_and(|s| s.reason == "pause") {
             return Err(RpcError::new(
                 "invoke_requires_event_stop",
@@ -142,7 +132,80 @@ impl Session {
                 "shadowdroid debug break line --backend jdwp --file <File.kt> --line <n>",
             ]));
         }
-        self.ensure_thread_not_busy(thread)?;
+        if thread == 0 {
+            return Err(RpcError::new(
+                "invalid_expression",
+                "an invoke needs a suspended thread; select a frame",
+            ));
+        }
+        self.ensure_thread_not_busy(thread)
+    }
+
+    /// Several calls on `thread` under one disarm/re-arm of our requests,
+    /// each bounded by `per_call` and all by `budget`. A call that misses
+    /// its deadline ends the batch and leaves the thread busy, as in
+    /// [`Session::invoke_on`]. Returns one result per call made and why the
+    /// batch stopped early (`budget`, `timeout`), if it did.
+    pub(super) async fn invoke_many(
+        &self,
+        thread: u64,
+        calls: Vec<InvokeCall>,
+        per_call: Duration,
+        budget: Duration,
+    ) -> RpcResult<(Vec<Result<InvokeResult, String>>, Option<&'static str>)> {
+        self.invoke_preflight(thread)?;
+        let started = std::time::Instant::now();
+        let disarmed = self.begin_invoke(thread).await;
+        let mut results = Vec::with_capacity(calls.len());
+        for call in calls {
+            let Some(remaining) = budget.checked_sub(started.elapsed()) else {
+                self.end_invoke(disarmed, true).await;
+                return Ok((results, Some("budget")));
+            };
+            let deadline = per_call.min(remaining);
+            let jdwp = self.jdwp.clone();
+            let mut task = tokio::spawn(async move {
+                run_call(&jdwp, thread, &call, deadline + LATE_REPLY_WINDOW).await
+            });
+            match tokio::time::timeout(deadline, &mut task).await {
+                Ok(joined) => results.push(match joined {
+                    Ok(Ok(value)) => Ok(value),
+                    Ok(Err(error)) => Err(error.to_string()),
+                    Err(error) => Err(format!("invoke task failed: {error}")),
+                }),
+                Err(_) => {
+                    {
+                        let mut state = self.invoke_state();
+                        state.busy = Some(thread);
+                        state.timeouts += 1;
+                    }
+                    self.end_invoke(disarmed, false).await;
+                    let shared = self.invoke_state.clone();
+                    tokio::spawn(async move {
+                        let _ = task.await;
+                        let mut state = shared.lock().expect("invoke state lock");
+                        state.busy = None;
+                        state.invoking = None;
+                    });
+                    results.push(Err(format!(
+                        "invoke_timeout: no return within {} ms",
+                        deadline.as_millis()
+                    )));
+                    return Ok((results, Some("timeout")));
+                }
+            }
+        }
+        self.end_invoke(disarmed, true).await;
+        Ok((results, None))
+    }
+
+    pub(super) async fn invoke_on(
+        &self,
+        thread: u64,
+        call: InvokeCall,
+        timeout: Duration,
+    ) -> RpcResult<InvokeResult> {
+        self.invoke_preflight(thread)?;
         let disarmed = self.begin_invoke(thread).await;
 
         let jdwp = self.jdwp.clone();

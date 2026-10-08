@@ -435,7 +435,7 @@ pub async fn run(cmd: &DebuggerCmd, ctx: JdwpContext<'_>) -> Result<()> {
                 CoroutinesCmd::Snapshot(args) => (
                     &args.session,
                     "coroutines_snapshot",
-                    json!({"limit": args.limit, "depth": args.depth}),
+                    json!({"limit": args.limit, "depth": args.depth, "invoke": args.invoke}),
                     args.timeout_ms,
                 ),
                 CoroutinesCmd::Threads(args) => (

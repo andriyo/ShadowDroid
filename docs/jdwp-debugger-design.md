@@ -45,9 +45,12 @@
 > - **step-until-screen-change** runs `mode: "run_to_frame"`
 >   ([§5.5](#55-stepping-and-threads)).
 > - **Coroutines**: `snapshot` also discovers coroutines process-wide with
->   ReferenceType.Instances (capped at 100 per class, class discovery cached
->   per session); source lines are not read (they need an invoke) and the
->   response points at `aar coroutines`.
+>   ReferenceType.Instances (capped at 100 per class). Class discovery is
+>   cached per session and kept current by a SUSPEND_NONE ClassPrepare watch
+>   that excludes framework packages; InstanceCounts skips empty classes;
+>   reads run 16 in flight. `--invoke` reads source lines through
+>   `BaseContinuationImpl.getStackTraceElement()` on the event-stopped
+>   thread, under one disarm of our requests, bounded to 64 calls and 2 s.
 > - **Backend policy** ([§4.4](#44-backend-selection)): `auto` resolves per
 >   command and reports `backend_reason`.
 > - Earlier decisions stand: flat `debug_backend` config key, unix hosts
@@ -56,8 +59,8 @@
 >   (ceiling 100/s), ANR warning after 4 s for attach-to-running sessions.
 >
 > Not done: `debug record`, `debug native`/mixed mode, and `debug clients`
-> (Studio only); SMAP inline-body resolution; coroutine
-> source lines; `step-until-screen-change --stop-at frame`; Windows hosts.
+> (Studio only); SMAP inline-body resolution;
+> `step-until-screen-change --stop-at frame`; Windows hosts.
 
 Design and phased plan for a debugger that needs **no Android Studio**: the CLI
 speaks JDWP to the app itself, through the same adb connection it already owns,

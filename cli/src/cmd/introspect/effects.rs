@@ -861,6 +861,7 @@ pub(super) fn command_effect_contract(
 /// Debugger verbs whose `--invoke` runs app methods in the debuggee.
 const INVOKE_COMMANDS: &[&str] = &[
     "debug eval",
+    "debug coroutines snapshot",
     "debug inspect",
     "debug break line",
     "debug break update",

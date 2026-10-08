@@ -210,6 +210,9 @@ impl DebuggerCmd {
             }
             DebuggerCmd::Eval(args) if args.invoke => Some("--invoke"),
             DebuggerCmd::Inspect(args) if args.invoke => Some("--invoke"),
+            DebuggerCmd::Coroutines(CoroutinesCmd::Snapshot(args)) if args.invoke => {
+                Some("--invoke")
+            }
             DebuggerCmd::Break(BreakCmd::Line { invoke: true, .. }) => Some("--invoke"),
             DebuggerCmd::Break(BreakCmd::Line {
                 variant: Some(variant),
@@ -719,6 +722,11 @@ pub struct CoroutineSnapshotArgs {
     /// Object expansion depth for spilled locals.
     #[arg(long, default_value_t = 1)]
     pub depth: u32,
+    /// Read each continuation's source line by calling its
+    /// getStackTraceElement() (runs app code; needs a breakpoint or step stop;
+    /// jdwp backend).
+    #[arg(long)]
+    pub invoke: bool,
     /// Debugger manager request timeout.
     #[arg(long, default_value_t = 2500)]
     pub timeout_ms: u32,

@@ -13,7 +13,7 @@
 //! read here.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures_util::stream::{self, StreamExt};
 use serde_json::{Value as Json, json};
@@ -21,16 +21,25 @@ use std::future::Future;
 
 use super::codec::Value;
 use super::inspect::{RenderOptions, SelectedFrame};
+use super::invoke::InvokeCall;
 use super::protocol::{event_kind, suspend_policy};
 use super::resolve;
 use super::session::{Owner, RpcError, RpcResult, Session, is_framework_class};
-use super::vm::Modifier;
+use super::vm::{InvokeResult, Modifier};
 
 /// Instances read per class (device default cap).
 const MAX_INSTANCES_PER_CLASS: i32 = 100;
 /// JDWP requests in flight at once: the connection demuxes replies by
 /// packet id, so independent reads overlap their adb round trips.
 const CONCURRENCY: usize = 16;
+/// Source lines read per snapshot (one invoke each, ~8 ms on a device).
+const MAX_SOURCE_LINES: usize = 64;
+/// Time budget for those invokes, and the bound on any one of them.
+const SOURCE_LINES_BUDGET: Duration = Duration::from_secs(2);
+const SOURCE_LINE_CALL: Duration = Duration::from_millis(500);
+const GET_STACK_TRACE_ELEMENT: (&str, &str) =
+    ("getStackTraceElement", "()Ljava/lang/StackTraceElement;");
+
 /// Class loads in these packages never add coroutine or app continuation
 /// classes; the class-load watch skips them in the VM.
 const CLASS_WATCH_EXCLUDES: &[&str] = &[
@@ -244,7 +253,12 @@ impl Session {
         }))
     }
 
-    pub async fn coroutine_snapshot(&self, limit: u32, options: RenderOptions) -> RpcResult<Json> {
+    pub async fn coroutine_snapshot(
+        &self,
+        limit: u32,
+        options: RenderOptions,
+        invoke: bool,
+    ) -> RpcResult<Json> {
         if self.suspension().is_none() {
             return Ok(json!({
                 "available": false,
@@ -264,9 +278,23 @@ impl Session {
         };
         let started = Instant::now();
         let discovered = self.discover_coroutines(limit as usize).await;
-        let (coroutines, discovery) = match discovered {
+        let (mut coroutines, mut discovery) = match discovered {
             Ok((coroutines, discovery)) => (coroutines, discovery),
             Err(error) => (Vec::new(), json!({"ok": false, "error": error.message})),
+        };
+        let source_lines = if invoke {
+            self.read_source_lines(&mut coroutines, &mut discovery)
+                .await
+        } else {
+            json!({
+                "available": false,
+                "reason": "needs_invoke",
+                "detail": "a continuation's source line comes from BaseContinuationImpl.getStackTraceElement(), an invoke",
+                "next_actions": [
+                    "shadowdroid debug coroutines snapshot --invoke --backend jdwp",
+                    "shadowdroid aar coroutines",
+                ],
+            })
         };
         Ok(json!({
             "available": true,
@@ -284,8 +312,148 @@ impl Session {
             "coroutines": coroutines,
             "discovery": discovery,
             "elapsed_ms": started.elapsed().as_millis() as u64,
-            "source_lines": "need getStackTraceElement() (an invoke); `aar coroutines` gives in-app dumps with lines",
+            "source_lines": source_lines,
         }))
+    }
+
+    /// `--invoke`: each discovered continuation's `getStackTraceElement()`
+    /// on the stopped thread (our requests disarmed meanwhile), bounded by
+    /// [`MAX_SOURCE_LINES`] and [`SOURCE_LINES_BUDGET`]. Adds `source` to
+    /// each continuation and returns the summary.
+    async fn read_source_lines(&self, coroutines: &mut [Json], discovery: &mut Json) -> Json {
+        let started = Instant::now();
+        // `invoke_preflight` refuses a `debug pause` stop before it looks at
+        // the thread (such a stop may have none).
+        let thread = self.suspension().and_then(|s| s.thread).unwrap_or(0);
+        let preflight = self.invoke_preflight(thread);
+        if let Err(error) = preflight {
+            let reason = if error.code == "invoke_requires_event_stop" {
+                "needs_event_stop"
+            } else {
+                "invoke_unavailable"
+            };
+            return json!({
+                "available": false,
+                "reason": reason,
+                "detail": error.message,
+                "next_actions": [
+                    "shadowdroid debug step-over --backend jdwp",
+                    "shadowdroid debug coroutines snapshot --invoke --backend jdwp",
+                ],
+            });
+        }
+        // Continuations in output order: owned ones, then unowned.
+        let mut targets: Vec<u64> = Vec::new();
+        for coroutine in coroutines.iter() {
+            for continuation in coroutine["continuations"].as_array().into_iter().flatten() {
+                targets.extend(continuation["object_id"].as_u64());
+            }
+        }
+        for continuation in discovery["unowned_continuations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            targets.extend(continuation["object_id"].as_u64());
+        }
+        let total = targets.len();
+        targets.truncate(MAX_SOURCE_LINES);
+        let mut calls = Vec::new();
+        let mut called = Vec::new();
+        for object in &targets {
+            if let Some((class_id, method_id)) = self.stack_trace_element_method(*object).await {
+                calls.push(InvokeCall::Instance {
+                    object: *object,
+                    class_id,
+                    method_id,
+                    args: Vec::new(),
+                });
+                called.push(*object);
+            }
+        }
+        let (results, stopped) = match self
+            .invoke_many(thread, calls, SOURCE_LINE_CALL, SOURCE_LINES_BUDGET)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return json!({"available": false, "reason": error.code, "detail": error.message});
+            }
+        };
+        let mut sources: HashMap<u64, Json> = HashMap::new();
+        let mut errors = 0;
+        for (object, result) in called.iter().zip(results) {
+            let source = match result {
+                Ok(InvokeResult { value, exception }) => {
+                    match (value.object_id(), exception.object_id()) {
+                        (_, Some(_)) => json!({"error": "getStackTraceElement() threw"}),
+                        (Some(element), None) => self.stack_trace_element(element).await,
+                        (None, None) => json!({"error": "no debug metadata (null element)"}),
+                    }
+                }
+                Err(error) => json!({"error": error}),
+            };
+            if source.get("error").is_some() {
+                errors += 1;
+            }
+            sources.insert(*object, source);
+        }
+        let read = sources.len();
+        let attach = |continuation: &mut Json| {
+            if let Some(source) = continuation["object_id"]
+                .as_u64()
+                .and_then(|id| sources.get(&id))
+            {
+                continuation["source"] = source.clone();
+            }
+        };
+        for coroutine in coroutines.iter_mut() {
+            if let Some(list) = coroutine["continuations"].as_array_mut() {
+                list.iter_mut().for_each(attach);
+            }
+        }
+        if let Some(list) = discovery["unowned_continuations"].as_array_mut() {
+            list.iter_mut().for_each(attach);
+        }
+        json!({
+            "available": true,
+            "method": "BaseContinuationImpl.getStackTraceElement()",
+            "read": read,
+            "errors": errors,
+            "continuations": total,
+            "skipped": total - read,
+            "stopped_early": stopped,
+            "max_lines": MAX_SOURCE_LINES,
+            "budget_ms": SOURCE_LINES_BUDGET.as_millis() as u64,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+        })
+    }
+
+    /// `(declaring class, method)` of `getStackTraceElement()` for `object`.
+    async fn stack_trace_element_method(&self, object: u64) -> Option<(u64, u64)> {
+        let (type_id, _) = self.runtime_type(object).await.ok()?;
+        for class in self.hierarchy(type_id).await.ok()? {
+            if let Some(method) = self
+                .methods(class)
+                .await
+                .ok()?
+                .iter()
+                .find(|m| (m.name.as_str(), m.signature.as_str()) == GET_STACK_TRACE_ELEMENT)
+            {
+                return Some((class, method.method_id));
+            }
+        }
+        None
+    }
+
+    /// A `StackTraceElement` → `{class, method, file, line}`, by field reads.
+    async fn stack_trace_element(&self, element: u64) -> Json {
+        json!({
+            "class": self.read_named(element, "declaringClass").await,
+            "method": self.read_named(element, "methodName").await,
+            "file": self.read_named(element, "fileName").await,
+            "line": self.read_named(element, "lineNumber").await,
+        })
     }
 
     async fn continuation_candidates(
