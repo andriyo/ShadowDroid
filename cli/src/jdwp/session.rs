@@ -1994,6 +1994,10 @@ pub fn parse_handle(handle: &str) -> Option<u64> {
     handle.strip_prefix("obj_")?.parse().ok()
 }
 
+/// Set when a line has code in a loaded class but none of it matches the
+/// breakpoint's `--variant`.
+pub(super) const VARIANT_MATCHES_NOTHING_NOTE: &str = "the line has code, but none of it matches --variant (outer: the enclosing method; lambda: the innermost lambda); try --variant all";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2037,7 +2041,3 @@ mod tests {
         assert_eq!(timeout.detail["command"], "VirtualMachine.Version");
     }
 }
-
-/// Set when a line has code in a loaded class but none of it matches the
-/// breakpoint's `--variant`.
-pub(super) const VARIANT_MATCHES_NOTHING_NOTE: &str = "the line has code, but none of it matches --variant (outer: the enclosing method; lambda: the innermost lambda); try --variant all";

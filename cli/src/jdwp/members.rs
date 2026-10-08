@@ -529,6 +529,10 @@ impl Session {
     }
 }
 
+/// Recorded on a field breakpoint that asked for a slow watch on a Kotlin
+/// delegated property and got accessor breakpoints instead.
+pub(super) const DELEGATED_PROPERTY_NOTE: &str = "delegated property: its field holds the delegate object and is never reassigned, so a field watch would not fire on writes; breaking on the set/get accessors instead (no slowdown)";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,7 +579,3 @@ mod tests {
         assert!(dex_return_indices(&[]).is_empty());
     }
 }
-
-/// Recorded on a field breakpoint that asked for a slow watch on a Kotlin
-/// delegated property and got accessor breakpoints instead.
-pub(super) const DELEGATED_PROPERTY_NOTE: &str = "delegated property: its field holds the delegate object and is never reassigned, so a field watch would not fire on writes; breaking on the set/get accessors instead (no slowdown)";
