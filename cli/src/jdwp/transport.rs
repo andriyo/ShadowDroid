@@ -58,8 +58,9 @@ pub async fn connect_tcp(address: &str, timeout: Duration) -> Result<TcpStream> 
     Ok(stream)
 }
 
-/// Pids with a JDWP endpoint (the `jdwp` device service lists debuggable
-/// processes, one per line, then closes).
+/// Pids with a JDWP endpoint. Current adbd answers the `jdwp` device service
+/// like `track-jdwp`: one length-prefixed list, then the stream stays open for
+/// updates. Older builds send a bare list and close.
 pub async fn debuggable_pids(serial: &str, timeout: Duration) -> Result<Vec<u32>> {
     let serial = serial.to_string();
     tokio::task::spawn_blocking(move || -> Result<Vec<u32>> {
@@ -68,6 +69,11 @@ pub async fn debuggable_pids(serial: &str, timeout: Duration) -> Result<Vec<u32>
         let mut body = Vec::new();
         let mut chunk = [0_u8; 4096];
         loop {
+            // A complete framed list is the whole answer: waiting for EOF
+            // would cost the full read timeout on every attach.
+            if let Some(list) = first_framed_list(&body) {
+                return Ok(parse_pid_list(list));
+            }
             match stream.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(n) => body.extend_from_slice(&chunk[..n]),
@@ -89,6 +95,16 @@ pub async fn debuggable_pids(serial: &str, timeout: Duration) -> Result<Vec<u32>
     })
     .await
     .context("adb jdwp worker")?
+}
+
+/// The first complete `%04x`-framed message in `body`, framing included.
+fn first_framed_list(body: &[u8]) -> Option<&[u8]> {
+    let header = body.get(..4)?;
+    if !header.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    let len = usize::from_str_radix(std::str::from_utf8(header).ok()?, 16).ok()?;
+    body.get(..4 + len)
 }
 
 /// Parse a `jdwp` / `track-jdwp` listing. `track-jdwp` prefixes each update
@@ -194,6 +210,23 @@ mod tests {
         // A pid that happens to look like hex is not mistaken for a prefix.
         assert_eq!(parse_pid_list(b"1234\n"), vec![1234]);
         assert_eq!(parse_pid_list(b"garbage\n0\n42"), vec![42]);
+    }
+
+    #[test]
+    fn a_complete_framed_list_ends_the_read() {
+        // Partial frame: keep reading.
+        assert_eq!(first_framed_list(b"0010123\n"), None);
+        // Complete frame followed by the start of an update: stop at the frame.
+        let body = b"000c22736\n30578\n000a";
+        let list = first_framed_list(body).expect("framed list");
+        assert_eq!(parse_pid_list(list), vec![22736, 30578]);
+        // An empty device answers "0000".
+        assert_eq!(
+            parse_pid_list(first_framed_list(b"0000").unwrap()),
+            Vec::<u32>::new()
+        );
+        // A bare (unframed) list is not mistaken for a frame header.
+        assert_eq!(first_framed_list(b"1234\n"), None);
     }
 
     #[test]
