@@ -357,6 +357,8 @@ replace them. Any other agent that can run a shell command can bootstrap from
   sample app.
 - [Agent verification roadmap](docs/agent-verification-roadmap.md) — implementation status,
   acceptance gates and remaining experiments.
+- [Standalone debugger design](docs/jdwp-debugger-design.md) — the planned
+  `debug --backend jdwp` path that needs no Android Studio (design, not shipped).
 - [Requirement verification](docs/verification.md) — executable plans, build/JUnit evidence,
   lifecycle, configuration, SQLite, visual and Android platform checks (experimental).
 - [Concurrent agent sessions](docs/sessions.md) — one device driver, passive advisers,

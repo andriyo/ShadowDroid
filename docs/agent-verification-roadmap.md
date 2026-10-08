@@ -1,6 +1,6 @@
 # Agent verification roadmap
 
-Status: E01–E10 and local E13/C0–C1 implementation delivered as experimental capabilities, with local validation recorded in the [validation report](verification-validation.md). E01 effectiveness measurement is a small pilot, and E12 Linux CI/publication gates remain separate. E11, model judging, physical camera/Wear and distributed coordination are conditional follow-ons. The [verification guide](verification.md) records actual command contracts; the original work packages below preserve the broader acceptance targets. Written 2026-09-18 against source commit `add874bd004e313014889a420abcba555b0df070` (`main`, source version `1.1.0`). The baseline below describes inspected source, not an installed binary or a new device-validation result.
+Status: E01–E10 and local E13/C0–C1 implementation delivered as experimental capabilities, with local validation recorded in the [validation report](verification-validation.md). E01 effectiveness measurement is a small pilot, and E12 Linux CI/publication gates remain separate. Model judging, physical camera/Wear and distributed coordination are conditional follow-ons. E11 was re-scoped on 2026-10-08 from "optional deeper headless inspection" to a standalone JDWP debugger backend; see the [standalone debugger design](jdwp-debugger-design.md). The [verification guide](verification.md) records actual command contracts; the original work packages below preserve the broader acceptance targets. Written 2026-09-18 against source commit `add874bd004e313014889a420abcba555b0df070` (`main`, source version `1.1.0`). The baseline below describes inspected source, not an installed binary or a new device-validation result.
 
 The objective is to help an AI coding agent finish Android engineering tasks with evidence that the requested behavior works. The first investment is a persistent requirement checklist connected to lifecycle checks and existing tests. Subsequent work adds visual review, database checks, migration diagnostics, and Android system-boundary probes.
 
@@ -93,10 +93,10 @@ P0 is required for the first verification release, P1 expands the core based on 
 | M1 — Evidence and regressions | E03 ledger/coordinator; E04 test reports; E13/C1 coordinated sessions | M0 | Requirement-to-report path plus exclusive driver, passive observers and safe recovery |
 | M2 — Lifecycle verification | E05 transitions; E06 configuration matrix; revised skill | M1 | Demonstrated detection of state-loss and theme failures with recovery; first release candidate |
 | M3 — Data and presentation | E07 SQL; E08 visual/accessibility | M2 contracts | Persistence and visual defects localized with trustworthy evidence |
-| M4 — Migration and platform depth | E09 constraints; E10 boundary adapters; optional E11 deeper headless inspection | M1 contracts; relevant M2/M3 adapters | Each adapter earns inclusion through fixtures and task-level evaluation |
+| M4 — Migration and platform depth | E09 constraints; E10 boundary adapters; E11 standalone debugger backend (JDWP, no Studio) | M1 contracts; relevant M2/M3 adapters | Each adapter earns inclusion through fixtures and task-level evaluation |
 | M5 — Validated release | E12 packaging, docs, independent holdout evaluation | Applicable milestone gates | Published claims match measured evidence and packaged capabilities |
 
-E01 measurement and E12 release discipline apply throughout; they are not postponed until the end. E04 and E05 can be implemented independently after E03's contracts settle. E07 and E08 can proceed independently once artifact and matrix contracts stabilize. E09 is not blocked on all visual/storage work. E11 must not block the first release.
+E01 measurement and E12 release discipline apply throughout; they are not postponed until the end. E04 and E05 can be implemented independently after E03's contracts settle. E07 and E08 can proceed independently once artifact and matrix contracts stabilize. E09 is not blocked on all visual/storage work. E11 did not block the first release and is now a separately gated workstream with its own design and spike.
 
 E13/C0 and E03 settle contracts together. The E03 offline ledger can ship independently, but its live coordinator must use E13/C1 ownership. Advanced delegation/pooling in E13/C2 and remote coordination in E13/C3 are later expansions, not M2 prerequisites.
 
@@ -214,13 +214,15 @@ For media, distinguish visible playback, active sessions, and actual resource-re
 
 **Acceptance:** each adapter catches an independently seeded defect and passes the repaired case. Absence from a limited `dumpsys` or log sample is not proof of release or non-delivery. A generic intent sniffer, universal leak detector, and physical-device guarantees are outside the initial adapter scope.
 
-### E11 — Optional deeper headless inspection
+### E11 — Standalone debugger backend (JDWP, no Android Studio)
 
-**Priority / size:** P2 / L. **Depends on:** measured E01/E08/E09 gaps.
+**Priority / size:** P1 / L. **Depends on:** the P0 spike in the [standalone debugger design](jdwp-debugger-design.md); E13 lease semantics for the attach side effect.
 
-Investigate a headless path for missing Compose semantics or targeted runtime diagnostics only if task failures show that basic accessibility, logs, test adapters, and existing Studio integration are insufficient. Compare a debug-only app bridge, supported inspection interfaces, and test-framework adapters before attempting a new debugger implementation.
+Decision (2026-10-08): this package previously declined to build a JDWP stack and asked for a debug-only app bridge or supported inspection interfaces first. That holds for Compose semantics and Layout Inspector data, which stay Studio-backed. It is reversed for the debugger itself. The existing `debug` verbs already restrict evaluation to deterministic path expressions, so the only IDE-specific component a debugger needs, a Kotlin fragment compiler, is not in scope; what remains is protocol, class/line lookup, and rendering, which fit the CLI binary.
 
-**Acceptance:** a feasibility spike demonstrates useful additional evidence on an independent app, documents version/app changes and lifecycle effects, and preserves truthful fallback behavior. Do not gate M2 on Studio installation, a new JDWP stack, a model service, or mandatory application instrumentation.
+Scope: a host-side JDWP client in Rust, speaking to the app over the in-tree ADB wire `jdwp:<pid>` stream, hosted in a per-process daemon with a unix-socket control channel like the proxy daemon. The `debug` verb names, ids, and JSON envelopes are unchanged; every response gains a `backend` field and `--backend auto|studio|jdwp` follows whichever debugger already holds the process, since JDWP attach is exclusive per pid. Breakpoints resolve from the project source index plus `SourceFile`/`LineTable`/SMAP, bind late through ClassPrepare, and gain a `--wait-for-launch` path via `am set-debug-app -w` for code that runs before the first frame. Conditions and logpoints evaluate in the daemon with thread-only suspend and visible throttling. Native/mixed mode, Layout Inspector enrichment, and IDE-compiled expressions remain Studio features. A JVMTI agent is a conditional second phase, only for capabilities JDWP cannot provide.
+
+**Acceptance:** the P0 spike attaches to the sample app on the headless emulator, binds `MainActivity.kt:68`, hits it from the intent trigger, reads locals and `this`, steps, resumes, and detaches cleanly, with every ART/JDWP surprise recorded. P1 ships when the existing `debug` e2e journeys pass with `--backend jdwp`, a contract test shows identical JSON shape for the same scenario on both backends, a Kotlin-property watchpoint fires, and a breakpoint in `Application.onCreate` hits from a `--from-start` launch. Do not require Studio for any phase-1 verb, do not require the JVMTI agent for any verb, and keep the minimum API at 28 with an explicit `unsupported_api_level` error below it.
 
 ### E12 — Release, documentation, and measured claims
 
