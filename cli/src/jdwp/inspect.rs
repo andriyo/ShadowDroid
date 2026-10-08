@@ -228,7 +228,9 @@ impl Session {
             let table = self
                 .variable_table(selected.location.class_id, selected.location.method_id)
                 .await?;
-            if table.is_empty() {
+            if selected.location.is_native() {
+                warning = Some("native method frame: no Java locals");
+            } else if table.is_empty() {
                 warning = Some("method has no local variable table (compiled without debug info?)");
             }
         }

@@ -503,14 +503,20 @@ impl Session {
             .ok()
             .and_then(|table| table.line_at(location.index));
         let source = self.source_file(location.class_id).await.ok().flatten();
-        json!({
+        // JDWP reports a native frame's index as -1 (u64::MAX on the wire).
+        let native = location.is_native();
+        let mut value = json!({
             "class": class,
             "method": method.as_ref().map(|(name, _)| name),
             "method_signature": method.as_ref().map(|(_, signature)| signature),
-            "line": line,
+            "line": if native { None } else { line },
             "source": source,
-            "code_index": location.index,
-        })
+            "code_index": if native { None } else { Some(location.index) },
+        });
+        if native {
+            value["native"] = json!(true);
+        }
+        value
     }
 
     // ── status ────────────────────────────────────────────────────────

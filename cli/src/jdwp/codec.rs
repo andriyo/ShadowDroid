@@ -188,6 +188,13 @@ pub struct Location {
     pub index: u64,
 }
 
+impl Location {
+    /// A native method frame: JDWP sends code index -1.
+    pub fn is_native(&self) -> bool {
+        self.index == u64::MAX
+    }
+}
+
 /// A JDWP value. Object-like values keep their tag so strings, arrays,
 /// threads, and class objects stay distinguishable without a round trip.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -530,6 +537,18 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_minus_one_code_index_is_a_native_frame() {
+        let native = Location {
+            type_tag: 1,
+            class_id: 1,
+            method_id: 2,
+            index: u64::MAX,
+        };
+        assert!(native.is_native());
+        assert!(!Location { index: 0, ..native }.is_native());
+    }
     use proptest::prelude::*;
 
     fn sizes_strategy() -> impl Strategy<Value = IdSizes> {
