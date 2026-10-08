@@ -64,6 +64,9 @@ pub struct State {
     pub reject_handshake: bool,
     /// Accept the handshake bytes and never answer (a wedged endpoint).
     pub silent_handshake: bool,
+    /// Load `Late` while answering AllClassesWithGeneric: its ClassPrepare
+    /// goes out before the reply, which already lists it (the bind race).
+    pub prepare_late_during_scan: bool,
     pub connections: u32,
     pub step_line_index: u64,
 }
@@ -171,38 +174,11 @@ impl FakeVm {
     /// Load `io.example.app.Late`: one ClassPrepare composite carrying an
     /// event for every matching ClassPrepare request (policy EVENT_THREAD).
     pub fn load_late_class(&self) -> usize {
-        let matching: Vec<i32> = self.with_state(|state| {
-            state.late_loaded = true;
-            state
-                .requests
-                .iter()
-                .filter(|r| r.kind == 8 && !state.cleared.contains(&r.id))
-                .filter(|r| {
-                    r.source_name
-                        .as_deref()
-                        .is_none_or(|name| name == "Late.kt")
-                        && r.class_match
-                            .as_deref()
-                            .is_none_or(|pattern| class_matches("io.example.app.Late", pattern))
-                })
-                .map(|r| r.id)
-                .collect()
-        });
-        let mut body = vec![1_u8];
-        put_i32(&mut body, matching.len() as i32);
-        for request in &matching {
-            body.push(8);
-            put_i32(&mut body, *request);
-            put_u64(&mut body, MAIN_THREAD);
-            body.push(1);
-            put_u64(&mut body, 105);
-            put_str(&mut body, "Lio/example/app/Late;");
-            put_i32(&mut body, 7);
+        let (count, packet) = self.with_state(late_prepare_packet);
+        if let Some(packet) = packet {
+            self.send(&packet);
         }
-        if !matching.is_empty() {
-            self.send(&command_packet(0x4000_0002, 64, 100, &body));
-        }
-        matching.len()
+        count
     }
 
     /// Drop the connection (the app process died).
@@ -211,6 +187,44 @@ impl FakeVm {
             let _ = stream.shutdown(std::net::Shutdown::Both);
         }
     }
+}
+
+/// Mark `io.example.app.Late` loaded and build the ClassPrepare composite
+/// for every matching request (policy EVENT_THREAD).
+fn late_prepare_packet(state: &mut State) -> (usize, Option<Vec<u8>>) {
+    state.late_loaded = true;
+    let matching: Vec<i32> = state
+        .requests
+        .iter()
+        .filter(|r| r.kind == 8 && !state.cleared.contains(&r.id))
+        .filter(|r| {
+            r.source_name
+                .as_deref()
+                .is_none_or(|name| name == "Late.kt")
+                && r.class_match
+                    .as_deref()
+                    .is_none_or(|pattern| class_matches("io.example.app.Late", pattern))
+        })
+        .map(|r| r.id)
+        .collect();
+    if matching.is_empty() {
+        return (0, None);
+    }
+    let mut body = vec![1_u8];
+    put_i32(&mut body, matching.len() as i32);
+    for request in &matching {
+        body.push(8);
+        put_i32(&mut body, *request);
+        put_u64(&mut body, MAIN_THREAD);
+        body.push(1);
+        put_u64(&mut body, 105);
+        put_str(&mut body, "Lio/example/app/Late;");
+        put_i32(&mut body, 7);
+    }
+    (
+        matching.len(),
+        Some(command_packet(0x4000_0002, 64, 100, &body)),
+    )
 }
 
 fn class_matches(name: &str, pattern: &str) -> bool {
@@ -416,6 +430,19 @@ fn serve(mut stream: TcpStream, shared: Arc<Shared>) {
         shared.changed.notify_all();
         if silent {
             continue;
+        }
+        if (set, cmd) == (1, 20) {
+            let packet = {
+                let mut state = shared.state.lock().unwrap();
+                if state.prepare_late_during_scan && !state.late_loaded {
+                    late_prepare_packet(&mut state).1
+                } else {
+                    None
+                }
+            };
+            if let (Some(packet), Some(writer)) = (packet, shared.writer.lock().unwrap().as_mut()) {
+                let _ = writer.write_all(&packet);
+            }
         }
         let (error, reply, after) = handle(&shared, set, cmd, &body);
         if let Some(writer) = shared.writer.lock().unwrap().as_mut() {

@@ -256,6 +256,10 @@ struct State {
     owners: HashMap<i32, Owner>,
     /// source basename → ClassPrepare request id
     line_prepares: HashMap<String, i32>,
+    /// `(breakpoint id, class, method, code index)` claimed by a binder.
+    /// The scan and ClassPrepare paths can race on one class; the claim is
+    /// taken before the request is set so each location binds once.
+    claims: BTreeSet<(String, u64, u64, u64)>,
     suspension: Option<Suspension>,
     epoch: u64,
     pinned: BTreeSet<u64>,
@@ -717,17 +721,45 @@ impl Session {
                 method_id: method.method_id,
                 index,
             };
-            let request_id = self
+            let claim = (id.to_string(), class_id, method.method_id, index);
+            if !self.state().claims.insert(claim.clone()) {
+                continue;
+            }
+            let request_id = match self
                 .jdwp
                 .set_event(
                     event_kind::BREAKPOINT,
                     suspend_policy::ALL,
                     &[Modifier::LocationOnly(location)],
                 )
-                .await?;
-            self.state()
-                .owners
-                .insert(request_id, Owner::Breakpoint(id.to_string()));
+                .await
+            {
+                Ok(request_id) => request_id,
+                Err(error) => {
+                    self.state().claims.remove(&claim);
+                    return Err(error.into());
+                }
+            };
+            let removed_meanwhile = {
+                let mut state = self.state();
+                if state.breakpoints.contains_key(id) {
+                    state
+                        .owners
+                        .insert(request_id, Owner::Breakpoint(id.to_string()));
+                    false
+                } else {
+                    state.claims.remove(&claim);
+                    true
+                }
+            };
+            if removed_meanwhile {
+                // Removed while this request was in flight.
+                let _ = self
+                    .jdwp
+                    .clear_event(event_kind::BREAKPOINT, request_id)
+                    .await;
+                continue;
+            }
             bound.push(BoundLocation {
                 request_id,
                 class: resolve::type_name(&signature),
@@ -870,7 +902,11 @@ impl Session {
     }
 
     pub async fn remove_breakpoint(&self, id: &str) -> RpcResult<Json> {
-        let removed = self.state().breakpoints.remove(id);
+        let removed = {
+            let mut state = self.state();
+            state.claims.retain(|(owner, ..)| owner != id);
+            state.breakpoints.remove(id)
+        };
         let Some(breakpoint) = removed else {
             return Err(RpcError::new(
                 "breakpoint_not_found",
@@ -1181,7 +1217,27 @@ impl Session {
     pub(super) async fn handle_composite(&self, composite: Composite) {
         let mut stopped = false;
         let mut thread_to_resume = None;
+        // One stop per (breakpoint, thread, location) per composite, even if
+        // two requests of the same breakpoint sit at that location.
+        let mut stops = BTreeSet::new();
         for event in &composite.events {
+            if let Event::Breakpoint {
+                thread, location, ..
+            } = event
+            {
+                let owner = self.state().owners.get(&event.request_id()).cloned();
+                if let Some(Owner::Breakpoint(id)) = owner
+                    && !stops.insert((
+                        id,
+                        *thread,
+                        location.class_id,
+                        location.method_id,
+                        location.index,
+                    ))
+                {
+                    continue;
+                }
+            }
             {
                 let mut state = self.state();
                 state.events_seen += 1;

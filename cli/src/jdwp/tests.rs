@@ -352,3 +352,34 @@ async fn pause_reads_the_main_thread_and_resume_balances_it() {
     let warning = session.resume().await.unwrap();
     assert_eq!(warning["warning"], "session was not suspended");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_class_prepared_during_the_scan_is_bound_once() {
+    let vm = FakeVm::start();
+    let session = attach(&vm, WAIT).await;
+    vm.with_state(|s| s.prepare_late_during_scan = true);
+    // The ClassPrepare for Late arrives before the AllClasses reply that
+    // already lists it: both binding paths see the same class.
+    let line = session.break_line(target("Late.kt"), 7).await.unwrap();
+    vm.wait_for(WAIT, "the prepare thread to resume", |s| {
+        s.thread_resumes == 1
+    });
+    // Let the event-loop bind (if any) settle.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let at_late_run = vm.with_state(|s| {
+        s.requests
+            .iter()
+            .filter(|r| r.kind == 2 && r.location.is_some_and(|(_, m, i)| m == 1050 && i == 0))
+            .count()
+    });
+    assert_eq!(
+        at_late_run, 1,
+        "one Breakpoint request per location: {line}"
+    );
+    let breakpoints = session.breakpoints();
+    assert_eq!(
+        breakpoints[0]["locations"].as_array().unwrap().len(),
+        1,
+        "{breakpoints}"
+    );
+}
