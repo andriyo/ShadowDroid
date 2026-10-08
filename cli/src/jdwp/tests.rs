@@ -434,8 +434,10 @@ async fn uncaught_means_not_caught_by_app_code() {
     );
     session.resume().await.unwrap();
 
-    // Truly uncaught: a stop as well.
+    // The framework rethrows the same object: reported once, then resumed.
+    let resumes = vm.with_state(|s| s.resumes);
     assert_eq!(vm.throw_exception(None), 1);
-    wait_suspended(&session).await;
-    assert_eq!(session.breakpoints()[0]["hit_count"], 2);
+    vm.wait_for(WAIT, "the rethrow to resume", |s| s.resumes == resumes + 1);
+    assert!(session.suspension().is_none());
+    assert_eq!(session.breakpoints()[0]["hit_count"], 1);
 }

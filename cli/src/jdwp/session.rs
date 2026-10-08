@@ -270,6 +270,9 @@ struct State {
     /// The scan and ClassPrepare paths can race on one class; the claim is
     /// taken before the request is set so each location binds once.
     claims: BTreeSet<(String, u64, u64, u64)>,
+    /// Throwables an uncaught-only breakpoint already stopped on: a
+    /// framework catch-and-rethrow re-raises the same object.
+    reported_throwables: VecDeque<u64>,
     suspension: Option<Suspension>,
     epoch: u64,
     pinned: BTreeSet<u64>,
@@ -1339,8 +1342,20 @@ impl Session {
                         ..
                     })
                 );
-                if uncaught_only && self.caught_by_app(catch_location.as_ref()).await {
-                    return Ok(false);
+                if uncaught_only {
+                    if self.caught_by_app(catch_location.as_ref()).await {
+                        return Ok(false);
+                    }
+                    if let Some(object) = exception.object_id() {
+                        let mut state = self.state();
+                        if state.reported_throwables.contains(&object) {
+                            return Ok(false);
+                        }
+                        if state.reported_throwables.len() >= RECENT_EVENTS {
+                            state.reported_throwables.pop_front();
+                        }
+                        state.reported_throwables.push_back(object);
+                    }
                 }
                 self.record_stop(
                     "exception",
