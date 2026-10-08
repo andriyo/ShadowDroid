@@ -511,6 +511,8 @@ const CLASSES: &[Class] = &[
             // Kotlin property accessors (`var counter`).
             (1011, "setCounter", "(I)V", &[(0, 40), (3, 41)]),
             (1012, "getCounter", "()I", &[(0, 42)]),
+            // Setter of the delegated property `status` (field `status$delegate`).
+            (1018, "setStatus", "(Ljava/lang/String;)V", &[(0, 44)]),
             // A synthetic bridge a function reference adds: never bound.
             (
                 1013,

@@ -1589,3 +1589,35 @@ async fn coroutines_are_discovered_process_wide_through_instances() {
     let running = session.coroutine_snapshot(8, OPTIONS).await.unwrap();
     assert_eq!(running["available"], false);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_watch_on_a_delegated_property_breaks_on_its_setter_instead() {
+    let vm = FakeVm::start();
+    let session = attach(&vm, WAIT).await;
+    // `status` is `by mutableStateOf(...)`: the class has `status$delegate`
+    // (assigned once) and `setStatus`; a field watch would never fire.
+    let value = session
+        .break_field(
+            "io.example.app.MainActivity",
+            "status",
+            false,
+            true,
+            true,
+            Duration::from_secs(60),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(value["mechanism"], "accessor_breakpoints", "{value}");
+    assert!(
+        value["note"]
+            .as_str()
+            .unwrap()
+            .contains("delegated property"),
+        "{value}"
+    );
+    assert_eq!(value["locations"][0]["method"], "setStatus", "{value}");
+    assert!(value["slow_until"].is_null(), "{value}");
+    assert_eq!(session.slow_requests(), 0);
+    assert!(vm.with_state(|s| s.requests.iter().all(|r| r.kind != 20 && r.kind != 21)));
+}

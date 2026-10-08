@@ -295,6 +295,8 @@ pub(super) struct Breakpoint {
     /// A slow field watch auto-clears at this time (epoch seconds).
     pub(super) slow_until: Option<f64>,
     pub(super) expired_reason: Option<&'static str>,
+    /// Why the daemon bound something other than what was asked for.
+    pub(super) note: Option<&'static str>,
 }
 
 impl Breakpoint {
@@ -317,6 +319,7 @@ impl Breakpoint {
             throttled_until: None,
             slow_until: None,
             expired_reason: None,
+            note: None,
         };
         breakpoint.set_opts(opts);
         breakpoint
@@ -382,6 +385,7 @@ impl Breakpoint {
             "expired": self.expired,
             "expired_reason": self.expired_reason,
             "slow_until": self.slow_until,
+            "note": self.note,
             "created_at": self.created_at,
         });
         let extra = match &self.kind {

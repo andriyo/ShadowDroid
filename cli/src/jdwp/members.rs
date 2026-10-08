@@ -348,13 +348,32 @@ impl Session {
                 if *class != class_name {
                     return Ok(());
                 }
-                if *watch {
+                let mut watch = *watch;
+                if watch {
+                    // A delegated property (`by mutableStateOf`, `by lazy`)
+                    // stores the delegate object, assigned once: a watch on
+                    // `<name>$delegate` never fires on property writes, which
+                    // go through set<Name>(). Break on the accessors instead,
+                    // and skip the whole-app slowdown.
                     let fields = self.fields(class_id).await?;
                     let delegate = format!("{field}$delegate");
-                    let found = fields
-                        .iter()
-                        .find(|f| f.name == *field)
-                        .or_else(|| fields.iter().find(|f| f.name == delegate));
+                    if !fields.iter().any(|f| f.name == *field)
+                        && fields.iter().any(|f| f.name == delegate)
+                    {
+                        watch = false;
+                        let mut state = self.state();
+                        if let Some(b) = state.breakpoints.get_mut(id) {
+                            b.slow_until = None;
+                            b.note = Some(DELEGATED_PROPERTY_NOTE);
+                            if let BreakpointKind::Field { watch, .. } = &mut b.kind {
+                                *watch = false;
+                            }
+                        }
+                    }
+                }
+                if watch {
+                    let fields = self.fields(class_id).await?;
+                    let found = fields.iter().find(|f| f.name == *field);
                     let Some(found) = found else {
                         let mut state = self.state();
                         if let Some(b) = state.breakpoints.get_mut(id) {
@@ -556,3 +575,7 @@ mod tests {
         assert!(dex_return_indices(&[]).is_empty());
     }
 }
+
+/// Recorded on a field breakpoint that asked for a slow watch on a Kotlin
+/// delegated property and got accessor breakpoints instead.
+pub(super) const DELEGATED_PROPERTY_NOTE: &str = "delegated property: its field holds the delegate object and is never reassigned, so a field watch would not fire on writes; breaking on the set/get accessors instead (no slowdown)";
