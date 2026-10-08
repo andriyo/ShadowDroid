@@ -780,6 +780,7 @@ fn attach_next_actions(map: &mut serde_json::Map<String, serde_json::Value>) {
         .map(str::trim)
         .filter(|action| !action.is_empty())
         .map(|action| executable_action(action, map))
+        .filter_map(|action| on_debug_backend(action, map))
         .collect::<Vec<_>>();
 
     let command_path = effective_command_path(map);
@@ -795,7 +796,9 @@ fn attach_next_actions(map: &mut serde_json::Map<String, serde_json::Value>) {
         );
     }
     for action in fallbacks {
-        let action = executable_action(&action, map);
+        let Some(action) = on_debug_backend(executable_action(&action, map), map) else {
+            continue;
+        };
         if !actions.contains(&action) {
             actions.push(action);
         }
@@ -812,6 +815,55 @@ fn attach_next_actions(map: &mut serde_json::Map<String, serde_json::Value>) {
     }
     actions.truncate(MAX_NEXT_ACTIONS);
     map.insert("next_actions".into(), serde_json::json!(actions));
+}
+
+/// `debug` verbs the standalone JDWP backend serves (`debug --backend jdwp`).
+const JDWP_DEBUG_VERBS: &[&str] = &[
+    "attach",
+    "detach",
+    "stop",
+    "sessions",
+    "status",
+    "breakpoints",
+    "pause",
+    "resume",
+    "step-in",
+    "step-over",
+    "step-out",
+    "stack",
+    "threads",
+    "variables",
+    "eval",
+    "inspect",
+];
+const JDWP_BREAK_KINDS: &[&str] = &["line", "exception", "remove"];
+
+/// A result from the jdwp debugger backend must not send an agent to the
+/// Studio bridge: catalog follow-ups for `debug` verbs gain `--backend jdwp`
+/// when that backend serves them and are dropped when it does not. Actions
+/// that already name a backend, and every other command, pass through.
+fn on_debug_backend(
+    action: String,
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    if observed_value(map, "backend").as_deref() != Some("jdwp")
+        || !action.starts_with("shadowdroid ")
+        || action.contains("--backend")
+    {
+        return Some(action);
+    }
+    let Some(at) = action.find(" debug ") else {
+        return Some(action);
+    };
+    let mut words = action[at + " debug ".len()..].split_whitespace();
+    let supported = match words.next() {
+        Some("break") => words
+            .next()
+            .is_some_and(|kind| JDWP_BREAK_KINDS.contains(&kind)),
+        Some(verb) => JDWP_DEBUG_VERBS.contains(&verb),
+        None => false,
+    };
+    supported.then(|| format!("{action} --backend jdwp"))
 }
 
 /// Interactive commands executed inside `watch` still use the public command
@@ -1655,6 +1707,45 @@ pub fn emit_error(stage: &str, code: &str, msg: &str, extra: serde_json::Value) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jdwp_results_keep_debug_follow_ups_on_the_jdwp_backend() {
+        let map = serde_json::json!({"backend": "jdwp"});
+        let map = map.as_object().unwrap();
+        let keep = |action: &str| on_debug_backend(action.to_string(), map);
+        assert_eq!(
+            keep("shadowdroid debug variables").as_deref(),
+            Some("shadowdroid debug variables --backend jdwp")
+        );
+        assert_eq!(
+            keep("shadowdroid -d emulator-5554 debug break line --file A.kt --line 3").as_deref(),
+            Some(
+                "shadowdroid -d emulator-5554 debug break line --file A.kt --line 3 --backend jdwp"
+            )
+        );
+        // Verbs the jdwp backend does not serve would land on Studio: dropped.
+        assert_eq!(keep("shadowdroid debug snapshot"), None);
+        assert_eq!(keep("shadowdroid debug coroutines threads"), None);
+        assert_eq!(keep("shadowdroid debug break method --class A"), None);
+        // Explicit backends, discovery, and other commands pass through.
+        for action in [
+            "shadowdroid debug watch list --backend studio",
+            "shadowdroid commands --json --describe 'debug eval'",
+            "shadowdroid ui dump",
+        ] {
+            assert_eq!(keep(action).as_deref(), Some(action));
+        }
+        // Studio results are untouched.
+        let studio = serde_json::json!({"backend": "studio"});
+        assert_eq!(
+            on_debug_backend(
+                "shadowdroid debug snapshot".into(),
+                studio.as_object().unwrap()
+            )
+            .as_deref(),
+            Some("shadowdroid debug snapshot")
+        );
+    }
     use crate::proto::Element;
 
     #[test]
