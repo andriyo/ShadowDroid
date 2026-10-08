@@ -9,6 +9,9 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+/// Bound on the object → type cache (cleared when full).
+const MAX_CACHED_OBJECT_TYPES: usize = 200_000;
+
 use futures_util::future::BoxFuture;
 use serde_json::{Value as Json, json};
 
@@ -561,7 +564,25 @@ impl Session {
 
     /// Runtime class of `object`, with its signature cached.
     pub(super) async fn runtime_type(&self, object: u64) -> RpcResult<(u64, String)> {
-        let (_, type_id) = self.jdwp.object_type(object).await?;
+        let cached = self
+            .cache
+            .lock()
+            .expect("cache")
+            .object_types
+            .get(&object)
+            .copied();
+        let type_id = match cached {
+            Some(type_id) => type_id,
+            None => {
+                let (_, type_id) = self.jdwp.object_type(object).await?;
+                let mut cache = self.cache.lock().expect("cache");
+                if cache.object_types.len() >= MAX_CACHED_OBJECT_TYPES {
+                    cache.object_types.clear();
+                }
+                cache.object_types.insert(object, type_id);
+                type_id
+            }
+        };
         Ok((type_id, self.signature(type_id).await?))
     }
 

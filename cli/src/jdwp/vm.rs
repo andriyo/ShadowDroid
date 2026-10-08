@@ -640,6 +640,29 @@ impl Jdwp {
         }
     }
 
+    /// Live instance counts of exactly each of `type_ids`, in order.
+    pub async fn instance_counts(&self, type_ids: &[u64]) -> Result<Vec<u64>, JdwpError> {
+        let mut w = self.writer();
+        w.i32(type_ids.len() as i32);
+        for id in type_ids {
+            w.reference_type_id(*id);
+        }
+        let data = self
+            .call(
+                set::VIRTUAL_MACHINE,
+                super::protocol::vm::INSTANCE_COUNTS,
+                w.into_bytes(),
+            )
+            .await?;
+        decode("VirtualMachine.InstanceCounts", || {
+            let mut r = Reader::new(&data, self.sizes());
+            let count = r.count()?;
+            (0..count)
+                .map(|_| r.i64().map(|n| n.max(0) as u64))
+                .collect()
+        })
+    }
+
     /// Live instances of exactly `type_id`, at most `max`.
     pub async fn instances(&self, type_id: u64, max: i32) -> Result<Vec<u64>, JdwpError> {
         let mut w = self.writer();

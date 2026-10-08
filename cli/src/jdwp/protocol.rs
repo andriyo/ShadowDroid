@@ -38,6 +38,7 @@ pub mod vm {
     pub const CREATE_STRING: u8 = 11;
     pub const CAPABILITIES_NEW: u8 = 17;
     pub const ALL_CLASSES_WITH_GENERIC: u8 = 20;
+    pub const INSTANCE_COUNTS: u8 = 21;
 }
 
 pub mod reference_type {
@@ -325,6 +326,7 @@ pub fn command_name(command_set: u8, command: u8) -> String {
         (set::REFERENCE_TYPE, reference_type::SOURCE_FILE) => "ReferenceType.SourceFile",
         (set::REFERENCE_TYPE, reference_type::STATUS) => "ReferenceType.Status",
         (set::REFERENCE_TYPE, reference_type::INSTANCES) => "ReferenceType.Instances",
+        (set::VIRTUAL_MACHINE, vm::INSTANCE_COUNTS) => "VirtualMachine.InstanceCounts",
         (set::REFERENCE_TYPE, reference_type::SOURCE_DEBUG_EXTENSION) => {
             "ReferenceType.SourceDebugExtension"
         }

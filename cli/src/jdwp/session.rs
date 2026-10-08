@@ -187,6 +187,9 @@ pub(super) enum Owner {
     ExceptionPrepare(String),
     /// Deferred method/field binding: stays armed for every match.
     MemberPrepare(String),
+    /// SUSPEND_NONE class-load watch that keeps the coroutine class cache
+    /// current.
+    CoroutinePrepare,
 }
 
 /// What a bound location re-arms with after a config change.
@@ -503,6 +506,9 @@ pub(super) struct Cache {
     pub line_tables: HashMap<(u64, u64), Arc<LineTable>>,
     pub variable_tables: HashMap<(u64, u64), Arc<Vec<Variable>>>,
     pub thread_names: HashMap<u64, String>,
+    /// Object → runtime type. JDWP never reuses an object id for another
+    /// object unless it is disposed, so this cannot go stale.
+    pub object_types: HashMap<u64, u64>,
 }
 
 pub struct Session {
@@ -519,6 +525,8 @@ pub struct Session {
     /// Watch specs and their cached values (by watch id).
     pub(super) watches: Mutex<(Vec<super::watches::WatchSpec>, HashMap<String, Json>)>,
     coroutine_classes: Mutex<Option<super::coroutines::CoroutineClasses>>,
+    /// Classes loaded since the coroutine class scan, classified lazily.
+    pub(super) coroutine_pending: Mutex<Vec<(u64, String)>>,
 }
 
 impl Session {
@@ -541,6 +549,7 @@ impl Session {
             invoke_state: Default::default(),
             watches: Mutex::new((Vec::new(), HashMap::new())),
             coroutine_classes: Mutex::new(None),
+            coroutine_pending: Mutex::new(Vec::new()),
             logpoint_log: super::logpoints::LogpointLog::new(
                 format!(
                     "logpoints_jdwp_{}_{}",
@@ -1791,6 +1800,15 @@ impl Session {
                 Some(Owner::MemberPrepare(id)),
             ) => {
                 self.bind_member(&id, *type_id, signature).await?;
+                Ok(false)
+            }
+            (
+                Event::ClassPrepare {
+                    type_id, signature, ..
+                },
+                Some(Owner::CoroutinePrepare),
+            ) => {
+                self.note_loaded_class(*type_id, signature);
                 Ok(false)
             }
             (

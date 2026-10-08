@@ -30,6 +30,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 pub const MAIN_THREAD: u64 = 300;
+const WORKER_THREAD: u64 = 301;
 pub const ACTIVITY_CLASS: u64 = 100;
 pub const ON_NEW_INTENT: u64 = 1001;
 pub const ACTIVITY_OBJECT: u64 = 500;
@@ -84,6 +85,10 @@ pub struct State {
     pub invokes: Vec<(u64, Vec<Value>)>,
     /// Lets a pending `hang()` invoke reply.
     pub release_hang: bool,
+    /// `Work$late$1` (a continuation class) has loaded.
+    pub late_coroutine_loaded: bool,
+    /// Type ids asked for with ReferenceType.Instances.
+    pub instances_asked: Vec<u64>,
 }
 
 /// A JDWP value as the fake decodes it.
@@ -201,6 +206,45 @@ impl FakeVm {
         }
         self.send(&command_packet(0x4000_0001, 64, 100, &body));
         matching.len()
+    }
+
+    /// Load `io.example.app.Work$late$1`: a SUSPEND_NONE ClassPrepare for
+    /// every ClassPrepare request without a ClassMatch (the coroutine
+    /// class-load watch excludes framework packages only).
+    pub fn load_late_coroutine_class(&self) -> usize {
+        let (count, packet) = self.with_state(|state| {
+            state.late_coroutine_loaded = true;
+            let matching: Vec<i32> = state
+                .requests
+                .iter()
+                .filter(|r| {
+                    r.kind == 8 && r.class_match.is_none() && !state.cleared.contains(&r.id)
+                })
+                .map(|r| r.id)
+                .collect();
+            if matching.is_empty() {
+                return (0, None);
+            }
+            let mut body = vec![0_u8];
+            put_i32(&mut body, matching.len() as i32);
+            for request in &matching {
+                body.push(8);
+                put_i32(&mut body, *request);
+                put_u64(&mut body, WORKER_THREAD);
+                body.push(1);
+                put_u64(&mut body, 131);
+                put_str(&mut body, "Lio/example/app/Work$late$1;");
+                put_i32(&mut body, 7);
+            }
+            (
+                matching.len(),
+                Some(command_packet(0x4000_0003, 64, 100, &body)),
+            )
+        });
+        if let Some(packet) = packet {
+            self.send(&packet);
+        }
+        count
     }
 
     /// Load `io.example.app.Late`: one ClassPrepare composite carrying an
@@ -637,6 +681,21 @@ const CLASSES: &[Class] = &[
         source: Some("JobSupport.kt"),
         methods: &[],
     },
+    // Loaded by `load_late_coroutine_class`: continuation 712 (label 5)
+    // of the "worker" coroutine.
+    Class {
+        id: 131,
+        signature: "Lio/example/app/Work$late$1;",
+        source: Some("Work.kt"),
+        methods: &[],
+    },
+    // A coroutine class with no live instance (InstanceCounts skips it).
+    Class {
+        id: 132,
+        signature: "Lkotlinx/coroutines/LazyStandaloneCoroutine;",
+        source: Some("Builders.common.kt"),
+        methods: &[],
+    },
 ];
 
 /// `(object, class)` of the coroutine world.
@@ -651,6 +710,7 @@ const WORLD_OBJECTS: &[(u64, u64)] = &[
     (711, 128),
     (720, 121),
     (721, 130),
+    (712, 131),
 ];
 
 /// `(object, field, tag, value)` of the coroutine world.
@@ -665,6 +725,8 @@ const WORLD_FIELDS: &[(u64, u64, u8, u64)] = &[
     (710, 2104, b's', 501),
     (711, 2108, b'L', 700),
     (720, 2101, b'L', 721),
+    (712, 2102, b'L', 711),
+    (712, 2109, b'I', 5),
 ];
 
 /// `(class, field id, name, signature)` of the coroutine world.
@@ -683,7 +745,19 @@ const WORLD_CLASS_FIELDS: &[(u64, u64, &str, &str)] = &[
         "Lkotlin/coroutines/CoroutineContext$Element;",
     ),
     (128, 2108, "delegate", "Lkotlin/coroutines/Continuation;"),
+    (131, 2109, "label", "I"),
 ];
+
+/// Live instances of exactly `type_id`.
+fn live_instances(state: &State, type_id: u64) -> &'static [u64] {
+    match type_id {
+        // The framework coroutine first: ranking, not discovery order, decides.
+        121 => &[720, 700],
+        123 => &[710],
+        131 if state.late_coroutine_loaded => &[712],
+        _ => &[],
+    }
+}
 
 fn superclass_of(type_id: u64) -> u64 {
     match type_id {
@@ -691,6 +765,8 @@ fn superclass_of(type_id: u64) -> u64 {
         121 => 120,
         123 => 122,
         130 => 129,
+        131 => 122,
+        132 => 121,
         _ => 104,
     }
 }
@@ -703,6 +779,7 @@ fn loaded(state: &State) -> impl Iterator<Item = &'static Class> + '_ {
     CLASSES
         .iter()
         .filter(move |c| c.id != 105 || state.late_loaded)
+        .filter(move |c| c.id != 131 || state.late_coroutine_loaded)
 }
 
 fn serve(mut stream: TcpStream, shared: Arc<Shared>) {
@@ -1005,15 +1082,20 @@ fn handle(shared: &Shared, set: u8, cmd: u8, body: &[u8]) -> (u16, Vec<u8>, Afte
                 put_i32(&mut out, 2);
             }
         }
+        // VirtualMachine.InstanceCounts
+        (1, 21) => {
+            let count = c.i32();
+            put_i32(&mut out, count);
+            for _ in 0..count {
+                let type_id = c.u64();
+                put_u64(&mut out, live_instances(&state, type_id).len() as u64);
+            }
+        }
         // ReferenceType.Instances
         (2, 16) => {
             let type_id = c.u64();
-            let instances: &[u64] = match type_id {
-                // The framework coroutine first: ranking, not discovery order, decides.
-                121 => &[720, 700],
-                123 => &[710],
-                _ => &[],
-            };
+            state.instances_asked.push(type_id);
+            let instances = live_instances(&state, type_id);
             put_i32(&mut out, instances.len() as i32);
             for id in instances {
                 out.push(b'L');
@@ -1216,7 +1298,7 @@ fn handle(shared: &Shared, set: u8, cmd: u8, body: &[u8]) -> (u16, Vec<u8>, Afte
         (9, 9) => {
             let object = c.u64();
             out.push(u8::from(
-                !matches!(object, 500..=504 | 700..=711) && !state.strings.contains_key(&object),
+                !matches!(object, 500..=504 | 700..=740) && !state.strings.contains_key(&object),
             ));
         }
         (10, 1) => match c.u64() {

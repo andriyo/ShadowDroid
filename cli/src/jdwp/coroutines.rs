@@ -15,15 +15,35 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
+use futures_util::stream::{self, StreamExt};
 use serde_json::{Value as Json, json};
+use std::future::Future;
 
 use super::codec::Value;
 use super::inspect::{RenderOptions, SelectedFrame};
+use super::protocol::{event_kind, suspend_policy};
 use super::resolve;
-use super::session::{RpcError, RpcResult, Session, is_framework_class};
+use super::session::{Owner, RpcError, RpcResult, Session, is_framework_class};
+use super::vm::Modifier;
 
 /// Instances read per class (device default cap).
 const MAX_INSTANCES_PER_CLASS: i32 = 100;
+/// JDWP requests in flight at once: the connection demuxes replies by
+/// packet id, so independent reads overlap their adb round trips.
+const CONCURRENCY: usize = 16;
+/// Class loads in these packages never add coroutine or app continuation
+/// classes; the class-load watch skips them in the VM.
+const CLASS_WATCH_EXCLUDES: &[&str] = &[
+    "java.*",
+    "javax.*",
+    "sun.*",
+    "libcore.*",
+    "dalvik.*",
+    "android.*",
+    "androidx.*",
+    "com.android.*",
+    "kotlin.*",
+];
 /// Base of every single-handler job state (`Incomplete`).
 const JOB_NODE: &str = "Lkotlinx/coroutines/JobNode;";
 const ABSTRACT_COROUTINE: &str = "Lkotlinx/coroutines/AbstractCoroutine;";
@@ -68,11 +88,57 @@ pub fn flow_kind(type_name: &str) -> Option<&'static str> {
 }
 
 /// Classes that hold coroutines and continuations, discovered once per
-/// session (class hierarchy walks cost ~1 s on a real app).
+/// session (class hierarchy walks cost ~1 s on a real app) and kept current
+/// by a SUSPEND_NONE ClassPrepare watch.
 #[derive(Default, Clone)]
 pub struct CoroutineClasses {
     pub coroutines: Vec<(u64, String)>,
     pub continuations: Vec<(u64, String)>,
+}
+
+impl CoroutineClasses {
+    /// Add `other`'s classes not already present; returns how many.
+    fn merge(&mut self, other: CoroutineClasses) -> usize {
+        let known: HashSet<u64> = self
+            .coroutines
+            .iter()
+            .chain(&self.continuations)
+            .map(|(id, _)| *id)
+            .collect();
+        let before = self.coroutines.len() + self.continuations.len();
+        self.coroutines.extend(
+            other
+                .coroutines
+                .into_iter()
+                .filter(|(id, _)| !known.contains(id)),
+        );
+        self.continuations.extend(
+            other
+                .continuations
+                .into_iter()
+                .filter(|(id, _)| !known.contains(id)),
+        );
+        self.coroutines.len() + self.continuations.len() - before
+    }
+}
+
+/// Run `futures` with at most [`CONCURRENCY`] in flight, keeping order.
+async fn bounded<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
+    stream::iter(futures).buffered(CONCURRENCY).collect().await
+}
+
+/// Whether a class could hold coroutines (`Some(true)`: in
+/// `kotlinx.coroutines`) or app continuations (`Some(false)`); the class
+/// hierarchy decides.
+pub fn coroutine_candidate(signature: &str) -> Option<bool> {
+    if !signature.starts_with('L') || signature.contains("$$") {
+        return None;
+    }
+    if signature.starts_with("Lkotlinx/coroutines/") {
+        return Some(true);
+    }
+    let name = resolve::type_name(signature);
+    (!is_framework_class(&name) && signature.contains('$')).then_some(false)
 }
 
 impl Session {
@@ -331,96 +397,248 @@ impl Session {
         }
     }
 
+    /// A class load the coroutine watch saw: kept for the next snapshot.
+    pub(super) fn note_loaded_class(&self, type_id: u64, signature: &str) {
+        if coroutine_candidate(signature).is_some() {
+            self.coroutine_pending
+                .lock()
+                .expect("coroutine pending")
+                .push((type_id, signature.to_string()));
+        }
+    }
+
     /// Classes of coroutines (concrete AbstractCoroutine subclasses) and of
     /// app continuations (BaseContinuationImpl subclasses outside framework
-    /// packages), cached for the session.
-    async fn coroutine_classes(&self) -> RpcResult<CoroutineClasses> {
-        if let Some(cached) = self.coroutine_classes_cache() {
-            return Ok(cached);
-        }
-        let mut found = CoroutineClasses::default();
-        for class in self.jdwp.all_classes().await? {
-            let signature = &class.signature;
-            if !signature.starts_with('L') || signature.contains("$$") {
-                continue;
-            }
-            let name = resolve::type_name(signature);
-            let in_coroutines = signature.starts_with("Lkotlinx/coroutines/");
-            let app = !is_framework_class(&name) && signature.contains('$');
-            if !in_coroutines && !app {
-                continue;
-            }
-            self.cache
-                .lock()
-                .expect("cache")
-                .signatures
-                .insert(class.type_id, signature.clone());
-            let Ok(chain) = self.hierarchy(class.type_id).await else {
-                continue;
+    /// packages). The first call scans every loaded class and starts a
+    /// class-load watch; later calls classify only the classes loaded since.
+    async fn coroutine_classes(&self) -> RpcResult<(CoroutineClasses, Json)> {
+        let started = Instant::now();
+        if let Some(mut cached) = self.coroutine_classes_cache() {
+            let pending =
+                std::mem::take(&mut *self.coroutine_pending.lock().expect("coroutine pending"));
+            let loaded = pending.len();
+            let added = if pending.is_empty() {
+                0
+            } else {
+                let added = cached.merge(self.classify_classes(pending).await);
+                self.set_coroutine_classes_cache(cached.clone());
+                added
             };
-            let mut ancestors = Vec::new();
-            for ancestor in chain.iter().skip(1) {
-                if let Ok(sig) = self.signature(*ancestor).await {
-                    ancestors.push(sig);
-                }
+            return Ok((
+                cached,
+                json!({
+                    "cached": true,
+                    "classes_loaded_since": loaded,
+                    "classes_added": added,
+                    "classes_ms": started.elapsed().as_millis() as u64,
+                }),
+            ));
+        }
+        // Watch first, so a class loaded during the scan is not missed (a
+        // duplicate is merged away).
+        let watching = self.watch_coroutine_class_loads().await;
+        let candidates: Vec<(u64, String)> = self
+            .jdwp
+            .all_classes()
+            .await?
+            .into_iter()
+            .filter(|class| coroutine_candidate(&class.signature).is_some())
+            .map(|class| (class.type_id, class.signature))
+            .collect();
+        let scanned = candidates.len();
+        let found = self.classify_classes(candidates).await;
+        self.set_coroutine_classes_cache(found.clone());
+        Ok((
+            found,
+            json!({
+                "cached": false,
+                "candidate_classes": scanned,
+                "class_load_watch": watching,
+                "classes_ms": started.elapsed().as_millis() as u64,
+            }),
+        ))
+    }
+
+    /// A SUSPEND_NONE ClassPrepare request outside framework packages.
+    async fn watch_coroutine_class_loads(&self) -> bool {
+        let modifiers: Vec<Modifier> = CLASS_WATCH_EXCLUDES
+            .iter()
+            .map(|pattern| Modifier::ClassExclude((*pattern).to_string()))
+            .collect();
+        match self
+            .jdwp
+            .set_event(event_kind::CLASS_PREPARE, suspend_policy::NONE, &modifiers)
+            .await
+        {
+            Ok(request) => {
+                self.state().owners.insert(request, Owner::CoroutinePrepare);
+                true
             }
-            if in_coroutines && ancestors.iter().any(|s| s == ABSTRACT_COROUTINE) {
-                found.coroutines.push((class.type_id, name));
-            } else if app && ancestors.iter().any(|s| s == BASE_CONTINUATION) {
-                found.continuations.push((class.type_id, name));
+            Err(error) => {
+                tracing::warn!("coroutine class-load watch: {error}");
+                false
             }
         }
-        self.set_coroutine_classes_cache(found.clone());
-        Ok(found)
+    }
+
+    /// Hierarchy walks for `candidates`, concurrently.
+    async fn classify_classes(&self, candidates: Vec<(u64, String)>) -> CoroutineClasses {
+        let futures: Vec<_> = candidates
+            .into_iter()
+            .map(|(type_id, signature)| self.classify_class(type_id, signature))
+            .collect();
+        let mut classified: Vec<(bool, u64, String)> =
+            bounded(futures).await.into_iter().flatten().collect();
+        classified.sort_by_key(|(_, id, _)| *id);
+        let mut found = CoroutineClasses::default();
+        for (coroutine, id, name) in classified {
+            if coroutine {
+                found.coroutines.push((id, name));
+            } else {
+                found.continuations.push((id, name));
+            }
+        }
+        found
+    }
+
+    /// `(is coroutine, id, name)` when the class holds coroutines or app
+    /// continuations.
+    async fn classify_class(&self, type_id: u64, signature: String) -> Option<(bool, u64, String)> {
+        let in_coroutines = coroutine_candidate(&signature)?;
+        self.cache
+            .lock()
+            .expect("cache")
+            .signatures
+            .insert(type_id, signature.clone());
+        let chain = self.hierarchy(type_id).await.ok()?;
+        let wanted = if in_coroutines {
+            ABSTRACT_COROUTINE
+        } else {
+            BASE_CONTINUATION
+        };
+        for ancestor in chain.iter().skip(1) {
+            if self.signature(*ancestor).await.ok().as_deref() == Some(wanted) {
+                return Some((in_coroutines, type_id, resolve::type_name(&signature)));
+            }
+        }
+        None
+    }
+
+    async fn class_instances(
+        &self,
+        class_id: u64,
+        class_name: String,
+    ) -> RpcResult<Vec<(u64, String)>> {
+        let objects = self
+            .jdwp
+            .instances(class_id, MAX_INSTANCES_PER_CLASS)
+            .await?;
+        Ok(objects
+            .into_iter()
+            .map(|object| (object, class_name.clone()))
+            .collect())
+    }
+
+    async fn coroutine_entry(&self, object: u64, class_name: String) -> (u64, Json) {
+        (object, self.coroutine_info(object, &class_name).await)
+    }
+
+    async fn continuation_entry(
+        &self,
+        object: u64,
+        class_name: String,
+    ) -> (u64, String, Option<u64>, Option<Json>) {
+        let completion = self
+            .field_by_name(object, "completion")
+            .await
+            .and_then(|v| v.object_id());
+        let label = self.read_named(object, "label").await;
+        (object, class_name, completion, label)
+    }
+
+    async fn owned_continuation(
+        &self,
+        info: Json,
+        completion: Option<u64>,
+        coroutines: &BTreeMap<u64, Json>,
+    ) -> (Option<u64>, Json) {
+        (self.owning_coroutine(completion, coroutines).await, info)
+    }
+
+    /// Live instances of each class with any (InstanceCounts skips empty
+    /// classes in one call; without it every class is asked).
+    async fn live_instances(
+        &self,
+        classes: &[(u64, String)],
+    ) -> RpcResult<(Vec<(u64, String)>, u64, bool)> {
+        let ids: Vec<u64> = classes.iter().map(|(id, _)| *id).collect();
+        let counts = if ids.is_empty() {
+            Vec::new()
+        } else {
+            self.jdwp.instance_counts(&ids).await.unwrap_or_default()
+        };
+        let counted = counts.len() == ids.len();
+        let wanted: Vec<&(u64, String)> = classes
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !counted || counts[*index] > 0)
+            .map(|(_, class)| class)
+            .collect();
+        let queried = wanted.len() as u64;
+        let futures: Vec<_> = wanted
+            .into_iter()
+            .map(|(class_id, class_name)| self.class_instances(*class_id, class_name.clone()))
+            .collect();
+        let per_class = bounded(futures).await;
+        let mut out = Vec::new();
+        let mut truncated = false;
+        for objects in per_class {
+            let objects = objects?;
+            truncated |= objects.len() as i32 >= MAX_INSTANCES_PER_CLASS;
+            out.extend(objects);
+        }
+        Ok((out, queried, truncated))
     }
 
     async fn discover_coroutines(&self, limit: usize) -> RpcResult<(Vec<Json>, Json)> {
         let started = Instant::now();
-        let classes = self.coroutine_classes().await?;
+        let (classes, class_discovery) = self.coroutine_classes().await?;
         let classes_ms = started.elapsed().as_millis() as u64;
-        let mut truncated = false;
-        let mut coroutines: BTreeMap<u64, Json> = BTreeMap::new();
-        for (class_id, class_name) in &classes.coroutines {
-            let instances = self
-                .jdwp
-                .instances(*class_id, MAX_INSTANCES_PER_CLASS)
-                .await?;
-            truncated |= instances.len() as i32 >= MAX_INSTANCES_PER_CLASS;
-            for object in instances {
-                coroutines.insert(object, self.coroutine_info(object, class_name).await);
-            }
-        }
+        let (coroutine_objects, coroutine_queried, coroutines_truncated) =
+            self.live_instances(&classes.coroutines).await?;
+        let (continuation_objects, continuation_queried, continuations_truncated) =
+            self.live_instances(&classes.continuations).await?;
+        let mut truncated = coroutines_truncated || continuations_truncated;
+        let futures: Vec<_> = coroutine_objects
+            .into_iter()
+            .map(|(object, class_name)| self.coroutine_entry(object, class_name))
+            .collect();
+        let coroutines: BTreeMap<u64, Json> = bounded(futures).await.into_iter().collect();
         // Continuations, grouped under the coroutine their completion chain
         // reaches.
+        let futures: Vec<_> = continuation_objects
+            .into_iter()
+            .map(|(object, class_name)| self.continuation_entry(object, class_name))
+            .collect();
+        let continuations = bounded(futures).await;
+        let parents: HashSet<u64> = continuations.iter().filter_map(|c| c.2).collect();
+        let futures: Vec<_> = continuations
+            .into_iter()
+            .map(|(object, class_name, completion, label)| {
+                let info = json!({
+                    "class": class_name,
+                    "object_id": object,
+                    "label": label,
+                    "leaf": !parents.contains(&object),
+                });
+                self.owned_continuation(info, completion, &coroutines)
+            })
+            .collect();
+        let owned = bounded(futures).await;
         let mut chains: HashMap<u64, Vec<Json>> = HashMap::new();
         let mut orphans = Vec::new();
-        let mut parents = HashSet::new();
-        let mut continuations = Vec::new();
-        for (class_id, class_name) in &classes.continuations {
-            let instances = self
-                .jdwp
-                .instances(*class_id, MAX_INSTANCES_PER_CLASS)
-                .await?;
-            truncated |= instances.len() as i32 >= MAX_INSTANCES_PER_CLASS;
-            for object in instances {
-                let completion = self
-                    .field_by_name(object, "completion")
-                    .await
-                    .and_then(|v| v.object_id());
-                if let Some(parent) = completion {
-                    parents.insert(parent);
-                }
-                continuations.push((object, class_name.clone(), completion));
-            }
-        }
-        for (object, class_name, completion) in continuations {
-            let info = json!({
-                "class": class_name,
-                "object_id": object,
-                "label": self.read_named(object, "label").await,
-                "leaf": !parents.contains(&object),
-            });
-            match self.owning_coroutine(completion, &coroutines).await {
+        for (owner, info) in owned {
+            match owner {
                 Some(owner) => chains.entry(owner).or_default().push(info),
                 None => orphans.push(info),
             }
@@ -452,8 +670,11 @@ impl Session {
             out,
             json!({
                 "ok": true,
+                "cached": class_discovery["cached"],
+                "class_discovery": class_discovery,
                 "coroutine_classes": classes.coroutines.len(),
                 "continuation_classes": classes.continuations.len(),
+                "classes_queried": coroutine_queried + continuation_queried,
                 "classes_ms": classes_ms,
                 "elapsed_ms": started.elapsed().as_millis() as u64,
                 "max_instances_per_class": MAX_INSTANCES_PER_CLASS,

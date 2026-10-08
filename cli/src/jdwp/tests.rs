@@ -1574,7 +1574,8 @@ async fn coroutines_are_discovered_process_wide_through_instances() {
         "io.example.app.Work$run$1"
     );
     assert_eq!(worker["continuations"][0]["label"], 2);
-    assert_eq!(snapshot["discovery"]["coroutine_classes"], 1);
+    // StandaloneCoroutine and LazyStandaloneCoroutine (no instances).
+    assert_eq!(snapshot["discovery"]["coroutine_classes"], 2);
     assert_eq!(snapshot["discovery"]["continuation_classes"], 1);
     assert!(snapshot["threads"][0]["dispatcher"]["name"] == "Dispatchers.Main");
 
@@ -1694,4 +1695,77 @@ async fn a_variant_with_no_location_on_the_line_says_so() {
             .unwrap()
             .contains("--variant")
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coroutine_discovery_is_cached_kept_current_and_skips_empty_classes() {
+    let vm = FakeVm::start();
+    let session = stopped_at_line_31(&vm).await;
+    let cold = session.coroutine_snapshot(64, OPTIONS).await.unwrap();
+    let discovery = &cold["discovery"];
+    assert_eq!(discovery["cached"], false, "{discovery}");
+    assert_eq!(discovery["class_discovery"]["class_load_watch"], true);
+    // LazyStandaloneCoroutine has no instance: InstanceCounts skips it.
+    assert_eq!(discovery["coroutine_classes"], 2, "{discovery}");
+    assert!(vm.with_state(|s| s.commands.contains(&(1, 21))));
+    assert!(!vm.with_state(|s| s.instances_asked.contains(&132)));
+    assert!(discovery["elapsed_ms"].is_number());
+    // The class-load watch: SUSPEND_NONE ClassPrepare, framework excluded.
+    let watch = vm.with_state(|s| {
+        s.requests
+            .iter()
+            .find(|r| r.kind == 8 && r.class_match.is_none())
+            .map(|r| (r.policy, r.modifier_kinds.clone()))
+    });
+    let (policy, modifiers) = watch.expect("class-load watch");
+    assert_eq!(policy, 0);
+    assert!(modifiers.iter().all(|m| *m == 6), "{modifiers:?}");
+
+    let warm = session.coroutine_snapshot(64, OPTIONS).await.unwrap();
+    assert_eq!(warm["discovery"]["cached"], true);
+    assert_eq!(warm["discovery"]["class_discovery"]["classes_added"], 0);
+    assert_eq!(warm["coroutines"], cold["coroutines"]);
+
+    // A continuation class loaded later joins the cache without a rescan.
+    assert_eq!(vm.load_late_coroutine_class(), 1);
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while session.coroutine_pending.lock().unwrap().is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "class load never seen"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let scans = vm.with_state(|s| s.commands.iter().filter(|c| **c == (1, 20)).count());
+    let later = session.coroutine_snapshot(64, OPTIONS).await.unwrap();
+    assert_eq!(
+        later["discovery"]["class_discovery"]["classes_added"], 1,
+        "{later}"
+    );
+    assert_eq!(later["discovery"]["continuation_classes"], 2);
+    assert_eq!(
+        vm.with_state(|s| s.commands.iter().filter(|c| **c == (1, 20)).count()),
+        scans,
+        "no second full class scan"
+    );
+    let worker = later["coroutines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "worker")
+        .unwrap()
+        .clone();
+    let labels: Vec<_> = worker["continuations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["label"].clone())
+        .collect();
+    assert_eq!(
+        labels,
+        [serde_json::json!(2), serde_json::json!(5)],
+        "{worker}"
+    );
+    // A SUSPEND_NONE event never resumes anything.
+    assert!(session.suspension().is_some());
 }
