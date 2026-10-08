@@ -62,6 +62,8 @@ pub struct State {
     /// Commands that never get a reply (timeout tests).
     pub silent: Vec<(u8, u8)>,
     pub reject_handshake: bool,
+    /// Accept the handshake bytes and never answer (a wedged endpoint).
+    pub silent_handshake: bool,
     pub connections: u32,
     pub step_line_index: u64,
 }
@@ -380,6 +382,12 @@ fn serve(mut stream: TcpStream, shared: Arc<Shared>) {
     }
     if shared.state.lock().unwrap().reject_handshake {
         // What a second debugger sees: adb OKAY, then EOF before the echo.
+        return;
+    }
+    if shared.state.lock().unwrap().silent_handshake {
+        // Hold the stream open, never echo, until the client gives up.
+        let mut sink = [0_u8; 64];
+        while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
         return;
     }
     stream.write_all(b"JDWP-Handshake").unwrap();

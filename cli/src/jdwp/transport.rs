@@ -21,31 +21,55 @@ pub fn tcp_override() -> Option<String> {
     crate::hostenv::nonempty_env(TCP_OVERRIDE_ENV).map(|value| value.to_string_lossy().into_owned())
 }
 
+/// Why `jdwp:<pid>` could not be opened. The stage matters to the caller:
+/// a failed `host:transport` is a device problem, while a refusal of the
+/// `jdwp:<pid>` service itself means the process exposes no JDWP endpoint.
+#[derive(Debug, thiserror::Error)]
+pub enum ConnectError {
+    /// The ADB server is unreachable or rejected `host:transport:<serial>`
+    /// (unknown serial, device offline or unauthorized).
+    #[error("device transport: {0:#}")]
+    Transport(anyhow::Error),
+    /// The transport is up but adbd refused `jdwp:<pid>` (on current adbd it
+    /// answers `FAIL closed` for a non-debuggable or missing pid).
+    #[error("jdwp service: {0:#}")]
+    Service(anyhow::Error),
+    #[error("opening jdwp:{pid} timed out after {timeout_ms} ms")]
+    Timeout { pid: u32, timeout_ms: u64 },
+}
+
 /// Open the `jdwp:<pid>` stream for `serial` through the ADB server.
-pub async fn connect_adb(serial: &str, pid: u32, timeout: Duration) -> Result<TcpStream> {
+pub async fn connect_adb(
+    serial: &str,
+    pid: u32,
+    timeout: Duration,
+) -> Result<TcpStream, ConnectError> {
     let serial = serial.to_string();
     let stream = tokio::time::timeout(
         timeout,
-        tokio::task::spawn_blocking(move || -> Result<std::net::TcpStream> {
-            let mut stream = adb_wire::transport(&serial, Some(timeout))?;
-            adb_wire::request(&mut stream, &format!("jdwp:{pid}"))?;
+        tokio::task::spawn_blocking(move || -> Result<std::net::TcpStream, ConnectError> {
+            let mut stream =
+                adb_wire::transport(&serial, Some(timeout)).map_err(ConnectError::Transport)?;
+            adb_wire::request(&mut stream, &format!("jdwp:{pid}"))
+                .map_err(ConnectError::Service)?;
             // Hand the socket to tokio with no read deadline: the session
             // enforces per-request deadlines itself.
-            stream.set_read_timeout(None)?;
-            stream.set_write_timeout(None)?;
-            stream.set_nonblocking(true)?;
+            let configure = |stream: &std::net::TcpStream| -> std::io::Result<()> {
+                stream.set_read_timeout(None)?;
+                stream.set_write_timeout(None)?;
+                stream.set_nonblocking(true)
+            };
+            configure(&stream).map_err(|e| ConnectError::Transport(e.into()))?;
             Ok(stream)
         }),
     )
     .await
-    .map_err(|_| {
-        anyhow!(
-            "opening jdwp:{pid} timed out after {} ms",
-            timeout.as_millis()
-        )
+    .map_err(|_| ConnectError::Timeout {
+        pid,
+        timeout_ms: timeout.as_millis() as u64,
     })?
-    .context("adb transport worker")??;
-    TcpStream::from_std(stream).context("register the JDWP stream with tokio")
+    .map_err(|e| ConnectError::Transport(anyhow!("adb transport worker: {e}")))??;
+    TcpStream::from_std(stream).map_err(|e| ConnectError::Transport(e.into()))
 }
 
 /// Plain TCP to a forwarded or fake JDWP endpoint.

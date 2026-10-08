@@ -21,6 +21,12 @@ use super::protocol::{self, HANDSHAKE, HEADER_LEN};
 pub enum JdwpError {
     #[error("JDWP handshake failed: {0}")]
     Handshake(String),
+    /// The endpoint closed the stream before echoing the handshake. On ART
+    /// this is the signature of another debugger holding the process.
+    #[error(
+        "JDWP connection closed after {read} of 14 handshake bytes (another debugger may hold the process)"
+    )]
+    HandshakeClosed { read: usize },
     #[error("{command} did not reply within {timeout_ms} ms")]
     Timeout { command: String, timeout_ms: u64 },
     #[error("JDWP connection closed: {0}")]
@@ -86,11 +92,9 @@ impl Connection {
     {
         tokio::time::timeout(handshake_timeout, handshake(&mut stream))
             .await
-            .map_err(|_| {
-                JdwpError::Handshake(format!(
-                    "no handshake reply within {} ms",
-                    handshake_timeout.as_millis()
-                ))
+            .map_err(|_| JdwpError::Timeout {
+                command: "JDWP-Handshake".into(),
+                timeout_ms: handshake_timeout.as_millis() as u64,
             })??;
 
         let (read_half, write_half) = tokio::io::split(stream);
@@ -239,10 +243,7 @@ where
             .await
             .map_err(|e| JdwpError::Handshake(format!("read: {e}")))?;
         if n == 0 {
-            return Err(JdwpError::Handshake(format!(
-                "connection closed after {read} of {} handshake bytes (another debugger may hold the process)",
-                HANDSHAKE.len()
-            )));
+            return Err(JdwpError::HandshakeClosed { read });
         }
         read += n;
     }
@@ -502,7 +503,10 @@ mod tests {
             .await
             .err()
             .unwrap();
-        assert!(error.to_string().contains("another debugger"), "{error}");
+        assert!(
+            matches!(error, JdwpError::HandshakeClosed { read: 0 }),
+            "{error}"
+        );
 
         let (client, mut server) = duplex(64);
         tokio::spawn(async move {
@@ -524,7 +528,11 @@ mod tests {
             .await
             .err()
             .unwrap();
-        assert!(error.to_string().contains("no handshake reply"), "{error}");
+        // A silent endpoint is a timeout, never "another debugger".
+        assert!(
+            matches!(&error, JdwpError::Timeout { command, .. } if command == "JDWP-Handshake"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

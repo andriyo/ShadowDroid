@@ -79,40 +79,92 @@ async fn connect(args: &DebugdArgs) -> RpcResult<tokio::net::TcpStream> {
             }),
         None => super::transport::connect_adb(&args.serial, args.pid, CONNECT_TIMEOUT)
             .await
-            .map_err(|error| {
-                RpcError::new(
-                    "process_not_debuggable",
-                    format!("adb refused jdwp:{}: {error:#}", args.pid),
-                )
-                .detail(json!({"serial": args.serial, "pid": args.pid}))
-                .next(&[
-                    "the app must be debuggable (debug build) or the image ro.debuggable=1",
-                    "shadowdroid app current",
-                ])
-            }),
+            .map_err(|error| connect_error(args, error)),
+    }
+}
+
+/// Blame the stage that failed: the device transport, or the app's endpoint.
+fn connect_error(args: &DebugdArgs, error: super::transport::ConnectError) -> RpcError {
+    use super::transport::ConnectError;
+    let detail = json!({"serial": args.serial, "pid": args.pid, "reason": error.to_string()});
+    match error {
+        ConnectError::Transport(_) => RpcError::new(
+            "device_unavailable",
+            format!("cannot reach {} through adb: {error}", args.serial),
+        )
+        .retryable()
+        .detail(detail)
+        .next(&["shadowdroid devices", "adb devices -l"]),
+        ConnectError::Service(_) => RpcError::new(
+            "process_not_debuggable",
+            format!("adb refused jdwp:{}: {error}", args.pid),
+        )
+        .detail(detail)
+        .next(&[
+            "the app must be debuggable (debug build) or the image ro.debuggable=1",
+            "shadowdroid app current",
+        ]),
+        ConnectError::Timeout { .. } => RpcError::new("debugger_timeout", error.to_string())
+            .retryable()
+            .detail(detail),
+    }
+}
+
+/// Map a failed JDWP handshake. Only "OKAY, then EOF before the echo" is
+/// the spike's signature of another debugger holding the process; a silent
+/// endpoint or an I/O error is reported as what it is.
+fn handshake_error(
+    args: &DebugdArgs,
+    error: super::conn::JdwpError,
+    elapsed: Duration,
+) -> RpcError {
+    use super::conn::JdwpError;
+    let elapsed_ms = elapsed.as_millis() as u64;
+    match error {
+        JdwpError::HandshakeClosed { read } => RpcError::new(
+            "debugger_already_attached",
+            format!("another debugger holds pid {}: {error}", args.pid),
+        )
+        .detail(json!({
+            "serial": args.serial,
+            "pid": args.pid,
+            "handshake_bytes_read": read,
+            "elapsed_ms": elapsed_ms,
+        }))
+        .next(&[
+            "shadowdroid debug sessions --backend jdwp",
+            "shadowdroid debug detach --backend jdwp",
+            "detach the debugger in Android Studio, then retry",
+        ]),
+        JdwpError::Timeout { .. } => RpcError::new(
+            "debugger_timeout",
+            format!(
+                "pid {} did not answer the JDWP handshake: {error}",
+                args.pid
+            ),
+        )
+        .retryable()
+        .detail(json!({
+            "serial": args.serial,
+            "pid": args.pid,
+            "command": "JDWP-Handshake",
+            "elapsed_ms": elapsed_ms,
+        })),
+        other => RpcError::new(
+            "daemon_unreachable",
+            format!("JDWP handshake with pid {} failed: {other}", args.pid),
+        )
+        .retryable()
+        .detail(json!({"serial": args.serial, "pid": args.pid, "elapsed_ms": elapsed_ms})),
     }
 }
 
 async fn start(args: &DebugdArgs) -> RpcResult<()> {
     let stream = connect(args).await?;
+    let handshake_started = std::time::Instant::now();
     let (conn, incoming) = super::conn::Connection::start(stream, CONNECT_TIMEOUT)
         .await
-        .map_err(|error| match error {
-            // adb answers OKAY, then the app's adbconnection closes the
-            // stream before echoing the handshake: another debugger (Studio,
-            // or a second debugd) holds the process.
-            super::conn::JdwpError::Handshake(message) => RpcError::new(
-                "debugger_already_attached",
-                format!("another debugger holds pid {}: {message}", args.pid),
-            )
-            .detail(json!({"serial": args.serial, "pid": args.pid}))
-            .next(&[
-                "shadowdroid debug sessions --backend jdwp",
-                "shadowdroid debug detach --backend jdwp",
-                "detach the debugger in Android Studio, then retry",
-            ]),
-            other => other.into(),
-        })?;
+        .map_err(|error| handshake_error(args, error, handshake_started.elapsed()))?;
     let jdwp = super::vm::Jdwp::new(conn, COMMAND_TIMEOUT);
     let sizes = jdwp.id_sizes(FIRST_REQUEST_TIMEOUT).await?;
     let version = jdwp.version().await?;

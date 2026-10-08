@@ -114,7 +114,11 @@ impl From<JdwpError> for RpcError {
             JdwpError::Closed(reason) => RpcError::new("debugger_disconnected", message)
                 .detail(json!({"reason": reason}))
                 .next(&["shadowdroid debug attach --backend jdwp --package <pkg>"]),
-            JdwpError::Handshake(_) => RpcError::new("debugger_already_attached", message),
+            JdwpError::HandshakeClosed { read } => {
+                RpcError::new("debugger_already_attached", message)
+                    .detail(json!({"handshake_bytes_read": read}))
+            }
+            JdwpError::Handshake(_) => RpcError::new("daemon_unreachable", message).retryable(),
             JdwpError::Codec { command, .. } => {
                 RpcError::new("jdwp_protocol_error", message).detail(json!({"command": command}))
             }

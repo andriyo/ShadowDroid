@@ -212,6 +212,20 @@ fn a_held_process_is_reported_as_already_attached() {
     let (error, code) = env.run(&["debug", "attach", "--backend", "jdwp", "--pid", "4242"]);
     assert_ne!(code, 0);
     assert_eq!(error["code"], "debugger_already_attached", "{error}");
+    assert_eq!(error["detail"]["handshake_bytes_read"], 0, "{error}");
+    assert!(registry_files(&env.registry_dir()).is_empty());
+}
+
+#[test]
+fn a_silent_handshake_is_a_timeout_not_another_debugger() {
+    let env = Env::new();
+    env.vm.with_state(|state| state.silent_handshake = true);
+    let (error, code) = env.run(&["debug", "attach", "--backend", "jdwp", "--pid", "4242"]);
+    assert_ne!(code, 0);
+    assert_eq!(error["code"], "debugger_timeout", "{error}");
+    assert_eq!(error["detail"]["command"], "JDWP-Handshake", "{error}");
+    assert_eq!(error["detail"]["pid"], 4242, "{error}");
+    assert!(error["detail"]["elapsed_ms"].as_u64().is_some(), "{error}");
     assert!(registry_files(&env.registry_dir()).is_empty());
 }
 
