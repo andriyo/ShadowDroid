@@ -10,20 +10,28 @@
 //!   vm        — typed JDWP commands
 //!   transport — adb `jdwp:<pid>` streams, pid discovery, TCP for tests
 //!   resolve   — source file → package → candidate classes (pure)
+//!   expr      — condition / log-expression grammar (pure)
+//!   logpoints — bounded logpoint event stream with cursors
+//!   breakpoints — options, arming, conditions, logpoints, continue-until
 //!   session   — breakpoints, deferred binding, suspension state, event loop
 //!   inspect   — stack/threads/variables/eval/inspect and value renderers
+//!   launch    — `am set-debug-app -w` launch-time attach orchestration
 //!   paths     — `~/.shadowdroid/debug/<serial>/<pid>.*` registry layout
 //!   daemon    — `__debugd`: JSON-RPC over a 0600 unix socket
 //!   control   — client side: spawn, readiness, RPC
 //!   commands  — `debug` verb mapping for the jdwp backend
 
+pub mod breakpoints;
 pub mod codec;
 pub mod commands;
 pub mod conn;
 pub mod control;
 pub mod daemon;
 pub mod events;
+pub mod expr;
 pub mod inspect;
+pub mod launch;
+pub mod logpoints;
 pub mod paths;
 #[allow(dead_code)] // numbered protocol table; not every entry has a caller yet
 pub mod protocol;

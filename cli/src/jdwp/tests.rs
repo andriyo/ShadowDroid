@@ -30,6 +30,7 @@ async fn attach(vm: &FakeVm, timeout: Duration) -> Arc<Session> {
             attached_at: 0.0,
             vm: json!({}),
             capabilities: json!({}),
+            launched_under_debugger: false,
         },
     );
     tokio::spawn(session.clone().run_events(incoming));
@@ -69,7 +70,7 @@ async fn line_breakpoint_binds_hits_and_reads_the_frame() {
     let session = attach(&vm, WAIT).await;
 
     let breakpoint = session
-        .break_line(target("MainActivity.kt"), 31)
+        .break_line(target("MainActivity.kt"), 31, Default::default())
         .await
         .unwrap();
     assert_eq!(breakpoint["bound"], true, "{breakpoint}");
@@ -108,7 +109,14 @@ async fn line_breakpoint_binds_hits_and_reads_the_frame() {
         .iter()
         .map(|v| v["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(names, ["tag", "count"], "markers and `this` are hidden");
+    assert_eq!(
+        names,
+        ["tag", "count", "it", "it"],
+        "markers and `this` are hidden; inlined `\\N` suffixes stripped"
+    );
+    assert_eq!(variables["variables"][2]["slot_name"], "it\\1");
+    let it = session.eval("it", None, None, OPTIONS).await.unwrap();
+    assert_eq!(it["result"]["value"], "42", "the innermost `it` wins");
     assert_eq!(variables["variables"][0]["value"], "hello");
     assert_eq!(variables["variables"][1]["value"], "42");
     let this = &variables["this"];
@@ -230,11 +238,14 @@ async fn line_breakpoint_binds_hits_and_reads_the_frame() {
 async fn deferred_binding_handles_every_event_in_one_composite() {
     let vm = FakeVm::start();
     let session = attach(&vm, WAIT).await;
-    let line = session.break_line(target("Late.kt"), 7).await.unwrap();
+    let line = session
+        .break_line(target("Late.kt"), 7, Default::default())
+        .await
+        .unwrap();
     assert_eq!(line["bound"], false);
     assert_eq!(line["pending_reason"], "class_not_loaded");
     let exception = session
-        .break_exception("io.example.app.Late", true, true)
+        .break_exception("io.example.app.Late", true, true, Default::default())
         .await
         .unwrap();
     assert_eq!(exception["pending_reason"], "class_not_loaded");
@@ -269,7 +280,7 @@ async fn unowned_events_resume_and_lines_without_code_stay_pending() {
     let session = attach(&vm, WAIT).await;
     // Line 99 is in a loaded file but has no code: pending, still armed.
     let breakpoint = session
-        .break_line(target("MainActivity.kt"), 99)
+        .break_line(target("MainActivity.kt"), 99, Default::default())
         .await
         .unwrap();
     assert_eq!(breakpoint["pending_reason"], "line_not_in_loaded_classes");
@@ -298,7 +309,10 @@ async fn inline_bodies_are_reported_as_unsupported_locations() {
     let session = attach(&vm, WAIT).await;
     let mut inline = target("MainActivity.kt");
     inline.inline_body = true;
-    let error = session.break_line(inline, 31).await.unwrap_err();
+    let error = session
+        .break_line(inline, 31, Default::default())
+        .await
+        .unwrap_err();
     assert_eq!(error.code, "unsupported_location");
     assert_eq!(error.detail["reason"], "inline_body");
 }
@@ -361,7 +375,10 @@ async fn a_class_prepared_during_the_scan_is_bound_once() {
     vm.with_state(|s| s.prepare_late_during_scan = true);
     // The ClassPrepare for Late arrives before the AllClasses reply that
     // already lists it: both binding paths see the same class.
-    let line = session.break_line(target("Late.kt"), 7).await.unwrap();
+    let line = session
+        .break_line(target("Late.kt"), 7, Default::default())
+        .await
+        .unwrap();
     vm.wait_for(WAIT, "the prepare thread to resume", |s| {
         s.thread_resumes == 1
     });
@@ -391,7 +408,7 @@ async fn uncaught_means_not_caught_by_app_code() {
     let session = attach(&vm, WAIT).await;
     // java.lang.String (id 103) stands in for any loaded throwable class.
     let breakpoint = session
-        .break_exception("java.lang.String", false, true)
+        .break_exception("java.lang.String", false, true, Default::default())
         .await
         .unwrap();
     assert_eq!(breakpoint["bound"], true, "{breakpoint}");
@@ -447,7 +464,7 @@ async fn a_missing_kotlin_property_points_at_its_delegate() {
     let vm = FakeVm::start();
     let session = attach(&vm, WAIT).await;
     session
-        .break_line(target("MainActivity.kt"), 31)
+        .break_line(target("MainActivity.kt"), 31, Default::default())
         .await
         .unwrap();
     vm.hit_breakpoint(5);
@@ -468,4 +485,472 @@ async fn a_missing_kotlin_property_points_at_its_delegate() {
         .await
         .unwrap_err();
     assert_eq!(plain.message, "field not found: nothing");
+}
+
+// ── P1b: conditions, logpoints, lifecycle ───────────────────────────────
+
+use super::breakpoints::{BreakpointOptions, BreakpointUpdate, SuspendKind};
+use super::logpoints::Filter;
+
+fn logpoint_options(expression: Option<&str>) -> BreakpointOptions {
+    BreakpointOptions {
+        suspend: SuspendKind::None,
+        log_expression: expression.map(str::to_string),
+        log_message: expression.is_none(),
+        owner: Some("agent".into()),
+        ..Default::default()
+    }
+}
+
+async fn events(session: &Session, filter: &Filter) -> serde_json::Value {
+    session
+        .logpoint_events(Some(0), 50, filter, Duration::from_secs(5))
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conditions_evaluate_in_the_daemon_and_resume_when_false() {
+    let vm = FakeVm::start();
+    let session = attach(&vm, WAIT).await;
+    let created = session
+        .break_line_with(
+            target("MainActivity.kt"),
+            31,
+            BreakpointOptions {
+                condition: Some("count > 100".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(created["created"], true);
+    let request = vm.with_state(|s| {
+        s.requests
+            .iter()
+            .rev()
+            .find(|r| r.kind == 2)
+            .cloned()
+            .unwrap()
+    });
+    assert_eq!(
+        request.policy, 1,
+        "conditions suspend only the event thread"
+    );
+
+    // False: the thread is resumed, no stop.
+    assert_eq!(vm.hit_breakpoint(5), 1);
+    vm.wait_for(WAIT, "the false condition to resume", |s| {
+        s.thread_resumes == 1
+    });
+    assert!(session.suspension().is_none());
+    assert_eq!(session.breakpoints()[0]["hit_count"], 0);
+
+    // True after an update: a stop, widened to the whole VM.
+    let updated = session
+        .update_breakpoint(
+            "bp_1",
+            BreakpointUpdate {
+                condition: Some("count == 42 && tag == \"hello\"".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated["condition"], "count == 42 && tag == \"hello\"");
+    assert_eq!(vm.hit_breakpoint(5), 1);
+    wait_suspended(&session).await;
+    assert_eq!(session.status().await["suspend_reason"], "breakpoint");
+    assert_eq!(session.breakpoints()[0]["hit_count"], 1);
+    session.resume().await.unwrap();
+
+    // A condition that cannot evaluate leaves the thread suspended and
+    // records the error (design §5.3).
+    session
+        .update_breakpoint(
+            "bp_1",
+            BreakpointUpdate {
+                condition: Some("missing.field > 1".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(vm.hit_breakpoint(5), 1);
+    wait_suspended(&session).await;
+    assert_eq!(session.status().await["suspend_reason"], "condition_error");
+    let error = &session.breakpoints()[0]["last_evaluation_error"];
+    assert_eq!(error["kind"], "condition", "{error}");
+    assert!(error["message"].as_str().unwrap().contains("unknown local"));
+
+    // An unparseable condition is rejected unless forced.
+    let rejected = session
+        .update_breakpoint(
+            "bp_1",
+            BreakpointUpdate {
+                condition: Some("this.toString()".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(rejected.code, "debug_expression_invalid");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logpoints_log_without_stopping_and_page_by_cursor() {
+    let vm = FakeVm::start();
+    let session = attach(&vm, WAIT).await;
+    let added = session
+        .logpoint_add(target("MainActivity.kt"), 31, logpoint_options(Some("tag")))
+        .await
+        .unwrap();
+    assert_eq!(added["created"], true);
+    assert_eq!(added["breakpoint"]["kind"], "logpoint");
+    assert_eq!(added["breakpoint"]["owner"], "agent");
+    assert_eq!(added["breakpoint"]["suspend_policy"], "NONE");
+    let id = added["breakpoint"]["id"].as_str().unwrap().to_string();
+
+    assert_eq!(vm.hit_breakpoint(5), 1);
+    vm.wait_for(WAIT, "the logpoint thread to resume", |s| {
+        s.thread_resumes == 1
+    });
+    let page = events(&session, &Filter::default()).await;
+    let event = &page["events"][0];
+    assert_eq!(event["type"], "logpoint");
+    assert_eq!(event["event_kind"], "message");
+    assert_eq!(event["message"], "hello");
+    assert_eq!(event["breakpoint_id"], id.as_str());
+    assert_eq!(event["owner"], "agent");
+    assert_eq!(event["line"], 31);
+    assert_eq!(event["seq"], 1);
+    assert!(
+        page["stream_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("logpoints_jdwp_")
+    );
+    assert!(session.suspension().is_none(), "logpoints never stop");
+
+    // Same owner, same line: reconfigured, not duplicated.
+    let again = session
+        .logpoint_add(
+            target("MainActivity.kt"),
+            31,
+            logpoint_options(Some("count")),
+        )
+        .await
+        .unwrap();
+    assert_eq!(again["created"], false);
+    assert_eq!(again["breakpoint"]["id"], id.as_str());
+    // Another owner or a plain breakpoint there conflicts.
+    let other = BreakpointOptions {
+        owner: Some("someone-else".into()),
+        ..logpoint_options(Some("tag"))
+    };
+    let conflict = session
+        .logpoint_add(target("MainActivity.kt"), 31, other)
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.code, "logpoint_conflict");
+    assert_eq!(conflict.detail["existing_owner"], "agent");
+    let breakpoint_there = session
+        .break_line_with(target("MainActivity.kt"), 31, Default::default())
+        .await
+        .unwrap_err();
+    assert_eq!(breakpoint_there.code, "logpoint_conflict");
+
+    let listed = session.logpoints(None, Some("agent"));
+    assert_eq!(listed["logpoints"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["defaults"]["max_events_per_second"], 20);
+    let wrong = session
+        .logpoint_remove(&id, "someone-else")
+        .await
+        .unwrap_err();
+    assert_eq!(wrong.code, "logpoint_owner_mismatch");
+    let cleared = session.logpoint_clear("agent").await.unwrap();
+    assert_eq!(cleared["removed"], 1);
+    assert!(session.is_quiescent());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hit_position_logpoint_never_suspends() {
+    let vm = FakeVm::start();
+    let session = attach(&vm, WAIT).await;
+    session
+        .logpoint_add(target("MainActivity.kt"), 31, logpoint_options(None))
+        .await
+        .unwrap();
+    let request = vm.with_state(|s| {
+        s.requests
+            .iter()
+            .rev()
+            .find(|r| r.kind == 2)
+            .cloned()
+            .unwrap()
+    });
+    assert_eq!(request.policy, 0, "pure hit logging uses SUSPEND_NONE");
+    assert_eq!(vm.hit_breakpoint(5), 1);
+    let page = events(&session, &Filter::default()).await;
+    assert_eq!(
+        page["events"][0]["message"],
+        "Breakpoint reached at io.example.app.MainActivity.onNewIntent(MainActivity.kt:31)"
+    );
+    assert_eq!(vm.with_state(|s| (s.resumes, s.thread_resumes)), (0, 0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn over_the_rate_limit_a_suspending_logpoint_is_disarmed_then_rearmed() {
+    let vm = FakeVm::start();
+    let session = attach(&vm, WAIT).await;
+    let options = BreakpointOptions {
+        max_events_per_second: Some(1),
+        ..logpoint_options(Some("tag"))
+    };
+    session
+        .logpoint_add(target("MainActivity.kt"), 31, options)
+        .await
+        .unwrap();
+    // Two hits in one second window (retry across a boundary).
+    let mut throttled = serde_json::Value::Null;
+    for _ in 0..3 {
+        let resumed = vm.with_state(|s| s.thread_resumes);
+        vm.hit_breakpoint(5);
+        vm.wait_for(WAIT, "a resume", |s| s.thread_resumes > resumed);
+        vm.hit_breakpoint(5);
+        vm.wait_for(WAIT, "a resume", |s| s.thread_resumes > resumed + 1);
+        throttled = session.breakpoints()[0].clone();
+        if throttled["throttled"] == true {
+            break;
+        }
+    }
+    assert_eq!(throttled["throttled"], true, "{throttled}");
+    assert!(throttled["dropped"].as_u64().unwrap() >= 1);
+    assert!(throttled["rearm_at"].is_number());
+    assert!(
+        throttled["locations"][0]["request_id"].is_null(),
+        "disarmed, not deleted"
+    );
+    assert_eq!(vm.hit_breakpoint(5), 0, "no request left to fire");
+
+    let rearm_at = throttled["rearm_at"].as_f64().unwrap();
+    while crate::events::now_ts() < rearm_at {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    session.rearm_due().await;
+    let rearmed = &session.breakpoints()[0];
+    assert_eq!(rearmed["throttled"], false);
+    assert!(rearmed["locations"][0]["request_id"].is_number());
+    let page = events(&session, &Filter::default()).await;
+    assert!(page["rate_limited_total"].as_u64().unwrap() >= 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pass_counts_are_native_count_modifiers_that_expire() {
+    let vm = FakeVm::start();
+    let session = attach(&vm, WAIT).await;
+    session
+        .break_line_with(
+            target("MainActivity.kt"),
+            31,
+            BreakpointOptions {
+                pass_count: Some(3),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let request = vm.with_state(|s| {
+        s.requests
+            .iter()
+            .rev()
+            .find(|r| r.kind == 2)
+            .cloned()
+            .unwrap()
+    });
+    assert_eq!(
+        request.modifier_kinds,
+        [7, 1],
+        "LocationOnly, then Count last"
+    );
+    assert_eq!(request.policy, 2);
+    assert_eq!(vm.hit_breakpoint(5), 1);
+    wait_suspended(&session).await;
+    let breakpoint = &session.breakpoints()[0];
+    assert_eq!(breakpoint["expired"], true, "{breakpoint}");
+    assert!(breakpoint["locations"][0]["request_id"].is_null());
+    assert_eq!(breakpoint["pass_count"], 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn break_line_is_idempotent_and_update_disables_and_reenables() {
+    let vm = FakeVm::start();
+    let session = attach(&vm, WAIT).await;
+    let first = session
+        .break_line_with(target("MainActivity.kt"), 31, Default::default())
+        .await
+        .unwrap();
+    let again = session
+        .break_line_with(target("MainActivity.kt"), 31, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(again["created"], false);
+    assert_eq!(again["breakpoint"]["id"], first["breakpoint"]["id"]);
+    assert_eq!(session.breakpoints().as_array().unwrap().len(), 1);
+
+    let disabled = session
+        .update_breakpoint(
+            "bp_1",
+            BreakpointUpdate {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(disabled["enabled"], false);
+    assert!(disabled["locations"][0]["request_id"].is_null());
+    assert_eq!(vm.hit_breakpoint(5), 0, "nothing armed while disabled");
+
+    let enabled = session
+        .update_breakpoint(
+            "bp_1",
+            BreakpointUpdate {
+                enabled: Some(true),
+                suspend: Some(SuspendKind::Thread),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(enabled["suspend_policy"], "THREAD");
+    let request = vm.with_state(|s| {
+        s.requests
+            .iter()
+            .rev()
+            .find(|r| r.kind == 2)
+            .cloned()
+            .unwrap()
+    });
+    assert_eq!(request.policy, 1);
+
+    // --disabled at creation sets nothing on the VM.
+    let created = session
+        .break_line_with(
+            target("MainActivity.kt"),
+            21,
+            BreakpointOptions {
+                enabled: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(created["breakpoint"]["locations"][0]["request_id"].is_null());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn temporary_breakpoints_and_continue_until_clean_up() {
+    let vm = FakeVm::start();
+    let session = attach(&vm, WAIT).await;
+    session
+        .break_line_with(
+            target("MainActivity.kt"),
+            31,
+            BreakpointOptions {
+                temporary: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(vm.hit_breakpoint(5), 1);
+    wait_suspended(&session).await;
+    assert!(
+        session.breakpoints().as_array().unwrap().is_empty(),
+        "removed after its hit"
+    );
+    session.resume().await.unwrap();
+
+    // continue-until arms a temporary breakpoint, waits, and removes it.
+    let hitter = {
+        let vm = vm.clone();
+        tokio::spawn(async move {
+            for _ in 0..100 {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                if vm.hit_breakpoint(5) > 0 {
+                    return;
+                }
+            }
+        })
+    };
+    let reached = session
+        .continue_until(target("MainActivity.kt"), 31, None, WAIT)
+        .await
+        .unwrap();
+    hitter.await.unwrap();
+    assert_eq!(reached["matched"], true);
+    assert_eq!(reached["temporary_breakpoint"], true);
+    assert_eq!(reached["session"]["position"]["line"], 31);
+    assert!(session.breakpoints().as_array().unwrap().is_empty());
+
+    // Nothing hits: a typed timeout, and the temporary one is gone too.
+    session.resume().await.unwrap();
+    let timeout = session
+        .continue_until(
+            target("MainActivity.kt"),
+            31,
+            None,
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(timeout.code, "debug_wait_timeout");
+    assert!(session.breakpoints().as_array().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wait_stop_reports_stops_and_process_exit() {
+    let vm = FakeVm::start();
+    let session = attach(&vm, WAIT).await;
+    let idle = session.wait_stop(None, Duration::from_millis(50)).await;
+    assert_eq!(idle["timed_out"], true);
+    session
+        .break_line(target("MainActivity.kt"), 31, Default::default())
+        .await
+        .unwrap();
+    let epoch = session.status().await["epoch"].as_u64().unwrap();
+    let hitter = {
+        let vm = vm.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            vm.hit_breakpoint(5);
+        })
+    };
+    let stopped = session.wait_stop(Some(epoch), WAIT).await;
+    hitter.await.unwrap();
+    assert_eq!(stopped["stopped"], true);
+    assert_eq!(stopped["session"]["breakpoint_id"], "bp_1");
+    // EOF without VMDeath (an Android crash): reported as closed.
+    vm.kill_connection();
+    let closed = session.wait_stop(Some(u64::MAX), WAIT).await;
+    assert!(closed["closed"].is_string(), "{closed}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_warns_about_anr_after_a_long_stop_in_an_attached_process() {
+    let vm = FakeVm::start();
+    let session = attach(&vm, WAIT).await;
+    session.pause().await.unwrap();
+    assert!(session.status().await["warning"].is_null());
+    session.backdate_suspension(5.0);
+    let status = session.status().await;
+    assert!(
+        status["warning"]
+            .as_str()
+            .unwrap()
+            .contains("wait-for-launch"),
+        "{status}"
+    );
+    let stack = session.stack(None, 4).await.unwrap();
+    assert!(stack["warning"].is_string());
 }

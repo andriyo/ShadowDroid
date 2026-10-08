@@ -98,6 +98,8 @@ pub fn spawn(
     pid: u32,
     package: Option<&str>,
     startup_id: &str,
+    init: Option<&Path>,
+    launched_under_debugger: bool,
 ) -> Result<std::process::Child> {
     paths::ensure_serial_dir(serial)?;
     let exe = std::env::current_exe().context("resolve current exe")?;
@@ -126,6 +128,12 @@ pub fn spawn(
     if let Some(package) = package {
         command.arg("--package").arg(package);
     }
+    if let Some(init) = init {
+        command.arg("--init").arg(init);
+    }
+    if launched_under_debugger {
+        command.arg("--launched-under-debugger");
+    }
     if let Some(idle) = crate::hostenv::nonempty_env("SHADOWDROID_DEBUGD_IDLE_TIMEOUT_MS") {
         command.arg("--idle-timeout-ms").arg(idle);
     }
@@ -139,6 +147,24 @@ pub fn spawn(
         command.process_group(0);
     }
     command.spawn().context("spawn debug daemon")
+}
+
+/// Write the launch-time breakpoints for `__debugd --init` (owner-only).
+pub fn write_init(
+    serial: &str,
+    pid: u32,
+    init: &super::daemon::InitialBreakpoints,
+) -> Result<std::path::PathBuf> {
+    let dir = paths::ensure_serial_dir(serial)?;
+    let path = dir.join(format!("{pid}.init.json"));
+    std::fs::write(&path, serde_json::to_vec(init)?)
+        .with_context(|| format!("write {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(path)
 }
 
 pub enum Ready {

@@ -835,8 +835,15 @@ const JDWP_DEBUG_VERBS: &[&str] = &[
     "variables",
     "eval",
     "inspect",
+    "logpoint",
+    "continue-until",
+    "auto",
+    "snapshot",
+    "run-until-crash",
+    "step-until-screen-change",
+    "step-until-log",
 ];
-const JDWP_BREAK_KINDS: &[&str] = &["line", "exception", "remove"];
+const JDWP_BREAK_KINDS: &[&str] = &["line", "exception", "update", "remove"];
 
 /// A result from the jdwp debugger backend must not send an agent to the
 /// Studio bridge: catalog follow-ups for `debug` verbs gain `--backend jdwp`
@@ -1724,7 +1731,11 @@ mod tests {
             )
         );
         // Verbs the jdwp backend does not serve would land on Studio: dropped.
-        assert_eq!(keep("shadowdroid debug snapshot"), None);
+        assert_eq!(
+            keep("shadowdroid debug snapshot").as_deref(),
+            Some("shadowdroid debug snapshot --backend jdwp")
+        );
+        assert_eq!(keep("shadowdroid debug watch list"), None);
         assert_eq!(keep("shadowdroid debug coroutines threads"), None);
         assert_eq!(keep("shadowdroid debug break method --class A"), None);
         // Explicit backends, discovery, and other commands pass through.

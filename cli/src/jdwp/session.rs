@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use tokio::sync::{mpsc, watch};
 
+use super::breakpoints::BreakpointOptions;
 use super::codec::{Location, Value};
 use super::conn::{Incoming, JdwpError};
 use super::events::{Composite, Event};
@@ -53,6 +54,9 @@ pub fn is_framework_class(class: &str) -> bool {
             .is_some_and(|prefix| class.starts_with(prefix))
     })
 }
+
+/// After this long suspended, an attach-to-running session warns about ANRs.
+const ANR_WARNING_SECS: f64 = 4.0;
 
 /// Cap on objects pinned with DisableCollection while suspended.
 pub const MAX_LIVE_HANDLES: usize = 512;
@@ -166,10 +170,12 @@ pub struct SessionInfo {
     pub attached_at: f64,
     pub vm: Json,
     pub capabilities: Json,
+    /// Started under `am set-debug-app -w`: the system runs no ANR timers.
+    pub launched_under_debugger: bool,
 }
 
 #[derive(Clone, Debug)]
-enum Owner {
+pub(super) enum Owner {
     Breakpoint(String),
     Step,
     /// Deferred line binding for one source file name.
@@ -178,18 +184,28 @@ enum Owner {
     ExceptionPrepare(String),
 }
 
+/// What a bound location re-arms with after a config change.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Arm {
+    Line(Location),
+    Exception(u64),
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct BoundLocation {
-    pub request_id: i32,
+    /// `None` while the breakpoint is disabled.
+    pub request_id: Option<i32>,
     pub class: String,
     pub method: String,
     pub code_index: u64,
     #[serde(skip)]
     pub class_id: u64,
+    #[serde(skip)]
+    pub(super) arm: Arm,
 }
 
 #[derive(Clone, Debug)]
-enum BreakpointKind {
+pub(super) enum BreakpointKind {
     Line {
         target: SourceTarget,
         line: u32,
@@ -202,31 +218,105 @@ enum BreakpointKind {
 }
 
 #[derive(Clone, Debug)]
-struct Breakpoint {
-    id: String,
-    kind: BreakpointKind,
-    locations: Vec<BoundLocation>,
-    pending_reason: Option<&'static str>,
-    hit_count: u64,
-    created_at: f64,
+pub(super) struct Breakpoint {
+    pub(super) id: String,
+    pub(super) kind: BreakpointKind,
+    pub(super) locations: Vec<BoundLocation>,
+    pub(super) pending_reason: Option<&'static str>,
+    pub(super) hit_count: u64,
+    pub(super) created_at: f64,
+    pub(super) opts: BreakpointOptions,
+    /// Parsed condition; `Err` keeps a `--force`d unparseable one.
+    pub(super) condition: Option<Result<super::expr::Expr, String>>,
+    pub(super) log_expression: Option<Result<super::expr::Expr, String>>,
+    pub(super) last_evaluation_error: Option<Json>,
+    pub(super) last_hit_at: Option<f64>,
+    pub(super) rate: super::logpoints::RateWindow,
+    pub(super) dropped: u64,
+    /// A pass-count request fired and is spent.
+    pub(super) expired: bool,
+    /// Disarmed by the rate limit until this time (epoch seconds).
+    pub(super) throttled_until: Option<f64>,
 }
 
 impl Breakpoint {
-    fn to_json(&self) -> Json {
+    pub(super) fn new(id: String, kind: BreakpointKind, opts: BreakpointOptions) -> Self {
+        let mut breakpoint = Breakpoint {
+            id,
+            kind,
+            locations: Vec::new(),
+            pending_reason: None,
+            hit_count: 0,
+            created_at: crate::events::now_ts(),
+            opts: BreakpointOptions::default(),
+            condition: None,
+            log_expression: None,
+            last_evaluation_error: None,
+            last_hit_at: None,
+            rate: Default::default(),
+            dropped: 0,
+            expired: false,
+            throttled_until: None,
+        };
+        breakpoint.set_opts(opts);
+        breakpoint
+    }
+
+    pub(super) fn set_opts(&mut self, opts: BreakpointOptions) {
+        self.condition = opts.condition.as_deref().map(super::expr::parse);
+        self.log_expression = opts.log_expression.as_deref().map(super::expr::parse);
+        self.opts = opts;
+    }
+
+    /// The `(target basename or path, line)` a line breakpoint sits on.
+    pub(super) fn line_key(&self) -> Option<(String, u32)> {
+        match &self.kind {
+            BreakpointKind::Line { target, line } => Some((target_key(target), *line)),
+            BreakpointKind::Exception { .. } => None,
+        }
+    }
+
+    pub(super) fn to_json(&self) -> Json {
+        let logpoint = self.opts.is_logpoint();
         let mut value = json!({
             "id": self.id,
-            "enabled": true,
+            "backend": "jdwp",
+            "kind": if logpoint { "logpoint" } else { "breakpoint" },
+            "enabled": self.opts.enabled,
+            "temporary": self.opts.temporary,
             "bound": !self.locations.is_empty(),
             "locations": self.locations,
             "pending_reason": self.pending_reason,
             "hit_count": self.hit_count,
-            "suspend_policy": "all",
+            "last_hit_at": self.last_hit_at,
+            "hit_count_source": if logpoint {
+                "shadowdroid_observed_log_callbacks"
+            } else {
+                "shadowdroid_observed_session_pauses"
+            },
+            "suspend_policy": self.opts.suspend.as_studio(),
+            "condition": self.opts.condition,
+            "log_expression": self.opts.log_expression,
+            "log_message": self.opts.log_message,
+            "log_stack": self.opts.log_stack,
+            "pass_count_enabled": self.opts.pass_count.is_some_and(|n| n > 0),
+            "pass_count": self.opts.pass_count.unwrap_or(0),
+            "owner": self.opts.owner,
+            "managed": self.opts.owner.is_some(),
+            "created_by_bridge": self.opts.owner.is_some(),
+            "max_message_chars": logpoint.then(|| self.opts.max_message_chars()),
+            "max_events_per_second": self.opts.needs_eval().then(|| self.opts.max_events_per_second()),
+            "last_evaluation_error": self.last_evaluation_error,
+            "throttled": self.throttled_until.is_some(),
+            "rearm_at": self.throttled_until,
+            "dropped": self.dropped,
+            "expired": self.expired,
             "created_at": self.created_at,
         });
         let extra = match &self.kind {
             BreakpointKind::Line { target, line } => json!({
                 "type": "line",
-                "file": target.path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| target.basename.clone()),
+                "file": target_key(target),
                 "source": target.basename,
                 "package": target.package,
                 "line": line,
@@ -249,6 +339,16 @@ impl Breakpoint {
     }
 }
 
+/// A line breakpoint's file identity: the local path when known, else the
+/// source file name.
+pub(super) fn target_key(target: &SourceTarget) -> String {
+    target
+        .path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| target.basename.clone())
+}
+
 #[derive(Clone, Debug)]
 pub struct Suspension {
     pub reason: &'static str,
@@ -260,10 +360,10 @@ pub struct Suspension {
 }
 
 #[derive(Default)]
-struct State {
-    breakpoints: BTreeMap<String, Breakpoint>,
+pub(super) struct State {
+    pub(super) breakpoints: BTreeMap<String, Breakpoint>,
     next_breakpoint: u32,
-    owners: HashMap<i32, Owner>,
+    pub(super) owners: HashMap<i32, Owner>,
     /// source basename → ClassPrepare request id
     line_prepares: HashMap<String, i32>,
     /// `(breakpoint id, class, method, code index)` claimed by a binder.
@@ -273,10 +373,10 @@ struct State {
     /// Throwables an uncaught-only breakpoint already stopped on: a
     /// framework catch-and-rethrow re-raises the same object.
     reported_throwables: VecDeque<u64>,
-    suspension: Option<Suspension>,
-    epoch: u64,
+    pub(super) suspension: Option<Suspension>,
+    pub(super) epoch: u64,
     pinned: BTreeSet<u64>,
-    closed: Option<String>,
+    pub(super) closed: Option<String>,
     recent_events: VecDeque<Json>,
     events_seen: u64,
 }
@@ -301,6 +401,8 @@ pub struct Session {
     changed: watch::Sender<u64>,
     last_activity: Mutex<Instant>,
     use_source_name_match: bool,
+    pub(super) logpoint_log: super::logpoints::LogpointLog,
+    initial_breakpoints: Mutex<Vec<Json>>,
 }
 
 impl Session {
@@ -319,14 +421,37 @@ impl Session {
             use_source_name_match: !crate::hostenv::env_truthy(
                 "SHADOWDROID_JDWP_NO_SOURCE_NAME_MATCH",
             ),
+            initial_breakpoints: Mutex::new(Vec::new()),
+            logpoint_log: super::logpoints::LogpointLog::new(
+                format!(
+                    "logpoints_jdwp_{}_{}",
+                    std::process::id(),
+                    (crate::events::now_ts() * 1000.0) as u64
+                ),
+                super::logpoints::DEFAULT_CAPACITY,
+            ),
         })
     }
 
-    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+    pub(super) fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().expect("session state lock")
     }
 
-    fn bump(&self) {
+    /// Results of the launch-time breakpoints (`__debugd --init`).
+    pub fn set_initial_breakpoints(&self, results: Vec<Json>) {
+        *self.initial_breakpoints.lock().expect("initial lock") = results;
+    }
+
+    pub fn initial_breakpoints(&self) -> Json {
+        Json::Array(
+            self.initial_breakpoints
+                .lock()
+                .expect("initial lock")
+                .clone(),
+        )
+    }
+
+    pub(super) fn bump(&self) {
         self.changed.send_modify(|n| *n += 1);
     }
 
@@ -360,7 +485,7 @@ impl Session {
         self.state().epoch
     }
 
-    fn ensure_open(&self) -> RpcResult<()> {
+    pub(super) fn ensure_open(&self) -> RpcResult<()> {
         match self.closed_reason() {
             Some(reason) => Err(RpcError::new(
                 "debuggee_exited",
@@ -553,9 +678,22 @@ impl Session {
             Some(object) if object != 0 => self.pin(object).await,
             _ => None,
         };
+        // An attach-to-running process still has ANR timers: a stop with
+        // pending input shows "Application Not Responding" after ~5 s.
+        let anr_warning = suspension.as_ref().and_then(|s| {
+            let held = crate::events::now_ts() - s.at;
+            (!self.info.launched_under_debugger && held > ANR_WARNING_SECS).then(|| {
+                format!(
+                    "suspended for {held:.0} s in a process attached while running: Android shows an ANR dialog for pending input; use `debug attach --wait-for-launch` for long inspection"
+                )
+            })
+        });
         let state = self.state();
         json!({
             "id": self.info.session_id,
+            "epoch": state.epoch,
+            "launched_under_debugger": self.info.launched_under_debugger,
+            "warning": anr_warning,
             "index": 0,
             "name": self.info.package.clone().unwrap_or_else(|| format!("pid {}", self.info.pid)),
             "backend": "jdwp",
@@ -601,7 +739,7 @@ impl Session {
         )
     }
 
-    fn allocate_breakpoint_id(&self) -> String {
+    pub(super) fn allocate_breakpoint_id(&self) -> String {
         let mut state = self.state();
         state.next_breakpoint += 1;
         format!("bp_{}", state.next_breakpoint)
@@ -610,7 +748,12 @@ impl Session {
     /// Set a line breakpoint. Binds every loaded location now and keeps a
     /// ClassPrepare request armed so classes loaded later (lambdas, lazily
     /// loaded activities) bind on prepare.
-    pub async fn break_line(&self, target: SourceTarget, line: u32) -> RpcResult<Json> {
+    pub async fn break_line(
+        &self,
+        target: SourceTarget,
+        line: u32,
+        opts: BreakpointOptions,
+    ) -> RpcResult<Json> {
         self.ensure_open()?;
         if target.inline_body {
             return Err(RpcError::new(
@@ -628,17 +771,14 @@ impl Session {
         // through ClassPrepare instead of falling between the two paths.
         self.state().breakpoints.insert(
             id.clone(),
-            Breakpoint {
-                id: id.clone(),
-                kind: BreakpointKind::Line {
+            Breakpoint::new(
+                id.clone(),
+                BreakpointKind::Line {
                     target: target.clone(),
                     line,
                 },
-                locations: Vec::new(),
-                pending_reason: None,
-                hit_count: 0,
-                created_at: crate::events::now_ts(),
-            },
+                opts,
+            ),
         );
         let deferred = self.ensure_line_prepare(&target).await;
         let scanned = self.scan_loaded_classes(&id, &target, line).await;
@@ -755,39 +895,46 @@ impl Session {
             if !self.state().claims.insert(claim.clone()) {
                 continue;
             }
-            let request_id = match self
-                .jdwp
-                .set_event(
-                    event_kind::BREAKPOINT,
-                    suspend_policy::ALL,
-                    &[Modifier::LocationOnly(location)],
-                )
-                .await
-            {
+            let Some((kind, opts)) = self
+                .state()
+                .breakpoints
+                .get(id)
+                .map(|b| (b.kind.clone(), b.opts.clone()))
+            else {
+                self.state().claims.remove(&claim);
+                continue;
+            };
+            let armed = if opts.enabled {
+                self.arm(id, &kind, Arm::Line(location), &opts)
+                    .await
+                    .map(Some)
+            } else {
+                Ok(None)
+            };
+            let request_id = match armed {
                 Ok(request_id) => request_id,
                 Err(error) => {
                     self.state().claims.remove(&claim);
-                    return Err(error.into());
+                    return Err(error);
                 }
             };
             let removed_meanwhile = {
                 let mut state = self.state();
                 if state.breakpoints.contains_key(id) {
-                    state
-                        .owners
-                        .insert(request_id, Owner::Breakpoint(id.to_string()));
                     false
                 } else {
                     state.claims.remove(&claim);
+                    if let Some(request) = request_id {
+                        state.owners.remove(&request);
+                    }
                     true
                 }
             };
             if removed_meanwhile {
                 // Removed while this request was in flight.
-                let _ = self
-                    .jdwp
-                    .clear_event(event_kind::BREAKPOINT, request_id)
-                    .await;
+                if let Some(request) = request_id {
+                    let _ = self.jdwp.clear_event(event_kind::BREAKPOINT, request).await;
+                }
                 continue;
             }
             bound.push(BoundLocation {
@@ -796,6 +943,7 @@ impl Session {
                 method: method.name.clone(),
                 code_index: index,
                 class_id,
+                arm: Arm::Line(location),
             });
         }
         Ok(bound)
@@ -853,28 +1001,32 @@ impl Session {
         class: &str,
         caught: bool,
         uncaught: bool,
+        opts: BreakpointOptions,
     ) -> RpcResult<Json> {
         self.ensure_open()?;
+        opts.validate()?;
         let id = self.allocate_breakpoint_id();
-        let mut breakpoint = Breakpoint {
-            id: id.clone(),
-            kind: BreakpointKind::Exception {
-                class: class.to_string(),
-                caught,
-                uncaught,
-            },
-            locations: Vec::new(),
-            pending_reason: None,
-            hit_count: 0,
-            created_at: crate::events::now_ts(),
+        let kind = BreakpointKind::Exception {
+            class: class.to_string(),
+            caught,
+            uncaught,
         };
+        self.state()
+            .breakpoints
+            .insert(id.clone(), Breakpoint::new(id.clone(), kind, opts));
         let signature = format!("L{};", class.replace('.', "/"));
-        let loaded = self.jdwp.classes_by_signature(&signature).await?;
+        let loaded = match self.jdwp.classes_by_signature(&signature).await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                self.state().breakpoints.remove(&id);
+                return Err(error.into());
+            }
+        };
         if let Some(class_info) = loaded.first() {
-            let location = self
-                .set_exception_request(&id, class_info.type_id, caught, uncaught)
-                .await?;
-            breakpoint.locations.push(location);
+            let location = self.set_exception_request(&id, class_info.type_id).await?;
+            if let Some(breakpoint) = self.state().breakpoints.get_mut(&id) {
+                breakpoint.locations.push(location);
+            }
         } else {
             let request_id = self
                 .jdwp
@@ -884,44 +1036,35 @@ impl Session {
                     &[Modifier::ClassMatch(class.to_string())],
                 )
                 .await?;
-            self.state()
+            let mut state = self.state();
+            state
                 .owners
                 .insert(request_id, Owner::ExceptionPrepare(id.clone()));
-            breakpoint.pending_reason = Some("class_not_loaded");
+            if let Some(breakpoint) = state.breakpoints.get_mut(&id) {
+                breakpoint.pending_reason = Some("class_not_loaded");
+            }
         }
-        let value = breakpoint.to_json();
-        self.state().breakpoints.insert(id, breakpoint);
         self.touch();
-        Ok(value)
+        Ok(self
+            .state()
+            .breakpoints
+            .get(&id)
+            .map(Breakpoint::to_json)
+            .unwrap_or(Json::Null))
     }
 
-    async fn set_exception_request(
-        &self,
-        id: &str,
-        type_id: u64,
-        caught: bool,
-        uncaught: bool,
-    ) -> RpcResult<BoundLocation> {
-        // On Android a crash is never "uncaught" to JDWP: Looper.loopOnce and
-        // Compose's pointer dispatch catch and rethrow, so ART reports a catch
-        // location and an uncaught-only request never fires (spike Q11).
-        // Ask for caught events too and keep, daemon-side, the ones no app
-        // frame catches (see `caught_by_app`).
-        let request_id = self
-            .jdwp
-            .set_event(
-                event_kind::EXCEPTION,
-                suspend_policy::ALL,
-                &[Modifier::ExceptionOnly {
-                    exception: type_id,
-                    caught: caught || uncaught,
-                    uncaught,
-                }],
-            )
-            .await?;
-        self.state()
-            .owners
-            .insert(request_id, Owner::Breakpoint(id.to_string()));
+    async fn set_exception_request(&self, id: &str, type_id: u64) -> RpcResult<BoundLocation> {
+        let (kind, opts) = self
+            .state()
+            .breakpoints
+            .get(id)
+            .map(|b| (b.kind.clone(), b.opts.clone()))
+            .ok_or_else(|| RpcError::new("breakpoint_not_found", format!("no breakpoint {id}")))?;
+        let request_id = if opts.enabled {
+            Some(self.arm(id, &kind, Arm::Exception(type_id), &opts).await?)
+        } else {
+            None
+        };
         let class = self
             .signature(type_id)
             .await
@@ -933,6 +1076,7 @@ impl Session {
             method: String::new(),
             code_index: 0,
             class_id: type_id,
+            arm: Arm::Exception(type_id),
         })
     }
 
@@ -953,9 +1097,9 @@ impl Session {
             BreakpointKind::Line { .. } => event_kind::BREAKPOINT,
             BreakpointKind::Exception { .. } => event_kind::EXCEPTION,
         };
-        for location in &breakpoint.locations {
-            let _ = self.jdwp.clear_event(kind, location.request_id).await;
-            self.state().owners.remove(&location.request_id);
+        for request in breakpoint.locations.iter().filter_map(|l| l.request_id) {
+            let _ = self.jdwp.clear_event(kind, request).await;
+            self.state().owners.remove(&request);
         }
         // Exception breakpoints still waiting for their class.
         let pending: Vec<i32> = self
@@ -1109,7 +1253,7 @@ impl Session {
     }
 
     /// Wait until a suspension newer than `after_epoch` exists.
-    async fn wait_for_stop(
+    pub(super) async fn wait_for_stop(
         &self,
         changes: &mut watch::Receiver<u64>,
         after_epoch: u64,
@@ -1321,8 +1465,8 @@ impl Session {
                 },
                 Some(Owner::Breakpoint(id)),
             ) => {
-                self.record_stop("breakpoint", Some(*thread), Some(*location), Some(id), None);
-                Ok(true)
+                self.on_hit(&id, event.request_id(), *thread, *location, None)
+                    .await
             }
             (
                 Event::Exception {
@@ -1357,14 +1501,14 @@ impl Session {
                         state.reported_throwables.push_back(object);
                     }
                 }
-                self.record_stop(
-                    "exception",
-                    Some(*thread),
-                    Some(*location),
-                    Some(id),
+                self.on_hit(
+                    &id,
+                    event.request_id(),
+                    *thread,
+                    *location,
                     Some(*exception),
-                );
-                Ok(true)
+                )
+                .await
             }
             (
                 Event::SingleStep {
@@ -1390,13 +1534,8 @@ impl Session {
             }
             (Event::ClassPrepare { type_id, .. }, Some(Owner::ExceptionPrepare(id))) => {
                 let class = self.state().breakpoints.get(&id).map(|b| b.kind.clone());
-                if let Some(BreakpointKind::Exception {
-                    caught, uncaught, ..
-                }) = class
-                {
-                    let location = self
-                        .set_exception_request(&id, *type_id, caught, uncaught)
-                        .await?;
+                if let Some(BreakpointKind::Exception { .. }) = class {
+                    let location = self.set_exception_request(&id, *type_id).await?;
                     {
                         let mut state = self.state();
                         if let Some(breakpoint) = state.breakpoints.get_mut(&id) {
@@ -1445,7 +1584,7 @@ impl Session {
         }
     }
 
-    fn record_stop(
+    pub(super) fn record_stop(
         &self,
         reason: &'static str,
         thread: Option<u64>,
@@ -1454,11 +1593,6 @@ impl Session {
         exception: Option<Value>,
     ) {
         let mut state = self.state();
-        if let Some(id) = &breakpoint_id
-            && let Some(breakpoint) = state.breakpoints.get_mut(id)
-        {
-            breakpoint.hit_count += 1;
-        }
         state.epoch += 1;
         state.suspension = Some(Suspension {
             reason,
@@ -1551,6 +1685,13 @@ impl Session {
             .collect();
         for object in pinned {
             let _ = self.jdwp.enable_collection(object).await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn backdate_suspension(&self, seconds: f64) {
+        if let Some(suspension) = self.state().suspension.as_mut() {
+            suspension.at -= seconds;
         }
     }
 

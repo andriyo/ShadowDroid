@@ -318,6 +318,12 @@ fn strip_comment_and_strings(line: &str) -> String {
     out
 }
 
+/// A local's name without the `\N…` suffix Kotlin adds to slots of
+/// inlined code (`it\1` → `it`, `$composer\6` → `$composer`).
+pub fn display_local_name(name: &str) -> &str {
+    name.split('\\').next().unwrap_or(name)
+}
+
 /// Kotlin compiler bookkeeping locals that are never user state:
 /// inline-function markers (`$i$f$…`, `$i$a$…`).
 pub fn is_hidden_local(name: &str) -> bool {
@@ -454,6 +460,13 @@ fun after() {
             locate(Path::new("README.md"), 1, Some(dir.path())),
             Err(LocateError::NotASourceFile(_))
         ));
+    }
+
+    #[test]
+    fn inlined_slot_suffixes_are_stripped_for_display() {
+        assert_eq!(display_local_name("it\\1"), "it");
+        assert_eq!(display_local_name("$composer\\6"), "$composer");
+        assert_eq!(display_local_name("plain"), "plain");
     }
 
     #[test]

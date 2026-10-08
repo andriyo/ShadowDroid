@@ -44,6 +44,76 @@ pub struct DebugdArgs {
     /// Exit after this long with no breakpoints, nothing suspended, and no requests.
     #[arg(long, default_value_t = DEFAULT_IDLE_TIMEOUT_MS)]
     pub idle_timeout_ms: u64,
+    /// JSON file of breakpoints to set right after the handshake, before the
+    /// daemon reports ready (launch-time debugging).
+    #[arg(long)]
+    pub init: Option<std::path::PathBuf>,
+    /// The process was started under `am set-debug-app -w` (no ANR timers).
+    #[arg(long)]
+    pub launched_under_debugger: bool,
+}
+
+/// Breakpoints a launch-time attach installs before anything else runs.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct InitialBreakpoints {
+    pub lines: Vec<InitialLine>,
+    pub exceptions: Vec<InitialException>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct InitialLine {
+    pub target: super::resolve::SourceTarget,
+    pub line: u32,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct InitialException {
+    pub class: String,
+    #[serde(default = "yes")]
+    pub caught: bool,
+    #[serde(default = "yes")]
+    pub uncaught: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// Set the initial breakpoints; each result (breakpoint or error) is kept for
+/// `status` so the attach reply can show what bound.
+async fn install_initial(session: &Session, init: &InitialBreakpoints) -> Vec<Json> {
+    use super::breakpoints::BreakpointOptions;
+    let mut results = Vec::new();
+    for line in &init.lines {
+        let outcome = session
+            .break_line_with(line.target.clone(), line.line, BreakpointOptions::default())
+            .await;
+        results.push(match outcome {
+            Ok(value) => value["breakpoint"].clone(),
+            Err(error) => json!({
+                "ok": false,
+                "file": line.target.basename,
+                "line": line.line,
+                "error": error,
+            }),
+        });
+    }
+    for exception in &init.exceptions {
+        let outcome = session
+            .break_exception(
+                &exception.class,
+                exception.caught,
+                exception.uncaught,
+                BreakpointOptions::default(),
+            )
+            .await;
+        results.push(match outcome {
+            Ok(value) => value,
+            Err(error) => json!({"ok": false, "exception": exception.class, "error": error}),
+        });
+    }
+    results
 }
 
 /// A structured startup failure the parent turns into the attach error.
@@ -194,9 +264,36 @@ async fn start(args: &DebugdArgs) -> RpcResult<()> {
             },
         }),
         capabilities: Json::Object(capability_map),
+        launched_under_debugger: args.launched_under_debugger,
     };
     let session = Session::new(jdwp, info);
     let events = tokio::spawn(session.clone().run_events(incoming));
+    if let Some(path) = &args.init {
+        let init: InitialBreakpoints = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .ok_or_else(|| {
+                RpcError::new(
+                    "invalid_request",
+                    format!("unreadable initial breakpoints {}", path.display()),
+                )
+            })?;
+        // `Debug.waitForDebugger` releases the app ~1.3 s after the last
+        // debugger command; keep it parked until every request is set.
+        let pinger = {
+            let jdwp = session.jdwp.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let _ = jdwp.version().await;
+                }
+            })
+        };
+        let installed = install_initial(&session, &init).await;
+        pinger.abort();
+        session.set_initial_breakpoints(installed);
+        let _ = std::fs::remove_file(path);
+    }
 
     let socket = paths::socket_path(&args.serial, args.pid)
         .map_err(|error| RpcError::new("daemon_unreachable", format!("{error:#}")))?;
@@ -287,6 +384,7 @@ async fn serve(
                 }
             }
             _ = tick.tick() => {
+                session.rearm_due().await;
                 if let Some(reason) = session.closed_reason() {
                     tracing::info!("debugd exiting: {reason}");
                     break;
@@ -299,6 +397,10 @@ async fn serve(
             _ = tokio::signal::ctrl_c() => break,
             _ = terminate.recv() => break,
         }
+    }
+    if session.closed_reason().is_some() {
+        // Let in-flight long-polls (`wait_stop`) report the exit.
+        tokio::time::sleep(Duration::from_millis(300)).await;
     }
     Ok(())
 }
@@ -378,6 +480,16 @@ async fn serve_client(
     Ok(())
 }
 
+fn target_param(params: &Json) -> RpcResult<super::resolve::SourceTarget> {
+    serde_json::from_value(params.get("target").cloned().unwrap_or(Json::Null))
+        .map_err(|error| RpcError::new("invalid_request", format!("target: {error}")))
+}
+
+fn options_param(params: &Json) -> RpcResult<super::breakpoints::BreakpointOptions> {
+    serde_json::from_value(params.get("options").cloned().unwrap_or(json!({})))
+        .map_err(|error| RpcError::new("invalid_request", format!("options: {error}")))
+}
+
 fn str_param<'a>(params: &'a Json, name: &str) -> Option<&'a str> {
     params.get(name).and_then(Json::as_str)
 }
@@ -406,6 +518,7 @@ pub async fn dispatch(session: &Arc<Session>, method: &str, params: &Json) -> Rp
             "daemon_pid": std::process::id(),
             "session": session.status().await,
             "details": session.details(),
+            "initial_breakpoints": session.initial_breakpoints(),
         })),
         "detach" => {
             session.release_handles().await;
@@ -413,11 +526,11 @@ pub async fn dispatch(session: &Arc<Session>, method: &str, params: &Json) -> Rp
             Ok(json!({"detached": true, "session_id": session.info.session_id}))
         }
         "break_line" => {
-            let target: super::resolve::SourceTarget =
-                serde_json::from_value(params.get("target").cloned().unwrap_or(Json::Null))
-                    .map_err(|error| RpcError::new("invalid_request", error.to_string()))?;
+            let target = target_param(params)?;
             let line = u64_param(params, "line", 0) as u32;
-            Ok(json!({"breakpoint": session.break_line(target, line).await?}))
+            session
+                .break_line_with(target, line, options_param(params)?)
+                .await
         }
         "break_exception" => {
             let class = str_param(params, "class")
@@ -427,7 +540,70 @@ pub async fn dispatch(session: &Arc<Session>, method: &str, params: &Json) -> Rp
                 .get("uncaught")
                 .and_then(Json::as_bool)
                 .unwrap_or(true);
-            Ok(json!({"breakpoint": session.break_exception(class, caught, uncaught).await?}))
+            let breakpoint = session
+                .break_exception(class, caught, uncaught, options_param(params)?)
+                .await?;
+            Ok(json!({"breakpoint": breakpoint, "created": true}))
+        }
+        "break_update" => {
+            let id = str_param(params, "id")
+                .ok_or_else(|| RpcError::new("invalid_request", "missing id"))?;
+            let update: super::breakpoints::BreakpointUpdate =
+                serde_json::from_value(params.get("update").cloned().unwrap_or(json!({})))
+                    .map_err(|error| RpcError::new("invalid_request", error.to_string()))?;
+            Ok(json!({"breakpoint": session.update_breakpoint(id, update).await?}))
+        }
+        "logpoint_add" => {
+            let target = target_param(params)?;
+            let line = u64_param(params, "line", 0) as u32;
+            session
+                .logpoint_add(target, line, options_param(params)?)
+                .await
+        }
+        "logpoints" => Ok(session.logpoints(str_param(params, "id"), str_param(params, "owner"))),
+        "logpoint_events" => {
+            let filter = super::logpoints::Filter {
+                breakpoint_id: str_param(params, "id").map(str::to_string),
+                owner: str_param(params, "owner").map(str::to_string),
+                session: str_param(params, "session")
+                    .filter(|s| *s != session.info.session_id)
+                    .map(str::to_string),
+            };
+            let after = params.get("after").and_then(Json::as_u64);
+            let limit = u64_param(params, "limit", 100) as usize;
+            let timeout = Duration::from_millis(u64_param(params, "timeout_ms", 0));
+            Ok(session
+                .logpoint_events(after, limit, &filter, timeout)
+                .await)
+        }
+        "logpoint_remove" => {
+            let id = str_param(params, "id")
+                .ok_or_else(|| RpcError::new("invalid_request", "missing id"))?;
+            let owner = str_param(params, "owner").unwrap_or("shadowdroid");
+            session.logpoint_remove(id, owner).await
+        }
+        "logpoint_clear" => {
+            let owner = str_param(params, "owner").unwrap_or("shadowdroid");
+            session.logpoint_clear(owner).await
+        }
+        "continue_until" => {
+            let target = target_param(params)?;
+            let line = u64_param(params, "line", 0) as u32;
+            let timeout = Duration::from_millis(u64_param(params, "timeout_ms", 10_000));
+            session
+                .continue_until(
+                    target,
+                    line,
+                    str_param(params, "condition").map(str::to_string),
+                    timeout,
+                )
+                .await
+        }
+        "wait_stop" => {
+            let timeout = Duration::from_millis(u64_param(params, "timeout_ms", 1_000).min(30_000));
+            Ok(session
+                .wait_stop(params.get("after_epoch").and_then(Json::as_u64), timeout)
+                .await)
         }
         "break_remove" => {
             let id = str_param(params, "id")

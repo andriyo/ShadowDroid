@@ -107,6 +107,15 @@ pub struct AutoArgs {
     /// Do not attach Android Studio's debugger; only resolve, launch, and snapshot.
     #[arg(long)]
     pub no_attach: bool,
+    /// Start the app under the debugger so breakpoints catch startup code (jdwp backend).
+    #[arg(long, conflicts_with = "no_start")]
+    pub from_start: bool,
+    /// Line breakpoint set at attach, as FILE:LINE (repeatable; jdwp backend).
+    #[arg(long = "break", value_name = "FILE:LINE")]
+    pub break_at: Vec<String>,
+    /// Exception breakpoint set at attach (repeatable; jdwp backend).
+    #[arg(long, value_name = "CLASS")]
+    pub break_exception: Vec<String>,
     /// App foreground wait timeout after launch.
     #[arg(long, default_value_t = 20000)]
     pub timeout_ms: u32,
@@ -310,6 +319,11 @@ impl DebugArgs {
     pub fn uses_jdwp(&self) -> bool {
         self.backend == Some(debugger::DebugBackend::Jdwp)
     }
+
+    /// A composed workflow the jdwp backend does not serve yet.
+    pub fn jdwp_unsupported_workflow(&self) -> bool {
+        self.uses_jdwp() && matches!(self.cmd, DebugCmd::Record(_) | DebugCmd::Native(_))
+    }
 }
 
 pub async fn run_host_only(args: &DebugArgs, device: Option<&str>) -> Result<()> {
@@ -321,27 +335,106 @@ pub async fn run_host_only(args: &DebugArgs, device: Option<&str>) -> Result<()>
     }
 }
 
-pub async fn run(serial: &Serial, client: &ServerClient, args: DebugArgs) -> Result<()> {
+pub async fn run(
+    serial: &Serial,
+    client: &ServerClient,
+    args: DebugArgs,
+    project_root: Option<&Path>,
+) -> Result<()> {
     let studio_url = args.studio_url;
+    let jdwp = args.backend == Some(debugger::DebugBackend::Jdwp);
+    let dbg = if jdwp {
+        Dbg::Jdwp
+    } else {
+        Dbg::Studio(studio_url.as_deref())
+    };
     match args.cmd {
-        DebugCmd::Auto(args) => debug_auto(serial, client, args, studio_url.as_deref()).await,
-        DebugCmd::Snapshot(args) => snapshot_cmd(serial, client, args, studio_url.as_deref()).await,
+        DebugCmd::Auto(args) if jdwp => debug_auto_jdwp(serial, client, args, project_root).await,
+        DebugCmd::Auto(args) => {
+            if args.from_start || !args.break_at.is_empty() || !args.break_exception.is_empty() {
+                return Err(debugger::studio_unsupported(
+                    "--from-start, --break, and --break-exception",
+                ));
+            }
+            debug_auto(serial, client, args, studio_url.as_deref()).await
+        }
+        DebugCmd::Snapshot(args) => snapshot_cmd(serial, client, args, dbg).await,
+        DebugCmd::Record(_) | DebugCmd::Native(_) if jdwp => Err(jdwp_unsupported(
+            "this `debug` workflow is not available on the jdwp backend yet",
+        )),
         DebugCmd::Record(args) => record_cmd(serial, client, args, studio_url.as_deref()).await,
         DebugCmd::Replay(args) => replay_cmd(serial, client, args).await,
         DebugCmd::Studio(cmd) => {
             debugger::run(&cmd, Some(serial.as_str()), studio_url.as_deref()).await
         }
         DebugCmd::StepUntilScreenChange(args) => {
-            step_until_screen_change(serial, client, args, studio_url.as_deref()).await
+            step_until_screen_change(serial, client, args, dbg).await
         }
-        DebugCmd::StepUntilLog(args) => {
-            step_until_log(serial, client, args, studio_url.as_deref()).await
-        }
+        DebugCmd::StepUntilLog(args) => step_until_log(serial, client, args, dbg).await,
+        DebugCmd::RunUntilCrash(args) if jdwp => run_until_crash_jdwp(serial, client, args).await,
         DebugCmd::RunUntilCrash(args) => {
             run_until_crash(serial, client, args, studio_url.as_deref()).await
         }
         DebugCmd::Native(cmd) => native_cmd(serial, client, cmd, studio_url.as_deref()).await,
         DebugCmd::Tombstones(cmd) => tombstones_cmd(serial, cmd).await,
+    }
+}
+
+/// Which debugger serves the composed workflows' debugger sections.
+#[derive(Clone, Copy)]
+enum Dbg<'a> {
+    Studio(Option<&'a str>),
+    Jdwp,
+}
+
+fn jdwp_unsupported(message: &str) -> anyhow::Error {
+    crate::diagnostic::DiagnosticError::new("unsupported_by_backend", "debugger", message)
+        .detail(json!({"backend": "jdwp"}))
+        .next_actions(["re-run with --backend studio"])
+        .into()
+}
+
+/// Step-over primitive for the step-until helpers.
+enum Stepper {
+    Studio(BridgeClient, Option<String>),
+    Jdwp(crate::jdwp::commands::RegistryEntry),
+}
+
+impl Stepper {
+    fn new(serial: &Serial, dbg: Dbg<'_>, session: Option<String>) -> Result<Self> {
+        Ok(match dbg {
+            Dbg::Studio(url) => Stepper::Studio(BridgeClient::new(url)?, session),
+            Dbg::Jdwp => Stepper::Jdwp(crate::jdwp::commands::session_for(
+                serial.as_str(),
+                session.as_deref(),
+            )?),
+        })
+    }
+
+    async fn step_over(&self) -> Result<()> {
+        match self {
+            Stepper::Studio(bridge, session) => {
+                studio_control(bridge, session_action::STEP_OVER, session.as_deref()).await?;
+            }
+            Stepper::Jdwp(entry) => {
+                crate::jdwp::commands::call(
+                    entry,
+                    "step",
+                    json!({"depth": "over"}),
+                    Duration::from_secs(30),
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The debugger section of a snapshot from either backend.
+async fn debugger_section(serial: &Serial, dbg: Dbg<'_>, depth: u32) -> Value {
+    match dbg {
+        Dbg::Studio(url) => debugger_snapshot(Some(serial.as_str()), url, depth).await,
+        Dbg::Jdwp => crate::jdwp::commands::debugger_snapshot(serial.as_str(), depth).await,
     }
 }
 
@@ -450,7 +543,7 @@ async fn debug_auto(
             logs: args.logs,
             depth: args.depth,
         },
-        studio_url,
+        Dbg::Studio(studio_url),
     )
     .await?;
     let sample_valid = snapshot
@@ -609,9 +702,9 @@ async fn snapshot_cmd(
     serial: &Serial,
     client: &ServerClient,
     args: SnapshotArgs,
-    studio_url: Option<&str>,
+    dbg: Dbg<'_>,
 ) -> Result<()> {
-    let value = snapshot_value(serial, client, &args, studio_url).await?;
+    let value = snapshot_value(serial, client, &args, dbg).await?;
     if let Some(path) = args.out {
         crate::cmd::artifact::write_json_and_emit("debug_snapshot", &path, &value)?;
     } else {
@@ -624,13 +717,13 @@ async fn snapshot_value(
     serial: &Serial,
     client: &ServerClient,
     args: &SnapshotArgs,
-    studio_url: Option<&str>,
+    dbg: Dbg<'_>,
 ) -> Result<Value> {
     let state = client.state().await.context("reading server state")?;
     // A paused debuggee cannot answer UiAutomation: reading its tree blocks
     // until the server gives up (~20 s) and then looks like an empty screen.
     // Ask the debugger first and skip the tree while a session is suspended.
-    let debugger = debugger_snapshot(Some(serial.as_str()), studio_url, args.depth).await;
+    let debugger = debugger_section(serial, dbg, args.depth).await;
     let suspended = debugger_suspended_on(&debugger, serial.as_str());
     let screen = if suspended {
         None
@@ -1470,10 +1563,9 @@ async fn step_until_screen_change(
     serial: &Serial,
     client: &ServerClient,
     args: StudioWaitArgs,
-    studio_url: Option<&str>,
+    dbg: Dbg<'_>,
 ) -> Result<()> {
-    let bridge = BridgeClient::new(studio_url)?;
-    let session_s = args.session.clone();
+    let stepper = Stepper::new(serial, dbg, args.session.clone())?;
     let initial = client.screen().await.context("reading initial screen")?;
     let initial_hash = initial.screen_hash.clone();
     let initial_hash_version = initial.screen_hash_version;
@@ -1482,8 +1574,7 @@ async fn step_until_screen_change(
 
     loop {
         if Instant::now() >= deadline {
-            let snapshot =
-                final_snapshot(serial, client, &args.app, studio_url, args.depth, 120).await?;
+            let snapshot = final_snapshot(serial, client, &args.app, dbg, args.depth, 120).await?;
             return Err(crate::diagnostic::DiagnosticError::new(
                 "debug_wait_timeout",
                 "debugger",
@@ -1504,13 +1595,12 @@ async fn step_until_screen_change(
             .into());
         }
 
-        studio_control(&bridge, session_action::STEP_OVER, session_s.as_deref()).await?;
+        stepper.step_over().await?;
         steps += 1;
         tokio::time::sleep(Duration::from_millis(args.poll_ms.max(25))).await;
         let screen = client.screen().await.context("reading screen after step")?;
         if screen.screen_hash != initial_hash {
-            let snapshot =
-                final_snapshot(serial, client, &args.app, studio_url, args.depth, 120).await?;
+            let snapshot = final_snapshot(serial, client, &args.app, dbg, args.depth, 120).await?;
             emit_json(&json!({
                 "type": "step_until_screen_change",
                 "ok": true,
@@ -1530,10 +1620,9 @@ async fn step_until_log(
     serial: &Serial,
     client: &ServerClient,
     args: StepUntilLogArgs,
-    studio_url: Option<&str>,
+    dbg: Dbg<'_>,
 ) -> Result<()> {
-    let bridge = BridgeClient::new(studio_url)?;
-    let session_s = args.wait.session.clone();
+    let stepper = Stepper::new(serial, dbg, args.wait.session.clone())?;
     let (log_tx, mut log_rx) = mpsc::channel(256);
     spawn_logcat(serial.clone(), log_tx);
     let deadline = Instant::now() + Duration::from_millis(args.wait.timeout_ms);
@@ -1541,15 +1630,8 @@ async fn step_until_log(
 
     loop {
         if Instant::now() >= deadline {
-            let snapshot = final_snapshot(
-                serial,
-                client,
-                &args.wait.app,
-                studio_url,
-                args.wait.depth,
-                120,
-            )
-            .await?;
+            let snapshot =
+                final_snapshot(serial, client, &args.wait.app, dbg, args.wait.depth, 120).await?;
             return Err(crate::diagnostic::DiagnosticError::new(
                 "debug_wait_timeout",
                 "debugger",
@@ -1572,7 +1654,7 @@ async fn step_until_log(
             .into());
         }
 
-        studio_control(&bridge, session_action::STEP_OVER, session_s.as_deref()).await?;
+        stepper.step_over().await?;
         steps += 1;
         let step_deadline = Instant::now() + Duration::from_millis(args.wait.poll_ms.max(25));
         while Instant::now() < step_deadline {
@@ -1587,7 +1669,7 @@ async fn step_until_log(
                             serial,
                             client,
                             &args.wait.app,
-                            studio_url,
+                            dbg,
                             args.wait.depth,
                             120,
                         )
@@ -1647,7 +1729,12 @@ async fn run_until_crash(
         if Instant::now() >= deadline {
             let elapsed_ms = duration_millis(started.elapsed())?;
             let (snapshot, snapshot_error) = final_snapshot_best_effort(
-                serial, client, &args.app, studio_url, args.depth, args.logs,
+                serial,
+                client,
+                &args.app,
+                Dbg::Studio(studio_url),
+                args.depth,
+                args.logs,
             )
             .await;
             let result = json!({
@@ -1690,7 +1777,12 @@ async fn run_until_crash(
             Ok(Some(crash)) => {
                 let elapsed_ms = duration_millis(started.elapsed())?;
                 let (snapshot, snapshot_error) = final_snapshot_best_effort(
-                    serial, client, &args.app, studio_url, args.depth, args.logs,
+                    serial,
+                    client,
+                    &args.app,
+                    Dbg::Studio(studio_url),
+                    args.depth,
+                    args.logs,
                 )
                 .await;
                 let correlation = crash_correlation(&crash, &snapshot);
@@ -1743,15 +1835,595 @@ async fn run_until_crash(
     }
 }
 
+/// `debug auto --backend jdwp [--from-start]`: resolve and launch the app as
+/// the Studio path does, attach the standalone debugger (with `--break`
+/// breakpoints installed before startup code runs under `--from-start`),
+/// and return the same `debug_auto` snapshot shape.
+async fn debug_auto_jdwp(
+    serial: &Serial,
+    client: &ServerClient,
+    args: AutoArgs,
+    project_root: Option<&Path>,
+) -> Result<()> {
+    use crate::jdwp::commands as jdwp;
+    let config = ShadowDroidConfig::load()?;
+    let requested = args
+        .package
+        .as_deref()
+        .or(args.app.as_deref())
+        .or(args.target.as_deref());
+    let (resolved, app_label) = resolve_auto_app(serial, client, &config, requested).await?;
+    let package = resolved.package.clone();
+    let mut steps = Vec::new();
+    let mut ok = package.is_some();
+    steps.push(json!({
+        "step": "resolve_app",
+        "ok": package.is_some(),
+        "requested": requested,
+        "resolved": resolved,
+        "label": app_label,
+    }));
+    let project_root = project_root
+        .map(Path::to_path_buf)
+        .or_else(|| config.project.as_deref().map(PathBuf::from));
+    let init = jdwp::initial_breakpoints_from(
+        &args.break_at,
+        &args.break_exception,
+        project_root.as_deref(),
+    )?;
+
+    let attach = match &package {
+        None => json!({
+            "ok": false,
+            "skipped": true,
+            "reason": "no package resolved",
+            "next_command": "shadowdroid debug auto --backend jdwp --app <app alias or package>",
+        }),
+        Some(package) if args.from_start => {
+            let request = jdwp::AttachRequest {
+                serial: serial.as_str(),
+                package: Some(package),
+                pid: None,
+                init,
+                wait_for_launch: true,
+                launch_timeout: Duration::from_millis(u64::from(args.timeout_ms)),
+            };
+            let attached = jdwp::attach_with(request, |package| async move {
+                let started = client.app_start(&package, None).await?;
+                Ok(json!({
+                    "ok": started.ok,
+                    "activity": started.activity,
+                    "warning": started.warning,
+                }))
+            })
+            .await;
+            let value = jdwp_attach_value(attached);
+            ok &= value["ok"] == true;
+            if value["ok"] == true {
+                let wait = wait_front_or_stop(serial, client, package, args.timeout_ms).await;
+                ok &= wait["ok"] == true;
+                steps.push(wait);
+            }
+            value
+        }
+        Some(package) => {
+            if args.no_start {
+                steps.push(json!({
+                    "step": "app_start",
+                    "skipped": true,
+                    "reason": "--no-start",
+                    "package": package,
+                }));
+            } else {
+                let started = client.app_start(package, None).await;
+                ok &= started.is_ok();
+                steps.push(json!({
+                    "step": "app_start",
+                    "ok": started.is_ok(),
+                    "package": package,
+                    "error": started.err().map(|e| e.to_string()),
+                }));
+                let wait = wait_front_or_stop(serial, client, package, args.timeout_ms).await;
+                ok &= wait["ok"] == true;
+                steps.push(wait);
+            }
+            if args.no_attach {
+                json!({"skipped": true, "reason": "--no-attach"})
+            } else {
+                let request = jdwp::AttachRequest {
+                    serial: serial.as_str(),
+                    package: Some(package),
+                    pid: None,
+                    init,
+                    wait_for_launch: false,
+                    launch_timeout: Duration::from_millis(u64::from(args.timeout_ms)),
+                };
+                let attached = jdwp::attach_with(request, |_| async { Ok(json!({})) }).await;
+                let value = jdwp_attach_value(attached);
+                ok &= value["ok"] == true;
+                value
+            }
+        }
+    };
+
+    let snapshot = snapshot_value(
+        serial,
+        client,
+        &SnapshotArgs {
+            app: package.clone().or_else(|| requested.map(str::to_string)),
+            out: None,
+            screenshot_dir: args.screenshot_dir.clone(),
+            no_screenshot: args.no_screenshot,
+            logs: args.logs,
+            depth: args.depth,
+        },
+        Dbg::Jdwp,
+    )
+    .await?;
+    let sample_valid = snapshot
+        .get("sample_valid")
+        .cloned()
+        .unwrap_or(Value::Bool(false));
+    let result = json!({
+        "type": "debug_auto",
+        "schema_version": 1,
+        "ok": ok,
+        "backend": "jdwp",
+        "sample_valid": sample_valid,
+        "device": serial,
+        "app": {
+            "requested": requested,
+            "package": package,
+            "label": app_label,
+            "resolution": resolved,
+        },
+        "steps": steps,
+        "attach": attach,
+        "snapshot": snapshot,
+    });
+    if !ok {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "debug_auto_failed",
+            "debugger",
+            "automatic Android debug setup did not complete",
+        )
+        .detail(result)
+        .next_actions([
+            "inspect detail.steps and detail.attach for the first failed stage",
+            "shadowdroid debug status --backend jdwp",
+        ])
+        .into());
+    }
+    emit_json(&result)
+}
+
+fn jdwp_attach_value(attached: Result<Value>) -> Value {
+    match attached {
+        Ok(mut value) => {
+            value["ok"] = json!(true);
+            value["backend"] = json!("jdwp");
+            value
+        }
+        Err(error) => {
+            let diagnostic = error.downcast_ref::<crate::diagnostic::DiagnosticError>();
+            json!({
+                "ok": false,
+                "backend": "jdwp",
+                "code": diagnostic.map(|d| d.code.clone()),
+                "error": error.to_string(),
+                "detail": diagnostic.map(|d| d.detail.clone()),
+            })
+        }
+    }
+}
+
+/// Wait for the app in front, or for a jdwp stop (a startup breakpoint keeps
+/// the activity from resuming, which is success here, not a timeout).
+async fn wait_front_or_stop(
+    serial: &Serial,
+    client: &ServerClient,
+    package: &str,
+    timeout_ms: u32,
+) -> Value {
+    let stopped = async {
+        let Ok(entry) = crate::jdwp::commands::session_for(serial.as_str(), None) else {
+            // Not attached yet: never resolves, the app wait decides.
+            return std::future::pending::<Value>().await;
+        };
+        loop {
+            match crate::jdwp::commands::call_raw(
+                &entry,
+                "wait_stop",
+                json!({"after_epoch": 0, "timeout_ms": 1000}),
+                Duration::from_secs(5),
+            )
+            .await
+            {
+                Ok(reply) if reply["stopped"] == true => return reply,
+                Ok(_) => {}
+                Err(_) => return std::future::pending::<Value>().await,
+            }
+        }
+    };
+    tokio::select! {
+        wait = client.app_wait(package, timeout_ms, true) => match wait {
+            Ok(wait) => json!({
+                "step": "app_wait",
+                "ok": wait.matched,
+                "package": package,
+                "timeout_ms": timeout_ms,
+                "current": wait.current,
+            }),
+            Err(err) => json!({
+                "step": "app_wait",
+                "ok": false,
+                "package": package,
+                "timeout_ms": timeout_ms,
+                "error": err.to_string(),
+            }),
+        },
+        stop = stopped => json!({
+            "step": "app_wait",
+            "ok": true,
+            "package": package,
+            "stopped_in_debugger": true,
+            "session": stop.get("session"),
+        }),
+    }
+}
+
+/// `debug run-until-crash --backend jdwp`: an app-uncaught Throwable
+/// breakpoint catches a Java crash with its live frame before the process
+/// dies; a native crash ends the wait through VMDeath/EOF and falls back to
+/// the logcat crash and tombstone scan.
+async fn run_until_crash_jdwp(
+    serial: &Serial,
+    client: &ServerClient,
+    args: RunUntilCrashArgs,
+) -> Result<()> {
+    use crate::jdwp::commands as jdwp;
+    let started = Instant::now();
+    let entry = jdwp::session_for(serial.as_str(), args.session.as_deref())?;
+    let rpc_timeout = Duration::from_secs(30);
+    let armed = jdwp::call(
+        &entry,
+        "break_exception",
+        json!({"class": "java.lang.Throwable", "caught": false, "uncaught": true}),
+        rpc_timeout,
+    )
+    .await?;
+    let breakpoint_id = armed
+        .pointer("/breakpoint/id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let status = jdwp::call(&entry, "status", json!({}), rpc_timeout).await?;
+    let epoch = status.pointer("/session/epoch").and_then(Value::as_u64);
+    let resume = if status.pointer("/session/suspended") == Some(&json!(true)) {
+        match jdwp::call(&entry, "resume", json!({}), rpc_timeout).await {
+            Ok(value) => json!({"attempted": true, "ok": true, "result": value}),
+            Err(err) => json!({"attempted": true, "ok": false, "error": err.to_string()}),
+        }
+    } else {
+        json!({"attempted": false, "ok": true, "reason": "not suspended"})
+    };
+    let after_epoch = jdwp::call(&entry, "status", json!({}), rpc_timeout)
+        .await
+        .ok()
+        .and_then(|s| s.pointer("/session/epoch").and_then(Value::as_u64))
+        .or(epoch);
+
+    let (crash_tx, mut crash_rx) = mpsc::channel(32);
+    spawn_crash_logcat(serial.clone(), args.app.clone(), crash_tx);
+    let device_released = crate::runtime::release_for_passive_wait().await?;
+    let deadline = Instant::now() + Duration::from_millis(args.timeout_ms);
+    let mut process_exit: Option<Value> = None;
+
+    let outcome = loop {
+        if Instant::now() >= deadline {
+            break None;
+        }
+        if let Some(exit) = &process_exit {
+            // The process died without a Java stop: give logcat a moment to
+            // report the native crash, then fall back to the tombstone scan.
+            let grace = Instant::now() + Duration::from_secs(3);
+            let crash = loop {
+                match tokio::time::timeout(Duration::from_millis(100), crash_rx.recv()).await {
+                    Ok(Some(crash)) => break Some(crash),
+                    Ok(None) => break None,
+                    Err(_) if Instant::now() >= grace => break None,
+                    Err(_) => {}
+                }
+            };
+            break Some(JdwpCrashOutcome::ProcessExited {
+                crash,
+                exit: exit.clone(),
+            });
+        }
+        let wait = jdwp::call_raw(
+            &entry,
+            "wait_stop",
+            json!({"after_epoch": after_epoch, "timeout_ms": 500}),
+            Duration::from_secs(5),
+        );
+        tokio::select! {
+            crash = crash_rx.recv() => match crash {
+                Some(crash) => break Some(JdwpCrashOutcome::Logcat(crash)),
+                None => bail!("crash logcat stopped before a crash was detected"),
+            },
+            reply = wait => match reply {
+                Ok(reply) if reply["stopped"] == true => {
+                    break Some(JdwpCrashOutcome::Stopped(reply));
+                }
+                Ok(reply) if !reply["closed"].is_null() => {
+                    process_exit = Some(json!({"reason": reply["closed"]}));
+                }
+                Ok(_) => {}
+                // The daemon exits with the process (JDWP EOF).
+                Err(_) => process_exit = Some(json!({"reason": "debug daemon exited with the process"})),
+            },
+        }
+    };
+    let elapsed_ms = duration_millis(started.elapsed())?;
+
+    let mut result = json!({
+        "type": "run_until_crash",
+        "schema_version": 1,
+        "backend": "jdwp",
+        "elapsed_ms": elapsed_ms,
+        "device_released_while_waiting": device_released,
+        "jdwp": {"resume": resume, "breakpoint_id": breakpoint_id},
+        "app": {"requested": args.app.clone()},
+    });
+    let crash = match outcome {
+        None => {
+            let _ = jdwp::call(
+                &entry,
+                "break_remove",
+                json!({"id": breakpoint_id}),
+                rpc_timeout,
+            )
+            .await;
+            let (snapshot, snapshot_error) = final_snapshot_best_effort(
+                serial,
+                client,
+                &args.app,
+                Dbg::Jdwp,
+                args.depth,
+                args.logs,
+            )
+            .await;
+            result["ok"] = json!(false);
+            result["timeout"] = json!(true);
+            result["snapshot"] = snapshot;
+            if let Some(error) = snapshot_error {
+                result["snapshot_error"] = json!(error);
+            }
+            if let Some(path) = args.out.as_deref() {
+                crate::cmd::artifact::write_json(path, &result)?;
+            }
+            return Err(crate::diagnostic::DiagnosticError::new(
+                "crash_wait_timeout",
+                "debugger",
+                format!("no crash was detected within {}ms", args.timeout_ms),
+            )
+            .retryable(true)
+            .detail(json!({
+                "result": result,
+                "written_to": args.out.as_ref().map(|path| path.display().to_string()),
+            }))
+            .next_actions([
+                "inspect detail.result.snapshot and confirm the target app/process",
+                "reproduce the failure again or increase --timeout-ms",
+            ])
+            .into());
+        }
+        Some(JdwpCrashOutcome::Stopped(reply)) => {
+            let stopped_here = reply
+                .pointer("/session/breakpoint_id")
+                .and_then(Value::as_str)
+                == Some(breakpoint_id.as_str());
+            if !stopped_here {
+                let _ = jdwp::call(
+                    &entry,
+                    "break_remove",
+                    json!({"id": breakpoint_id}),
+                    rpc_timeout,
+                )
+                .await;
+                return Err(crate::diagnostic::DiagnosticError::new(
+                    "debug_stopped_elsewhere",
+                    "debugger",
+                    "the app stopped at another breakpoint before any crash",
+                )
+                .detail(json!({"backend": "jdwp", "session": reply.get("session")}))
+                .next_actions([
+                    "shadowdroid debug stack --backend jdwp",
+                    "shadowdroid debug run-until-crash --backend jdwp",
+                ])
+                .into());
+            }
+            let exception = jdwp::call(
+                &entry,
+                "inspect",
+                json!({"expression": "$exception", "depth": 1}),
+                rpc_timeout,
+            )
+            .await
+            .unwrap_or_else(|err| json!({"error": err.to_string()}));
+            let stack = jdwp::call(&entry, "stack", json!({"limit": 64}), rpc_timeout)
+                .await
+                .unwrap_or_else(|err| json!({"error": err.to_string()}));
+            let locals = jdwp::call(
+                &entry,
+                "variables",
+                json!({"depth": args.depth, "max_fields": 48, "max_array_items": 24}),
+                rpc_timeout,
+            )
+            .await
+            .unwrap_or_else(|err| json!({"error": err.to_string()}));
+            // Resuming now lets the app crash for real; keep it stopped for
+            // inspection and drop only our temporary breakpoint.
+            let _ = jdwp::call(
+                &entry,
+                "break_remove",
+                json!({"id": breakpoint_id}),
+                rpc_timeout,
+            )
+            .await;
+            let crash = crash_from_stop(&reply, &exception, &stack);
+            result["stop"] = json!({
+                "session": reply.get("session"),
+                "exception": exception.get("result"),
+                "throwing_frame": stack.pointer("/frames/0"),
+                "locals": locals,
+                "stack": stack.get("frames"),
+            });
+            crash
+        }
+        Some(JdwpCrashOutcome::Logcat(crash)) => {
+            let _ = jdwp::call(
+                &entry,
+                "break_remove",
+                json!({"id": breakpoint_id}),
+                rpc_timeout,
+            )
+            .await;
+            crash
+        }
+        Some(JdwpCrashOutcome::ProcessExited { crash, exit }) => {
+            result["process_exited"] = exit;
+            result["tombstones"] = tombstone_status(serial).await;
+            match crash {
+                Some(crash) => crash,
+                None => {
+                    let (snapshot, snapshot_error) = final_snapshot_best_effort(
+                        serial,
+                        client,
+                        &args.app,
+                        Dbg::Jdwp,
+                        args.depth,
+                        args.logs,
+                    )
+                    .await;
+                    result["ok"] = json!(true);
+                    result["timeout"] = json!(false);
+                    result["crash"] = Value::Null;
+                    result["snapshot"] = snapshot;
+                    if let Some(error) = snapshot_error {
+                        result["snapshot_error"] = json!(error);
+                    }
+                    emit_or_write_json(args.out.as_deref(), &result)?;
+                    return Ok(());
+                }
+            }
+        }
+    };
+    let (snapshot, snapshot_error) =
+        final_snapshot_best_effort(serial, client, &args.app, Dbg::Jdwp, args.depth, args.logs)
+            .await;
+    let correlation = crash_correlation(&crash, &snapshot);
+    if args.bundle.is_some() {
+        result["bundle"] = write_crash_bundle(
+            serial,
+            &args.app,
+            &crash,
+            &snapshot,
+            args.bundle.as_deref(),
+            args.native_artifacts,
+            args.logs.max(200),
+        )
+        .await;
+    }
+    result["ok"] = json!(true);
+    result["timeout"] = json!(false);
+    result["app"]["package"] = json!(crash.package.clone());
+    result["crash"] = serde_json::to_value(&crash).unwrap_or(Value::Null);
+    result["correlation"] = correlation;
+    result["snapshot"] = snapshot;
+    if let Some(error) = snapshot_error {
+        result["snapshot_error"] = json!(error);
+    }
+    emit_or_write_json(args.out.as_deref(), &result)?;
+    Ok(())
+}
+
+enum JdwpCrashOutcome {
+    /// The uncaught-Throwable breakpoint (or another stop) suspended the app.
+    Stopped(Value),
+    /// Logcat saw the crash first (the breakpoint missed it).
+    Logcat(CrashEvent),
+    /// The process ended without a Java stop (native crash, kill).
+    ProcessExited {
+        crash: Option<CrashEvent>,
+        exit: Value,
+    },
+}
+
+/// A `CrashEvent` from a live exception stop, so the crash correlation and
+/// bundle code serve both backends.
+fn crash_from_stop(reply: &Value, exception: &Value, stack: &Value) -> CrashEvent {
+    let rendered = exception.get("result").cloned().unwrap_or(Value::Null);
+    let chain = rendered
+        .get("cause_chain")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let frames: Vec<String> = stack
+        .get("frames")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|frame| {
+            format!(
+                "{}.{}({}:{})",
+                frame["class"].as_str().unwrap_or("?"),
+                frame["method"].as_str().unwrap_or("?"),
+                frame["source"].as_str().unwrap_or("Unknown Source"),
+                frame["line"]
+                    .as_i64()
+                    .map(|line| line.to_string())
+                    .unwrap_or_else(|| "?".into()),
+            )
+        })
+        .collect();
+    let session = reply.get("session").cloned().unwrap_or(Value::Null);
+    CrashEvent {
+        kind: "java".into(),
+        ts: crate::events::now_ts(),
+        package: session["package"].as_str().map(str::to_string),
+        pid: session["pid"].as_i64().map(|pid| pid as i32),
+        thread: session["thread"].as_str().map(str::to_string),
+        exception: rendered["type"].as_str().map(str::to_string),
+        message: rendered["message"].as_str().map(str::to_string),
+        stack: frames,
+        caused_by: chain
+            .iter()
+            .skip(1)
+            .map(|cause| crate::events::CausedBy {
+                exception: cause["type"].as_str().unwrap_or("?").to_string(),
+                message: cause["message"].as_str().map(str::to_string),
+                stack: Vec::new(),
+            })
+            .collect(),
+        signal: None,
+        signal_name: None,
+        backtrace: Vec::new(),
+        raw: String::new(),
+        context: vec!["captured live by the jdwp debugger before the process died".into()],
+        device_info: Value::Null,
+    }
+}
+
 async fn final_snapshot_best_effort(
     serial: &Serial,
     client: &ServerClient,
     app: &Option<String>,
-    studio_url: Option<&str>,
+    dbg: Dbg<'_>,
     depth: u32,
     logs: u32,
 ) -> (Value, Option<String>) {
-    match final_snapshot(serial, client, app, studio_url, depth, logs).await {
+    match final_snapshot(serial, client, app, dbg, depth, logs).await {
         Ok(snapshot) => (snapshot, None),
         Err(err) => {
             let error = err.to_string();
@@ -1925,7 +2597,7 @@ async fn final_snapshot(
     serial: &Serial,
     client: &ServerClient,
     app: &Option<String>,
-    studio_url: Option<&str>,
+    dbg: Dbg<'_>,
     depth: u32,
     logs: u32,
 ) -> Result<Value> {
@@ -1940,7 +2612,7 @@ async fn final_snapshot(
             logs,
             depth,
         },
-        studio_url,
+        dbg,
     )
     .await
 }
@@ -2493,6 +3165,53 @@ fn duration_millis(duration: Duration) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_live_jdwp_exception_stop_becomes_a_correlatable_crash() {
+        let reply = json!({"session": {
+            "package": "io.example.app",
+            "pid": 4242,
+            "thread": "main",
+            "suspended": true,
+            "device": {"serial": "emulator-5554"},
+        }});
+        let exception = json!({"result": {
+            "type": "java.lang.IllegalStateException",
+            "message": "boom",
+            "cause_chain": [
+                {"type": "java.lang.IllegalStateException", "message": "boom"},
+                {"type": "java.io.IOException", "message": "disk"},
+            ],
+        }});
+        let stack = json!({"frames": [
+            {"class": "io.example.app.MainActivity", "method": "crashNow", "source": "MainActivity.kt", "line": 240},
+            {"class": "android.view.View", "method": "performClick", "source": null, "line": null},
+        ]});
+        let crash = crash_from_stop(&reply, &exception, &stack);
+        assert_eq!(crash.kind, "java");
+        assert_eq!(crash.pid, Some(4242));
+        assert_eq!(
+            crash.exception.as_deref(),
+            Some("java.lang.IllegalStateException")
+        );
+        assert_eq!(crash.message.as_deref(), Some("boom"));
+        assert_eq!(crash.caused_by.len(), 1);
+        assert_eq!(crash.caused_by[0].exception, "java.io.IOException");
+        assert_eq!(
+            crash.stack[0],
+            "io.example.app.MainActivity.crashNow(MainActivity.kt:240)"
+        );
+        // The existing correlation reads the source location back out.
+        let snapshot = json!({"debugger": {"available": true, "status": reply.clone()}});
+        let correlation = crash_correlation(&crash, &snapshot);
+        assert_eq!(correlation["source_locations"][0]["line"], 240);
+        assert_eq!(correlation["source_locations"][0]["method"], "crashNow");
+        let jdwp_snapshot = json!({"debugger": {"available": true, "status": {"sessions": [reply["session"].clone()]}}});
+        assert_eq!(
+            crash_correlation(&crash, &jdwp_snapshot)["session_suspended"],
+            true
+        );
+    }
 
     #[test]
     fn suspended_sessions_on_this_device_skip_the_screen_tree() {

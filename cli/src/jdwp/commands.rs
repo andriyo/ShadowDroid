@@ -4,18 +4,25 @@
 //! Verbs the backend does not serve yet fail with `unsupported_by_backend`
 //! instead of silently falling back to Studio.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::{Value as Json, json};
 
-use super::control::{self, CallError, Ready};
-use super::paths::{self, RegistryEntry};
-use super::resolve::{self, LocateError};
+use super::breakpoints::{BreakpointOptions, BreakpointUpdate, SuspendKind};
+pub use super::control::CallError;
+use super::control::{self, Ready};
+use super::daemon::{InitialBreakpoints, InitialException, InitialLine};
+pub use super::paths::RegistryEntry;
+use super::paths::{self};
+use super::resolve::{self, LocateError, SourceTarget};
 use super::session::RpcError;
 use super::transport;
-use crate::cmd::debugger::{BreakCmd, DebugMode, DebuggerCmd};
+use crate::cmd::debugger::{
+    BreakCmd, DebugMode, DebuggerCmd, LaunchArgs, LogpointCmd, LogpointEventFilters,
+    LogpointReader, SuspendArg, follow_logpoint_events, validate_logpoint_stream,
+};
 use crate::diagnostic::DiagnosticError;
 
 /// Minimum API level: OpenJDK libjdwp under ART (design §4.3).
@@ -74,6 +81,7 @@ pub async fn run(cmd: &DebuggerCmd, ctx: JdwpContext<'_>) -> Result<()> {
             pid,
             mode,
             dialog,
+            launch,
             ..
         } => {
             if *dialog {
@@ -89,7 +97,21 @@ pub async fn run(cmd: &DebuggerCmd, ctx: JdwpContext<'_>) -> Result<()> {
                     "jdwp attach needs a device; pass -d <serial>",
                 )
             })?;
-            attach(serial, package.as_deref(), *pid).await?
+            let request = AttachRequest {
+                serial,
+                package: package.as_deref(),
+                pid: *pid,
+                init: initial_breakpoints(launch, ctx.project_root)?,
+                wait_for_launch: launch.wait_for_launch,
+                launch_timeout: Duration::from_millis(launch.launch_timeout_ms),
+            };
+            let host = super::launch::AdbHost {
+                serial: serial.to_string(),
+            };
+            attach_with(request, |package| async move {
+                super::launch::monkey_launch(&host, &package).await
+            })
+            .await?
         }
         DebuggerCmd::Detach(selector) | DebuggerCmd::Stop(selector) => {
             let entry = select(ctx.serial, selector.session.as_deref())?;
@@ -103,60 +125,41 @@ pub async fn run(cmd: &DebuggerCmd, ctx: JdwpContext<'_>) -> Result<()> {
             temporary,
             condition,
             clear_condition,
+            force,
             ..
         }) => {
-            if *disabled || *temporary || condition.is_some() || *clear_condition {
-                return Err(unsupported("break line --disabled/--temporary/--condition"));
-            }
-            let target = match resolve::locate(file, *line, ctx.project_root) {
-                Ok(target) => target,
-                Err(LocateError::Ambiguous(candidates)) => {
-                    return Err(DiagnosticError::new(
-                        "breakpoint_unresolved",
-                        "debugger",
-                        format!("{} matches several project files", file.display()),
-                    )
-                    .detail(json!({"backend": "jdwp", "candidates": candidates}))
-                    .next_actions(["pass a longer path suffix or an absolute path in --file"])
-                    .into());
-                }
-                Err(LocateError::NoCodeAtLine { path, line, reason }) => {
-                    return Err(DiagnosticError::new(
-                        "breakpoint_unresolved",
-                        "debugger",
-                        format!("{path}:{line} has no code ({reason})"),
-                    )
-                    .detail(
-                        json!({"backend": "jdwp", "file": path, "line": line, "reason": reason}),
-                    )
-                    .next_actions(["pick a line with an executable statement"])
-                    .into());
-                }
-                Err(LocateError::NotASourceFile(name)) => {
-                    return Err(DiagnosticError::new(
-                        "breakpoint_unresolved",
-                        "debugger",
-                        format!("{name} is not a .kt or .java source file"),
-                    )
-                    .detail(json!({"backend": "jdwp"}))
-                    .into());
-                }
-            };
+            let target = locate_target(file, *line, ctx.project_root)?;
             let entry = select(ctx.serial, None)?;
+            let options = BreakpointOptions {
+                enabled: !*disabled,
+                temporary: *temporary,
+                condition: condition.clone(),
+                force: *force,
+                ..Default::default()
+            };
             let mut value = rpc(
                 &entry,
                 "break_line",
-                json!({"target": target, "line": line}),
+                json!({"target": target, "line": line, "options": options}),
                 DEFAULT_CALL_TIMEOUT,
             )
             .await?;
+            if *clear_condition && value["created"] == false {
+                let id = value
+                    .pointer("/breakpoint/id")
+                    .cloned()
+                    .unwrap_or(Json::Null);
+                value = rpc(
+                    &entry,
+                    "break_update",
+                    json!({"id": id, "update": {"clear_condition": true}}),
+                    DEFAULT_CALL_TIMEOUT,
+                )
+                .await?;
+                value["created"] = json!(false);
+            }
             if target.path.is_none() {
-                // A typo binds nothing, ever: say the file was not found
-                // locally and that binding is by file name only.
-                value["warning"] = json!(format!(
-                    "{} was not found under the project root; binding by file name only, with no package filter or line check",
-                    target.basename
-                ));
+                value["warning"] = json!(not_found_locally(&target));
             }
             value
         }
@@ -167,14 +170,42 @@ pub async fn run(cmd: &DebuggerCmd, ctx: JdwpContext<'_>) -> Result<()> {
             uncaught,
             ..
         }) => {
-            if *disabled {
-                return Err(unsupported("break exception --disabled"));
-            }
             let entry = select(ctx.serial, None)?;
+            let options = BreakpointOptions {
+                enabled: !*disabled,
+                ..Default::default()
+            };
             rpc(
                 &entry,
                 "break_exception",
-                json!({"class": exception, "caught": caught, "uncaught": uncaught}),
+                json!({"class": exception, "caught": caught, "uncaught": uncaught, "options": options}),
+                DEFAULT_CALL_TIMEOUT,
+            )
+            .await?
+        }
+        DebuggerCmd::Break(BreakCmd::Update(args)) => {
+            let entry = select(ctx.serial, None)?;
+            let update = BreakpointUpdate {
+                enabled: args.enabled,
+                temporary: args.temporary,
+                condition: args.condition.clone(),
+                clear_condition: args.clear_condition,
+                log_expression: args.log_expression.clone(),
+                clear_log_expression: args.clear_log_expression,
+                log_message: args.log_message,
+                log_stack: args.log_stack,
+                suspend: args.suspend.map(|suspend| match suspend {
+                    SuspendArg::All => SuspendKind::All,
+                    SuspendArg::Thread => SuspendKind::Thread,
+                    SuspendArg::None => SuspendKind::None,
+                }),
+                pass_count: args.pass_count,
+                force: args.force,
+            };
+            rpc(
+                &entry,
+                "break_update",
+                json!({"id": args.id, "update": update}),
                 DEFAULT_CALL_TIMEOUT,
             )
             .await?
@@ -191,10 +222,36 @@ pub async fn run(cmd: &DebuggerCmd, ctx: JdwpContext<'_>) -> Result<()> {
         }
         DebuggerCmd::Break(BreakCmd::Method { .. }) => return Err(unsupported("break method")),
         DebuggerCmd::Break(BreakCmd::Field { .. }) => return Err(unsupported("break field")),
-        DebuggerCmd::Break(BreakCmd::Update(_)) => return Err(unsupported("break update")),
         DebuggerCmd::Breakpoints => {
             let entry = select(ctx.serial, None)?;
             rpc(&entry, "breakpoints", json!({}), DEFAULT_CALL_TIMEOUT).await?
+        }
+        DebuggerCmd::Logpoint(cmd) => return logpoint(cmd, &ctx).await,
+        DebuggerCmd::ContinueUntil(args) => {
+            let (Some(file), Some(line)) = (&args.file, args.line) else {
+                return Err(DiagnosticError::new(
+                    "unsupported_by_backend",
+                    "debugger",
+                    "continue-until on the jdwp backend needs --file and --line (a condition alone has no place to stop)",
+                )
+                .detail(json!({"backend": "jdwp"}))
+                .next_actions(["add --file <File.kt> --line <n>"])
+                .into());
+            };
+            let target = locate_target(file, line, ctx.project_root)?;
+            let entry = select(ctx.serial, args.session.as_deref())?;
+            rpc(
+                &entry,
+                "continue_until",
+                json!({
+                    "target": target,
+                    "line": line,
+                    "condition": args.condition,
+                    "timeout_ms": args.timeout_ms,
+                }),
+                timeout_for(args.timeout_ms),
+            )
+            .await?
         }
         DebuggerCmd::Pause(selector) => {
             simple(ctx.serial, selector.session.as_deref(), "pause", json!({})).await?
@@ -302,13 +359,407 @@ pub async fn run(cmd: &DebuggerCmd, ctx: JdwpContext<'_>) -> Result<()> {
             .await?
         }
         DebuggerCmd::Clients(_) => return Err(unsupported("clients")),
-        DebuggerCmd::Logpoint(_) => return Err(unsupported("logpoint")),
         DebuggerCmd::Coroutines(_) => return Err(unsupported("coroutines")),
-        DebuggerCmd::ContinueUntil(_) => return Err(unsupported("continue-until")),
         DebuggerCmd::Watch(_) => return Err(unsupported("watch")),
     };
     emit(value);
     Ok(())
+}
+
+fn not_found_locally(target: &SourceTarget) -> String {
+    // A typo binds nothing, ever: say the file was not found locally and that
+    // binding is by file name only.
+    format!(
+        "{} was not found under the project root; binding by file name only, with no package filter or line check",
+        target.basename
+    )
+}
+
+/// Resolve `--file`/`--line` to a source target, with the structured
+/// `breakpoint_unresolved` errors.
+pub fn locate_target(file: &Path, line: u32, project_root: Option<&Path>) -> Result<SourceTarget> {
+    match resolve::locate(file, line, project_root) {
+        Ok(target) => Ok(target),
+        Err(LocateError::Ambiguous(candidates)) => Err(DiagnosticError::new(
+            "breakpoint_unresolved",
+            "debugger",
+            format!("{} matches several project files", file.display()),
+        )
+        .detail(json!({"backend": "jdwp", "candidates": candidates}))
+        .next_actions(["pass a longer path suffix or an absolute path in --file"])
+        .into()),
+        Err(LocateError::NoCodeAtLine { path, line, reason }) => Err(DiagnosticError::new(
+            "breakpoint_unresolved",
+            "debugger",
+            format!("{path}:{line} has no code ({reason})"),
+        )
+        .detail(json!({"backend": "jdwp", "file": path, "line": line, "reason": reason}))
+        .next_actions(["pick a line with an executable statement"])
+        .into()),
+        Err(LocateError::NotASourceFile(name)) => Err(DiagnosticError::new(
+            "breakpoint_unresolved",
+            "debugger",
+            format!("{name} is not a .kt or .java source file"),
+        )
+        .detail(json!({"backend": "jdwp"}))
+        .into()),
+    }
+}
+
+/// `File.kt:31` → (`File.kt`, 31).
+pub fn parse_break_spec(spec: &str) -> Result<(PathBuf, u32)> {
+    let parsed = spec
+        .rsplit_once(':')
+        .and_then(|(file, line)| Some((file.trim(), line.trim().parse::<u32>().ok()?)))
+        .filter(|(file, line)| !file.is_empty() && *line > 0);
+    match parsed {
+        Some((file, line)) => Ok((PathBuf::from(file), line)),
+        None => Err(DiagnosticError::new(
+            "invalid_arguments",
+            "debugger",
+            format!("--break expects FILE:LINE, got `{spec}`"),
+        )
+        .next_actions(["--break MainActivity.kt:61"])
+        .into()),
+    }
+}
+
+/// `--break` / `--break-exception` → the daemon's initial breakpoints.
+pub fn initial_breakpoints_from(
+    breaks: &[String],
+    exceptions: &[String],
+    project_root: Option<&Path>,
+) -> Result<InitialBreakpoints> {
+    let mut init = InitialBreakpoints::default();
+    for spec in breaks {
+        let (file, line) = parse_break_spec(spec)?;
+        init.lines.push(InitialLine {
+            target: locate_target(&file, line, project_root)?,
+            line,
+        });
+    }
+    for class in exceptions {
+        init.exceptions.push(InitialException {
+            class: class.clone(),
+            caught: true,
+            uncaught: true,
+        });
+    }
+    Ok(init)
+}
+
+fn initial_breakpoints(
+    launch: &LaunchArgs,
+    project_root: Option<&Path>,
+) -> Result<InitialBreakpoints> {
+    initial_breakpoints_from(&launch.break_at, &launch.break_exception, project_root)
+}
+
+/// Everything `debug attach --backend jdwp` (and `debug auto`) needs.
+pub struct AttachRequest<'a> {
+    pub serial: &'a str,
+    pub package: Option<&'a str>,
+    pub pid: Option<i32>,
+    pub init: InitialBreakpoints,
+    pub wait_for_launch: bool,
+    pub launch_timeout: Duration,
+}
+
+/// Attach, optionally starting the app under `am set-debug-app -w` first
+/// (`launch` starts it). Initial breakpoints are installed by the daemon
+/// before it reports ready.
+pub async fn attach_with<L, LFut>(request: AttachRequest<'_>, launch: L) -> Result<Json>
+where
+    L: FnOnce(String) -> LFut,
+    LFut: std::future::Future<Output = Result<Json>>,
+{
+    let tcp = transport::tcp_override();
+    if !request.wait_for_launch {
+        return attach(
+            request.serial,
+            request.package,
+            request.pid,
+            request.init,
+            false,
+        )
+        .await;
+    }
+    let package = request.package.ok_or_else(|| {
+        DiagnosticError::new(
+            "invalid_arguments",
+            "debugger",
+            "--wait-for-launch needs --package (or a configured app)",
+        )
+        .next_actions(["shadowdroid debug attach --backend jdwp --wait-for-launch --package <pkg>"])
+    })?;
+    if tcp.is_some() {
+        // Test/forward mode: there is no device to launch on.
+        let mut value = attach(
+            request.serial,
+            Some(package),
+            request.pid,
+            request.init,
+            true,
+        )
+        .await?;
+        value["launch"] = json!({
+            "wait_for_launch": true,
+            "steps": [{"step": "launch", "skipped": true, "reason": "SHADOWDROID_JDWP_TCP"}],
+        });
+        return Ok(value);
+    }
+    check_api_level(request.serial).await?;
+    let host = super::launch::AdbHost {
+        serial: request.serial.to_string(),
+    };
+    let mut steps = Vec::new();
+    let init = request.init;
+    let serial = request.serial;
+    let outcome = super::launch::launch_for_debug(
+        &host,
+        package,
+        request.launch_timeout,
+        Duration::from_millis(100),
+        &mut steps,
+        || launch(package.to_string()),
+        |pid| attach(serial, Some(package), Some(pid as i32), init, true),
+    )
+    .await;
+    match outcome {
+        Ok(mut value) => {
+            value["launch"] = json!({"wait_for_launch": true, "steps": steps});
+            Ok(value)
+        }
+        Err(error) => match error.downcast::<DiagnosticError>() {
+            Ok(mut diagnostic) => {
+                if diagnostic.detail.is_object() {
+                    diagnostic.detail["launch_steps"] = json!(steps);
+                }
+                Err(diagnostic.into())
+            }
+            Err(error) => {
+                Err(
+                    DiagnosticError::new("debug_launch_failed", "debugger", format!("{error:#}"))
+                        .detail(json!({"backend": "jdwp", "launch_steps": steps}))
+                        .next_actions([
+                            "shadowdroid app current",
+                            "shadowdroid debug status --backend jdwp",
+                        ])
+                        .into(),
+                )
+            }
+        },
+    }
+}
+
+// ── logpoints ───────────────────────────────────────────────────────────
+
+struct DaemonLogpoints(RegistryEntry);
+
+impl LogpointReader for DaemonLogpoints {
+    async fn read_page(
+        &self,
+        after: Option<u64>,
+        limit: u32,
+        timeout_ms: u32,
+        filters: &LogpointEventFilters,
+    ) -> Result<Json> {
+        rpc(
+            &self.0,
+            "logpoint_events",
+            json!({
+                "after": after,
+                "limit": limit,
+                "timeout_ms": timeout_ms,
+                "id": filters.breakpoint_id,
+                "owner": filters.owner,
+                "session": filters.session,
+            }),
+            Duration::from_millis(u64::from(timeout_ms)) + CALL_HEADROOM,
+        )
+        .await
+    }
+}
+
+async fn logpoint(cmd: &LogpointCmd, ctx: &JdwpContext<'_>) -> Result<()> {
+    let value = match cmd {
+        LogpointCmd::Add(args) => {
+            let target = locate_target(&args.file, args.line, ctx.project_root)?;
+            let entry = select(ctx.serial, None)?;
+            let options = BreakpointOptions {
+                enabled: !args.disabled,
+                temporary: args.temporary,
+                condition: args.condition.clone(),
+                force: args.force,
+                suspend: SuspendKind::None,
+                pass_count: args.pass_count.filter(|n| *n > 0),
+                log_expression: args.expression.clone(),
+                log_message: args.log_message,
+                log_stack: args.log_stack,
+                owner: Some(args.owner.clone()),
+                max_events_per_second: args.max_events_per_second,
+                max_message_chars: args.max_message_chars,
+            };
+            let mut value = rpc(
+                &entry,
+                "logpoint_add",
+                json!({"target": target, "line": args.line, "options": options}),
+                DEFAULT_CALL_TIMEOUT,
+            )
+            .await?;
+            if target.path.is_none() && value["warning"].is_null() {
+                value["warning"] = json!(not_found_locally(&target));
+            }
+            value
+        }
+        LogpointCmd::List(args) => {
+            let entry = select(
+                ctx.serial,
+                args.filters.session.as_deref().filter(|s| is_jdwp_id(s)),
+            )?;
+            rpc(
+                &entry,
+                "logpoints",
+                json!({"id": args.filters.breakpoint_id, "owner": args.filters.owner}),
+                DEFAULT_CALL_TIMEOUT,
+            )
+            .await?
+        }
+        LogpointCmd::Events(args) => {
+            let entry = select(
+                ctx.serial,
+                args.filters.session.as_deref().filter(|s| is_jdwp_id(s)),
+            )?;
+            let filters = LogpointEventFilters::from(&args.filters);
+            let page = DaemonLogpoints(entry)
+                .read_page(args.after, args.limit, 0, &filters)
+                .await?;
+            validate_logpoint_stream(&page, args.stream_id.as_deref(), args.after)?;
+            page
+        }
+        LogpointCmd::Follow(args) => {
+            let entry = select(
+                ctx.serial,
+                args.filters.session.as_deref().filter(|s| is_jdwp_id(s)),
+            )?;
+            return follow_logpoint_events(&DaemonLogpoints(entry), args).await;
+        }
+        LogpointCmd::Remove(args) => {
+            let entry = select(ctx.serial, None)?;
+            rpc(
+                &entry,
+                "logpoint_remove",
+                json!({"id": args.id, "owner": args.owner}),
+                DEFAULT_CALL_TIMEOUT,
+            )
+            .await?
+        }
+        LogpointCmd::Clear(args) => {
+            let entry = select(ctx.serial, None)?;
+            rpc(
+                &entry,
+                "logpoint_clear",
+                json!({"owner": args.owner}),
+                DEFAULT_CALL_TIMEOUT,
+            )
+            .await?
+        }
+    };
+    emit(value);
+    Ok(())
+}
+
+fn is_jdwp_id(session: &str) -> bool {
+    session.starts_with("jdwp:") || session.parse::<u32>().is_ok()
+}
+
+// ── library surface for the composed `debug` workflows ──────────────────
+
+/// The registered session for `serial`, if exactly one is attached.
+pub fn session_for(serial: &str, session: Option<&str>) -> Result<RegistryEntry> {
+    select(Some(serial), session)
+}
+
+/// One daemon call with jdwp diagnostics.
+pub async fn call(
+    entry: &RegistryEntry,
+    method: &str,
+    params: Json,
+    timeout: Duration,
+) -> Result<Json> {
+    rpc(entry, method, params, timeout).await
+}
+
+/// One daemon call that keeps "unreachable" distinct (the process ended).
+pub async fn call_raw(
+    entry: &RegistryEntry,
+    method: &str,
+    params: Json,
+    timeout: Duration,
+) -> std::result::Result<Json, CallError> {
+    control::call(entry, method, params, timeout).await
+}
+
+/// The `debugger` section of `debug snapshot --backend jdwp`, in the Studio
+/// section's shape (`status.sessions[]`, `breakpoints`, `stack`,
+/// `variables`, `logpoint_events`).
+pub async fn debugger_snapshot(serial: &str, depth: u32) -> Json {
+    let entry = match select(Some(serial), None) {
+        Ok(entry) => entry,
+        Err(error) => {
+            return json!({
+                "available": false,
+                "ok": false,
+                "backend": "jdwp",
+                "type": "jdwp_debugger_unavailable",
+                "error": error.to_string(),
+                "next_command": "shadowdroid debug attach --backend jdwp --package <pkg>",
+            });
+        }
+    };
+    let timeout = Duration::from_secs(10);
+    let status = match rpc(&entry, "status", json!({}), timeout).await {
+        Ok(status) => status,
+        Err(error) => {
+            return json!({
+                "available": false,
+                "ok": false,
+                "backend": "jdwp",
+                "type": "jdwp_debugger_unavailable",
+                "error": error.to_string(),
+            });
+        }
+    };
+    let or_error = |result: Result<Json>| {
+        result.unwrap_or_else(|error| json!({"ok": false, "error": error.to_string()}))
+    };
+    let breakpoints = or_error(rpc(&entry, "breakpoints", json!({}), timeout).await);
+    let stack = or_error(rpc(&entry, "stack", json!({"limit": 24}), timeout).await);
+    let variables = or_error(
+        rpc(
+            &entry,
+            "variables",
+            json!({"depth": depth, "max_fields": 48, "max_array_items": 24}),
+            timeout,
+        )
+        .await,
+    );
+    let logpoint_events =
+        or_error(rpc(&entry, "logpoint_events", json!({"limit": 50}), timeout).await);
+    json!({
+        "available": true,
+        "backend": "jdwp",
+        "status": {
+            "ok": true,
+            "backend": "jdwp",
+            "sessions": [status.get("session").cloned().unwrap_or(Json::Null)],
+            "vm": status.pointer("/details/vm"),
+        },
+        "breakpoints": breakpoints,
+        "stack": stack,
+        "variables": variables,
+        "logpoint_events": logpoint_events,
+    })
 }
 
 /// Studio cannot see a process our daemon holds (its client list keeps
@@ -487,7 +938,13 @@ async fn status(serial: Option<&str>) -> Result<Json> {
     }))
 }
 
-async fn attach(serial: &str, package: Option<&str>, pid: Option<i32>) -> Result<Json> {
+async fn attach(
+    serial: &str,
+    package: Option<&str>,
+    pid: Option<i32>,
+    init: InitialBreakpoints,
+    launched_under_debugger: bool,
+) -> Result<Json> {
     let tcp = transport::tcp_override();
     if tcp.is_none() {
         check_api_level(serial).await?;
@@ -523,10 +980,39 @@ async fn attach(serial: &str, package: Option<&str>, pid: Option<i32>) -> Result
     if let Some(entry) = paths::read_entry(&registry) {
         match control::call(&entry, "status", json!({}), Duration::from_secs(3)).await {
             Ok(status) => {
+                // Already attached: set any requested breakpoints now.
+                let mut installed = Vec::new();
+                for line in &init.lines {
+                    installed.push(
+                        rpc(
+                            &entry,
+                            "break_line",
+                            json!({"target": line.target, "line": line.line}),
+                            DEFAULT_CALL_TIMEOUT,
+                        )
+                        .await
+                        .map(|value| value["breakpoint"].clone())
+                        .unwrap_or_else(|error| json!({"ok": false, "error": error.to_string()})),
+                    );
+                }
+                for exception in &init.exceptions {
+                    installed.push(
+                        rpc(
+                            &entry,
+                            "break_exception",
+                            json!({"class": exception.class}),
+                            DEFAULT_CALL_TIMEOUT,
+                        )
+                        .await
+                        .map(|value| value["breakpoint"].clone())
+                        .unwrap_or_else(|error| json!({"ok": false, "error": error.to_string()})),
+                    );
+                }
                 return Ok(json!({
                     "action": "attach",
                     "already_attached": true,
                     "session": status.get("session"),
+                    "breakpoints": installed,
                 }));
             }
             Err(_) => control::prune(&entry),
@@ -538,12 +1024,25 @@ async fn attach(serial: &str, package: Option<&str>, pid: Option<i32>) -> Result
         std::process::id(),
         (crate::events::now_ts() * 1000.0) as u64
     );
-    let mut child = control::spawn(serial, pid, package, &startup_id)?;
+    let init_path = if init.lines.is_empty() && init.exceptions.is_empty() {
+        None
+    } else {
+        Some(control::write_init(serial, pid, &init)?)
+    };
+    let mut child = control::spawn(
+        serial,
+        pid,
+        package,
+        &startup_id,
+        init_path.as_deref(),
+        launched_under_debugger,
+    )?;
     match control::await_ready(serial, pid, &startup_id, &mut child, ATTACH_READY_TIMEOUT).await {
         Ready::Up(status) => Ok(json!({
             "action": "attach",
             "already_attached": false,
             "session": status.get("session"),
+            "breakpoints": status.get("initial_breakpoints"),
             "vm": status.pointer("/details/vm"),
             "capabilities": status.pointer("/details/capabilities"),
         })),

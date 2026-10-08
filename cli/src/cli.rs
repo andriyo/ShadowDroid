@@ -2163,16 +2163,20 @@ async fn run_inner() -> Result<()> {
             )
             .await;
         }
-        Cmd::Debug(args) if args.uses_jdwp() => {
+        Cmd::Debug(args) if args.jdwp_unsupported_workflow() => {
+            // Rejected before any device or server bring-up.
+            return Err(crate::diagnostic::DiagnosticError::new(
+                "unsupported_by_backend",
+                "debugger",
+                "this `debug` workflow is not available on the jdwp backend yet",
+            )
+            .detail(json!({"backend": "jdwp"}))
+            .next_actions(["re-run with --backend studio"])
+            .into());
+        }
+        Cmd::Debug(args) if args.uses_jdwp() && args.is_host_only() => {
             let DebugCmd::Studio(debugger_cmd) = &args.cmd else {
-                return Err(crate::diagnostic::DiagnosticError::new(
-                    "unsupported_by_backend",
-                    "debugger",
-                    "this `debug` workflow is not available on the jdwp backend yet",
-                )
-                .detail(json!({"backend": "jdwp"}))
-                .next_actions(["re-run with --backend studio"])
-                .into());
+                unreachable!("host-only debug commands are debugger verbs");
             };
             // Only attach needs a device; the other verbs find their daemon
             // in the registry (scoped by an explicit device when given).
@@ -2195,6 +2199,13 @@ async fn run_inner() -> Result<()> {
         Cmd::Debug(args) if args.is_host_only() => {
             // Refuse before touching the device or the bridge: Studio cannot
             // see a process the jdwp daemon holds and would fail later.
+            if let DebugCmd::Studio(DebuggerCmd::Attach { launch, .. }) = &args.cmd
+                && launch.is_requested()
+            {
+                return Err(crate::cmd::debugger::studio_unsupported(
+                    "--wait-for-launch, --break, and --break-exception",
+                ));
+            }
             if let DebugCmd::Studio(DebuggerCmd::Attach { package, pid, .. }) = &args.cmd {
                 crate::jdwp::commands::ensure_not_held_by_jdwp(
                     selection.explicit_device.as_deref(),
@@ -2465,7 +2476,9 @@ async fn run_inner() -> Result<()> {
         Cmd::App(app_cmd) => dispatch_app(app_cmd, &client, &config, &serial).await?,
         Cmd::Device(device_cmd) => dispatch_device(device_cmd, &client, &serial).await?,
         Cmd::Files(files_cmd) => dispatch_files(files_cmd, &client, &serial).await?,
-        Cmd::Debug(args) => crate::cmd::debug::run(&serial, &client, args).await?,
+        Cmd::Debug(args) => {
+            crate::cmd::debug::run(&serial, &client, args, project.as_deref()).await?
+        }
         Cmd::Layout(args) => crate::cmd::layout::run(&serial, &client, args).await?,
         Cmd::Ui(ui_cmd) => {
             dispatch_ui(ui_cmd, &client, &serial, apk.as_deref(), any_apk_version).await?

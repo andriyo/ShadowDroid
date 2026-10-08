@@ -131,6 +131,8 @@ pub enum DebuggerCmd {
         /// Open Android Studio's built-in attach dialog instead of attaching headlessly.
         #[arg(long)]
         dialog: bool,
+        #[command(flatten)]
+        launch: LaunchArgs,
     },
     /// Breakpoint commands.
     #[command(subcommand)]
@@ -172,6 +174,41 @@ pub enum DebuggerCmd {
     /// Watch expression commands.
     #[command(subcommand)]
     Watch(WatchCmd),
+}
+
+/// Launch-time debugging (jdwp backend): breakpoints set at attach, and an
+/// optional fresh start under the debugger.
+#[derive(Args, Clone, Debug, Default)]
+pub struct LaunchArgs {
+    /// Restart the app under `am set-debug-app -w` and attach before its code runs.
+    #[arg(long)]
+    pub wait_for_launch: bool,
+    /// Line breakpoint set at attach, as FILE:LINE (repeatable).
+    #[arg(long = "break", value_name = "FILE:LINE")]
+    pub break_at: Vec<String>,
+    /// Exception breakpoint set at attach (repeatable).
+    #[arg(long, value_name = "CLASS")]
+    pub break_exception: Vec<String>,
+    /// How long to wait for the launched process.
+    #[arg(long, default_value_t = 20_000)]
+    pub launch_timeout_ms: u64,
+}
+
+impl LaunchArgs {
+    pub fn is_requested(&self) -> bool {
+        self.wait_for_launch || !self.break_at.is_empty() || !self.break_exception.is_empty()
+    }
+}
+
+/// A jdwp-only option given to the Studio backend.
+pub(crate) fn studio_unsupported(what: &str) -> anyhow::Error {
+    crate::diagnostic::DiagnosticError::new(
+        "unsupported_by_backend",
+        "debugger",
+        format!("{what} needs the standalone debugger; add --backend jdwp"),
+    )
+    .detail(serde_json::json!({"backend": "studio"}))
+    .into()
 }
 
 #[derive(Subcommand)]
@@ -836,7 +873,13 @@ pub async fn run(cmd: &DebuggerCmd, device: Option<&str>, studio_url: Option<&st
             mode,
             configuration,
             dialog,
+            launch,
         } => {
+            if launch.is_requested() {
+                return Err(studio_unsupported(
+                    "--wait-for-launch, --break, and --break-exception",
+                ));
+            }
             let pid_s = pid.map(|pid| pid.to_string());
             let dialog_s = dialog.to_string();
             let mode_s = mode.map(DebugMode::as_str);
@@ -1354,7 +1397,35 @@ fn logpoint_filter_params(filters: &LogpointFilterArgs) -> [(&'static str, Optio
     ]
 }
 
-async fn follow_logpoint_events(bridge: &BridgeClient, args: &LogpointFollowArgs) -> Result<()> {
+/// A source of logpoint event pages: the Studio bridge or a jdwp daemon.
+/// Both answer with the same cursor/stream-id page shape.
+pub(crate) trait LogpointReader {
+    async fn read_page(
+        &self,
+        after: Option<u64>,
+        limit: u32,
+        timeout_ms: u32,
+        filters: &LogpointEventFilters,
+    ) -> Result<Value>;
+}
+
+impl LogpointReader for BridgeClient {
+    async fn read_page(
+        &self,
+        after: Option<u64>,
+        limit: u32,
+        timeout_ms: u32,
+        filters: &LogpointEventFilters,
+    ) -> Result<Value> {
+        self.read_logpoint_events(after, limit, timeout_ms, filters)
+            .await
+    }
+}
+
+pub(crate) async fn follow_logpoint_events<R: LogpointReader>(
+    bridge: &R,
+    args: &LogpointFollowArgs,
+) -> Result<()> {
     let filters = LogpointEventFilters::from(&args.filters);
     let limit = args.limit.max(1);
     let poll_ms = args.poll_ms.clamp(50, 5_000);
@@ -1366,7 +1437,7 @@ async fn follow_logpoint_events(bridge: &BridgeClient, args: &LogpointFollowArgs
     let mut rate_limited_total = 0u64;
 
     if args.after.is_none() {
-        let initial = bridge.read_logpoint_events(None, 1, 0, &filters).await?;
+        let initial = bridge.read_page(None, 1, 0, &filters).await?;
         stream_id = Some(required_logpoint_stream_id(&initial)?.to_string());
         evicted_total = cursor_field(&initial, "evicted_total").unwrap_or(0);
         rate_limited_total = cursor_field(&initial, "rate_limited_total").unwrap_or(0);
@@ -1400,7 +1471,7 @@ async fn follow_logpoint_events(bridge: &BridgeClient, args: &LogpointFollowArgs
             })
             .unwrap_or(poll_ms)
             .max(1);
-        let request = bridge.read_logpoint_events(Some(cursor), limit, timeout_ms, &filters);
+        let request = bridge.read_page(Some(cursor), limit, timeout_ms, &filters);
         let page = tokio::select! {
             result = request => result?,
             result = &mut stop => {
@@ -1598,7 +1669,7 @@ fn required_logpoint_stream_id(page: &Value) -> Result<&str> {
         })
 }
 
-fn validate_logpoint_stream(
+pub(crate) fn validate_logpoint_stream(
     page: &Value,
     expected_stream_id: Option<&str>,
     after: Option<u64>,

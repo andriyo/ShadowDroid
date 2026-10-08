@@ -164,7 +164,8 @@ impl Session {
         }
         let (thread, _) = self.select_thread(thread).await?;
         let frames = self.thread_frames(thread, limit).await?;
-        Ok(json!({"session": session, "frames": frames}))
+        let warning = session.get("warning").cloned().unwrap_or(Json::Null);
+        Ok(json!({"session": session, "frames": frames, "warning": warning}))
     }
 
     pub async fn threads(&self, limit: u32) -> RpcResult<Json> {
@@ -236,16 +237,21 @@ impl Session {
         }
         for (local, value) in &locals {
             let mut visiting = HashSet::new();
-            variables.push(
-                self.render(
-                    local.name.clone(),
+            let display = resolve::display_local_name(&local.name);
+            let mut rendered = self
+                .render(
+                    display.to_string(),
                     *value,
                     Some(resolve::type_name(&local.signature)),
                     options,
                     &mut visiting,
                 )
-                .await,
-            );
+                .await;
+            if display != local.name {
+                // Inlined code: Kotlin suffixes the slot name (`it\1`).
+                rendered["slot_name"] = json!(local.name);
+            }
+            variables.push(rendered);
         }
         let this = match self.this_value(&selected).await {
             Ok(Some(this)) => {
@@ -431,6 +437,19 @@ impl Session {
         selected: &SelectedFrame,
         expression: &str,
     ) -> RpcResult<(Value, Option<String>)> {
+        let exception = self.suspension().and_then(|s| s.exception);
+        self.evaluate_path_with(selected, expression, exception)
+            .await
+    }
+
+    /// Read a path in `selected`; `exception` is what `$exception` names
+    /// (the stop's throwable, or the event's while a condition runs).
+    pub(super) async fn evaluate_path_with(
+        &self,
+        selected: &SelectedFrame,
+        expression: &str,
+        exception: Option<Value>,
+    ) -> RpcResult<(Value, Option<String>)> {
         let expr = expression.trim();
         if expr.is_empty() {
             return Err(RpcError::new("invalid_expression", "empty expression"));
@@ -439,7 +458,7 @@ impl Session {
         let base = &expr[..base_end];
         let (value, declared) = if base == EXCEPTION_ROOT {
             // The exception an exception breakpoint stopped on.
-            let exception = self.suspension().and_then(|s| s.exception).ok_or_else(|| {
+            let exception = exception.ok_or_else(|| {
                 RpcError::new(
                     "invalid_expression",
                     "`$exception` is only set while stopped at an exception breakpoint",
@@ -456,9 +475,20 @@ impl Session {
             (this, None)
         } else {
             let locals = self.visible_locals(selected).await?;
+            // The bare name matches inlined slots too (`it` for `it\1`); the
+            // innermost visible one (latest start, then narrowest) wins.
             let (local, value) = locals
                 .into_iter()
-                .find(|(local, _)| local.name == base)
+                .filter(|(local, _)| {
+                    local.name == base || resolve::display_local_name(&local.name) == base
+                })
+                .max_by_key(|(local, _)| {
+                    (
+                        local.name == base,
+                        local.code_index,
+                        std::cmp::Reverse(local.length),
+                    )
+                })
                 .ok_or_else(|| {
                     RpcError::new("invalid_expression", format!("unknown local: {base}"))
                         .next(&["shadowdroid debug variables --backend jdwp"])
@@ -627,6 +657,11 @@ impl Session {
             self.jdwp.object_values(object, &[field.field_id]).await?
         };
         Ok(values.into_iter().next().unwrap_or(Value::Void))
+    }
+
+    /// The primitive inside a boxed value (`java.lang.Integer.value`, …).
+    pub(super) async fn unboxed(&self, object: u64) -> Option<Value> {
+        self.field_by_name(object, "value").await
     }
 
     async fn field_by_name(&self, object: u64, name: &str) -> Option<Value> {
@@ -1005,6 +1040,11 @@ fn primitive_text(value: &Value) -> Json {
         Value::Double(v) => json!(v.to_string()),
         Value::Object { .. } => Json::Null,
     }
+}
+
+/// Whether a class signature is a boxed primitive.
+pub fn is_boxed(signature: &str) -> bool {
+    boxed_primitive(signature).is_some()
 }
 
 fn boxed_primitive(signature: &str) -> Option<&'static str> {

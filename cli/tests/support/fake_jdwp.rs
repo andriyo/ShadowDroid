@@ -71,6 +71,8 @@ pub struct State {
     pub prepare_late_during_scan: bool,
     pub connections: u32,
     pub step_line_index: u64,
+    /// Breakpoint composites sent.
+    pub hits: u32,
 }
 
 struct Shared {
@@ -145,8 +147,8 @@ impl FakeVm {
     /// Fire every breakpoint request at `onNewIntent` code index `index` as
     /// one composite (suspend policy ALL), as ART does.
     pub fn hit_breakpoint(&self, index: u64) -> usize {
-        let matching: Vec<i32> = self.with_state(|state| {
-            state
+        let (matching, policy): (Vec<i32>, u8) = self.with_state(|state| {
+            let requests: Vec<&Request> = state
                 .requests
                 .iter()
                 .filter(|r| r.kind == 2 && !state.cleared.contains(&r.id))
@@ -154,14 +156,21 @@ impl FakeVm {
                     r.location
                         .is_some_and(|(_, method, at)| method == ON_NEW_INTENT && at == index)
                 })
-                .map(|r| r.id)
-                .collect()
+                .collect();
+            // The composite carries the strongest policy among its events.
+            let policy = requests.iter().map(|r| r.policy).max().unwrap_or(0);
+            (requests.iter().map(|r| r.id).collect(), policy)
         });
         if matching.is_empty() {
             return 0;
         }
-        self.with_state(|state| state.suspend_count += 1);
-        let mut body = vec![2_u8];
+        self.with_state(|state| {
+            state.hits += 1;
+            if policy != 0 {
+                state.suspend_count += 1;
+            }
+        });
+        let mut body = vec![policy];
         put_i32(&mut body, matching.len() as i32);
         for request in &matching {
             body.push(2);
@@ -688,6 +697,9 @@ fn handle(shared: &Shared, set: u8, cmd: u8, body: &[u8]) -> (u16, Vec<u8>, Afte
                     (0, "tag", "Ljava/lang/String;", 20, 1),
                     (5, "count", "I", 15, 2),
                     (5, "$i$f$inline", "I", 15, 3),
+                    // Inlined lambdas: Kotlin suffixes the slot names.
+                    (0, "it\\1", "Ljava/lang/String;", 20, 4),
+                    (5, "it\\2", "I", 15, 5),
                 ]
             } else {
                 &[]
@@ -914,9 +926,13 @@ fn handle(shared: &Shared, set: u8, cmd: u8, body: &[u8]) -> (u16, Vec<u8>, Afte
                         out.push(b's');
                         put_u64(&mut out, 501);
                     }
-                    2 | 3 => {
+                    2 | 3 | 5 => {
                         out.push(b'I');
                         put_i32(&mut out, 42);
+                    }
+                    4 => {
+                        out.push(b's');
+                        put_u64(&mut out, 501);
                     }
                     _ => return (35, Vec::new(), After::Nothing),
                 }
