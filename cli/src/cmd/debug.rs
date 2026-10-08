@@ -702,6 +702,7 @@ async fn debug_auto(
         "type": "debug_auto",
         "schema_version": 1,
         "ok": ok,
+        "backend": "studio",
         "sample_valid": sample_valid,
         "device": serial,
         "app": {
