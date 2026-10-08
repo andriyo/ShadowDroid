@@ -391,6 +391,17 @@ enum Dbg<'a> {
     Jdwp,
 }
 
+impl Dbg<'_> {
+    /// The `backend` every result carries; it also keeps catalog
+    /// `next_actions` on the backend that produced the result.
+    fn backend(&self) -> &'static str {
+        match self {
+            Dbg::Studio(_) => "studio",
+            Dbg::Jdwp => "jdwp",
+        }
+    }
+}
+
 fn jdwp_unsupported(message: &str) -> anyhow::Error {
     crate::diagnostic::DiagnosticError::new("unsupported_by_backend", "debugger", message)
         .detail(json!({"backend": "jdwp"}))
@@ -1586,6 +1597,7 @@ async fn step_until_screen_change(
             )
             .retryable(true)
             .detail(json!({
+                "backend": dbg.backend(),
                 "steps": steps,
                 "timeout_ms": args.timeout_ms,
                 "initial_screen_hash": initial_hash,
@@ -1607,6 +1619,7 @@ async fn step_until_screen_change(
             let snapshot = final_snapshot(serial, client, &args.app, dbg, args.depth, 120).await?;
             emit_json(&json!({
                 "type": "step_until_screen_change",
+                "backend": dbg.backend(),
                 "ok": true,
                 "steps": steps,
                 "initial_screen_hash": initial_hash,
@@ -1646,6 +1659,7 @@ async fn step_until_log(
             )
             .retryable(true)
             .detail(json!({
+                "backend": dbg.backend(),
                 "pattern": args.pattern,
                 "steps": steps,
                 "timeout_ms": args.wait.timeout_ms,
@@ -1680,6 +1694,7 @@ async fn step_until_log(
                         .await?;
                         emit_json(&json!({
                             "type": "step_until_log",
+                            "backend": dbg.backend(),
                             "ok": true,
                             "pattern": args.pattern,
                             "steps": steps,
