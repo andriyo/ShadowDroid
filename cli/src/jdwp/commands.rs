@@ -920,6 +920,16 @@ pub async fn debugger_snapshot(serial: &str, depth: u32) -> Json {
     })
 }
 
+/// The serial of the only registered session across every device, if there
+/// is exactly one: the device a device-changing verb with no `-d` acts on.
+pub fn sole_session_serial() -> Option<String> {
+    let entries = paths::entries(None);
+    match entries.as_slice() {
+        [only] => Some(only.serial.clone()),
+        _ => None,
+    }
+}
+
 /// A live daemon that holds the target: the `--backend auto` rule that
 /// follows the process (design §4.4). A pid or package narrows the match;
 /// without either any live session in scope counts. Dead registries are

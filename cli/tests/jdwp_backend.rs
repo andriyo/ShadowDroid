@@ -16,6 +16,7 @@ struct Env {
     home: PathBuf,
     project: PathBuf,
     vm: FakeVm,
+    adb: support::fake_adb::FakeAdb,
 }
 
 impl Env {
@@ -40,6 +41,7 @@ impl Env {
             home,
             project,
             vm: FakeVm::start(),
+            adb: support::fake_adb::FakeAdb::start("fake-serial"),
         }
     }
 
@@ -53,6 +55,7 @@ impl Env {
             .env_remove("USERPROFILE")
             .env("SHADOWDROID_QUIET", "1")
             .env("SHADOWDROID_JDWP_TCP", self.vm.address())
+            .env("ANDROID_ADB_SERVER_PORT", self.adb.port().to_string())
             .output()
             .expect("spawn shadowdroid");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -92,6 +95,7 @@ impl Drop for Env {
             .env("HOME", &self.home)
             .env("SHADOWDROID_QUIET", "1")
             .env("SHADOWDROID_JDWP_TCP", self.vm.address())
+            .env("ANDROID_ADB_SERVER_PORT", self.adb.port().to_string())
             .output();
     }
 }
@@ -480,6 +484,7 @@ impl Env {
             .env_remove("USERPROFILE")
             .env("SHADOWDROID_QUIET", "1")
             .env("SHADOWDROID_JDWP_TCP", self.vm.address())
+            .env("ANDROID_ADB_SERVER_PORT", self.adb.port().to_string())
             .output()
             .expect("spawn shadowdroid");
         String::from_utf8_lossy(&output.stdout)
@@ -867,7 +872,34 @@ fn break_line_without_a_session_suggests_setting_it_at_launch() {
     ]);
     assert_eq!(
         error["next_actions"][0],
-        "shadowdroid debug attach --backend jdwp --wait-for-launch --package io.example.app --break MainActivity.kt:20",
+        // The verb changes the device, so it was admitted on fake-serial and
+        // the follow-up names that device.
+        "shadowdroid -d fake-serial debug attach --backend jdwp --wait-for-launch --package io.example.app --break MainActivity.kt:20",
         "{error}"
     );
+}
+
+/// Device-changing verbs pass the runtime's admission (ownership, lock,
+/// quarantine) like every other driver command; read-only verbs stay
+/// passive and keep working from the registry alone.
+#[test]
+fn device_changing_verbs_are_admitted_and_reads_stay_passive() {
+    let env = Env::new();
+    env.ok(&["debug", "attach", "--backend", "jdwp", "--pid", "4242"]);
+
+    // The device disappears from adb: a read still answers from the daemon.
+    env.adb.set_online(false);
+    let stack = env.run(&["debug", "stack", "--backend", "jdwp"]);
+    assert_eq!(stack.0["backend"], "jdwp", "{}", stack.0);
+    assert_ne!(stack.0["code"], "device_unavailable", "{}", stack.0);
+
+    // A verb that changes the device must be admitted first, so it fails
+    // on the missing device instead of acting on the process.
+    let (pause, code) = env.run(&["debug", "pause", "--backend", "jdwp"]);
+    assert_ne!(code, 0, "{pause}");
+    assert_eq!(pause["code"], "device_unavailable", "{pause}");
+
+    env.adb.set_online(true);
+    env.ok(&["debug", "pause", "--backend", "jdwp"]);
+    env.ok(&["debug", "detach", "--backend", "jdwp"]);
 }

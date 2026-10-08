@@ -2194,14 +2194,31 @@ async fn run_inner() -> Result<()> {
             let DebugCmd::Studio(debugger_cmd) = &args.cmd else {
                 unreachable!("host-only debug commands are debugger verbs");
             };
-            // Only attach needs a device; the other verbs find their daemon
-            // in the registry (scoped by an explicit device when given).
-            let serial = match selection.explicit_device.clone() {
-                Some(device) => Some(device),
-                None if matches!(debugger_cmd, DebuggerCmd::Attach { .. }) => {
-                    Some(selection.resolve_online(&config).await?.to_string())
-                }
-                None => None,
+            // Same admission rule as the Studio branch below: a managed
+            // session, any reservation, attach, or a verb that changes the
+            // device (pause/step/break/…) must pass the runtime's ownership,
+            // lock, idle and quarantine checks before touching the process.
+            // Read-only verbs stay passive and find their daemon in the
+            // registry (scoped by an explicit device when given).
+            let needs_admission = crate::runtime::token().is_some()
+                || crate::runtime::has_reservations()?
+                || matches!(debugger_cmd, DebuggerCmd::Attach { .. })
+                || crate::cmd::introspect::changes_device(
+                    crate::events::current_command_path().unwrap_or("debug"),
+                );
+            let serial = if !needs_admission {
+                selection.explicit_device.clone()
+            } else if selection.explicit_device.is_none()
+                && !matches!(debugger_cmd, DebuggerCmd::Attach { .. })
+                && let Some(serial) = crate::jdwp::commands::sole_session_serial()
+            {
+                // No device named: admit the device the only live session is
+                // on rather than failing on "several devices online".
+                let serial = Serial::new(serial);
+                crate::runtime::admit(&serial).await?;
+                Some(serial.to_string())
+            } else {
+                Some(selection.resolve_online(&config).await?.to_string())
             };
             return crate::jdwp::commands::run(
                 debugger_cmd,
