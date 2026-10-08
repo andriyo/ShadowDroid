@@ -308,8 +308,21 @@ and `--max-events-per-second` keep their meaning.
   `java.*`, `kotlin.*`, `kotlinx.coroutines.*`, `android.*`, `androidx.*`,
   `dalvik.*`, and classes without line tables. This is what stops
   "step into" from landing in `Intrinsics.checkNotNullParameter`.
-- `step-until-screen-change` / `step-until-log` loop over step-over exactly as
-  they do now; only the step primitive changes.
+- `step-until-log` loops over step-over exactly as it does now; only the
+  step primitive changes.
+- `step-until-screen-change` cannot work that way on jdwp: the screen only
+  changes once the main thread returns to its message loop and draws, and
+  the UI tree cannot be read while the main thread is suspended (every
+  accessibility request times out, about 11 s per read). The jdwp verb
+  therefore runs `mode: "run_to_frame"`: step out until the top frame is
+  framework code (usually one step-out), hash a server screenshot with the
+  status bar excluded, resume, poll that hash every ~120 ms (a device
+  screenshot costs 9–33 ms while running), and pause as soon as it changes.
+  The result keeps the Studio shape and adds `mode`, `step_outs`, `polls`,
+  `ran_ms`, the position it started from, and the main thread's stack at the
+  pause (normally idle in the message loop). A one-shot breakpoint on
+  `Choreographer.doFrame` to stop inside the drawing frame is a possible
+  refinement, not implemented.
 - `threads` reports name, status, suspend count, and frames; the dispatcher
   hints used by `debug coroutines threads` are derived from thread names as
   today.

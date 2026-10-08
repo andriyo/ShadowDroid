@@ -1574,12 +1574,159 @@ fn find_divergences(runs: &[Vec<(String, u32)>]) -> Vec<Value> {
     out
 }
 
+/// Status-bar share of the screen height left out of jdwp screen hashes
+/// (the clock and icons change on their own).
+const STATUS_BAR_FRACTION: f32 = 0.06;
+/// Poll interval while the app runs toward a screen change.
+const SCREEN_POLL: Duration = Duration::from_millis(120);
+/// Step-outs tried before giving up on reaching framework code.
+const MAX_STEP_OUTS: u32 = 8;
+
+/// Hash of a PNG screenshot without the status bar, so only the app's own
+/// drawing counts as a screen change.
+fn screen_hash_without_status_bar(png: &[u8]) -> Result<String> {
+    let image = image::load_from_memory_with_format(png, image::ImageFormat::Png)
+        .context("decoding screenshot")?
+        .to_rgba8();
+    let (width, height) = image.dimensions();
+    let skip = ((height as f32) * STATUS_BAR_FRACTION) as u32;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&width.to_le_bytes());
+    for y in skip..height {
+        for x in 0..width {
+            hasher.update(&image.get_pixel(x, y).0);
+        }
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// `step-until-screen-change --backend jdwp` (`mode: "run_to_frame"`).
+///
+/// Stepping the main thread cannot change the screen: the frame is drawn
+/// after the handler returns to the message loop, and the UI tree cannot
+/// be read while the main thread is suspended (every accessibility request
+/// times out, ~11 s). So: step out until the top frame is framework code,
+/// hash a server screenshot (status bar cropped), resume, poll the hash,
+/// and pause again once it changes, reporting where the main thread was.
+async fn step_until_screen_change_jdwp(
+    serial: &Serial,
+    client: &ServerClient,
+    args: StudioWaitArgs,
+) -> Result<()> {
+    use crate::jdwp::commands as jdwp;
+    let started = Instant::now();
+    let entry = jdwp::session_for(serial.as_str(), args.session.as_deref())?;
+    let rpc_timeout = Duration::from_secs(30);
+    let status = jdwp::call(&entry, "status", json!({}), rpc_timeout).await?;
+    if status.pointer("/session/suspended") != Some(&json!(true)) {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "debugger_not_suspended",
+            "debugger",
+            "step-until-screen-change starts from a stop; the app is running",
+        )
+        .detail(json!({"backend": "jdwp"}))
+        .next_actions(["shadowdroid debug pause --backend jdwp"])
+        .into());
+    }
+    let from = status.pointer("/session/position").cloned();
+
+    // Leave app code: the change needs the message loop to run.
+    let mut step_outs = 0;
+    loop {
+        let stack = jdwp::call(&entry, "stack", json!({"limit": 1}), rpc_timeout).await?;
+        let top = stack
+            .pointer("/frames/0/class")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if top.is_empty()
+            || crate::jdwp::session::is_framework_class(top)
+            || step_outs >= MAX_STEP_OUTS
+        {
+            break;
+        }
+        jdwp::call(&entry, "step", json!({"depth": "out"}), rpc_timeout).await?;
+        step_outs += 1;
+    }
+
+    let shot = || async {
+        let png = client
+            .screenshot(Some("png"), Some(0.5), None)
+            .await
+            .context("capturing screenshot")?;
+        screen_hash_without_status_bar(&png)
+    };
+    let initial = shot().await?;
+    let resumed_at = Instant::now();
+    jdwp::call(&entry, "resume", json!({}), rpc_timeout).await?;
+    let deadline = resumed_at + Duration::from_millis(args.timeout_ms);
+    let mut polls = 0u64;
+    let changed = loop {
+        tokio::time::sleep(SCREEN_POLL).await;
+        polls += 1;
+        let hash = shot().await?;
+        if hash != initial {
+            break Some(hash);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+    };
+    let ran_ms = duration_millis(resumed_at.elapsed())?;
+    // Stop again so the result describes a suspended, inspectable state.
+    let paused = jdwp::call(&entry, "pause", json!({}), rpc_timeout).await?;
+    let main = jdwp::call(&entry, "stack", json!({"limit": 8}), rpc_timeout)
+        .await
+        .unwrap_or_else(|error| json!({"error": error.to_string()}));
+    let snapshot = final_snapshot(serial, client, &args.app, Dbg::Jdwp, args.depth, 120).await?;
+    let elapsed_ms = duration_millis(started.elapsed())?;
+    let result = json!({
+        "type": "step_until_screen_change",
+        "backend": "jdwp",
+        "mode": "run_to_frame",
+        "mode_detail": "stepped out to framework code, resumed, polled the screen hash (status bar excluded), then paused; stepping the main thread itself cannot change the screen",
+        "ok": changed.is_some(),
+        "steps": step_outs,
+        "step_outs": step_outs,
+        "from": from,
+        "polls": polls,
+        "ran_ms": ran_ms,
+        "elapsed_ms": elapsed_ms,
+        "initial_screen_hash": initial,
+        "screen_hash": changed,
+        "screen_hash_version": "jdwp_png_no_status_bar_v1",
+        "paused": paused.get("session"),
+        "main_thread": main.get("frames"),
+        "snapshot": snapshot,
+    });
+    if changed.is_none() {
+        return Err(crate::diagnostic::DiagnosticError::new(
+            "debug_wait_timeout",
+            "debugger",
+            format!(
+                "screen did not change within {}ms of running",
+                args.timeout_ms
+            ),
+        )
+        .retryable(true)
+        .detail(result)
+        .next_actions([
+            "drive the app (ui tap …) while it runs, or increase --timeout-ms",
+            "shadowdroid debug resume --backend jdwp",
+        ])
+        .into());
+    }
+    emit_json(&result)
+}
+
 async fn step_until_screen_change(
     serial: &Serial,
     client: &ServerClient,
     args: StudioWaitArgs,
     dbg: Dbg<'_>,
 ) -> Result<()> {
+    if let Dbg::Jdwp = dbg {
+        return step_until_screen_change_jdwp(serial, client, args).await;
+    }
     let stepper = Stepper::new(serial, dbg, args.session.clone())?;
     let initial = client.screen().await.context("reading initial screen")?;
     let initial_hash = initial.screen_hash.clone();
@@ -3186,6 +3333,34 @@ fn duration_millis(duration: Duration) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jdwp_screen_hashes_ignore_the_status_bar() {
+        let png = |status: [u8; 4], body: [u8; 4]| {
+            let mut image = image::RgbaImage::from_pixel(10, 100, image::Rgba(body));
+            for y in 0..5 {
+                for x in 0..10 {
+                    *image.get_pixel_mut(x, y) = image::Rgba(status);
+                }
+            }
+            let mut out = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image)
+                .write_to(&mut out, image::ImageFormat::Png)
+                .unwrap();
+            out.into_inner()
+        };
+        let base = screen_hash_without_status_bar(&png([0, 0, 0, 255], [9, 9, 9, 255])).unwrap();
+        let clock_ticked =
+            screen_hash_without_status_bar(&png([200, 0, 0, 255], [9, 9, 9, 255])).unwrap();
+        let app_drew =
+            screen_hash_without_status_bar(&png([0, 0, 0, 255], [9, 99, 9, 255])).unwrap();
+        assert_eq!(
+            base, clock_ticked,
+            "status bar changes are not screen changes"
+        );
+        assert_ne!(base, app_drew);
+        assert!(screen_hash_without_status_bar(b"not a png").is_err());
+    }
 
     #[test]
     fn a_live_jdwp_exception_stop_becomes_a_correlatable_crash() {
