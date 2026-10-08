@@ -103,24 +103,40 @@ What works:
 
 - `attach`/`detach`/`sessions`/`status`, `pause`/`resume`/`step-*`,
   `continue-until`, `stack`, `threads`, `variables`, `eval`, `inspect`, object
-  handles, `watch`, and the composed `auto`, `snapshot`, `run-until-crash`,
-  `step-until-log`, and `step-until-screen-change`.
+  handles, `watch` (path expressions; watches do not take `--invoke`), and the
+  composed `auto`, `snapshot`, `run-until-crash`, `step-until-log`, and
+  `step-until-screen-change`. Stepping the main thread cannot redraw the
+  screen, so on this backend `step-until-screen-change` steps out to
+  framework code, lets the app run, and pauses as soon as a screenshot hash
+  changes (`mode: run_to_frame`).
 - Line breakpoints resolved from your project sources (lambdas included;
-  `--variant outer|lambda` picks one), exception breakpoints, conditions,
+  `--variant outer|lambda` picks the enclosing method or the innermost
+  lambda, and a line with no such location reports
+  `pending_reason: no_location_for_variant`), exception breakpoints, conditions,
   pass counts, temporary/disabled breakpoints, and logpoints with the same
   event stream and cursors as Studio.
 - Method breakpoints, set as line breakpoints at the method's first line and
   at each return. Kotlin property watches use the getter/setter;
   `break field --accept-slowdown` sets a real field watch for a bounded
-  `--duration-ms` (it slows the whole app while armed).
+  `--duration-ms` (it slows the whole app while armed). A delegated property
+  (`by mutableStateOf`, `by lazy`) keeps the getter/setter even then: its
+  field holds the delegate and is never reassigned, so a field watch would
+  not fire; the breakpoint's `note` says so.
 - Startup code: `debug attach --wait-for-launch --package <pkg> --break
   File.kt:LINE` (or `debug auto --from-start --break …`) restarts the app
   under the debugger and installs breakpoints before the first line runs.
+  With several launcher activities, pass `--launch-activity .Main`; otherwise
+  the root of the app's last task (else the first launcher) is started and
+  the result warns. A process launched this way raises no ANR dialog while
+  stopped. Ctrl-C during the launch restores the debug-app setting and stops
+  the waiting process.
 - `run-until-crash` stops on an uncaught exception with the throwing frame
   and its locals still live, before the process dies.
 - `debug coroutines snapshot` lists coroutines process-wide (name,
-  dispatcher, state, suspended continuations) from a stopped session, read
-  from fields only; source lines need `aar coroutines`.
+  dispatcher, state, suspended continuations) from a stopped session (pause
+  first), read from fields only; coroutines running app code are listed
+  first under `--limit`. It walks the heap, so expect several seconds on an
+  emulator. Source lines need `aar coroutines`.
 
 Method calls are opt-in. Reads (fields, locals, array items, Kotlin
 properties with a backing field) never run app code. `--invoke` on `eval`,
@@ -142,7 +158,9 @@ Limits:
 - Field watches and method-exit events deoptimize the whole app; the
   defaults avoid them and the opt-in reports the cost.
 - Unix hosts (macOS, Linux); Android 9 (API 28) or newer; debuggable apps
-  (or any process on `ro.debuggable=1` emulator images).
+  (`android:debuggable`, i.e. debug builds). Only processes adbd lists on its
+  `jdwp` service can be attached; a release build reports
+  `process_not_debuggable`.
 
 ## Non-suspending logpoints
 
