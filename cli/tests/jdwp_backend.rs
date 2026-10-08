@@ -28,7 +28,11 @@ impl Env {
         std::fs::create_dir_all(&source).unwrap();
         std::fs::write(
             source.join("MainActivity.kt"),
-            "package io.example.app\n\nclass MainActivity\n",
+            // Code on every line the fake VM's line tables name (20..32).
+            format!(
+                "package io.example.app\n\nclass MainActivity {{\n{}}}\n",
+                "    val x = 1\n".repeat(40)
+            ),
         )
         .unwrap();
         Env {

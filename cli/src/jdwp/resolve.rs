@@ -30,6 +30,13 @@ pub enum LocateError {
     Ambiguous(Vec<String>),
     /// Not a file name the VM can match (`--file` must name a .kt/.java file).
     NotASourceFile(String),
+    /// The located file has no code at the line: past its end, blank, or a
+    /// comment. No class can ever bind it.
+    NoCodeAtLine {
+        path: String,
+        line: u32,
+        reason: &'static str,
+    },
 }
 
 /// Resolve `--file` to a [`SourceTarget`].
@@ -52,7 +59,7 @@ pub fn locate(
         return Err(LocateError::NotASourceFile(file.display().to_string()));
     }
     if file.is_file() {
-        return Ok(target_from_path(file.to_path_buf(), basename, line));
+        return checked(target_from_path(file.to_path_buf(), basename, line), line);
     }
     let root = project_root
         .map(Path::to_path_buf)
@@ -75,7 +82,10 @@ pub fn locate(
         match matches.len() {
             0 => {}
             1 => {
-                return Ok(target_from_path(root.join(&matches[0]), basename, line));
+                return checked(
+                    target_from_path(root.join(&matches[0]), basename, line),
+                    line,
+                );
             }
             _ => return Err(LocateError::Ambiguous(matches)),
         }
@@ -87,6 +97,49 @@ pub fn locate(
         package_known: false,
         inline_body: false,
     })
+}
+
+/// Reject a line no class can hold: past the end of the file, blank, or a
+/// comment. Anything else may carry code (Kotlin maps a closing brace to the
+/// function's return), so the VM's line tables stay the authority.
+fn checked(target: SourceTarget, line: u32) -> Result<SourceTarget, LocateError> {
+    let Some(path) = &target.path else {
+        return Ok(target);
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Ok(target);
+    };
+    if let Some(reason) = no_code_reason(&text, line) {
+        return Err(LocateError::NoCodeAtLine {
+            path: path.display().to_string(),
+            line,
+            reason,
+        });
+    }
+    Ok(target)
+}
+
+/// Why `line` (1-based) of `text` cannot hold code, if it cannot.
+pub fn no_code_reason(text: &str, line: u32) -> Option<&'static str> {
+    let Some(raw) = line
+        .checked_sub(1)
+        .and_then(|index| text.lines().nth(index as usize))
+    else {
+        return Some("past_end_of_file");
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Some("blank_line");
+    }
+    if trimmed.starts_with("//")
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with("*")
+        || trimmed.starts_with("import ")
+        || trimmed.starts_with("package ")
+    {
+        return Some("comment_or_declaration");
+    }
+    None
 }
 
 fn ends_with_components(relative: &str, wanted: &[String]) -> bool {
@@ -276,6 +329,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn lines_without_code_are_rejected_before_binding() {
+        let text = "package a\n\nimport b.C\n// note\nclass A {\n    fun f() = 1\n}\n";
+        assert_eq!(no_code_reason(text, 1), Some("comment_or_declaration"));
+        assert_eq!(no_code_reason(text, 2), Some("blank_line"));
+        assert_eq!(no_code_reason(text, 3), Some("comment_or_declaration"));
+        assert_eq!(no_code_reason(text, 4), Some("comment_or_declaration"));
+        assert_eq!(no_code_reason(text, 6), None);
+        // A closing brace can map to the return instruction: left to the VM.
+        assert_eq!(no_code_reason(text, 7), None);
+        assert_eq!(no_code_reason(text, 8), Some("past_end_of_file"));
+        assert_eq!(no_code_reason(text, 0), Some("past_end_of_file"));
+    }
+
+    #[test]
     fn packages_parse_in_both_languages() {
         assert_eq!(
             parse_package("// c\npackage io.github.x.sample\n\nimport a.b"),
@@ -360,14 +427,19 @@ fun after() {
         std::fs::write(src.join("Main.kt"), "package io.x\nfun main() {}\n").unwrap();
         let other = dir.path().join("lib/src/main/kotlin/io/y");
         std::fs::create_dir_all(&other).unwrap();
-        std::fs::write(other.join("Main.kt"), "package io.y\n").unwrap();
+        std::fs::write(other.join("Main.kt"), "package io.y\nfun other() {}\n").unwrap();
 
         let direct = locate(&src.join("Main.kt"), 2, None).unwrap();
         assert_eq!(direct.package.as_deref(), Some("io.x"));
         assert!(direct.package_known);
 
-        let suffix = locate(Path::new("io/y/Main.kt"), 1, Some(dir.path())).unwrap();
+        let suffix = locate(Path::new("io/y/Main.kt"), 2, Some(dir.path())).unwrap();
         assert_eq!(suffix.package.as_deref(), Some("io.y"));
+        // A located file is line-checked: the package line holds no code.
+        assert!(matches!(
+            locate(Path::new("io/y/Main.kt"), 1, Some(dir.path())),
+            Err(LocateError::NoCodeAtLine { line: 1, .. })
+        ));
 
         match locate(Path::new("Main.kt"), 1, Some(dir.path())) {
             Err(LocateError::Ambiguous(candidates)) => assert_eq!(candidates.len(), 2),

@@ -120,6 +120,18 @@ pub async fn run(cmd: &DebuggerCmd, ctx: JdwpContext<'_>) -> Result<()> {
                     .next_actions(["pass a longer path suffix or an absolute path in --file"])
                     .into());
                 }
+                Err(LocateError::NoCodeAtLine { path, line, reason }) => {
+                    return Err(DiagnosticError::new(
+                        "breakpoint_unresolved",
+                        "debugger",
+                        format!("{path}:{line} has no code ({reason})"),
+                    )
+                    .detail(
+                        json!({"backend": "jdwp", "file": path, "line": line, "reason": reason}),
+                    )
+                    .next_actions(["pick a line with an executable statement"])
+                    .into());
+                }
                 Err(LocateError::NotASourceFile(name)) => {
                     return Err(DiagnosticError::new(
                         "breakpoint_unresolved",
@@ -131,13 +143,22 @@ pub async fn run(cmd: &DebuggerCmd, ctx: JdwpContext<'_>) -> Result<()> {
                 }
             };
             let entry = select(ctx.serial, None)?;
-            rpc(
+            let mut value = rpc(
                 &entry,
                 "break_line",
                 json!({"target": target, "line": line}),
                 DEFAULT_CALL_TIMEOUT,
             )
-            .await?
+            .await?;
+            if target.path.is_none() {
+                // A typo binds nothing, ever: say the file was not found
+                // locally and that binding is by file name only.
+                value["warning"] = json!(format!(
+                    "{} was not found under the project root; binding by file name only, with no package filter or line check",
+                    target.basename
+                ));
+            }
+            value
         }
         DebuggerCmd::Break(BreakCmd::Exception {
             exception,
