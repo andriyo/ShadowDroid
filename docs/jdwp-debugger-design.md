@@ -260,11 +260,17 @@ availability.
   process name, with the existing ambiguity error listing candidates), spawns
   `debugd`, performs the `JDWP-Handshake`, reads IDSizes/CapabilitiesNew, and
   returns the session id. The VM is **not** suspended on attach.
-- `debug attach --wait-for-launch` and `debug auto --from-start` set
-  `am set-debug-app -w <pkg>` (plus `--persistent` only for the duration of
-  the command), launch, attach to the pid that appears in `track-jdwp`, then
-  issue VirtualMachine.Resume and `am clear-debug-app`. Breakpoints queued
-  before launch bind through ClassPrepare ([§5.2](#52-breakpoint-resolution)).
+- `debug attach --wait-for-launch` and `debug auto --from-start` set a
+  one-off `am set-debug-app -w <pkg>`, launch, attach to the pid that appears
+  in `track-jdwp`, then issue VirtualMachine.Resume. ActivityManager reverts
+  a one-off setting to the previous one by itself when the app starts, so a
+  successful launch restores nothing. A launch that fails or is interrupted
+  runs `am clear-debug-app` and, when a persistent setting existed before,
+  writes it back with `settings put global debug_app`/`wait_for_debugger`
+  (ActivityManager reads it on its next settings load); never `am
+  set-debug-app --persistent <prev>`, which force-stops that app.
+  Breakpoints queued before launch bind through ClassPrepare
+  ([§5.2](#52-breakpoint-resolution)).
 - `debug detach` disposes the VM connection (which clears all event requests
   and resumes the app), removes the registry, and exits the daemon. A dying
   daemon takes the same path from a `Drop` guard so an app is never left

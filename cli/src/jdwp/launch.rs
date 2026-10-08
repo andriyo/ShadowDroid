@@ -184,7 +184,17 @@ fn same_component(a: &str, b: &str) -> bool {
 
 /// The persistent debug-app setting found before the launch (Developer
 /// options "Select debug app" / "Wait for debugger", or `am set-debug-app
-/// --persistent`). `am clear-debug-app` clears it, so it is restored instead.
+/// --persistent`).
+///
+/// Our `am set-debug-app -w` is one-off (not persistent): ActivityManager
+/// keeps the previous setting aside and puts it back by itself when the
+/// launched app attaches, so a successful launch restores nothing. Only a
+/// launch that never started the app leaves our one-off setting behind;
+/// `am clear-debug-app` removes it but also clears a persistent setting, so
+/// that one is written back to `Settings.Global` (`debug_app`,
+/// `wait_for_debugger`) directly, which ActivityManager reads the next time
+/// it loads its settings. Never `am set-debug-app --persistent <prev>`:
+/// setting a debug app force-stops that app.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PreviousDebugApp {
     pub package: Option<String>,
@@ -205,30 +215,56 @@ async fn read_debug_app<H: LaunchHost>(host: &H) -> PreviousDebugApp {
     }
 }
 
-/// Put the debug-app setting back: clear it, or restore what was there.
-async fn restore_debug_app<H: LaunchHost>(
+/// After a launch that did not start the app: clear our one-off setting,
+/// then write a previous persistent setting back to the settings store.
+async fn clear_one_off_debug_app<H: LaunchHost>(
     host: &H,
     previous: &PreviousDebugApp,
     steps: &mut Vec<Json>,
 ) {
-    let command = match &previous.package {
-        Some(package) => format!(
-            "am set-debug-app{} --persistent {}",
-            if previous.wait_for_debugger {
-                " -w"
-            } else {
-                ""
-            },
+    let cleared = host.shell("am clear-debug-app").await;
+    steps.push(json!({
+        "step": "clear_debug_app",
+        "ok": cleared.is_ok(),
+        "command": "am clear-debug-app",
+        "error": cleared.as_ref().err().map(|e| e.to_string()),
+    }));
+    let Some(package) = &previous.package else {
+        return;
+    };
+    let commands = [
+        format!(
+            "settings put global debug_app {}",
             crate::config::quote_device_shell_arg(package)
         ),
-        None => "am clear-debug-app".to_string(),
-    };
-    let result = host.shell(&command).await;
+        format!(
+            "settings put global wait_for_debugger {}",
+            u8::from(previous.wait_for_debugger)
+        ),
+    ];
+    let mut errors = Vec::new();
+    for command in &commands {
+        if let Err(error) = host.shell(command).await {
+            errors.push(error.to_string());
+        }
+    }
     steps.push(json!({
-        "step": if previous.package.is_some() { "restore_debug_app" } else { "clear_debug_app" },
-        "ok": result.is_ok(),
-        "command": command,
-        "error": result.as_ref().err().map(|e| e.to_string()),
+        "step": "restore_debug_app",
+        "ok": errors.is_empty(),
+        "commands": commands,
+        "note": "written to Settings.Global; ActivityManager picks it up the next time it reads its settings (not through am set-debug-app, which force-stops the app)",
+        "errors": errors,
+    }));
+}
+
+/// After a launch that started the app: ActivityManager already reverted
+/// our one-off setting to whatever was there before.
+fn note_debug_app_reverted(previous: &PreviousDebugApp, steps: &mut Vec<Json>) {
+    steps.push(json!({
+        "step": "debug_app_reverted",
+        "ok": true,
+        "note": "the one-off set-debug-app reverts when the launched app starts; nothing to restore",
+        "previous_debug_app": previous.package,
     }));
 }
 
@@ -323,11 +359,19 @@ where
     };
     steps.append(&mut work_steps);
 
-    // Every exit path: a leftover `-w` would freeze the next launch.
-    restore_debug_app(host, &previous, steps).await;
+    // Every exit path leaves the setting as it was: a leftover `-w` would
+    // freeze the next launch. Success: the app started, so ActivityManager
+    // already reverted our one-off setting. Failure or interrupt: clear it
+    // (harmless when it already reverted) and write back a persistent one.
     let outcome = match outcome {
-        Some(Ok(attached)) => return Ok(attached),
-        failed => failed,
+        Some(Ok(attached)) => {
+            note_debug_app_reverted(&previous, steps);
+            return Ok(attached);
+        }
+        failed => {
+            clear_one_off_debug_app(host, &previous, steps).await;
+            failed
+        }
     };
     // Failed or interrupted before a debugger took the process: a process
     // already in waitForDebugger keeps waiting after clear-debug-app (the
@@ -520,8 +564,8 @@ mod tests {
                 "settings get global wait_for_debugger",
                 "am force-stop 'io.example.app'",
                 "am set-debug-app -w 'io.example.app'",
-                "am clear-debug-app",
-            ]
+            ],
+            "the one-off setting reverts by itself once the app starts"
         );
         let names: Vec<_> = steps.iter().map(|s| s["step"].as_str().unwrap()).collect();
         assert_eq!(
@@ -531,7 +575,7 @@ mod tests {
                 "set_debug_app",
                 "launch",
                 "process_started",
-                "clear_debug_app"
+                "debug_app_reverted"
             ]
         );
     }
@@ -629,7 +673,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_previous_debug_app_setting_is_restored_not_cleared() {
+    async fn a_previous_debug_app_setting_is_left_alone_on_success() {
         let host = FakeHost::new(vec![])
             .reply("settings get global debug_app", "com.other.app\n")
             .reply("settings get global wait_for_debugger", "1\n");
@@ -650,14 +694,55 @@ mod tests {
         .await
         .unwrap();
         let commands = host.commands();
-        assert_eq!(
-            commands.last().unwrap(),
-            "am set-debug-app -w --persistent 'com.other.app'"
+        // `am set-debug-app --persistent <prev>` would force-stop com.other.app.
+        assert!(
+            !commands.iter().any(|c| c.contains("com.other.app")),
+            "{commands:?}"
         );
         assert!(!commands.iter().any(|c| c == "am clear-debug-app"));
         assert_eq!(steps[0]["previous_debug_app"], "com.other.app");
         assert_eq!(steps[0]["previous_wait_for_debugger"], true);
-        assert_eq!(steps.last().unwrap()["step"], "restore_debug_app");
+        assert_eq!(steps.last().unwrap()["step"], "debug_app_reverted");
+    }
+
+    #[tokio::test]
+    async fn a_failed_launch_writes_a_persistent_setting_back_without_am() {
+        let host = FakeHost::new(vec![])
+            .reply("settings get global debug_app", "com.other.app\n")
+            .reply("settings get global wait_for_debugger", "1\n");
+        let mut steps = Vec::new();
+        launch_for_debug(
+            &host,
+            "io.example.app",
+            Duration::from_millis(20),
+            FAST,
+            &mut steps,
+            || async { Ok(json!({})) },
+            |pid| async move { Ok(pid) },
+            std::future::pending(),
+        )
+        .await
+        .unwrap_err();
+        let commands = host.commands();
+        let n = commands.len();
+        assert_eq!(
+            &commands[n - 3..],
+            [
+                "am clear-debug-app",
+                "settings put global debug_app 'com.other.app'",
+                "settings put global wait_for_debugger 1",
+            ],
+            "{commands:?}"
+        );
+        assert!(!commands.iter().any(|c| c.contains("--persistent")));
+        let restore = steps.last().unwrap();
+        assert_eq!(restore["step"], "restore_debug_app");
+        assert!(
+            restore["note"]
+                .as_str()
+                .unwrap()
+                .contains("Settings.Global")
+        );
     }
 
     #[tokio::test]
