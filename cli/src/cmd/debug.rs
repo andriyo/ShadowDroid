@@ -1783,6 +1783,36 @@ fn screen_hash_without_status_bar(png: &[u8]) -> Result<String> {
 /// times out, ~11 s). So: step out until the top frame is framework code,
 /// hash a server screenshot (status bar cropped), resume, poll the hash,
 /// and pause again once it changes, reporting where the main thread was.
+/// What `--timeout-ms` keeps back, after the run, for the final pause and
+/// snapshot: a quarter of it, at most 1.5 s.
+fn screen_change_reserve(total: Duration) -> Duration {
+    (total / 4).min(Duration::from_millis(1_500))
+}
+
+/// The whole `--timeout-ms` of a jdwp step-until-screen-change: step-outs,
+/// the run, the final pause, and the snapshot all come out of it.
+struct ScreenChangeBudget {
+    started: Instant,
+    total: Duration,
+}
+
+impl ScreenChangeBudget {
+    fn remaining(&self) -> Duration {
+        self.total.saturating_sub(self.started.elapsed())
+    }
+
+    /// When the run (polling) must end to leave the reserve.
+    fn run_deadline(&self) -> Instant {
+        self.started + self.total.saturating_sub(screen_change_reserve(self.total))
+    }
+
+    /// An RPC deadline from what is left, never below `floor` (a pause must
+    /// still be sent when the budget is spent).
+    fn rpc(&self, floor: Duration) -> Duration {
+        self.remaining().max(floor)
+    }
+}
+
 async fn step_until_screen_change_jdwp(
     serial: &Serial,
     client: &ServerClient,
@@ -1790,8 +1820,12 @@ async fn step_until_screen_change_jdwp(
 ) -> Result<()> {
     use crate::jdwp::commands as jdwp;
     let started = Instant::now();
+    let budget = ScreenChangeBudget {
+        started,
+        total: Duration::from_millis(args.timeout_ms),
+    };
     let entry = jdwp::session_for(serial.as_str(), args.session.as_deref())?;
-    let rpc_timeout = Duration::from_secs(30);
+    let rpc_timeout = budget.rpc(Duration::from_secs(2));
     let status = jdwp::call(&entry, "status", json!({}), rpc_timeout).await?;
     if status.pointer("/session/suspended") != Some(&json!(true)) {
         return Err(crate::diagnostic::DiagnosticError::new(
@@ -1808,6 +1842,10 @@ async fn step_until_screen_change_jdwp(
     // Leave app code: the change needs the message loop to run.
     let mut step_outs = 0;
     loop {
+        if Instant::now() >= budget.run_deadline() {
+            break;
+        }
+        let rpc_timeout = budget.rpc(Duration::from_millis(500));
         let stack = jdwp::call(&entry, "stack", json!({"limit": 1}), rpc_timeout).await?;
         let top = stack
             .pointer("/frames/0/class")
@@ -1832,27 +1870,58 @@ async fn step_until_screen_change_jdwp(
     };
     let initial = shot().await?;
     let resumed_at = Instant::now();
-    jdwp::call(&entry, "resume", json!({}), rpc_timeout).await?;
-    let deadline = resumed_at + Duration::from_millis(args.timeout_ms);
+    jdwp::call(
+        &entry,
+        "resume",
+        json!({}),
+        budget.rpc(Duration::from_secs(2)),
+    )
+    .await?;
+    let deadline = budget.run_deadline();
     let mut polls = 0u64;
     let changed = loop {
-        tokio::time::sleep(SCREEN_POLL).await;
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break None;
+        }
+        tokio::time::sleep(SCREEN_POLL.min(left)).await;
         polls += 1;
         let hash = shot().await?;
         if hash != initial {
             break Some(hash);
         }
-        if Instant::now() >= deadline {
-            break None;
-        }
     };
     let ran_ms = duration_millis(resumed_at.elapsed())?;
-    // Stop again so the result describes a suspended, inspectable state.
-    let paused = jdwp::call(&entry, "pause", json!({}), rpc_timeout).await?;
-    let main = jdwp::call(&entry, "stack", json!({"limit": 8}), rpc_timeout)
-        .await
-        .unwrap_or_else(|error| json!({"error": error.to_string()}));
-    let snapshot = final_snapshot(serial, client, &args.app, Dbg::Jdwp, args.depth, 120).await?;
+    // Stop again so the result describes a suspended, inspectable state;
+    // the pause is sent even when the budget is spent.
+    let paused = jdwp::call(
+        &entry,
+        "pause",
+        json!({}),
+        budget.rpc(Duration::from_secs(2)),
+    )
+    .await?;
+    let main = jdwp::call(
+        &entry,
+        "stack",
+        json!({"limit": 8}),
+        budget.rpc(Duration::from_millis(500)),
+    )
+    .await
+    .unwrap_or_else(|error| json!({"error": error.to_string()}));
+    let snapshot = match tokio::time::timeout(
+        budget.remaining(),
+        final_snapshot(serial, client, &args.app, Dbg::Jdwp, args.depth, 120),
+    )
+    .await
+    {
+        Ok(snapshot) => snapshot?,
+        Err(_) => json!({
+            "available": false,
+            "reason": "timeout_budget_spent",
+            "next_actions": ["shadowdroid debug snapshot --backend jdwp"],
+        }),
+    };
     let elapsed_ms = duration_millis(started.elapsed())?;
     let result = json!({
         "type": "step_until_screen_change",
@@ -1866,6 +1935,7 @@ async fn step_until_screen_change_jdwp(
         "polls": polls,
         "ran_ms": ran_ms,
         "elapsed_ms": elapsed_ms,
+        "budget_ms": args.timeout_ms,
         "initial_screen_hash": initial,
         "screen_hash": changed,
         "screen_hash_version": "jdwp_png_no_status_bar_v1",
@@ -3581,6 +3651,34 @@ mod tests {
         );
         assert_ne!(base, app_drew);
         assert!(screen_hash_without_status_bar(b"not a png").is_err());
+    }
+
+    #[test]
+    fn step_until_screen_change_spends_one_budget_on_every_phase() {
+        assert_eq!(
+            screen_change_reserve(Duration::from_secs(10)),
+            Duration::from_millis(1_500)
+        );
+        assert_eq!(
+            screen_change_reserve(Duration::from_secs(2)),
+            Duration::from_millis(500)
+        );
+        let started = Instant::now();
+        let budget = ScreenChangeBudget {
+            started,
+            total: Duration::from_secs(4),
+        };
+        // The run ends early enough to leave the pause and snapshot reserve.
+        assert_eq!(budget.run_deadline(), started + Duration::from_secs(3));
+        assert!(budget.remaining() <= Duration::from_secs(4));
+        // A spent budget still lets the pause go out.
+        let spent = ScreenChangeBudget {
+            started: started - Duration::from_secs(9),
+            total: Duration::from_secs(4),
+        };
+        assert_eq!(spent.remaining(), Duration::ZERO);
+        assert_eq!(spent.rpc(Duration::from_secs(2)), Duration::from_secs(2));
+        assert!(spent.run_deadline() < Instant::now());
     }
 
     #[test]
