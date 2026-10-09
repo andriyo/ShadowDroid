@@ -102,6 +102,16 @@ Studio is also reachable, Studio's sessions are listed too, each tagged with
 its `backend`. Set `debug_backend` in config, or pass `--backend
 studio|jdwp`, to pin one.
 
+The daemon's control channel is a unix socket, so the standalone debugger runs
+on macOS and Linux hosts. On Windows, `auto` stays on Android Studio
+(`backend_reason: jdwp_unsupported_on_host`) and `--backend jdwp` answers
+`unsupported_backend`.
+
+Standalone sessions follow the same device ownership as every other driver
+command (see [sessions](sessions.md)): attach and verbs that change the
+process (pause, step, breakpoints, launch) need the reservation's `--session`
+token when a device is reserved, and another driver gets `device_reserved`.
+
 `shadowdroid doctor --json` (add `--app <pkg>` or configure an app) has an
 advisory `debugger` check: whether this host can run the daemon, whether the
 device's adb `jdwp` service answers, the API level, whether the app is
