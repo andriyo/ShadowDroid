@@ -282,8 +282,10 @@ availability.
   successful launch restores nothing. A launch that fails or is interrupted
   runs `am clear-debug-app` and, when a persistent setting existed before,
   writes it back with `settings put global debug_app`/`wait_for_debugger`
-  (ActivityManager reads it on its next settings load); never `am
-  set-debug-app --persistent <prev>`, which force-stops that app.
+  (Developer options shows it again; ActivityManager reads it only at boot,
+  so it is inactive until a reboot, and the step says so with the command
+  that applies it now); never `am set-debug-app --persistent <prev>`
+  automatically, which force-stops that app.
   Breakpoints queued before launch bind through ClassPrepare
   ([§5.2](#52-breakpoint-resolution)).
 - `debug detach` disposes the VM connection (which clears all event requests

@@ -252,9 +252,21 @@ async fn clear_one_off_debug_app<H: LaunchHost>(
         "step": "restore_debug_app",
         "ok": errors.is_empty(),
         "commands": commands,
-        "note": "written to Settings.Global; ActivityManager picks it up the next time it reads its settings (not through am set-debug-app, which force-stops the app)",
+        "note": "written back to Settings.Global (Developer options shows it again), but ActivityManager reads that setting only at boot: until a reboot no debug app is active. `am set-debug-app` would apply it now, but it force-stops that app",
+        "effective": "after_reboot",
+        "apply_now": reapply_command(package, previous.wait_for_debugger),
         "errors": errors,
     }));
+}
+
+/// What makes a restored persistent setting active before a reboot (and
+/// force-stops `package`).
+fn reapply_command(package: &str, wait_for_debugger: bool) -> String {
+    format!(
+        "adb shell am set-debug-app --persistent{} {}",
+        if wait_for_debugger { " -w" } else { "" },
+        crate::config::quote_device_shell_arg(package)
+    )
 }
 
 /// After a launch that started the app: ActivityManager already reverted
@@ -742,6 +754,12 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("Settings.Global")
+        );
+        // ActivityManager does not re-read it until boot (live on API 36).
+        assert_eq!(restore["effective"], "after_reboot");
+        assert_eq!(
+            restore["apply_now"],
+            "adb shell am set-debug-app --persistent -w 'com.other.app'"
         );
     }
 
