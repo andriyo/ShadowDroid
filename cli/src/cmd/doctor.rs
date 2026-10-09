@@ -1026,6 +1026,12 @@ async fn debugger_check(
             .map(|pids| pids.len())
             .map_err(|error| format!("{error:#}")),
     );
+    // The bridge `debug` would use: $SHADOWDROID_STUDIO_DEBUGGER_URL (its
+    // --studio-url env), then config, then the plugin registry.
+    let studio_url = effective_studio_url(
+        std::env::var("SHADOWDROID_STUDIO_DEBUGGER_URL").ok(),
+        config.studio_url.as_deref(),
+    );
     let app = match package {
         Some(package) => {
             let quoted = crate::config::quote_device_shell_arg(package);
@@ -1044,8 +1050,7 @@ async fn debugger_check(
             .await
             .map(|entry| entry.session_id);
             let studio_attached =
-                studio_debugger_attached(serial.as_str(), package, config.studio_url.as_deref())
-                    .await;
+                studio_debugger_attached(serial.as_str(), package, studio_url.as_deref()).await;
             Some(AppDebugProbe {
                 package: package.to_string(),
                 debuggable_flag: package_debuggable(&dumpsys),
@@ -1060,7 +1065,7 @@ async fn debugger_check(
         Some(serial.as_str()),
         package,
         None,
-        config.studio_url.as_deref(),
+        studio_url.as_deref(),
         config,
         false,
     )
@@ -1076,6 +1081,12 @@ async fn debugger_check(
         app,
         auto: Some((backend, reason)),
     })
+}
+
+/// `--studio-url`'s precedence for `debug`: the env value, then config.
+fn effective_studio_url(env: Option<String>, config: Option<&str>) -> Option<String> {
+    env.filter(|url| !url.trim().is_empty())
+        .or_else(|| config.map(str::to_string))
 }
 
 /// Whether Studio's client list shows a debugger attached to `package` on
@@ -1349,6 +1360,19 @@ mod tests {
                 .detail
                 .contains("Android Studio's debugger is attached")
         );
+    }
+
+    #[test]
+    fn debugger_check_uses_the_studio_url_debug_would_use() {
+        assert_eq!(
+            effective_studio_url(Some("http://127.0.0.1:1".into()), Some("http://cfg:2")),
+            Some("http://127.0.0.1:1".into())
+        );
+        assert_eq!(
+            effective_studio_url(Some(" ".into()), Some("http://cfg:2")),
+            Some("http://cfg:2".into())
+        );
+        assert_eq!(effective_studio_url(None, None), None);
     }
 
     #[test]
