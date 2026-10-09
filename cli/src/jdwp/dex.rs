@@ -27,6 +27,12 @@ pub struct FieldSite {
     pub write: bool,
 }
 
+/// `invoke-*` opcodes: 0x6e–0x72, the `/range` forms 0x74–0x78, and
+/// invoke-polymorphic/custom 0xfa–0xfd.
+pub fn is_invoke(opcode: u8) -> bool {
+    matches!(opcode, 0x6e..=0x72 | 0x74..=0x78 | 0xfa..=0xfd)
+}
+
 /// Opcodes that name a field: `iget*` 0x52–0x58, `iput*` 0x59–0x5f,
 /// `sget*` 0x60–0x66, `sput*` 0x67–0x6d. Returns whether it writes.
 pub fn field_opcode(opcode: u8) -> Option<bool> {
@@ -450,6 +456,17 @@ pub fn descriptor(class: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn invoke_opcodes() {
+        for op in [0x6e, 0x71, 0x72, 0x74, 0x78, 0xfa, 0xfd] {
+            assert!(super::is_invoke(op), "{op:#x}");
+        }
+        // sget-object, new-instance, const-class, nop, return-void
+        for op in [0x62, 0x22, 0x1c, 0x00, 0x0e, 0x73] {
+            assert!(!super::is_invoke(op), "{op:#x}");
+        }
+    }
+
     use super::*;
 
     const FIXTURE: &[u8] = include_bytes!("../../tests/fixtures/dex/fields.dex");

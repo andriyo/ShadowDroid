@@ -55,6 +55,14 @@ pub fn is_framework_class(class: &str) -> bool {
     })
 }
 
+/// The class-loading machinery a runtime class resolution runs through.
+fn is_class_loading_class(class: &str) -> bool {
+    matches!(
+        class,
+        "java.lang.Class" | "java.lang.ClassLoader" | "java.lang.BootClassLoader"
+    ) || (class.starts_with("dalvik.system.") && class.ends_with("ClassLoader"))
+}
+
 /// Shown while a real field watch is armed.
 pub(super) const SLOW_WATCH_WARNING: &str = "a field watch makes ART interpret the whole app (about 10x slower UI on the emulator) until it is cleared; it auto-clears after --duration-ms";
 
@@ -1950,6 +1958,9 @@ impl Session {
     /// only when the exception unwinds through at least one app frame on the
     /// way to it.
     async fn escapes_app_code(&self, thread: u64, catch_location: Option<&Location>) -> bool {
+        if self.thrown_by_class_resolution(thread).await {
+            return false;
+        }
         let Some(catch) = catch_location else {
             return true;
         };
@@ -1976,6 +1987,44 @@ impl Session {
                 // An app frame (or one we cannot name) unwinds.
                 _ => return true,
             }
+        }
+        false
+    }
+
+    /// Whether the exception was thrown inside class loading the runtime
+    /// started to resolve a class for an instruction (`sget`, `new-instance`,
+    /// `const-class`, …) rather than an explicit `loadClass`/`forName` call.
+    /// ART catches those in native code and throws `NoClassDefFoundError`
+    /// at the instruction instead, but JDWP reports the next Java handler up
+    /// the stack as the catcher: a library probing for optional classes
+    /// (okhttp's platform detection during startup) looks like a crash.
+    async fn thrown_by_class_resolution(&self, thread: u64) -> bool {
+        let Ok(frames) = self.jdwp.frames(thread, 0, 16).await else {
+            return false;
+        };
+        let mut loader_frames = 0;
+        for (_, location) in &frames {
+            let Ok(signature) = self.signature(location.class_id).await else {
+                return false;
+            };
+            if is_class_loading_class(&resolve::type_name(&signature)) {
+                loader_frames += 1;
+                continue;
+            }
+            if loader_frames == 0 || location.is_native() {
+                return false;
+            }
+            let Ok(code) = self
+                .jdwp
+                .bytecodes(location.class_id, location.method_id)
+                .await
+            else {
+                return false;
+            };
+            let at = usize::try_from(location.index).unwrap_or(usize::MAX);
+            return code
+                .get(at.saturating_mul(2))
+                .is_some_and(|opcode| !super::dex::is_invoke(*opcode));
         }
         false
     }

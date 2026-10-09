@@ -642,6 +642,12 @@ const CLASSES: &[Class] = &[
         methods: &[(1050, "run", "()V", &[(0, 7)])],
     },
     Class {
+        id: 108,
+        signature: "Ldalvik/system/BaseDexClassLoader;",
+        source: Some("BaseDexClassLoader.java"),
+        methods: &[],
+    },
+    Class {
         id: 107,
         signature: "Ljava/lang/IllegalStateException;",
         source: Some("IllegalStateException.java"),
@@ -1253,6 +1259,9 @@ fn handle(shared: &Shared, set: u8, cmd: u8, body: &[u8]) -> (u16, Vec<u8>, Afte
                 let mut units = vec![0x0000; 10];
                 units.push(0x000e);
                 units
+            } else if method_id == 1019 {
+                // invoke-static {}, method@0 (an explicit Class.forName)
+                vec![0x0071, 0x0000, 0x0000, 0x000e]
             } else {
                 vec![0x000e]
             };

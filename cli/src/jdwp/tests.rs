@@ -1000,6 +1000,31 @@ async fn framework_internal_exceptions_are_not_crashes() {
     assert_eq!(session.status().await["suspend_reason"], "exception");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn class_resolution_probes_are_not_crashes() {
+    let vm = FakeVm::start();
+    let session = attach(&vm, WAIT).await;
+    session
+        .break_exception("java.lang.String", false, true, Default::default())
+        .await
+        .unwrap();
+    // A ClassNotFoundException thrown in the class loader while the runtime
+    // resolves a class for a non-invoke instruction (a nop stands in for
+    // okhttp's sget-object) in app/library code; JDWP names a framework
+    // catcher further up. ART swallows it natively: resumed, not a stop.
+    vm.with_state(|s| s.main_frames = Some(vec![(108, 6000, 2), (100, 1001, 5), (104, 6000, 3)]));
+    assert_eq!(vm.throw_exception_at(Some((104, 6000))), 1);
+    vm.wait_for(WAIT, "the resolution probe to resume", |s| s.resumes == 1);
+    assert!(session.suspension().is_none());
+
+    // The same throw under an explicit call (invoke-static at index 0)
+    // reaches the app: a stop.
+    vm.with_state(|s| s.main_frames = Some(vec![(108, 6000, 2), (100, 1019, 0), (104, 6000, 3)]));
+    assert_eq!(vm.throw_exception_at(Some((104, 6000))), 1);
+    wait_suspended(&session).await;
+    assert_eq!(session.status().await["suspend_reason"], "exception");
+}
+
 // ── P1c: --invoke ───────────────────────────────────────────────────────
 
 const INVOKE: Option<Duration> = Some(Duration::from_secs(2));
