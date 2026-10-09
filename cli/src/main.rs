@@ -66,6 +66,7 @@ mod video;
 mod watch;
 
 fn main() {
+    runtime::process_started();
     // `--quiet`/`-q` (or SHADOWDROID_QUIET) suppresses our own operational logs so
     // stdout stays clean JSON even under `2>&1`. It's read here, ahead of clap,
     // because tracing is initialized before argument dispatch. An explicit

@@ -1789,8 +1789,9 @@ fn screen_change_reserve(total: Duration) -> Duration {
     (total / 4).min(Duration::from_millis(1_500))
 }
 
-/// The whole `--timeout-ms` of a jdwp step-until-screen-change: step-outs,
-/// the run, the final pause, and the snapshot all come out of it.
+/// The whole `--timeout-ms` of a jdwp step-until-screen-change: the device
+/// bring-up, step-outs, the run, the final pause, and the snapshot all come
+/// out of it.
 struct ScreenChangeBudget {
     started: Instant,
     total: Duration,
@@ -1819,7 +1820,9 @@ async fn step_until_screen_change_jdwp(
     args: StudioWaitArgs,
 ) -> Result<()> {
     use crate::jdwp::commands as jdwp;
-    let started = Instant::now();
+    // The budget covers the whole command, including the server bring-up
+    // before this verb ran (~0.8 s while the app's main thread is stopped).
+    let started = crate::runtime::process_started();
     let budget = ScreenChangeBudget {
         started,
         total: Duration::from_millis(args.timeout_ms),
@@ -3679,6 +3682,10 @@ mod tests {
         assert_eq!(spent.remaining(), Duration::ZERO);
         assert_eq!(spent.rpc(Duration::from_secs(2)), Duration::from_secs(2));
         assert!(spent.run_deadline() < Instant::now());
+        // The budget starts with the process, not with the verb.
+        let process = crate::runtime::process_started();
+        assert_eq!(process, crate::runtime::process_started());
+        assert!(process <= Instant::now());
     }
 
     #[test]

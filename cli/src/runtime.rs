@@ -12,6 +12,14 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static OPTIONS: OnceLock<Options> = OnceLock::new();
+static PROCESS_STARTED: OnceLock<std::time::Instant> = OnceLock::new();
+
+/// When this command started: `main` reads it first, so a verb whose
+/// `--timeout-ms` bounds the whole command can count the device bring-up
+/// that runs before the verb (slow while a debugger holds the app stopped).
+pub fn process_started() -> std::time::Instant {
+    *PROCESS_STARTED.get_or_init(std::time::Instant::now)
+}
 static ACTIVE: Mutex<Option<Operation>> = Mutex::new(None);
 static TERMINAL: Mutex<Vec<Value>> = Mutex::new(Vec::new());
 static UNSETTLED_MUTATIONS: AtomicUsize = AtomicUsize::new(0);
