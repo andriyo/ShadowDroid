@@ -106,6 +106,22 @@ expect() {
     fi
 }
 
+# record_ok LABEL TRIES ARGS...: record, retrying while the response is not ok
+# (first UI reads after a server reinstall can be transiently empty).
+record_ok() {
+    local label="$1" tries="$2"
+    shift 2
+    local attempt
+    for ((attempt = 1; attempt <= tries; attempt++)); do
+        record "$label" "$@"
+        if jq -e '.ok == true' "$evidence_dir/$label.json" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    fail "$label: not ok after $tries attempt(s): $(jq -c '{code, msg, top_texts: .detail.top_texts}' "$evidence_dir/$label.json" 2>/dev/null)"
+}
+
 adb_shell() {
     adb -s "$serial" shell "$@" | tr -d '\r'
 }
@@ -332,21 +348,43 @@ record method-detach debug detach --backend jdwp
 step "run-until-crash through the fault controls"
 start_main
 record crash-attach debug attach --backend jdwp --package "$package_name"
-record crash-nav-wait ui wait --rid nav_lab --timeout-ms 15000
-record crash-nav-tap ui tap --rid nav_lab --exact
-record crash-search-wait ui wait --rid lab_search_input --timeout-ms 8000
-record crash-filter ui text crash --rid lab_search_input --clear
+# Every intermediate screen is verified: CI's default AVD is 320x640 @ mdpi,
+# where the fault buttons sit several screens down a nested scroller and a
+# full-screen swipe starts on the bottom navigation bar.
+record_ok crash-nav-wait 3 ui wait --rid nav_lab --timeout-ms 15000
+record_ok crash-nav-tap 2 ui tap --rid nav_lab --exact
+record_ok crash-search-wait 2 ui wait --rid lab_search_input --timeout-ms 8000
+pass "Lab workspace open"
+record_ok crash-filter 2 ui text crash --rid lab_search_input --clear
 record crash-keyboard ui hide-keyboard
-record crash-expand ui tap --rid lab_faults_section_toggle --exact
-record crash-reveal ui scroll-to --rid crash_button --exact --max-swipes 8
-expect crash-reveal '.ok == true' "crash button on screen"
+record crash-filter-check ui find --rid lab_search_input --exact
+expect crash-filter-check '[.elements[]?.text] | index("crash") != null' "Lab filtered to the fault section" '[.elements[]? | {rid, text}]'
+record_ok crash-toggle-visible 2 ui scroll-to --rid lab_faults_section_toggle --exact --direction up \
+    --container-rid fixture_lab_scroll --max-swipes 12
+record crash-expanded-before ui find --text "HIDE FIXTURES" --exact
+if ! jq -e '.ok == true and (.elements | length) > 0' "$evidence_dir/crash-expanded-before.json" >/dev/null 2>&1; then
+    record_ok crash-expand 2 ui tap --rid lab_faults_section_toggle --exact
+fi
+record crash-expanded ui wait --text "HIDE FIXTURES" --exact --timeout-ms 5000
+expect crash-expanded '.ok == true' "fault section expanded"
+record_ok crash-reveal 2 ui scroll-to --rid crash_button --exact --container-rid fixture_lab_scroll --max-swipes 20
+record crash-visible ui wait --rid crash_button --exact --timeout-ms 3000
+expect crash-visible '.ok == true and .matched == true' "crash button on screen" '{ok, code, msg, top_texts: .detail.top_texts}'
 crash_out="$evidence_dir/run-until-crash.json"
 (sd debug run-until-crash --backend jdwp --timeout-ms 60000 --bundle "$evidence_dir/crash-bundle" \
     2>"$evidence_dir/run-until-crash.stderr" | grep -v '^[[:space:]]*$' | tail -n 1 >"$crash_out") &
 crash_wait=$!
-# run-until-crash arms its exception request before it resumes and waits; a
-# tap that lands earlier would crash the app with nobody listening.
-sleep 5
+# Tap only once run-until-crash has its uncaught-exception request bound: a
+# crash before that has nobody listening.
+deadline=$((SECONDS + 20))
+until sd debug breakpoints --backend jdwp 2>/dev/null >"$evidence_dir/crash-armed.json" &&
+    jq -e '[.breakpoints[]? | select(.type == "exception" and .uncaught == true and .bound == true)] | length > 0' \
+        "$evidence_dir/crash-armed.json" >/dev/null 2>&1; do
+    ((SECONDS < deadline)) || fail "run-until-crash did not arm its exception breakpoint within 20s"
+    kill -0 "$crash_wait" 2>/dev/null || fail "run-until-crash exited before arming: $(cat "$crash_out" 2>/dev/null)"
+    sleep 0.3
+done
+pass "run-until-crash armed its uncaught-exception breakpoint"
 record crash-tap ui tap --rid crash_button --exact
 wait "$crash_wait" || true
 jq -e . "$crash_out" >/dev/null 2>&1 || fail "run-until-crash printed no JSON"
