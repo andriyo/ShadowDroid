@@ -1296,7 +1296,37 @@ async fn sessions(serial: Option<&str>, studio: Option<Option<&str>>) -> Result<
         }
         None => json!({"checked": false}),
     };
-    Ok(json!({"sessions": sessions, "backends": {"studio": studio_info}}))
+    let mut reply = json!({"sessions": sessions, "backends": {"studio": studio_info}});
+    surface_session_warning(&mut reply);
+    Ok(reply)
+}
+
+/// A suspended attach-to-running session's ANR report or long-stop warning
+/// lives on its session object; lift the first one to the reply's
+/// `warning`, and its relaunch to the head of `next_actions`, so an agent
+/// polling `status`/`sessions` sees it without reading every session.
+fn surface_session_warning(reply: &mut Json) {
+    let Some(session) = reply["sessions"].as_array().and_then(|sessions| {
+        sessions
+            .iter()
+            .find(|s| {
+                s["backend"] != "studio" && s["warning"].as_str().is_some_and(|w| !w.is_empty())
+            })
+            .cloned()
+    }) else {
+        return;
+    };
+    let id = session["id"].as_str().unwrap_or("jdwp session");
+    reply["warning"] = json!(format!(
+        "{id}: {}",
+        session["warning"].as_str().unwrap_or_default()
+    ));
+    if !session["anr"].is_null() {
+        reply["anr"] = json!({"session": id, "report": session["anr"]});
+    }
+    if session["suspended"] == true && session["launched_under_debugger"] != true {
+        reply["next_actions"] = json!([super::anr::relaunch_action(session["package"].as_str())]);
+    }
 }
 
 async fn status(serial: Option<&str>, studio: Option<Option<&str>>) -> Result<Json> {
@@ -1319,13 +1349,15 @@ async fn status(serial: Option<&str>, studio: Option<Option<&str>>) -> Result<Js
         }
         None => json!({"checked": false, "hint": "shadowdroid debug status --backend studio"}),
     };
-    Ok(json!({
+    let mut reply = json!({
         "backends": {
             "jdwp": {"available": cfg!(unix), "daemons": daemons},
             "studio": studio_info,
         },
         "sessions": sessions,
-    }))
+    });
+    surface_session_warning(&mut reply);
+    Ok(reply)
 }
 
 /// Bound on reading the Studio bridge from a jdwp `sessions`/`status`.
@@ -1674,5 +1706,33 @@ mod tests {
             .unwrap();
         assert!(!init.exceptions[0].caught);
         assert!(init.exceptions[0].uncaught);
+    }
+
+    #[test]
+    fn status_surfaces_a_session_anr_and_its_relaunch() {
+        let mut reply = json!({"sessions": [
+            {"id": "studio-1", "backend": "studio", "warning": "studio note"},
+            {"id": "jdwp:emu:1", "backend": "jdwp", "package": "io.example.app",
+             "suspended": true, "launched_under_debugger": false,
+             "anr": {"dialog": true}, "warning": "Android reports io.example.app not responding"},
+        ]});
+        surface_session_warning(&mut reply);
+        assert!(
+            reply["warning"]
+                .as_str()
+                .unwrap()
+                .starts_with("jdwp:emu:1: Android reports")
+        );
+        assert_eq!(reply["anr"]["session"], "jdwp:emu:1");
+        assert_eq!(
+            reply["next_actions"][0],
+            "shadowdroid debug attach --relaunch --backend jdwp --package io.example.app"
+        );
+
+        let mut quiet =
+            json!({"sessions": [{"id": "jdwp:emu:2", "backend": "jdwp", "warning": null}]});
+        surface_session_warning(&mut quiet);
+        assert!(quiet.get("warning").is_none());
+        assert!(quiet.get("next_actions").is_none());
     }
 }
